@@ -1,4 +1,8 @@
-src/.d
-src/.o
+**/*.o
+src/**/*.o
+*.o
+**/*.d
+src/**/*.d
+*.d
 memory-bank
 
