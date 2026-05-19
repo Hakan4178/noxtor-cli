@@ -303,6 +303,56 @@ static int test_noise_null_safety(void)
 }
 
 /* ================================================================
+ * TEST: Handshake onion payload exchange
+ * ================================================================ */
+static int test_handshake_onion_payload(void)
+{
+    uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
+    uint8_t b_priv[NOX_KEY_LEN], b_pub[NOX_KEY_LEN];
+    gen_static_keypair(a_priv, a_pub);
+    gen_static_keypair(b_priv, b_pub);
+
+    struct noise_handshake hs_a, hs_b;
+    TEST_ASSERT(handshake_init(&hs_a, true, a_priv, a_pub) == NOX_OK);
+    TEST_ASSERT(handshake_init(&hs_b, false, b_priv, b_pub) == NOX_OK);
+
+    const char *alice_onion = "alice12345678901234567890123456789012345678901234567890.onion";
+    const char *bob_onion = "bob12345678901234567890123456789012345678901234567890.onion";
+
+    uint8_t buf[NOISE_MAX_HANDSHAKE_LEN];
+    uint8_t pl[128];
+    size_t len, pl_len;
+
+    /* msg0: Alice -> Bob (no payload) */
+    len = sizeof(buf);
+    TEST_ASSERT(handshake_write(&hs_a, NULL, 0, buf, &len) == NOX_OK);
+    pl_len = sizeof(pl);
+    TEST_ASSERT(handshake_read(&hs_b, buf, len, pl, &pl_len) == NOX_OK);
+    TEST_ASSERT(pl_len == 0);
+
+    /* msg1: Bob -> Alice (carrying bob_onion) */
+    len = sizeof(buf);
+    TEST_ASSERT(handshake_write(&hs_b, (const uint8_t *)bob_onion, NOX_ONION_LEN + 1, buf, &len) == NOX_OK);
+    pl_len = sizeof(pl);
+    TEST_ASSERT(handshake_read(&hs_a, buf, len, pl, &pl_len) == NOX_OK);
+    TEST_ASSERT(pl_len == NOX_ONION_LEN + 1);
+    TEST_ASSERT(strcmp((const char *)pl, bob_onion) == 0);
+
+    /* msg2: Alice -> Bob (carrying alice_onion) */
+    len = sizeof(buf);
+    TEST_ASSERT(handshake_write(&hs_a, (const uint8_t *)alice_onion, NOX_ONION_LEN + 1, buf, &len) == NOX_OK);
+    pl_len = sizeof(pl);
+    TEST_ASSERT(handshake_read(&hs_b, buf, len, pl, &pl_len) == NOX_OK);
+    TEST_ASSERT(pl_len == NOX_ONION_LEN + 1);
+    TEST_ASSERT(strcmp((const char *)pl, alice_onion) == 0);
+
+    TEST_ASSERT(handshake_is_complete(&hs_a));
+    TEST_ASSERT(handshake_is_complete(&hs_b));
+
+    return 0;
+}
+
+/* ================================================================
  * MAIN
  * ================================================================ */
 int main(void)
@@ -320,6 +370,7 @@ int main(void)
     RUN_TEST(test_mac_tamper);
     RUN_TEST(test_remote_static_key);
     RUN_TEST(test_wrong_order);
+    RUN_TEST(test_handshake_onion_payload);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n\n",
             tests_passed, tests_run);

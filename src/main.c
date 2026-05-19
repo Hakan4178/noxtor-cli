@@ -24,6 +24,7 @@
 #include "crypto.h"
 #include "noise.h"
 #include "network.h"
+#include "database.h"
 #include "asm_utils.h"
 
 #include <stdio.h>
@@ -324,6 +325,7 @@ static void cleanup(struct app_state *state)
 {
     NOX_INFO(LOG_MOD_MAIN, "temizlik başlıyor...");
     restore_terminal();
+    db_close();
 
     /* Key materyali — arena'da yaşar, arena_destroy sıfırlar */
     state->master_key  = NULL;
@@ -353,6 +355,31 @@ static void cleanup(struct app_state *state)
     }
 
     NOX_INFO(LOG_MOD_MAIN, "temizlik tamamlandı");
+}
+
+static nox_err_t send_queued_callback(const char *text, void *ctx)
+{
+    struct app_state *state = (struct app_state *)ctx;
+    if (state->peer_fd < 0 || !state->session) return NOX_ERR_NET;
+
+    size_t pt_len = strlen(text) + 1;
+    uint8_t payload[4096 + NOX_MAC_LEN];
+    ssize_t ct_len = noise_encrypt(state->session, (const uint8_t *)text, pt_len, payload);
+    if (ct_len < 0) return NOX_ERR_CRYPTO;
+
+    struct frame_header fh = {
+        .magic = NOX_FRAME_MAGIC,
+        .type  = NOX_MSG_TEXT,
+        .seq   = state->tx_seq++,
+        .len   = (uint32_t)ct_len,
+    };
+    uint8_t wire[FRAME_HEADER_WIRE_SIZE];
+    frame_header_encode(&fh, wire);
+
+    if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK) return NOX_ERR_IO;
+    if (write_full(state->peer_fd, payload, (size_t)ct_len) != NOX_OK) return NOX_ERR_IO;
+
+    return NOX_OK;
 }
 
 /* ================================================================
@@ -413,7 +440,44 @@ static void event_loop(struct app_state *state)
                     continue;
                 }
 
+                /* ── TOFU Onay Modu ─────────────────── */
+                if (state->tofu_pending) {
+                    if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
+                        db_add_contact(state->tofu_onion, state->tofu_name, state->tofu_new_key);
+                        fprintf(stderr, "  [✓] Akran onaylandı ve kaydedildi: %s\n", state->tofu_name);
 
+                        state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
+                        if (state->session) {
+                            handshake_split(state->hs, state->session);
+                            strncpy(state->active_peer_onion, state->tofu_onion, NOX_ONION_LEN);
+                            state->active_peer_onion[NOX_ONION_LEN] = '\0';
+                            
+                            NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
+                            fprintf(stderr, "  [✓] şifreli kanal kuruldu (%s)\n> ", state->tofu_name);
+                            
+                            /* Kuyruktaki bekleyen mesajları gönder */
+                            db_process_queue(state->active_peer_onion, send_queued_callback, state);
+                        } else {
+                            fprintf(stderr, "  [!] Arena bellek hatası\n> ");
+                            close(state->tofu_peer_fd);
+                            state->peer_fd = -1;
+                            arena_restore(&state->arena, state->tofu_arena_mark);
+                        }
+                        state->hs = NULL;
+                        state->tofu_pending = false;
+                    } else if (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0) {
+                        fprintf(stderr, "  [*] Bağlantı reddedildi.\n> ");
+                        close(state->tofu_peer_fd);
+                        state->peer_fd = -1;
+                        state->hs = NULL;
+                        state->session = NULL;
+                        arena_restore(&state->arena, state->tofu_arena_mark);
+                        state->tofu_pending = false;
+                    } else {
+                        fprintf(stderr, "  [?] Lütfen 'y' veya 'n' giriniz (y/n): ");
+                    }
+                    continue;
+                }
 
                 /* ── Session aktifken: her satır mesaj ─── */
                 if (state->session && state->peer_fd >= 0) {
@@ -444,12 +508,107 @@ static void event_loop(struct app_state *state)
                 /* ── Session yokken: komut modu ─────── */
                 if (state->peer_fd < 0 && line[0] != '/') {
                     fprintf(stderr,
-                        "  [!] bağlantı yok — önce /connect kullan\n> ");
+                        "  [!] bağlantı yok — önce /connect kullan veya çevrimdışı mesaj için /msg kullan\n> ");
                     continue;
                 }
 
                 if (strcmp(line, "/addr") == 0) {
                     fprintf(stderr, "  %s\n> ", state->onion_addr);
+                    continue;
+                }
+
+                if (strncmp(line, "/add ", 5) == 0) {
+                    const char *p = line + 5;
+                    while (*p == ' ') p++;
+                    
+                    const char *onion_start = p;
+                    while (*p && *p != ' ') p++;
+                    size_t onion_len = (size_t)(p - onion_start);
+                    
+                    if (onion_len != NOX_ONION_LEN || *p == '\0') {
+                        fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /add <onion> <isim>\n> ");
+                        continue;
+                    }
+                    
+                    char onion[NOX_ONION_LEN + 1];
+                    memcpy(onion, onion_start, NOX_ONION_LEN);
+                    onion[NOX_ONION_LEN] = '\0';
+                    
+                    while (*p == ' ') p++;
+                    const char *name_start = p;
+                    if (*name_start == '\0') {
+                        fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /add <onion> <isim>\n> ");
+                        continue;
+                    }
+                    
+                    char name[NOX_CONTACT_NAME_LEN + 1];
+                    strncpy(name, name_start, NOX_CONTACT_NAME_LEN);
+                    name[NOX_CONTACT_NAME_LEN] = '\0';
+                    
+                    uint8_t zero_key[NOX_KEY_LEN];
+                    explicit_bzero(zero_key, sizeof(zero_key));
+                    
+                    nox_err_t err = db_add_contact(onion, name, zero_key);
+                    if (err == NOX_OK) {
+                        fprintf(stderr, "  [✓] Rehbere kaydedildi: %s (%s)\n> ", name, onion);
+                    } else {
+                        fprintf(stderr, "  [!] Veritabanı hatası\n> ");
+                    }
+                    continue;
+                }
+
+                if (strncmp(line, "/msg ", 5) == 0) {
+                    const char *p = line + 5;
+                    while (*p == ' ') p++;
+                    
+                    const char *onion_start = p;
+                    while (*p && *p != ' ') p++;
+                    size_t onion_len = (size_t)(p - onion_start);
+                    
+                    if (onion_len != NOX_ONION_LEN || *p == '\0') {
+                        fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /msg <onion> <mesaj>\n> ");
+                        continue;
+                    }
+                    
+                    char onion[NOX_ONION_LEN + 1];
+                    memcpy(onion, onion_start, NOX_ONION_LEN);
+                    onion[NOX_ONION_LEN] = '\0';
+                    
+                    while (*p == ' ') p++;
+                    const char *msg_start = p;
+                    if (*msg_start == '\0') {
+                        fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /msg <onion> <mesaj>\n> ");
+                        continue;
+                    }
+                    
+                    if (state->session && state->peer_fd >= 0 && strcmp(state->active_peer_onion, onion) == 0) {
+                        size_t mlen = strlen(msg_start) + 1;
+                        uint8_t ct[4096 + NOX_MAC_LEN];
+                        ssize_t ct_len = noise_encrypt(state->session,
+                            (const uint8_t *)msg_start, mlen, ct);
+                        if (ct_len >= 0) {
+                            struct frame_header fh = {
+                                .magic = NOX_FRAME_MAGIC,
+                                .type  = NOX_MSG_TEXT,
+                                .seq   = state->tx_seq++,
+                                .len   = (uint32_t)ct_len,
+                            };
+                            uint8_t wire[FRAME_HEADER_WIRE_SIZE];
+                            frame_header_encode(&fh, wire);
+                            write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE);
+                            write_full(state->peer_fd, ct, (size_t)ct_len);
+                            fprintf(stderr, "  [✓] Mesaj gönderildi (aktif bağlantı)\n> ");
+                        } else {
+                            fprintf(stderr, "  [!] Şifreleme hatası\n> ");
+                        }
+                    } else {
+                        nox_err_t err = db_queue_message(onion, msg_start);
+                        if (err == NOX_OK) {
+                            fprintf(stderr, "  [*] Mesaj kuyruğa eklendi (akran çevrimdışı)\n> ");
+                        } else {
+                            fprintf(stderr, "  [!] Kuyruğa ekleme başarısız\n> ");
+                        }
+                    }
                     continue;
                 }
 
@@ -512,7 +671,7 @@ static void event_loop(struct app_state *state)
                 }
 
                 fprintf(stderr,
-                    "  [?] komutlar: /addr  /connect <onion>  Ctrl+P\n> ");
+                    "  [?] komutlar: /addr  /connect <onion>  /add <onion> <isim>  /msg <onion> <mesaj>  Ctrl+P\n> ");
 
             } else if (fd == state->listen_fd) {
                 /* ── Gelen peer bağlantısı ───────── */
@@ -560,6 +719,7 @@ static void event_loop(struct app_state *state)
                     state->peer_fd = -1;
                     state->session = NULL;
                     state->hs = NULL;
+                    state->active_peer_onion[0] = '\0';
                     arena_restore(&state->arena,
                                   state->session_arena_mark);
                     fprintf(stderr, "\n  [*] peer ayrıldı\n> ");
@@ -591,7 +751,7 @@ static void event_loop(struct app_state *state)
                     if (state->hs->msg_index < 3) {
                         uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
                         size_t hslen = sizeof(hsbuf);
-                        handshake_write(state->hs, NULL, 0,
+                        handshake_write(state->hs, (const uint8_t *)state->onion_addr, NOX_ONION_LEN + 1,
                                          hsbuf, &hslen);
 
                         struct frame_header rfh = {
@@ -608,16 +768,103 @@ static void event_loop(struct app_state *state)
                     }
 
                     if (state->hs->msg_index >= 3) {
-                        state->session = arena_alloc(&state->arena,
-                                            sizeof(struct noise_session));
-                        if (state->session) {
-                            handshake_split(state->hs, state->session);
-                            NOX_INFO(LOG_MOD_NOISE,
-                                "session kuruldu — mesajlaşma hazır");
-                            fprintf(stderr,
-                                "\n  [✓] şifreli kanal kuruldu\n> ");
+                        char peer_onion[NOX_ONION_LEN + 1];
+                        explicit_bzero(peer_onion, sizeof(peer_onion));
+                        
+                        if (pl_len == NOX_ONION_LEN + 1 && pl[NOX_ONION_LEN] == '\0') {
+                            memcpy(peer_onion, pl, NOX_ONION_LEN + 1);
+                        } else {
+                            NOX_ERROR(LOG_MOD_NOISE, "Handshake payload geçersiz veya eksik");
+                            fprintf(stderr, "\n  [!] Hata: Akran geçerli bir adres iletmedi\n> ");
+                            close(fd);
+                            state->peer_fd = -1;
+                            state->hs = NULL;
+                            state->active_peer_onion[0] = '\0';
+                            arena_restore(&state->arena, state->session_arena_mark);
+                            continue;
                         }
-                        state->hs = NULL;
+
+                        char name[NOX_CONTACT_NAME_LEN + 1];
+                        uint8_t stored_key[NOX_KEY_LEN];
+                        explicit_bzero(name, sizeof(name));
+                        explicit_bzero(stored_key, sizeof(stored_key));
+
+                        nox_err_t db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key);
+                        uint8_t remote_pub[NOX_KEY_LEN];
+                        memcpy(remote_pub, state->hs->rs, NOX_KEY_LEN);
+
+                        char fp_str[NOX_KEY_LEN * 2 + 1];
+                        for (size_t k = 0; k < NOX_KEY_LEN; k++) {
+                            sprintf(&fp_str[k * 2], "%02x", remote_pub[k]);
+                        }
+
+                        bool zero_key = true;
+                        for (size_t k = 0; k < NOX_KEY_LEN; k++) {
+                            if (stored_key[k] != 0) {
+                                zero_key = false;
+                                break;
+                            }
+                        }
+
+                        if (db_err == NOX_OK && !zero_key) {
+                            if (memcmp(stored_key, remote_pub, NOX_KEY_LEN) == 0) {
+                                state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
+                                if (state->session) {
+                                    handshake_split(state->hs, state->session);
+                                    strncpy(state->active_peer_onion, peer_onion, NOX_ONION_LEN);
+                                    state->active_peer_onion[NOX_ONION_LEN] = '\0';
+                                    
+                                    NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
+                                    fprintf(stderr, "\n  [✓] şifreli kanal kuruldu (%s)\n> ", name);
+                                    
+                                    db_process_queue(state->active_peer_onion, send_queued_callback, state);
+                                } else {
+                                    fprintf(stderr, "\n  [!] Arena bellek hatası\n> ");
+                                    close(fd);
+                                    state->peer_fd = -1;
+                                    state->active_peer_onion[0] = '\0';
+                                    arena_restore(&state->arena, state->session_arena_mark);
+                                }
+                                state->hs = NULL;
+                            } else {
+                                fprintf(stderr, "\n  [!] UYARI: AKRANIN ANAHTARI DEĞİŞMİŞ! (MITM RİSKİ)\n");
+                                fprintf(stderr, "      Adres: %s\n", peer_onion);
+                                fprintf(stderr, "      Kayıtlı İsim: %s\n", name);
+                                fprintf(stderr, "      Yeni Fingerprint: %s\n", fp_str);
+                                fprintf(stderr, "  [?] Yeni anahtarı onaylıyor musunuz? (y/n): ");
+                                
+                                state->tofu_pending = true;
+                                state->tofu_peer_fd = fd;
+                                strncpy(state->tofu_onion, peer_onion, NOX_ONION_LEN);
+                                state->tofu_onion[NOX_ONION_LEN] = '\0';
+                                strncpy(state->tofu_name, name, NOX_CONTACT_NAME_LEN);
+                                state->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+                                memcpy(state->tofu_new_key, remote_pub, NOX_KEY_LEN);
+                                state->tofu_arena_mark = state->session_arena_mark;
+                            }
+                        } else {
+                            fprintf(stderr, "\n  [!] TOFU: Yeni peer bağlantısı\n");
+                            fprintf(stderr, "      Adres: %s\n", peer_onion);
+                            fprintf(stderr, "      Fingerprint: %s\n", fp_str);
+                            fprintf(stderr, "  [?] Bu bağlantıyı onaylıyor ve rehbere kaydediyor musunuz? (y/n): ");
+                            
+                            char default_name[NOX_CONTACT_NAME_LEN + 1];
+                            if (db_err == NOX_OK && zero_key && name[0] != '\0') {
+                                strncpy(default_name, name, NOX_CONTACT_NAME_LEN);
+                            } else {
+                                snprintf(default_name, sizeof(default_name), "peer_%.8s", peer_onion);
+                            }
+                            default_name[NOX_CONTACT_NAME_LEN] = '\0';
+
+                            state->tofu_pending = true;
+                            state->tofu_peer_fd = fd;
+                            strncpy(state->tofu_onion, peer_onion, NOX_ONION_LEN);
+                            state->tofu_onion[NOX_ONION_LEN] = '\0';
+                            strncpy(state->tofu_name, default_name, NOX_CONTACT_NAME_LEN);
+                            state->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+                            memcpy(state->tofu_new_key, remote_pub, NOX_KEY_LEN);
+                            state->tofu_arena_mark = state->session_arena_mark;
+                        }
                     }
                 } else if (fh.type == NOX_MSG_TEXT && state->session) {
                     uint8_t pt[4096];
@@ -844,6 +1091,15 @@ int main(int argc, char *argv[])
                                 state.session_key);
     if (err != NOX_OK) {
         NOX_FATAL(LOG_MOD_MAIN, "subkey türetimi başarısız: %s",
+                  nox_strerror(err));
+        arena_destroy(&state.arena);
+        return 1;
+    }
+
+    /* SQLite veritabanını başlat */
+    err = db_init(state.config_dir, state.db_key);
+    if (err != NOX_OK) {
+        NOX_FATAL(LOG_MOD_MAIN, "veritabanı başlatılamadı: %s",
                   nox_strerror(err));
         arena_destroy(&state.arena);
         return 1;

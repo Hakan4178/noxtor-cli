@@ -162,6 +162,15 @@ struct app_state {
     char     config_dir[NOX_PATH_MAX];
     char     identity_path[NOX_PATH_MAX];
     char     contacts_path[NOX_PATH_MAX];
+
+    /* TOFU State */
+    bool     tofu_pending;
+    int      tofu_peer_fd;
+    char     tofu_onion[NOX_ONION_LEN + 1];
+    char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
+    uint8_t  tofu_new_key[NOX_KEY_LEN];
+    size_t   tofu_arena_mark;
+    char     active_peer_onion[NOX_ONION_LEN + 1];
 };
 
 #endif /* PARANOID_TYPES_H */
