@@ -1105,55 +1105,67 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ── 11. Identity key yükle veya oluştur ─────────── */
-    uint8_t *pub_key = arena_alloc(&state.arena, NOX_KEY_LEN);
-    if (!pub_key) {
-        NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (pub_key)");
+    /* ── 11. Identity key yükle, oluştur ve Curve25519'a dönüştür ── */
+    state.my_static_priv = arena_alloc(&state.arena, NOX_KEY_LEN);
+    state.my_static_pub = arena_alloc(&state.arena, NOX_KEY_LEN);
+    if (!state.my_static_priv || !state.my_static_pub) {
+        NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (static keys)");
         arena_destroy(&state.arena);
         return 1;
     }
 
+    /* Geçici Ed25519 tamponları */
+    uint8_t ed_pub[32];
+    uint8_t ed_sk[64];
+    explicit_bzero(ed_pub, sizeof(ed_pub));
+    explicit_bzero(ed_sk, sizeof(ed_sk));
+
     if (state.first_run) {
-        /* İlk çalıştırma: yeni key pair üret */
+        /* İlk çalıştırma: yeni key pair üret ve kaydet */
         err = crypto_generate_identity(state.identity_path,
-                                       identity_unlock, pub_key);
+                                       identity_unlock, ed_pub);
         if (err != NOX_OK) {
             NOX_FATAL(LOG_MOD_MAIN, "identity key üretimi başarısız: %s",
-                      nox_strerror(err));
+                       nox_strerror(err));
             arena_destroy(&state.arena);
             return 1;
         }
         NOX_INFO(LOG_MOD_MAIN, "yeni identity key oluşturuldu");
-    } else {
-        /* Mevcut key'i yükle */
-        uint8_t *sk_buf = arena_alloc(&state.arena, 64);
-        if (!sk_buf) {
-            NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (sk)");
-            arena_destroy(&state.arena);
-            return 1;
-        }
-
-        err = crypto_load_identity(state.identity_path,
-                                   identity_unlock, sk_buf, pub_key);
-        if (err == NOX_ERR_AUTH) {
-            NOX_FATAL(LOG_MOD_MAIN, "yanlış PIN — identity key çözülemedi");
-            arena_destroy(&state.arena);
-            return 1;
-        }
-        if (err != NOX_OK) {
-            NOX_FATAL(LOG_MOD_MAIN, "identity key yükleme hatası: %s",
-                      nox_strerror(err));
-            arena_destroy(&state.arena);
-            return 1;
-        }
-        NOX_INFO(LOG_MOD_MAIN, "identity key yüklendi");
     }
+
+    /* Diskten şifreli anahtarı yükle */
+    err = crypto_load_identity(state.identity_path,
+                               identity_unlock, ed_sk, ed_pub);
+    if (err == NOX_ERR_AUTH) {
+        NOX_FATAL(LOG_MOD_MAIN, "yanlış PIN — identity key çözülemedi");
+        arena_destroy(&state.arena);
+        return 1;
+    }
+    if (err != NOX_OK) {
+        NOX_FATAL(LOG_MOD_MAIN, "identity key yükleme hatası: %s",
+                   nox_strerror(err));
+        arena_destroy(&state.arena);
+        return 1;
+    }
+    NOX_INFO(LOG_MOD_MAIN, "identity key yüklendi");
+
+    /* Ed25519 anahtar çiftini Curve25519 (X25519) formatına dönüştür */
+    err = crypto_ed25519_to_curve25519(state.my_static_pub, state.my_static_priv,
+                                       ed_pub, ed_sk);
+    if (err != NOX_OK) {
+        NOX_FATAL(LOG_MOD_MAIN, "anahtar dönüştürme başarısız");
+        arena_destroy(&state.arena);
+        return 1;
+    }
+
+    /* Hassas geçici Ed25519 verileri sıfırla */
+    explicit_bzero(ed_pub, sizeof(ed_pub));
+    explicit_bzero(ed_sk, sizeof(ed_sk));
+    memory_barrier();
 
     /*
      * identity_unlock artık gerekli değil — hemen sil.
      * Bu en hassas subkey: identity.key'i açan anahtar.
-     * arena_destroy eninde sonunda temizler ama
-     * saldırı yüzeyini minimize etmek için erken siliyoruz.
      */
     explicit_bzero(identity_unlock, NOX_KEY_LEN);
     memory_barrier();

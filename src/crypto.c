@@ -395,3 +395,26 @@ nox_err_t crypto_load_identity(const char *identity_path,
     NOX_INFO(LOG_MOD_CRYPTO, "identity.key başarıyla çözüldü");
     return NOX_OK;
 }
+
+/* ================================================================
+ * 2.3: IDENTITY KEY CONVERSION — Ed25519 → Curve25519
+ * ================================================================ */
+nox_err_t crypto_ed25519_to_curve25519(uint8_t curve25519_pk[NOX_KEY_LEN],
+                                       uint8_t curve25519_sk[NOX_KEY_LEN],
+                                       const uint8_t ed25519_pk[NOX_KEY_LEN],
+                                       const uint8_t ed25519_sk[64])
+{
+    if (ed25519_pk && curve25519_pk) {
+        if (crypto_sign_ed25519_pk_to_curve25519(curve25519_pk, ed25519_pk) != 0) {
+            NOX_ERROR(LOG_MOD_CRYPTO, "Ed25519 public key'i Curve25519'a dönüştürme başarısız");
+            return NOX_ERR_CRYPTO;
+        }
+    }
+    if (ed25519_sk && curve25519_sk) {
+        if (crypto_sign_ed25519_sk_to_curve25519(curve25519_sk, ed25519_sk) != 0) {
+            NOX_ERROR(LOG_MOD_CRYPTO, "Ed25519 secret key'i Curve25519'a dönüştürme başarısız");
+            return NOX_ERR_CRYPTO;
+        }
+    }
+    return NOX_OK;
+}

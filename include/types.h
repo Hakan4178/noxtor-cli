@@ -132,6 +132,8 @@ struct app_state {
     uint8_t *master_key;         /* arena'da, 32 byte                */
     uint8_t *db_key;             /* arena'da, 32 byte                */
     uint8_t *session_key;        /* arena'da, 32 byte                */
+    uint8_t *my_static_priv;     /* arena'da, 32 byte (Curve25519)  */
+    uint8_t *my_static_pub;      /* arena'da, 32 byte (Curve25519)  */
 
     /* Noise session (aktif bağlantı varsa) */
     struct noise_session *session; /* arena'da veya NULL              */

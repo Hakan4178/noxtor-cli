@@ -101,4 +101,13 @@ nox_err_t crypto_load_identity(const char *identity_path,
                                uint8_t secret_key_out[64],
                                uint8_t public_key_out[NOX_KEY_LEN]);
 
+/*
+ * Ed25519 anahtar çiftini Curve25519 (X25519) anahtar çiftine dönüştür.
+ * Noise XX handshake'i için kalıcı kimlik (static key) olarak kullanılır.
+ */
+nox_err_t crypto_ed25519_to_curve25519(uint8_t curve25519_pk[NOX_KEY_LEN],
+                                       uint8_t curve25519_sk[NOX_KEY_LEN],
+                                       const uint8_t ed25519_pk[NOX_KEY_LEN],
+                                       const uint8_t ed25519_sk[64]);
+
 #endif /* PARANOID_CRYPTO_H */
