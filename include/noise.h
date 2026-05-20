@@ -195,4 +195,36 @@ ssize_t noise_decrypt(struct noise_session *session,
                       const uint8_t *ciphertext, size_t ct_len,
                       uint8_t *out);
 
+/* ================================================================
+ * TEST-ONLY API — Deterministik handshake (Cacophony vektörleri)
+ *
+ * Production build'de derlenmez.
+ * Yalnızca make test sırasında -DNOISE_TEST_DETERMINISTIC aktif.
+ * ================================================================ */
+#ifdef NOISE_TEST_DETERMINISTIC
+
+/*
+ * handshake_inject_ephemeral — Ephemeral key'i dışarıdan enjekte et
+ *
+ * Test vektörleriyle deterministik handshake için gerekli.
+ * Production'da ephemeral key her zaman rastgele üretilir.
+ */
+nox_err_t handshake_inject_ephemeral(struct noise_handshake *hs,
+                                      const uint8_t e_priv[NOX_KEY_LEN]);
+
+/*
+ * handshake_init_with_prologue — Prologue destekli handshake init
+ *
+ * Cacophony test vektörleri non-empty prologue kullanır ("John Galt").
+ * Production'da handshake_init() boş prologue ile çalışır.
+ */
+nox_err_t handshake_init_with_prologue(struct noise_handshake *hs,
+                                        bool initiator,
+                                        const uint8_t s_priv[NOX_KEY_LEN],
+                                        const uint8_t s_pub[NOX_KEY_LEN],
+                                        const uint8_t *prologue,
+                                        size_t prologue_len);
+
+#endif /* NOISE_TEST_DETERMINISTIC */
+
 #endif /* PARANOID_NOISE_H */

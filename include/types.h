@@ -86,8 +86,8 @@ struct noise_cipher_state {
  * NOISE XX — Symmetric State (handshake sırasında)
  * ================================================================ */
 struct noise_symmetric_state {
-    uint8_t  ck[NOX_KEY_LEN];  /* chaining key                    */
-    uint8_t  h[NOX_KEY_LEN];   /* handshake hash (32 byte)        */
+    uint8_t  ck[64];           /* chaining key                    */
+    uint8_t  h[64];            /* handshake hash                  */
     struct noise_cipher_state cs;
 };
 

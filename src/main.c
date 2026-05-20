@@ -391,6 +391,9 @@ static nox_err_t send_queued_callback(const char *text, void *ctx)
 static void event_loop(struct app_state *state)
 {
     struct epoll_event events[4];
+    static uint8_t ct[4096 + NOX_MAC_LEN];
+    static uint8_t payload[4096 + NOX_MAC_LEN];
+    static uint8_t pt[4096];
 
     while (state->running && !g_shutdown) {
         int nfds = epoll_wait(state->epoll_fd, events, 4, 2000);
@@ -483,7 +486,6 @@ static void event_loop(struct app_state *state)
                 if (state->session && state->peer_fd >= 0) {
                     const char *msg = line;
                     size_t mlen = strlen(msg) + 1;
-                    uint8_t ct[4096 + NOX_MAC_LEN];
                     ssize_t ct_len = noise_encrypt(state->session,
                         (const uint8_t *)msg, mlen, ct);
                     if (ct_len < 0) {
@@ -583,7 +585,6 @@ static void event_loop(struct app_state *state)
                     
                     if (state->session && state->peer_fd >= 0 && strcmp(state->active_peer_onion, onion) == 0) {
                         size_t mlen = strlen(msg_start) + 1;
-                        uint8_t ct[4096 + NOX_MAC_LEN];
                         ssize_t ct_len = noise_encrypt(state->session,
                             (const uint8_t *)msg_start, mlen, ct);
                         if (ct_len >= 0) {
@@ -731,7 +732,6 @@ static void event_loop(struct app_state *state)
                 struct frame_header fh;
                 if (frame_header_decode(wire, &fh) != NOX_OK) continue;
 
-                uint8_t payload[4096 + NOX_MAC_LEN];
                 if (fh.len > sizeof(payload)) continue;
 
                 size_t got = 0;
@@ -850,7 +850,7 @@ static void event_loop(struct app_state *state)
                             
                             char default_name[NOX_CONTACT_NAME_LEN + 1];
                             if (db_err == NOX_OK && zero_key && name[0] != '\0') {
-                                strncpy(default_name, name, NOX_CONTACT_NAME_LEN);
+                                snprintf(default_name, sizeof(default_name), "%s", name);
                             } else {
                                 snprintf(default_name, sizeof(default_name), "peer_%.8s", peer_onion);
                             }
@@ -867,7 +867,6 @@ static void event_loop(struct app_state *state)
                         }
                     }
                 } else if (fh.type == NOX_MSG_TEXT && state->session) {
-                    uint8_t pt[4096];
                     ssize_t pt_len = noise_decrypt(state->session,
                         payload, fh.len, pt);
                     if (pt_len > 0) {

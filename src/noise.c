@@ -27,8 +27,8 @@ NOX_STATIC_ASSERT(crypto_aead_chacha20poly1305_ietf_ABYTES == NOX_MAC_LEN,
 NOX_STATIC_ASSERT(crypto_scalarmult_curve25519_BYTES == NOX_KEY_LEN,
                   "Curve25519 key boyutu uyumsuz");
 
-/* BLAKE2b hash boyutu — Noise spec: HASHLEN = 32 veya 64 */
-#define NOISE_HASHLEN  32U
+/* BLAKE2b hash boyutu — Noise spec: HASHLEN = 64 */
+#define NOISE_HASHLEN  64U
 
 /* ================================================================
  * 1. CIPHER STATE — ChaChaPoly-1305 AEAD
@@ -167,38 +167,87 @@ void symmetric_mix_hash(struct noise_symmetric_state *ss,
     crypto_generichash_blake2b_final(&state, ss->h, NOISE_HASHLEN);
 }
 
+#define BLAKE2B_BLOCK_SIZE 128U
+
+/*
+ * HMAC-BLAKE2b
+ *
+ * HMAC(k, m) = BLAKE2b((k ⊕ opad) || BLAKE2b((k ⊕ ipad) || m))
+ *
+ * block_size = 128 byte (BLAKE2b için)
+ * key > 128 byte ise önce hash'le, 64 byte'a indir
+ */
+__attribute__((strub))
+static void hmac_blake2b(const uint8_t *key,   size_t key_len,
+                         const uint8_t *data,  size_t data_len,
+                         uint8_t        out[NOISE_HASHLEN])
+{
+    uint8_t k[BLAKE2B_BLOCK_SIZE];
+    uint8_t ipad[BLAKE2B_BLOCK_SIZE];
+    uint8_t opad[BLAKE2B_BLOCK_SIZE];
+    uint8_t inner[NOISE_HASHLEN];
+
+    /* 1. key normalize */
+    memset(k, 0, sizeof(k));
+    if (key_len > BLAKE2B_BLOCK_SIZE) {
+        crypto_generichash_blake2b(k, NOISE_HASHLEN,
+                                   key, key_len,
+                                   NULL, 0);
+    } else {
+        memcpy(k, key, key_len);
+    }
+
+    /* 2. ipad ve opad üret */
+    for (size_t i = 0; i < BLAKE2B_BLOCK_SIZE; i++) {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+
+    /* 3. inner = BLAKE2b(ipad || data) */
+    crypto_generichash_blake2b_state st;
+    crypto_generichash_blake2b_init(&st, NULL, 0, NOISE_HASHLEN);
+    crypto_generichash_blake2b_update(&st, ipad, BLAKE2B_BLOCK_SIZE);
+    crypto_generichash_blake2b_update(&st, data, data_len);
+    crypto_generichash_blake2b_final(&st, inner, NOISE_HASHLEN);
+
+    /* 4. out = BLAKE2b(opad || inner) */
+    crypto_generichash_blake2b_init(&st, NULL, 0, NOISE_HASHLEN);
+    crypto_generichash_blake2b_update(&st, opad, BLAKE2B_BLOCK_SIZE);
+    crypto_generichash_blake2b_update(&st, inner, NOISE_HASHLEN);
+    crypto_generichash_blake2b_final(&st, out, NOISE_HASHLEN);
+
+    /* Temizlik */
+    explicit_bzero(k,     sizeof(k));
+    explicit_bzero(ipad,  sizeof(ipad));
+    explicit_bzero(opad,  sizeof(opad));
+    explicit_bzero(inner, sizeof(inner));
+}
+
 /*
  * HKDF helper — Noise spec HKDF(ck, input):
  *   temp_key = HMAC-HASH(ck, input)
  *   output1  = HMAC-HASH(temp_key, 0x01)
  *   output2  = HMAC-HASH(temp_key, output1 || 0x02)
- *
- * BLAKE2b'yi keyed hash olarak HMAC yerine kullanıyoruz.
  */
 static void hkdf_blake2b(const uint8_t ck[NOISE_HASHLEN],
-                          const uint8_t *ikm, size_t ikm_len,
-                          uint8_t out1[NOISE_HASHLEN],
-                          uint8_t out2[NOISE_HASHLEN])
+                         const uint8_t *ikm, size_t ikm_len,
+                         uint8_t out1[NOISE_HASHLEN],
+                         uint8_t out2[NOISE_HASHLEN])
 {
-    /* temp_key = HMAC-BLAKE2b(ck, ikm) */
     uint8_t temp_key[NOISE_HASHLEN];
-    crypto_generichash_blake2b(temp_key, NOISE_HASHLEN,
-                               ikm, ikm_len,
-                               ck, NOISE_HASHLEN);
+    uint8_t buf[NOISE_HASHLEN + 1];
+
+    /* temp_key = HMAC-BLAKE2b(ck, ikm) */
+    hmac_blake2b(ck, NOISE_HASHLEN, ikm, ikm_len, temp_key);
 
     /* output1 = HMAC-BLAKE2b(temp_key, 0x01) */
     uint8_t byte_01 = 0x01;
-    crypto_generichash_blake2b(out1, NOISE_HASHLEN,
-                               &byte_01, 1,
-                               temp_key, NOISE_HASHLEN);
+    hmac_blake2b(temp_key, NOISE_HASHLEN, &byte_01, 1, out1);
 
     /* output2 = HMAC-BLAKE2b(temp_key, output1 || 0x02) */
-    uint8_t buf[NOISE_HASHLEN + 1];
     memcpy(buf, out1, NOISE_HASHLEN);
     buf[NOISE_HASHLEN] = 0x02;
-    crypto_generichash_blake2b(out2, NOISE_HASHLEN,
-                               buf, sizeof(buf),
-                               temp_key, NOISE_HASHLEN);
+    hmac_blake2b(temp_key, NOISE_HASHLEN, buf, sizeof(buf), out2);
 
     explicit_bzero(temp_key, sizeof(temp_key));
     explicit_bzero(buf, sizeof(buf));
@@ -357,7 +406,15 @@ static nox_err_t write_msg0(struct noise_handshake *hs,
     size_t offset = 0;
 
     /* Generate ephemeral key pair */
+#ifndef NOISE_TEST_DETERMINISTIC
     crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
+#else
+    /* Test: inject edilmişse onu kullan, yoksa rastgele üret */
+    if (sodium_is_zero(hs->e, NOX_KEY_LEN))
+        crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
+    else
+        crypto_scalarmult_base(hs->e_pub, hs->e);
+#endif
 
     /* → e: send e_pub */
     memcpy(out + offset, hs->e_pub, NOX_KEY_LEN);
@@ -384,7 +441,15 @@ static nox_err_t write_msg1(struct noise_handshake *hs,
     uint8_t dh_out[NOX_KEY_LEN];
 
     /* Generate ephemeral key pair */
+#ifndef NOISE_TEST_DETERMINISTIC
     crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
+#else
+    /* Test: inject edilmişse onu kullan, yoksa rastgele üret */
+    if (sodium_is_zero(hs->e, NOX_KEY_LEN))
+        crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
+    else
+        crypto_scalarmult_base(hs->e_pub, hs->e);
+#endif
 
     /* ← e */
     memcpy(out + offset, hs->e_pub, NOX_KEY_LEN);
@@ -640,3 +705,49 @@ ssize_t noise_decrypt(struct noise_session *session,
     if (!session || !out) return -1;
     return cipher_decrypt(&session->rx, NULL, 0, ciphertext, ct_len, out);
 }
+
+/* ================================================================
+ * 5. TEST-ONLY — Deterministik handshake (Cacophony vektörleri)
+ *
+ * -DNOISE_TEST_DETERMINISTIC olmadan derlenmez.
+ * ================================================================ */
+#ifdef NOISE_TEST_DETERMINISTIC
+
+nox_err_t handshake_inject_ephemeral(struct noise_handshake *hs,
+                                      const uint8_t e_priv[NOX_KEY_LEN])
+{
+    if (!hs || !e_priv) return NOX_ERR_PROTO;
+    memcpy(hs->e, e_priv, NOX_KEY_LEN);
+    /* e_pub = scalar_mult(e_priv, basepoint) */
+    crypto_scalarmult_base(hs->e_pub, hs->e);
+    return NOX_OK;
+}
+
+nox_err_t handshake_init_with_prologue(struct noise_handshake *hs,
+                                        bool initiator,
+                                        const uint8_t s_priv[NOX_KEY_LEN],
+                                        const uint8_t s_pub[NOX_KEY_LEN],
+                                        const uint8_t *prologue,
+                                        size_t prologue_len)
+{
+    if (!hs || !s_priv || !s_pub) return NOX_ERR_PROTO;
+
+    explicit_bzero(hs, sizeof(*hs));
+    symmetric_init(&hs->ss, NOISE_PROTOCOL_NAME);
+
+    memcpy(hs->s, s_priv, NOX_KEY_LEN);
+    memcpy(hs->s_pub, s_pub, NOX_KEY_LEN);
+
+    hs->initiator = initiator;
+    hs->msg_index = 0;
+
+    /* Prologue — Cacophony vektörlerinde "John Galt" */
+    symmetric_mix_hash(&hs->ss, prologue, prologue_len);
+
+    NOX_DEBUG(LOG_MOD_NOISE, "handshake başlatıldı (%s, prologue=%zu byte)",
+              initiator ? "initiator" : "responder", prologue_len);
+
+    return NOX_OK;
+}
+
+#endif /* NOISE_TEST_DETERMINISTIC */

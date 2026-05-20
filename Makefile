@@ -154,12 +154,15 @@ DEBUG_FLAGS := \
 RELEASE_FLAGS := \
     -O2 \
     -g \
+    -flto \
     -fno-omit-frame-pointer \
     -fcf-protection=full \
     -fhardened \
     -DNDEBUG
 
 RELEASE_LINK := \
+    -flto \
+    $(LINK_COMMON) \
     -Wl,-z,shstk
 
 # ================================================================
@@ -244,7 +247,7 @@ analyze:
 # ----------------------------------------------------------------
 $(TARGET): $(OBJS)
 	$(MSG) 'LD' '$@'
-	$(Q)$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LIBS)
+	$(Q)$(CC) $(filter-out -fhardened,$(CFLAGS)) $^ -o $@ $(LDFLAGS) $(LIBS)
 
 # Nesne dosyası kuralı — bağımlılık takibi dahil
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
@@ -252,10 +255,19 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 	$(Q)$(CC) $(CFLAGS) $(DEPFLAGS) -I$(INC_DIR) -c $< -o $@
 
 # ----------------------------------------------------------------
-# TESTLER — ASan + UBSan, src objelere link eder
+# TESTLER — ASan + UBSan, ayrı .test.o ile NOISE_TEST_DETERMINISTIC
 # ----------------------------------------------------------------
-test: CFLAGS  = $(STD) $(WARN_BASE) $(HARDEN_COMMON) $(DEBUG_FLAGS)
-test: LDFLAGS = $(LINK_COMMON)
+TEST_CFLAGS  = $(STD) $(WARN_BASE) $(HARDEN_COMMON) $(DEBUG_FLAGS) \
+               -DNOISE_TEST_DETERMINISTIC
+TEST_LDFLAGS = $(LINK_COMMON)
+
+# Test-specific src objeler — NOISE_TEST_DETERMINISTIC ile derlenir
+TEST_SRC_OBJS = $(filter-out $(SRC_DIR)/main.test.o, $(SRCS:%.c=%.test.o))
+
+$(SRC_DIR)/%.test.o: $(SRC_DIR)/%.c
+	$(MSG) 'CC' '$< (test)'
+	$(Q)$(CC) $(TEST_CFLAGS) $(DEPFLAGS) -I$(INC_DIR) -c $< -o $@
+
 test: $(TEST_BINS)
 	@echo "=== Testler ASan/UBSan altında çalıştırılıyor ==="
 	@failed=0; \
@@ -271,13 +283,12 @@ test: $(TEST_BINS)
 	done; \
 	[ $$failed -eq 0 ] && echo "=== Tüm testler başarılı ===" || exit 1
 
-# Test binary kuralı — src objelerine link eder (main.o hariç)
-# Testlerin kendi main() fonksiyonu var, src/main.o çakışır
-TEST_OBJS = $(filter-out $(SRC_DIR)/main.o, $(OBJS))
-$(TEST_DIR)/%: $(TEST_DIR)/%.c $(TEST_OBJS)
+# Test binary kuralı — .test.o objelerine link eder (main.test.o hariç)
+# Testlerin kendi main() fonksiyonu var, src/main.test.o çakışır
+$(TEST_DIR)/%: $(TEST_DIR)/%.c $(TEST_SRC_OBJS)
 	$(MSG) 'TEST' '$@'
-	$(Q)$(CC) $(CFLAGS) $(DEPFLAGS) -I$(INC_DIR) $< $(TEST_OBJS) \
-	    -o $@ $(LDFLAGS) $(LIBS)
+	$(Q)$(CC) $(TEST_CFLAGS) $(DEPFLAGS) -I$(INC_DIR) $< $(TEST_SRC_OBJS) \
+	    -o $@ $(TEST_LDFLAGS) $(LIBS)
 
 # ----------------------------------------------------------------
 # TEMİZLİK
@@ -285,5 +296,6 @@ $(TEST_DIR)/%: $(TEST_DIR)/%.c $(TEST_OBJS)
 clean:
 	rm -f $(TARGET)
 	rm -f $(OBJS) $(DEPS)
+	rm -f $(SRC_DIR)/*.test.o $(SRC_DIR)/*.test.d
 	rm -f $(TEST_BINS) $(TEST_DEPS)
 	@echo "[*] Temizlendi."
