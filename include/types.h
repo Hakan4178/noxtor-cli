@@ -9,6 +9,7 @@
 #define PARANOID_TYPES_H
 
 #include "common.h"
+#include <sodium.h>
 
 /* ================================================================
  * SECURE ARENA — Güvenli bellek havuzu
@@ -63,7 +64,7 @@ enum msg_state {
 /* ================================================================
  * KİŞİ REHBERİ — TOFU modeli
  *
- * İlk bağlantıda noise_key kaydedilir.
+ * FKurulumda noise_key kaydedilir.
  * Sonraki bağlantılarda değişmişse MITM uyarısı.
  * ================================================================ */
 struct contact {
@@ -116,6 +117,40 @@ struct noise_session {
     struct noise_cipher_state tx;   /* gönderme yönü               */
     struct noise_cipher_state rx;   /* alma yönü                   */
     uint8_t  remote_static[NOX_KEY_LEN]; /* doğrulanmış peer key   */
+};
+
+/* ================================================================
+ * PLUGGABLE TRANSPORT & ASENKRON DOSYA DURUMLARI (Faz 6.2)
+ * ================================================================ */
+enum tor_transport_type {
+    TRANSPORT_DIRECT = 0,
+    TRANSPORT_SNOWFLAKE,
+    TRANSPORT_OBFS4
+};
+
+struct file_rx_state {
+    bool     active;
+    int      fd;                  /* hedef dosya tanımlayıcısı */
+    char     filename[256];       /* dezenfekte edilmiş dosya adı */
+    uint64_t expected_size;
+    uint64_t received_bytes;
+    uint8_t  expected_hash[32];   /* 256-bit BLAKE2b */
+    crypto_generichash_state hash_state;
+};
+
+struct file_tx_state {
+    bool     active;
+    int      fd;                  /* kaynak dosya tanımlayıcısı */
+    char     filename[256];       /* sadece dezenfekte dosya adı */
+    uint64_t total_size;
+    uint64_t sent_bytes;
+    uint8_t  hash[32];            /* önceden hesaplanan BLAKE2b */
+    
+    /* Kısmi yazım için frame tamponu */
+    uint8_t  tx_buf[4096 + 37 + NOX_MAC_LEN]; /* frame_header(37) + payload + MAC */
+    size_t   tx_len;              /* mevcut frame'in toplam boyutu */
+    size_t   tx_offset;           /* şimdiye dek yazılan byte */
+    size_t   current_chunk_size;  /* mevcut şifrelenmemiş dosya boyutu */
 };
 
 /* ================================================================
@@ -173,6 +208,19 @@ struct app_state {
     uint8_t  tofu_new_key[NOX_KEY_LEN];
     size_t   tofu_arena_mark;
     char     active_peer_onion[NOX_ONION_LEN + 1];
+
+    /* Async stdin buffering */
+    char    *stdin_buf;
+    size_t   stdin_len;
+    size_t   stdin_cap;
+
+    /* Pluggable Transport (Faz 6.2) */
+    enum tor_transport_type transport_type;
+    char     obfs4_bridge_line[512];
+
+    /* Asenkron Dosya İşlemleri */
+    struct file_rx_state rx_file;
+    struct file_tx_state tx_file;
 };
 
 #endif /* PARANOID_TYPES_H */

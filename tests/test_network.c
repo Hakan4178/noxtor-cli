@@ -195,6 +195,64 @@ static int test_listener_create(void)
     return 0;
 }
 
+/* UTF-8 multi-byte helper for testing chunk alignment */
+static size_t get_next_chunk_size_test(const char *msg, size_t offset, size_t total_len, size_t chunk_limit) {
+    if (total_len - offset <= chunk_limit) {
+        return total_len - offset;
+    }
+
+    size_t size = chunk_limit;
+    while (size > 0 && ((uint8_t)msg[offset + size] & 0xC0) == 0x80) {
+        size--;
+    }
+
+    if (size == 0) {
+        return chunk_limit;
+    }
+    return size;
+}
+
+static int test_utf8_chunking(void)
+{
+    /* Test 1: Plain ASCII does not back up */
+    char ascii_buf[100];
+    memset(ascii_buf, 'A', sizeof(ascii_buf));
+    ascii_buf[99] = '\0';
+    size_t chunk_sz = get_next_chunk_size_test(ascii_buf, 0, 99, 50);
+    TEST_ASSERT(chunk_sz == 50);
+
+    /* Test 2: Turkish 'ş' (2 bytes: \xc5\x9f) right at the boundary */
+    /* If the boundary (index 5) falls on the continuation byte \x9f (index 5) */
+    char utf8_buf[20] = "abcde\xc5\x9fghijk"; /* \xc5 is at index 5, \x9f is at index 6 */
+    /* Let's construct it specifically:
+       Index 0,1,2,3,4: a, b, c, d, e
+       Index 5: \xc5
+       Index 6: \x9f
+       Index 7: g
+    */
+    /* If limit is 6, index 6 of utf8_buf is \x9f, which is 0x9f (continuation byte: 0x9f & 0xC0 = 0x80) */
+    chunk_sz = get_next_chunk_size_test(utf8_buf, 0, strlen(utf8_buf), 6);
+    /* It should back up by 1 and return 5, splitting before \xc5 */
+    TEST_ASSERT(chunk_sz == 5);
+
+    /* Test 3: Rocket emoji (4 bytes: \xf0\x9f\x9a\x80) */
+    /* "abcde" (5 bytes) + "\xf0\x9f\x9a\x80" (4 bytes) + "fgh" */
+    char emoji_buf[30] = "abcde\xf0\x9f\x9a\x80" "fgh";
+    /* Rocket starts at index 5. Continuation bytes are at 6, 7, 8.
+       If limit is 8 (continuation byte \x9a at index 7), it should back up to 5.
+       If limit is 7 (continuation byte \x9f at index 6), it should back up to 5.
+       If limit is 6 (continuation byte \xf0 at index 5? No, \xf0 & 0xC0 = 0xC0, so index 5 is not a continuation byte!)
+       Wait, index 6 is \x9f (continuation byte), so limit 6 points to index 6 which is continuation byte -> back up to 5.
+       If limit is 9 (index 9 is 'f', not continuation byte), it returns 9.
+    */
+    TEST_ASSERT(get_next_chunk_size_test(emoji_buf, 0, strlen(emoji_buf), 8) == 5);
+    TEST_ASSERT(get_next_chunk_size_test(emoji_buf, 0, strlen(emoji_buf), 7) == 5);
+    TEST_ASSERT(get_next_chunk_size_test(emoji_buf, 0, strlen(emoji_buf), 6) == 5);
+    TEST_ASSERT(get_next_chunk_size_test(emoji_buf, 0, strlen(emoji_buf), 9) == 9);
+
+    return 0;
+}
+
 /* ================================================================
  * MAIN
  * ================================================================ */
@@ -208,6 +266,7 @@ int main(void)
     RUN_TEST(test_frame_overflow);
     RUN_TEST(test_frame_all_types);
     RUN_TEST(test_listener_create);
+    RUN_TEST(test_utf8_chunking);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n\n",
             tests_passed, tests_run);

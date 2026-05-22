@@ -80,6 +80,9 @@ nox_err_t epoll_remove_fd(int epoll_fd, int fd);
 /* epoll'a fd ekle */
 nox_err_t epoll_add_fd(int epoll_fd, int fd);
 
+/* epoll'daki fd olaylarını değiştir */
+nox_err_t epoll_modify_fd(int epoll_fd, int fd, uint32_t events);
+
 /* ================================================================
  * FRAME I/O — Wire format okuma/yazma
  *

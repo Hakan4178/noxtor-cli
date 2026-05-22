@@ -23,8 +23,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <poll.h>
+
 /* ================================================================
- * I/O HELPERS — EINTR + partial read/write koruması
+ * I/O HELPERS — EINTR + EAGAIN/EWOULDBLOCK koruması
  * ================================================================ */
 nox_err_t write_full(int fd, const void *buf, size_t len) {
   const uint8_t *p = (const uint8_t *)buf;
@@ -34,6 +36,15 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
     if (w < 0) {
       if (errno == EINTR)
         continue;
+#if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#else
+      if (errno == EAGAIN) {
+#endif
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+        poll(&pfd, 1, -1);
+        continue;
+      }
       return NOX_ERR_IO;
     }
     if (w == 0)
@@ -51,6 +62,15 @@ static nox_err_t read_full(int fd, void *buf, size_t len) {
     if (r < 0) {
       if (errno == EINTR)
         continue;
+#if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#else
+      if (errno == EAGAIN) {
+#endif
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        poll(&pfd, 1, -1);
+        continue;
+      }
       return NOX_ERR_IO;
     }
     if (r == 0)
@@ -179,16 +199,61 @@ static nox_err_t generate_torrc(struct app_state *state) {
     return NOX_ERR_TOR;
   }
 
-  /* Buffer boyutunu yeterli yap: 3 * NOX_PATH_MAX + sabit metin */
-  char content[NOX_PATH_MAX * 3 + 256];
-  int clen =
-      snprintf(content, sizeof(content),
+  /* Buffer boyutunu yeterli yap: 4 * NOX_PATH_MAX + 1024 */
+  char content[NOX_PATH_MAX * 4 + 1024];
+  int clen = 0;
+
+  if (state->transport_type == TRANSPORT_SNOWFLAKE) {
+    const char *snowflake_path = "/usr/bin/snowflake-client";
+    if (access("/usr/local/bin/snowflake-client", X_OK) == 0) {
+      snowflake_path = "/usr/local/bin/snowflake-client";
+    }
+    clen = snprintf(content, sizeof(content),
+             "SocksPort auto\n"
+             "ControlSocket %s/control.sock\n"
+             "CookieAuthentication 1\n"
+             "DataDirectory %s\n"
+             "Log notice file %s/tor.log\n"
+             "UseBridges 1\n"
+             "ClientTransportPlugin snowflake exec %s\n",
+             state->tor_data_dir, state->tor_data_dir, state->tor_data_dir, snowflake_path);
+  } else if (state->transport_type == TRANSPORT_OBFS4) {
+    const char *obfs4_path = "/usr/bin/obfs4proxy";
+    if (access("/usr/local/bin/obfs4proxy", X_OK) == 0) {
+      obfs4_path = "/usr/local/bin/obfs4proxy";
+    }
+    if (strlen(state->obfs4_bridge_line) > 0) {
+      clen = snprintf(content, sizeof(content),
                "SocksPort auto\n"
                "ControlSocket %s/control.sock\n"
                "CookieAuthentication 1\n"
                "DataDirectory %s\n"
-               "Log notice file %s/tor.log\n",
-               state->tor_data_dir, state->tor_data_dir, state->tor_data_dir);
+               "Log notice file %s/tor.log\n"
+               "UseBridges 1\n"
+               "Bridge %s\n"
+               "ClientTransportPlugin obfs4 exec %s\n",
+               state->tor_data_dir, state->tor_data_dir, state->tor_data_dir,
+               state->obfs4_bridge_line, obfs4_path);
+    } else {
+      clen = snprintf(content, sizeof(content),
+               "SocksPort auto\n"
+               "ControlSocket %s/control.sock\n"
+               "CookieAuthentication 1\n"
+               "DataDirectory %s\n"
+               "Log notice file %s/tor.log\n"
+               "UseBridges 1\n"
+               "ClientTransportPlugin obfs4 exec %s\n",
+               state->tor_data_dir, state->tor_data_dir, state->tor_data_dir, obfs4_path);
+    }
+  } else {
+    clen = snprintf(content, sizeof(content),
+             "SocksPort auto\n"
+             "ControlSocket %s/control.sock\n"
+             "CookieAuthentication 1\n"
+             "DataDirectory %s\n"
+             "Log notice file %s/tor.log\n",
+             state->tor_data_dir, state->tor_data_dir, state->tor_data_dir);
+  }
 
   if (clen <= 0 || (size_t)clen >= sizeof(content)) {
     NOX_ERROR(LOG_MOD_NET, "torrc içeriği çok büyük");
@@ -222,8 +287,11 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
     int status;
     pid_t res = waitpid(tor_pid, &status, WNOHANG);
     if (res > 0) {
-      NOX_ERROR(LOG_MOD_NET, "Tor beklenmedik şekilde sonlandı (exit=%d)",
-                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+      int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+      NOX_ERROR(LOG_MOD_NET, "Tor beklenmedik şekilde sonlandı (exit=%d)", exit_code);
+      
+      NOX_WARN(LOG_MOD_TOR, "Tor başlatılamadı. Eğer eski bir Tor sürümü kullanıyorsanız, yerleşik köprüler (--use-default-bridges) desteklenmiyor olabilir. Lütfen Tor sürümünü güncelleyin veya manuel özel köprü yapılandırın.");
+      
       return NOX_ERR_TOR;
     }
 
@@ -276,10 +344,29 @@ nox_err_t tor_spawn(struct app_state *state) {
       dup2(devnull, STDERR_FILENO);
       close(devnull);
     }
-    /* Tam yol — PATH manipülasyonundan korunma */
+    
     char arg0[] = "tor";
     char arg1[] = "-f";
-    char *argv[] = {arg0, arg1, state->torrc_path, NULL};
+    char arg_bridge[] = "--use-default-bridges";
+    
+    char *argv[8];
+    argv[0] = arg0;
+    argv[1] = arg1;
+    argv[2] = state->torrc_path;
+    int idx = 3;
+
+    bool use_default_bridges = false;
+    if (state->transport_type == TRANSPORT_SNOWFLAKE) {
+      use_default_bridges = true;
+    } else if (state->transport_type == TRANSPORT_OBFS4 && strlen(state->obfs4_bridge_line) == 0) {
+      use_default_bridges = true;
+    }
+
+    if (use_default_bridges) {
+      argv[idx++] = arg_bridge;
+    }
+    argv[idx] = NULL;
+
     execv("/usr/bin/tor", argv);
     execv("/usr/local/bin/tor", argv);
     _exit(127);
@@ -711,6 +798,12 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     return NOX_ERR_NET;
   }
 
+  /* Make socket non-blocking for asynchronous I/O */
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0) {
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  }
+
   *fd_out = fd;
   NOX_INFO(LOG_MOD_NET, "SOCKS5 bağlantı: %s:%u", onion_addr, port);
   return NOX_OK;
@@ -731,6 +824,15 @@ nox_err_t epoll_add_fd(int epoll_fd, int fd) {
 nox_err_t epoll_remove_fd(int epoll_fd, int fd) {
   if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL) != 0) {
     NOX_ERROR(LOG_MOD_NET, "epoll_ctl DEL: %s", strerror(errno));
+    return NOX_ERR_NET;
+  }
+  return NOX_OK;
+}
+
+nox_err_t epoll_modify_fd(int epoll_fd, int fd, uint32_t events) {
+  struct epoll_event ev = {.events = events, .data.fd = fd};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) != 0) {
+    NOX_ERROR(LOG_MOD_NET, "epoll_ctl MOD: %s", strerror(errno));
     return NOX_ERR_NET;
   }
   return NOX_OK;
