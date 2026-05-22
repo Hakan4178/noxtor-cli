@@ -25,6 +25,7 @@
 #include "noise.h"
 #include "network.h"
 #include "database.h"
+#include "ui.h"
 #include "asm_utils.h"
 
 #include <stdio.h>
@@ -46,7 +47,6 @@
 /* ================================================================
  * GLOBAL SHUTDOWN FLAG — async-signal-safe
  * ================================================================ */
-static volatile sig_atomic_t g_shutdown = 0;
 static struct termios g_orig_termios;
 static bool g_termios_saved = false;
 
@@ -503,7 +503,7 @@ static void process_line(struct app_state *state, const char *line) {
     if (state->tofu_pending) {
         if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
             db_add_contact(state->tofu_onion, state->tofu_name, state->tofu_new_key);
-            fprintf(stderr, "  [✓] Akran onaylandı ve kaydedildi: %s\n", state->tofu_name);
+            ui_print_system(state, "[✓] Akran onaylandı ve kaydedildi: %s", state->tofu_name);
 
             state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
             if (state->session) {
@@ -512,12 +512,12 @@ static void process_line(struct app_state *state, const char *line) {
                 state->active_peer_onion[NOX_ONION_LEN] = '\0';
                 
                 NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
-                fprintf(stderr, "  [✓] şifreli kanal kuruldu (%s)\n> ", state->tofu_name);
+                ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)", state->tofu_name);
                 
                 /* Kuyruktaki bekleyen mesajları gönder */
                 db_process_queue(state->active_peer_onion, send_queued_callback, state);
             } else {
-                fprintf(stderr, "  [!] Arena bellek hatası\n> ");
+                ui_print_error(state, "Arena bellek hatası");
                 close(state->tofu_peer_fd);
                 state->peer_fd = -1;
                 arena_restore(&state->arena, state->tofu_arena_mark);
@@ -525,7 +525,7 @@ static void process_line(struct app_state *state, const char *line) {
             state->hs = NULL;
             state->tofu_pending = false;
         } else if (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0) {
-            fprintf(stderr, "  [*] Bağlantı reddedildi.\n> ");
+            ui_print_system(state, "[*] Bağlantı reddedildi.");
             close(state->tofu_peer_fd);
             state->peer_fd = -1;
             state->hs = NULL;
@@ -533,7 +533,7 @@ static void process_line(struct app_state *state, const char *line) {
             arena_restore(&state->arena, state->tofu_arena_mark);
             state->tofu_pending = false;
         } else {
-            fprintf(stderr, "  [?] Lütfen 'y' veya 'n' giriniz (y/n): ");
+            fprintf(stderr, "  [?] Lütfen 'y' veya 'n' giriniz (y/n): "); /* raw — prompt değil */
         }
         return;
     }
@@ -542,22 +542,21 @@ static void process_line(struct app_state *state, const char *line) {
     if (state->session && state->peer_fd >= 0) {
         nox_err_t err = send_segmented_message(state, line);
         if (err == NOX_OK) {
-            fprintf(stderr, "\033[1A\r\033[K[Sen]: %s\n> ", line);
+            ui_print_outgoing(state, line);
         } else {
-            fprintf(stderr, "  [!] Şifreleme/Gönderim hatası\n> ");
+            ui_print_error(state, "Şifreleme/Gönderim hatası");
         }
         return;
     }
 
     /* ── Session yokken: komut modu ─────── */
     if (state->peer_fd < 0 && line[0] != '/') {
-        fprintf(stderr,
-            "  [!] bağlantı yok — önce /connect kullan veya çevrimdışı mesaj için /msg kullan\n> ");
+        ui_print_error(state, "bağlantı yok — önce /connect kullan veya çevrimdışı mesaj için /msg kullan");
         return;
     }
 
     if (strcmp(line, "/addr") == 0) {
-        fprintf(stderr, "  %s\n> ", state->onion_addr);
+        ui_print_system(state, "%s", state->onion_addr);
         return;
     }
 
@@ -570,7 +569,7 @@ static void process_line(struct app_state *state, const char *line) {
         size_t onion_len = (size_t)(p - onion_start);
         
         if (onion_len != NOX_ONION_LEN || *p == '\0') {
-            fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /add <onion> <isim>\n> ");
+            ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>");
             return;
         }
         
@@ -581,7 +580,7 @@ static void process_line(struct app_state *state, const char *line) {
         while (*p == ' ') p++;
         const char *name_start = p;
         if (*name_start == '\0') {
-            fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /add <onion> <isim>\n> ");
+            ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>");
             return;
         }
         
@@ -594,9 +593,9 @@ static void process_line(struct app_state *state, const char *line) {
         
         nox_err_t err = db_add_contact(onion, name, zero_key);
         if (err == NOX_OK) {
-            fprintf(stderr, "  [✓] Rehbere kaydedildi: %s (%s)\n> ", name, onion);
+            ui_print_system(state, "[✓] Rehbere kaydedildi: %s (%s)", name, onion);
         } else {
-            fprintf(stderr, "  [!] Veritabanı hatası\n> ");
+            ui_print_error(state, "Veritabanı hatası");
         }
         return;
     }
@@ -610,7 +609,7 @@ static void process_line(struct app_state *state, const char *line) {
         size_t onion_len = (size_t)(p - onion_start);
         
         if (onion_len != NOX_ONION_LEN || *p == '\0') {
-            fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /msg <onion> <mesaj>\n> ");
+            ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>");
             return;
         }
         
@@ -621,23 +620,23 @@ static void process_line(struct app_state *state, const char *line) {
         while (*p == ' ') p++;
         const char *msg_start = p;
         if (*msg_start == '\0') {
-            fprintf(stderr, "  [!] Hata: Geçersiz kullanım. Örnek: /msg <onion> <mesaj>\n> ");
+            ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>");
             return;
         }
         
         if (state->session && state->peer_fd >= 0 && strcmp(state->active_peer_onion, onion) == 0) {
             nox_err_t err = send_segmented_message(state, msg_start);
             if (err == NOX_OK) {
-                fprintf(stderr, "\033[1A\r\033[K[Sen]: %s\n> ", msg_start);
+                ui_print_outgoing(state, msg_start);
             } else {
-                fprintf(stderr, "  [!] Şifreleme/Gönderim hatası\n> ");
+                ui_print_error(state, "Şifreleme/Gönderim hatası");
             }
         } else {
             nox_err_t err = queue_segmented_message(onion, msg_start);
             if (err == NOX_OK) {
-                fprintf(stderr, "  [*] Mesaj kuyruğa eklendi (akran çevrimdışı)\n> ");
+                ui_print_system(state, "[*] Mesaj kuyruğa eklendi (akran çevrimdışı)");
             } else {
-                fprintf(stderr, "  [!] Kuyruğa ekleme başarısız\n> ");
+                ui_print_error(state, "Kuyruğa ekleme başarısız");
             }
         }
         return;
@@ -648,7 +647,7 @@ static void process_line(struct app_state *state, const char *line) {
         while (*target == ' ') target++;
 
         if (state->peer_fd >= 0) {
-            fprintf(stderr, "  [!] zaten bağlı\n> ");
+            ui_print_error(state, "zaten bağlı");
             return;
         }
 
@@ -658,7 +657,7 @@ static void process_line(struct app_state *state, const char *line) {
                             NOX_VIRTUAL_PORT,
                             state->socks_port, &peer_fd);
         if (err != NOX_OK) {
-            fprintf(stderr, "  [!] bağlantı başarısız\n> ");
+            ui_print_error(state, "bağlantı başarısız");
             return;
         }
 
@@ -672,7 +671,7 @@ static void process_line(struct app_state *state, const char *line) {
         state->hs = arena_alloc(&state->arena,
                          sizeof(struct noise_handshake));
         if (!state->hs) {
-            fprintf(stderr, "  [!] arena dolu\n> ");
+            ui_print_error(state, "arena dolu");
             return;
         }
 
@@ -697,7 +696,7 @@ static void process_line(struct app_state *state, const char *line) {
         write_full(peer_fd, hsbuf, hslen);
 
         NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi");
-        fprintf(stderr, "  [*] handshake başlatıldı\n> ");
+        ui_print_system(state, "[*] handshake başlatıldı");
         return;
     }
 
@@ -708,15 +707,13 @@ static void process_line(struct app_state *state, const char *line) {
 
         /* Çevrimdışı dosya gönderimi desteklenmiyor */
         if (state->peer_fd < 0 || !state->session) {
-            fprintf(stderr,
-                "  [!] Hata: Çevrimdışı dosyalar kuyruğa alınamaz. "
-                "Aktif bir bağlantı gerekir.\n> ");
+            ui_print_error(state, "Çevrimdışı dosyalar kuyruğa alınamaz. Aktif bir bağlantı gerekir.");
             return;
         }
 
         /* Zaten aktif bir dosya transferi var mı? */
         if (state->tx_file.active) {
-            fprintf(stderr, "  [!] Hata: Zaten aktif bir dosya transferi var.\n> ");
+            ui_print_error(state, "Zaten aktif bir dosya transferi var.");
             return;
         }
 
@@ -724,7 +721,7 @@ static void process_line(struct app_state *state, const char *line) {
         char path_copy[NOX_PATH_MAX];
         size_t path_len = strlen(filepath);
         if (path_len == 0 || path_len >= sizeof(path_copy)) {
-            fprintf(stderr, "  [!] Hata: Geçersiz dosya yolu.\n> ");
+            ui_print_error(state, "Geçersiz dosya yolu.");
             return;
         }
         memcpy(path_copy, filepath, path_len + 1);
@@ -732,22 +729,22 @@ static void process_line(struct app_state *state, const char *line) {
         /* Dosya var mı, okunabilir mi? */
         struct stat st;
         if (stat(path_copy, &st) != 0) {
-            fprintf(stderr, "  [!] Hata: Dosya bulunamadı: %s\n> ", strerror(errno));
+            ui_print_error(state, "Dosya bulunamadı: %s", strerror(errno));
             return;
         }
         if (!S_ISREG(st.st_mode)) {
-            fprintf(stderr, "  [!] Hata: Düzenli dosya değil.\n> ");
+            ui_print_error(state, "Düzenli dosya değil.");
             return;
         }
         if (st.st_size == 0) {
-            fprintf(stderr, "  [!] Hata: Boş dosya gönderilemez.\n> ");
+            ui_print_error(state, "Boş dosya gönderilemez.");
             return;
         }
 
         /* Dosyayı aç */
         int file_fd = open(path_copy, O_RDONLY | O_CLOEXEC);
         if (file_fd < 0) {
-            fprintf(stderr, "  [!] Hata: Dosya açılamadı: %s\n> ", strerror(errno));
+            ui_print_error(state, "Dosya açılamadı: %s", strerror(errno));
             return;
         }
 
@@ -769,7 +766,7 @@ static void process_line(struct app_state *state, const char *line) {
             ssize_t r = read(file_fd, hash_buf, sizeof(hash_buf));
             if (r < 0) {
                 if (errno == EINTR) continue;
-                fprintf(stderr, "  [!] Hata: Dosya okuma hatası: %s\n> ", strerror(errno));
+                ui_print_error(state, "Dosya okuma hatası: %s", strerror(errno));
                 explicit_bzero(hash_buf, sizeof(hash_buf));
                 close(file_fd);
                 return;
@@ -784,7 +781,7 @@ static void process_line(struct app_state *state, const char *line) {
 
         /* Dosya başına geri sar */
         if (lseek(file_fd, 0, SEEK_SET) != 0) {
-            fprintf(stderr, "  [!] Hata: lseek başarısız.\n> ");
+            ui_print_error(state, "lseek başarısız.");
             close(file_fd);
             return;
         }
@@ -824,7 +821,7 @@ static void process_line(struct app_state *state, const char *line) {
                                             meta, sizeof(meta), meta_ct);
         explicit_bzero(meta, sizeof(meta));
         if (meta_ct_len < 0) {
-            fprintf(stderr, "  [!] Hata: Metadata şifreleme hatası.\n> ");
+            ui_print_error(state, "Metadata şifreleme hatası.");
             close(file_fd);
             explicit_bzero(&state->tx_file, sizeof(state->tx_file));
             return;
@@ -841,7 +838,7 @@ static void process_line(struct app_state *state, const char *line) {
 
         if (write_full(state->peer_fd, mwire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
             write_full(state->peer_fd, meta_ct, (size_t)meta_ct_len) != NOX_OK) {
-            fprintf(stderr, "  [!] Hata: Metadata gönderim hatası.\n> ");
+            ui_print_error(state, "Metadata gönderim hatası.");
             close(file_fd);
             explicit_bzero(&state->tx_file, sizeof(state->tx_file));
             return;
@@ -850,13 +847,12 @@ static void process_line(struct app_state *state, const char *line) {
         /* peer_fd'yi EPOLLIN | EPOLLOUT olarak değiştir */
         epoll_modify_fd(state->epoll_fd, state->peer_fd, EPOLLIN | EPOLLOUT);
 
-        fprintf(stderr, "  [*] Dosya transferi başlatıldı: %s (%lu byte)\n> ",
+        ui_print_system(state, "[*] Dosya transferi başlatıldı: %s (%lu byte)",
                 safe_name, (unsigned long)state->tx_file.total_size);
         return;
     }
 
-    fprintf(stderr,
-        "  [?] komutlar: /addr  /connect <onion>  /add <onion> <isim>  /msg <onion> <mesaj>  /file <dosya>  Ctrl+P\n> ");
+    ui_print_system(state, "komutlar: /addr  /connect <onion>  /add <onion> <isim>  /msg <onion> <mesaj>  /file <dosya>  Ctrl+P");
 }
 
 static void process_stdin_events(struct app_state *state) {
@@ -929,7 +925,7 @@ static void process_stdin_events(struct app_state *state) {
         }
 
         if (trimmed_len == 0) {
-            fprintf(stderr, "> ");
+            ui_print_prompt(state);
         } else {
             process_line(state, line);
         }
@@ -995,8 +991,7 @@ static void event_loop(struct app_state *state)
                 explicit_bzero(cpriv, sizeof(cpriv));
 
                 NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi");
-                fprintf(stderr,
-                    "\n  [*] gelen bağlantı — handshake bekleniyor\n> ");
+                ui_print_system(state, "[*] gelen bağlantı — handshake bekleniyor");
 
             } else if (fd == state->peer_fd) {
                 /* ── Peer'a Veri Gönderimi (EPOLLOUT) ────── */
@@ -1015,15 +1010,18 @@ static void event_loop(struct app_state *state)
                                     state->tx_file.current_chunk_size = 0;
 
                                     if (state->tx_file.sent_bytes >= state->tx_file.total_size) {
-                                        fprintf(stderr, "\n  [✓] Dosya gönderimi tamamlandı (%lu byte)\n> ",
+                                        ui_print_system(state, "[✓] Dosya gönderimi tamamlandı (%lu byte)",
                                                 (unsigned long)state->tx_file.total_size);
                                         close(state->tx_file.fd);
                                         explicit_bzero(&state->tx_file, sizeof(state->tx_file));
                                         epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
+                                    } else {
+                                        ui_print_progress(state, state->tx_file.filename,
+                                                          state->tx_file.sent_bytes, state->tx_file.total_size, true);
                                     }
                                 }
                             } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                                fprintf(stderr, "\n  [!] Hata: Dosya gönderimi koptu (%s)\n> ", strerror(errno));
+                                ui_print_error(state, "Dosya gönderimi koptu (%s)", strerror(errno));
                                 close(state->tx_file.fd);
                                 explicit_bzero(&state->tx_file, sizeof(state->tx_file));
                                 epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
@@ -1049,13 +1047,13 @@ static void event_loop(struct app_state *state)
                                     state->tx_file.tx_len = FRAME_HEADER_WIRE_SIZE + (size_t)ct_len;
                                     state->tx_file.tx_offset = 0;
                                 } else {
-                                    fprintf(stderr, "\n  [!] Hata: Chunk şifreleme başarısız\n> ");
+                                    ui_print_error(state, "Chunk şifreleme başarısız");
                                     close(state->tx_file.fd);
                                     explicit_bzero(&state->tx_file, sizeof(state->tx_file));
                                     epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
                                 }
                             } else if (r < 0 && errno != EINTR) {
-                                fprintf(stderr, "\n  [!] Hata: Yerel dosya okuma başarısız\n> ");
+                                ui_print_error(state, "Yerel dosya okuma başarısız");
                                 close(state->tx_file.fd);
                                 explicit_bzero(&state->tx_file, sizeof(state->tx_file));
                                 epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
@@ -1069,7 +1067,9 @@ static void event_loop(struct app_state *state)
                 /* ── Peer'dan Veri Alımı (EPOLLIN) ───────── */
                 if (events[i].events & EPOLLIN) {
                     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-                    ssize_t r = read(fd, wire, FRAME_HEADER_WIRE_SIZE);
+
+                    /* İlk byte'ı oku — bağlantı durumunu kontrol et */
+                    ssize_t r = read(fd, wire, 1);
                     if (r <= 0) {
                         if (errno == EINTR) continue;
 #if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
@@ -1092,19 +1092,26 @@ static void event_loop(struct app_state *state)
                         if (state->tx_file.active) {
                             close(state->tx_file.fd);
                             explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-                            fprintf(stderr, "\n  [!] UYARI: Bağlantı koptuğu için dosya gönderimi iptal edildi.\n");
+                            ui_print_error(state, "Bağlantı koptuğu için dosya gönderimi iptal edildi.");
                         }
                         if (state->rx_file.active) {
+                            char bad_path[NOX_PATH_MAX];
+                            snprintf(bad_path, sizeof(bad_path), "received_%s", state->rx_file.filename);
                             close(state->rx_file.fd);
+                            unlink(bad_path);
                             explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-                            fprintf(stderr, "\n  [!] UYARI: Bağlantı koptuğu için dosya alımı iptal edildi.\n");
+                            ui_print_error(state, "Bağlantı koptuğu için dosya alımı iptal edildi ve yarım kalan dosya silindi.");
                         }
                         
-                        fprintf(stderr, "\n  [*] peer ayrıldı\n> ");
+                        ui_print_system(state, "[*] peer ayrıldı");
                         continue;
                     }
 
-                if (r != FRAME_HEADER_WIRE_SIZE) continue;
+                    /* Kalan header byte'larını tam oku (partial read koruması) */
+                    if (read_full(fd, wire + 1, FRAME_HEADER_WIRE_SIZE - 1) != NOX_OK) {
+                        NOX_ERROR(LOG_MOD_NET, "frame header eksik okundu");
+                        continue;
+                    }
 
                 struct frame_header fh;
                 if (frame_header_decode(wire, &fh) != NOX_OK) continue;
@@ -1115,15 +1122,9 @@ static void event_loop(struct app_state *state)
                 uint8_t *payload = malloc(4096 + NOX_MAC_LEN);
                 if (!payload) continue;
 
-                size_t got = 0;
-                while (got < fh.len) {
-                    ssize_t rr = read(fd, payload + got, fh.len - got);
-                    if (rr <= 0) break;
-                    got += (size_t)rr;
-                }
-                
-                if (got != fh.len) {
-                    explicit_bzero(payload, 4096 + NOX_MAC_LEN);
+                /* Payload'u tam oku (partial read koruması) */
+                if (read_full(fd, payload, fh.len) != NOX_OK) {
+                    NOX_ERROR(LOG_MOD_NET, "frame payload eksik okundu");
                     free(payload);
                     continue;
                 }
@@ -1161,7 +1162,7 @@ static void event_loop(struct app_state *state)
                             memcpy(peer_onion, pl, NOX_ONION_LEN + 1);
                         } else {
                             NOX_ERROR(LOG_MOD_NOISE, "Handshake payload geçersiz veya eksik");
-                            fprintf(stderr, "\n  [!] Hata: Akran geçerli bir adres iletmedi\n> ");
+                            ui_print_error(state, "Akran geçerli bir adres iletmedi");
                             close(fd);
                             state->peer_fd = -1;
                             state->hs = NULL;
@@ -1203,11 +1204,11 @@ static void event_loop(struct app_state *state)
                                     state->active_peer_onion[NOX_ONION_LEN] = '\0';
                                     
                                     NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
-                                    fprintf(stderr, "\n  [✓] şifreli kanal kuruldu (%s)\n> ", name);
+                                    ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)", name);
                                     
                                     db_process_queue(state->active_peer_onion, send_queued_callback, state);
                                 } else {
-                                    fprintf(stderr, "\n  [!] Arena bellek hatası\n> ");
+                                    ui_print_error(state, "Arena bellek hatası");
                                     close(fd);
                                     state->peer_fd = -1;
                                     state->active_peer_onion[0] = '\0';
@@ -1215,11 +1216,14 @@ static void event_loop(struct app_state *state)
                                 }
                                 state->hs = NULL;
                             } else {
-                                fprintf(stderr, "\n  [!] UYARI: AKRANIN ANAHTARI DEĞİŞMİŞ! (MITM RİSKİ)\n");
+                                ui_save_input(state);
+                                fprintf(stderr, "\n\033[31m  [!] UYARI: AKRANIN ANAHTARI DEĞİŞMİŞ! (MITM RİSKİ)\033[0m\n");
                                 fprintf(stderr, "      Adres: %s\n", peer_onion);
                                 fprintf(stderr, "      Kayıtlı İsim: %s\n", name);
                                 fprintf(stderr, "      Yeni Fingerprint: %s\n", fp_str);
                                 fprintf(stderr, "  [?] Yeni anahtarı onaylıyor musunuz? (y/n): ");
+                                fflush(stderr);
+                                ui_restore_input(state);
                                 
                                 state->tofu_pending = true;
                                 state->tofu_peer_fd = fd;
@@ -1231,10 +1235,13 @@ static void event_loop(struct app_state *state)
                                 state->tofu_arena_mark = state->session_arena_mark;
                             }
                         } else {
-                            fprintf(stderr, "\n  [!] TOFU: Yeni peer bağlantısı\n");
+                            ui_save_input(state);
+                            fprintf(stderr, "\n\033[33m  [!] TOFU: Yeni peer bağlantısı\033[0m\n");
                             fprintf(stderr, "      Adres: %s\n", peer_onion);
                             fprintf(stderr, "      Fingerprint: %s\n", fp_str);
                             fprintf(stderr, "  [?] Bu bağlantıyı onaylıyor ve rehbere kaydediyor musunuz? (y/n): ");
+                            fflush(stderr);
+                            ui_restore_input(state);
                             
                             char default_name[NOX_CONTACT_NAME_LEN + 1];
                             if (db_err == NOX_OK && zero_key && name[0] != '\0') {
@@ -1260,8 +1267,7 @@ static void event_loop(struct app_state *state)
                         ssize_t pt_len = noise_decrypt(state->session,
                             payload, fh.len, pt);
                         if (pt_len > 0) {
-                            /* Terminal satırını temizleyip mesajı bas ve yeni prompt aç */
-                            fprintf(stderr, "\r\033[K[Akran]: %s\n> ", (const char *)pt);
+                            ui_print_incoming(state, (const char *)pt);
                         }
                         explicit_bzero(pt, 4096);
                         free(pt);
@@ -1303,10 +1309,10 @@ static void event_loop(struct app_state *state)
                                     
                                     crypto_generichash_init(&state->rx_file.hash_state, NULL, 0, 32);
                                     
-                                    fprintf(stderr, "\n  [⬇] Gelen dosya: %s (%lu byte)\n> ",
+                                    ui_print_system(state, "[⬇] Gelen dosya: %s (%lu byte)",
                                             safe_name, (unsigned long)net_size);
                                 } else {
-                                    fprintf(stderr, "\n  [!] Hata: Gelen dosya (%s) oluşturulamadı\n> ", safe_name);
+                                    ui_print_error(state, "Gelen dosya (%s) oluşturulamadı", safe_name);
                                 }
                             } else if (state->rx_file.active) {
                                 /* Dosya verisi chunk'ı */
@@ -1322,16 +1328,25 @@ static void event_loop(struct app_state *state)
                                         close(state->rx_file.fd);
                                         
                                         if (memcmp(final_hash, state->rx_file.expected_hash, 32) == 0) {
-                                            fprintf(stderr, "\n  [✓] Dosya başarıyla alındı: %s\n> ", state->rx_file.filename);
+                                            ui_print_system(state, "[✓] Dosya başarıyla alındı: %s", state->rx_file.filename);
                                         } else {
-                                            fprintf(stderr, "\n  [!] UYARI: Alınan dosyanın (%s) hash'i uyuşmuyor! Dosya bozuk veya değiştirilmiş olabilir.\n> ", state->rx_file.filename);
+                                            char bad_path[NOX_PATH_MAX];
+                                            snprintf(bad_path, sizeof(bad_path), "received_%s", state->rx_file.filename);
+                                            unlink(bad_path);
+                                            ui_print_error(state, "HATA: Alınan dosyanın (%s) hash'i uyuşmuyor! Dosya silindi (bütünlük doğrulaması başarısız).", state->rx_file.filename);
                                         }
                                         
                                         explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+                                    } else {
+                                        ui_print_progress(state, state->rx_file.filename,
+                                                          state->rx_file.received_bytes, state->rx_file.expected_size, false);
                                     }
                                 } else {
-                                    fprintf(stderr, "\n  [!] Hata: Dosyaya yazılamadı, transfer iptal edildi\n> ");
+                                    char bad_path[NOX_PATH_MAX];
+                                    snprintf(bad_path, sizeof(bad_path), "received_%s", state->rx_file.filename);
                                     close(state->rx_file.fd);
+                                    unlink(bad_path);
+                                    ui_print_error(state, "Dosyaya yazılamadı, transfer iptal edildi ve yarım kalan dosya silindi.");
                                     explicit_bzero(&state->rx_file, sizeof(state->rx_file));
                                 }
                             }
@@ -1633,18 +1648,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ── Pluggable Transport Seçimi (Faz 6.2) ── */
-    prompt_transport_selection(&state);
-
-    /* SQLite veritabanını başlat */
-    err = db_init(state.config_dir, state.db_key);
-    if (err != NOX_OK) {
-        NOX_FATAL(LOG_MOD_MAIN, "veritabanı başlatılamadı: %s",
-                  nox_strerror(err));
-        arena_destroy(&state.arena);
-        return 1;
-    }
-
     /* ── 11. Identity key yükle, oluştur ve Curve25519'a dönüştür ── */
     state.my_static_priv = arena_alloc(&state.arena, NOX_KEY_LEN);
     state.my_static_pub = arena_alloc(&state.arena, NOX_KEY_LEN);
@@ -1711,6 +1714,22 @@ int main(int argc, char *argv[])
     memory_barrier();
     identity_unlock = NULL;
     NOX_DEBUG(LOG_MOD_MAIN, "identity_unlock bellekten silindi");
+
+    /* ── Pluggable Transport Seçimi (Faz 6.2) ── */
+    prompt_transport_selection(&state);
+    if (g_shutdown) {
+        cleanup(&state);
+        return 0;
+    }
+
+    /* SQLite veritabanını başlat */
+    err = db_init(state.config_dir, state.db_key);
+    if (err != NOX_OK) {
+        NOX_FATAL(LOG_MOD_MAIN, "veritabanı başlatılamadı: %s",
+                  nox_strerror(err));
+        arena_destroy(&state.arena);
+        return 1;
+    }
 
     NOX_INFO(LOG_MOD_MAIN, "public key hazır");
     NOX_DEBUG(LOG_MOD_MAIN, "arena: %zu byte / %zu KB kullanımda",
@@ -1862,10 +1881,13 @@ int main(int argc, char *argv[])
 
     fprintf(stderr,
         "\n  Komutlar:\n"
-        "    /addr              — .onion adresini göster\n"
-        "    /connect <onion>   — peer'a bağlan\n"
-        "    Ctrl+P             — çıkış\n"
-        "  Bağlantı kurulduktan sonra yazdığınız her şey mesaj olarak gönderilir.\n\n"
+        "    \033[38;2;210;24;38m/addr               — .onion adresini göster\033[0m\n"
+        "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+        "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi ekle\033[0m\n"
+        "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu mesaj gönder\033[0m\n"
+        "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder (aktif bağlantı gerektirir)\033[0m\n"
+        "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+        "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak gönderilir.\n\n"
         "> ");
 
     event_loop(&state);

@@ -14,8 +14,12 @@
  */
 
 #include "common.h"
+#include "types.h"
 
 #include <stdio.h>
+
+/* Global shutdown flag — tanım burada, extern types.h'de */
+volatile sig_atomic_t g_shutdown = 0;
 #include <stdarg.h>
 #include <time.h>
 

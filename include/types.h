@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include <sodium.h>
+#include <signal.h>
 
 /* ================================================================
  * SECURE ARENA — Güvenli bellek havuzu
@@ -213,6 +214,7 @@ struct app_state {
     char    *stdin_buf;
     size_t   stdin_len;
     size_t   stdin_cap;
+    bool     input_saved;        /* ui_save/restore iç içe çağrı koruması */
 
     /* Pluggable Transport (Faz 6.2) */
     enum tor_transport_type transport_type;
@@ -222,5 +224,7 @@ struct app_state {
     struct file_rx_state rx_file;
     struct file_tx_state tx_file;
 };
+
+extern volatile sig_atomic_t g_shutdown;
 
 #endif /* PARANOID_TYPES_H */

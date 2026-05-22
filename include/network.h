@@ -113,7 +113,8 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size,
 
 nox_err_t ctrl_send_command(int fd, const char *cmd);
 
-/* I/O helper — EINTR + partial write koruması */
+/* I/O helpers — EINTR + partial read/write koruması */
 nox_err_t write_full(int fd, const void *buf, size_t len);
+nox_err_t read_full(int fd, void *buf, size_t len);
 
 #endif /* PARANOID_NETWORK_H */

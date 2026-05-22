@@ -7,6 +7,7 @@
 #include "types.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -54,7 +55,7 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
   return NOX_OK;
 }
 
-static nox_err_t read_full(int fd, void *buf, size_t len) {
+nox_err_t read_full(int fd, void *buf, size_t len) {
   uint8_t *p = (uint8_t *)buf;
   size_t received = 0;
   while (received < len) {
@@ -165,10 +166,74 @@ static nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
   return NOX_OK;
 }
 
+static void rm_rf(const char *path) {
+  DIR *d = opendir(path);
+  if (!d) {
+    unlink(path);
+    return;
+  }
+  struct dirent *p;
+  while ((p = readdir(d))) {
+    if (strcmp(p->d_name, ".") == 0 || strcmp(p->d_name, "..") == 0) {
+      continue;
+    }
+    char buf[NOX_PATH_MAX];
+    int n = snprintf(buf, sizeof(buf), "%s/%s", path, p->d_name);
+    if (n > 0 && (size_t)n < sizeof(buf)) {
+      struct stat statbuf;
+      if (stat(buf, &statbuf) == 0) {
+        if (S_ISDIR(statbuf.st_mode)) {
+          rm_rf(buf);
+        } else {
+          unlink(buf);
+        }
+      }
+    }
+  }
+  closedir(d);
+  rmdir(path);
+}
+
+static void cleanup_stale_tor_dirs(const char *config_dir) {
+  DIR *d = opendir(config_dir);
+  if (!d) return;
+
+  struct dirent *p;
+  while ((p = readdir(d))) {
+    if (strncmp(p->d_name, "tor_data_", 9) == 0) {
+      int pid = atoi(p->d_name + 9);
+      if (pid > 0) {
+        if (kill(pid, 0) != 0 && errno == ESRCH) {
+          char path[NOX_PATH_MAX];
+          int n = snprintf(path, sizeof(path), "%s/%s", config_dir, p->d_name);
+          if (n > 0 && (size_t)n < sizeof(path)) {
+            rm_rf(path);
+          }
+        }
+      }
+    } else if (strncmp(p->d_name, "torrc_", 6) == 0) {
+      int pid = atoi(p->d_name + 6);
+      if (pid > 0) {
+        if (kill(pid, 0) != 0 && errno == ESRCH) {
+          char path[NOX_PATH_MAX];
+          int n = snprintf(path, sizeof(path), "%s/%s", config_dir, p->d_name);
+          if (n > 0 && (size_t)n < sizeof(path)) {
+            unlink(path);
+          }
+        }
+      }
+    }
+  }
+  closedir(d);
+}
+
 /* ================================================================
  * TORRC ÜRETİMİ
  * ================================================================ */
 static nox_err_t generate_torrc(struct app_state *state) {
+  /* Temizlik: Stale (artık) Tor dizinlerini temizle */
+  cleanup_stale_tor_dirs(state->config_dir);
+
   /* tor_data_<PID> — her instance kendi dizinini alır */
   int n = snprintf(state->tor_data_dir, NOX_PATH_MAX, "%s/tor_data_%d",
                    state->config_dir, (int)getpid());
@@ -215,7 +280,9 @@ static nox_err_t generate_torrc(struct app_state *state) {
              "DataDirectory %s\n"
              "Log notice file %s/tor.log\n"
              "UseBridges 1\n"
-             "ClientTransportPlugin snowflake exec %s\n",
+             "UpdateBridgesFromAuthority 1\n"
+             "ClientTransportPlugin snowflake exec %s\n"
+             "Bridge snowflake 192.0.2.3:80 2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 fingerprint=2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 url=https://snowflake-broker.torproject.net/ front=cdn.sstatic.net ice=stun:stun.l.google.com:19302 utls-imitation=hellorandomizedalpn\n",
              state->tor_data_dir, state->tor_data_dir, state->tor_data_dir, snowflake_path);
   } else if (state->transport_type == TRANSPORT_OBFS4) {
     const char *obfs4_path = "/usr/bin/obfs4proxy";
@@ -242,6 +309,7 @@ static nox_err_t generate_torrc(struct app_state *state) {
                "DataDirectory %s\n"
                "Log notice file %s/tor.log\n"
                "UseBridges 1\n"
+               "UpdateBridgesFromAuthority 1\n"
                "ClientTransportPlugin obfs4 exec %s\n",
                state->tor_data_dir, state->tor_data_dir, state->tor_data_dir, obfs4_path);
     }
@@ -283,6 +351,8 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
   int max_tries = timeout_sec * 10;
 
   for (int i = 0; i < max_tries; i++) {
+    if (g_shutdown) return NOX_ERR_TOR;
+
     /* Tor child sürecini kontrol et (zombi veya çökmüş mü?) */
     int status;
     pid_t res = waitpid(tor_pid, &status, WNOHANG);
@@ -347,25 +417,12 @@ nox_err_t tor_spawn(struct app_state *state) {
     
     char arg0[] = "tor";
     char arg1[] = "-f";
-    char arg_bridge[] = "--use-default-bridges";
     
-    char *argv[8];
+    char *argv[4];
     argv[0] = arg0;
     argv[1] = arg1;
     argv[2] = state->torrc_path;
-    int idx = 3;
-
-    bool use_default_bridges = false;
-    if (state->transport_type == TRANSPORT_SNOWFLAKE) {
-      use_default_bridges = true;
-    } else if (state->transport_type == TRANSPORT_OBFS4 && strlen(state->obfs4_bridge_line) == 0) {
-      use_default_bridges = true;
-    }
-
-    if (use_default_bridges) {
-      argv[idx++] = arg_bridge;
-    }
-    argv[idx] = NULL;
+    argv[3] = NULL;
 
     execv("/usr/bin/tor", argv);
     execv("/usr/local/bin/tor", argv);
@@ -622,33 +679,43 @@ void tor_shutdown(struct app_state *state) {
     state->tor_ctrl_fd = -1;
   }
 
-  if (state->tor_pid <= 0)
-    return;
+  if (state->tor_pid > 0) {
+    NOX_INFO(LOG_MOD_NET, "Tor sonlandırılıyor (PID=%d)", state->tor_pid);
 
-  NOX_INFO(LOG_MOD_NET, "Tor sonlandırılıyor (PID=%d)", state->tor_pid);
-
-  if (kill(state->tor_pid, SIGTERM) != 0) {
-    NOX_WARN(LOG_MOD_NET, "Tor SIGTERM başarısız: %s", strerror(errno));
-    state->tor_pid = 0;
-    return;
-  }
-
-  int status;
-  for (int i = 0; i < 50; i++) {
-    pid_t r = waitpid(state->tor_pid, &status, WNOHANG);
-    if (r > 0) {
-      NOX_INFO(LOG_MOD_NET, "Tor temiz kapandı");
-      state->tor_pid = 0;
-      return;
+    if (kill(state->tor_pid, SIGTERM) == 0) {
+      int status;
+      bool stopped = false;
+      for (int i = 0; i < 50; i++) {
+        pid_t r = waitpid(state->tor_pid, &status, WNOHANG);
+        if (r > 0) {
+          NOX_INFO(LOG_MOD_NET, "Tor temiz kapandı");
+          stopped = true;
+          break;
+        }
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000};
+        nanosleep(&ts, NULL);
+      }
+      if (!stopped) {
+        kill(state->tor_pid, SIGKILL);
+        waitpid(state->tor_pid, &status, 0);
+        NOX_WARN(LOG_MOD_NET, "Tor SIGKILL ile sonlandırıldı");
+      }
+    } else {
+      NOX_WARN(LOG_MOD_NET, "Tor SIGTERM başarısız: %s", strerror(errno));
     }
-    struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000};
-    nanosleep(&ts, NULL);
+    state->tor_pid = 0;
   }
 
-  kill(state->tor_pid, SIGKILL);
-  waitpid(state->tor_pid, &status, 0);
-  NOX_WARN(LOG_MOD_NET, "Tor SIGKILL ile sonlandırıldı");
-  state->tor_pid = 0;
+  /* torrc dosyasını sil */
+  if (state->torrc_path[0] != '\0') {
+    unlink(state->torrc_path);
+    state->torrc_path[0] = '\0';
+  }
+  /* tor_data dizinini temizle */
+  if (state->tor_data_dir[0] != '\0') {
+    rm_rf(state->tor_data_dir);
+    state->tor_data_dir[0] = '\0';
+  }
 }
 
 /* ================================================================
