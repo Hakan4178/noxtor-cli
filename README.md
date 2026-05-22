@@ -22,7 +22,7 @@ It works experimentally on Termux and natively on x86.
 It’s not finished yet there are still quite a few missing features but at least the messaging mechanics have been thoroughly tested using official Noise XX test vectors.
 In summary, it’s a Linux-exclusive, terminal-based messaging tool designed for activists, journalists, or individuals under censorship. Although the necessary security measures for such users haven’t been added yet, critical keys and data are currently being quickly erased from memory.
 
-Key features:
+### Key features:
 
 No central server.
 
@@ -33,7 +33,7 @@ End-to-end encryption via the Noise XX protocol (with forward secrecy, and it’
 Compliant with C23 standards, tested under ASan/UBSan—also tested with fanalyser.
 
 
-# Why not Signal:
+## Why not Signal:
 
 
 
