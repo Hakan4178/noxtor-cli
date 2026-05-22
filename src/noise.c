@@ -77,6 +77,11 @@ ssize_t cipher_encrypt(struct noise_cipher_state *cs,
         return (ssize_t)pt_len;
     }
 
+    if (cs->n == UINT64_MAX) {
+        NOX_ERROR(LOG_MOD_NOISE, "nonce counter tükendi — session yenilenmeli");
+        return -1;
+    }
+
     uint8_t nonce[12];
     encode_nonce(nonce, cs->n);
 
@@ -107,6 +112,11 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs,
 
     if (ct_len < NOX_MAC_LEN)
         return -1;
+
+    if (cs->n == UINT64_MAX) {
+        NOX_ERROR(LOG_MOD_NOISE, "nonce counter tükendi — session yenilenmeli");
+        return -1;
+    }
 
     uint8_t nonce[12];
     encode_nonce(nonce, cs->n);

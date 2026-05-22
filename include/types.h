@@ -45,12 +45,11 @@ struct __attribute__((packed)) frame_header {
     uint8_t  type;          /* enum msg_type                        */
     uint32_t seq;           /* sıra numarası                        */
     uint32_t len;           /* payload uzunluğu (şifreli, MAC dahil)*/
-    uint8_t  nonce[NOX_NONCE_LEN]; /* 24 byte nonce                 */
 };
 
-/* Wire format: 4+1+4+4+24 = 37 byte — padding yok */
-NOX_STATIC_ASSERT(sizeof(struct frame_header) == 37,
-                  "frame_header wire format boyutu 37 byte olmali");
+/* Wire format: 4+1+4+4 = 13 byte — padding yok, nonce Noise CipherState'te */
+NOX_STATIC_ASSERT(sizeof(struct frame_header) == 13,
+                  "frame_header wire format boyutu 13 byte olmali");
 
 /* ================================================================
  * MESAJ DURUMU — SQLite kuyruk state machine
@@ -148,7 +147,7 @@ struct file_tx_state {
     uint8_t  hash[32];            /* önceden hesaplanan BLAKE2b */
     
     /* Kısmi yazım için frame tamponu */
-    uint8_t  tx_buf[4096 + 37 + NOX_MAC_LEN]; /* frame_header(37) + payload + MAC */
+    uint8_t  tx_buf[4096 + 13 + NOX_MAC_LEN]; /* frame_header(13) + payload + MAC */
     size_t   tx_len;              /* mevcut frame'in toplam boyutu */
     size_t   tx_offset;           /* şimdiye dek yazılan byte */
     size_t   current_chunk_size;  /* mevcut şifrelenmemiş dosya boyutu */

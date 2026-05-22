@@ -99,7 +99,7 @@ nox_err_t frame_header_decode(const uint8_t *wire,
                                struct frame_header *hdr);
 
 /* Frame boyutu sabitleri */
-#define FRAME_HEADER_WIRE_SIZE  37U
+#define FRAME_HEADER_WIRE_SIZE  13U
 #define FRAME_MAX_PAYLOAD       (4096U + NOX_MAC_LEN)
 
 /* ================================================================

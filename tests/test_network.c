@@ -54,7 +54,6 @@ static int test_frame_roundtrip(void)
         .seq   = 42,
         .len   = 128,
     };
-    memset(orig.nonce, 0xAB, NOX_NONCE_LEN);
 
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     frame_header_encode(&orig, wire);
@@ -67,7 +66,6 @@ static int test_frame_roundtrip(void)
     TEST_ASSERT(decoded.type  == orig.type);
     TEST_ASSERT(decoded.seq   == orig.seq);
     TEST_ASSERT(decoded.len   == orig.len);
-    TEST_ASSERT(memcmp(decoded.nonce, orig.nonce, NOX_NONCE_LEN) == 0);
 
     return 0;
 }
@@ -83,7 +81,6 @@ static int test_frame_endian(void)
         .seq   = 0x01020304,
         .len   = 0x00FF0011,
     };
-    memset(hdr.nonce, 0, NOX_NONCE_LEN);
 
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     frame_header_encode(&hdr, wire);
@@ -164,7 +161,6 @@ static int test_frame_all_types(void)
             .seq   = (uint32_t)i,
             .len   = 64,
         };
-        memset(hdr.nonce, (int)i, NOX_NONCE_LEN);
 
         uint8_t wire[FRAME_HEADER_WIRE_SIZE];
         frame_header_encode(&hdr, wire);

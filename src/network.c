@@ -69,7 +69,10 @@ nox_err_t read_full(int fd, void *buf, size_t len) {
       if (errno == EAGAIN) {
 #endif
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        poll(&pfd, 1, -1);
+        int poller = poll(&pfd, 1, 10000); /* 10s timeout */
+        if (poller <= 0) {
+          return NOX_ERR_IO; /* Timeout veya hata */
+        }
         continue;
       }
       return NOX_ERR_IO;
@@ -196,7 +199,8 @@ static void rm_rf(const char *path) {
 
 static void cleanup_stale_tor_dirs(const char *config_dir) {
   DIR *d = opendir(config_dir);
-  if (!d) return;
+  if (!d)
+    return;
 
   struct dirent *p;
   while ((p = readdir(d))) {
@@ -273,54 +277,63 @@ static nox_err_t generate_torrc(struct app_state *state) {
     if (access("/usr/local/bin/snowflake-client", X_OK) == 0) {
       snowflake_path = "/usr/local/bin/snowflake-client";
     }
-    clen = snprintf(content, sizeof(content),
-             "SocksPort auto\n"
-             "ControlSocket %s/control.sock\n"
-             "CookieAuthentication 1\n"
-             "DataDirectory %s\n"
-             "Log notice file %s/tor.log\n"
-             "UseBridges 1\n"
-             "UpdateBridgesFromAuthority 1\n"
-             "ClientTransportPlugin snowflake exec %s\n"
-             "Bridge snowflake 192.0.2.3:80 2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 fingerprint=2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 url=https://snowflake-broker.torproject.net/ front=cdn.sstatic.net ice=stun:stun.l.google.com:19302 utls-imitation=hellorandomizedalpn\n",
-             state->tor_data_dir, state->tor_data_dir, state->tor_data_dir, snowflake_path);
+    clen = snprintf(
+        content, sizeof(content),
+        "SocksPort auto\n"
+        "ControlSocket %s/control.sock\n"
+        "CookieAuthentication 1\n"
+        "DataDirectory %s\n"
+        "Log notice file %s/tor.log\n"
+        "UseBridges 1\n"
+        "UpdateBridgesFromAuthority 1\n"
+        "ClientTransportPlugin snowflake exec %s\n"
+        "Bridge snowflake 192.0.2.3:80 "
+        "2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 "
+        "fingerprint=2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 "
+        "url=https://snowflake-broker.torproject.net/ front=cdn.sstatic.net "
+        "ice=stun:stun.l.google.com:19302 utls-imitation=hellorandomizedalpn\n",
+        state->tor_data_dir, state->tor_data_dir, state->tor_data_dir,
+        snowflake_path);
   } else if (state->transport_type == TRANSPORT_OBFS4) {
     const char *obfs4_path = "/usr/bin/obfs4proxy";
     if (access("/usr/local/bin/obfs4proxy", X_OK) == 0) {
       obfs4_path = "/usr/local/bin/obfs4proxy";
     }
     if (strlen(state->obfs4_bridge_line) > 0) {
-      clen = snprintf(content, sizeof(content),
-               "SocksPort auto\n"
-               "ControlSocket %s/control.sock\n"
-               "CookieAuthentication 1\n"
-               "DataDirectory %s\n"
-               "Log notice file %s/tor.log\n"
-               "UseBridges 1\n"
-               "Bridge %s\n"
-               "ClientTransportPlugin obfs4 exec %s\n",
-               state->tor_data_dir, state->tor_data_dir, state->tor_data_dir,
-               state->obfs4_bridge_line, obfs4_path);
+      clen =
+          snprintf(content, sizeof(content),
+                   "SocksPort auto\n"
+                   "ControlSocket %s/control.sock\n"
+                   "CookieAuthentication 1\n"
+                   "DataDirectory %s\n"
+                   "Log notice file %s/tor.log\n"
+                   "UseBridges 1\n"
+                   "Bridge %s\n"
+                   "ClientTransportPlugin obfs4 exec %s\n",
+                   state->tor_data_dir, state->tor_data_dir,
+                   state->tor_data_dir, state->obfs4_bridge_line, obfs4_path);
     } else {
       clen = snprintf(content, sizeof(content),
-               "SocksPort auto\n"
-               "ControlSocket %s/control.sock\n"
-               "CookieAuthentication 1\n"
-               "DataDirectory %s\n"
-               "Log notice file %s/tor.log\n"
-               "UseBridges 1\n"
-               "UpdateBridgesFromAuthority 1\n"
-               "ClientTransportPlugin obfs4 exec %s\n",
-               state->tor_data_dir, state->tor_data_dir, state->tor_data_dir, obfs4_path);
+                      "SocksPort auto\n"
+                      "ControlSocket %s/control.sock\n"
+                      "CookieAuthentication 1\n"
+                      "DataDirectory %s\n"
+                      "Log notice file %s/tor.log\n"
+                      "UseBridges 1\n"
+                      "UpdateBridgesFromAuthority 1\n"
+                      "ClientTransportPlugin obfs4 exec %s\n",
+                      state->tor_data_dir, state->tor_data_dir,
+                      state->tor_data_dir, obfs4_path);
     }
   } else {
-    clen = snprintf(content, sizeof(content),
-             "SocksPort auto\n"
-             "ControlSocket %s/control.sock\n"
-             "CookieAuthentication 1\n"
-             "DataDirectory %s\n"
-             "Log notice file %s/tor.log\n",
-             state->tor_data_dir, state->tor_data_dir, state->tor_data_dir);
+    clen =
+        snprintf(content, sizeof(content),
+                 "SocksPort auto\n"
+                 "ControlSocket %s/control.sock\n"
+                 "CookieAuthentication 1\n"
+                 "DataDirectory %s\n"
+                 "Log notice file %s/tor.log\n",
+                 state->tor_data_dir, state->tor_data_dir, state->tor_data_dir);
   }
 
   if (clen <= 0 || (size_t)clen >= sizeof(content)) {
@@ -346,22 +359,29 @@ static nox_err_t generate_torrc(struct app_state *state) {
  * ================================================================ */
 
 /* control.sock dosyasının oluşmasını bekler, Tor sürecini takip eder */
-static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path, int timeout_sec) {
+static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
+                                         int timeout_sec) {
   struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; /* 100 ms */
   int max_tries = timeout_sec * 10;
 
   for (int i = 0; i < max_tries; i++) {
-    if (g_shutdown) return NOX_ERR_TOR;
+    if (g_shutdown)
+      return NOX_ERR_TOR;
 
     /* Tor child sürecini kontrol et (zombi veya çökmüş mü?) */
     int status;
     pid_t res = waitpid(tor_pid, &status, WNOHANG);
     if (res > 0) {
       int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-      NOX_ERROR(LOG_MOD_NET, "Tor beklenmedik şekilde sonlandı (exit=%d)", exit_code);
-      
-      NOX_WARN(LOG_MOD_TOR, "Tor başlatılamadı. Eğer eski bir Tor sürümü kullanıyorsanız, yerleşik köprüler (--use-default-bridges) desteklenmiyor olabilir. Lütfen Tor sürümünü güncelleyin veya manuel özel köprü yapılandırın.");
-      
+      NOX_ERROR(LOG_MOD_NET, "Tor beklenmedik şekilde sonlandı (exit=%d)",
+                exit_code);
+
+      NOX_WARN(LOG_MOD_TOR,
+               "Tor başlatılamadı. Eğer eski bir Tor sürümü kullanıyorsanız, "
+               "yerleşik köprüler (--use-default-bridges) desteklenmiyor "
+               "olabilir. Lütfen Tor sürümünü güncelleyin veya manuel özel "
+               "köprü yapılandırın.");
+
       return NOX_ERR_TOR;
     }
 
@@ -414,10 +434,10 @@ nox_err_t tor_spawn(struct app_state *state) {
       dup2(devnull, STDERR_FILENO);
       close(devnull);
     }
-    
+
     char arg0[] = "tor";
     char arg1[] = "-f";
-    
+
     char *argv[4];
     argv[0] = arg0;
     argv[1] = arg1;
@@ -438,7 +458,8 @@ nox_err_t tor_spawn(struct app_state *state) {
   /* Control soket dosyasını bekle (Tor async oluşturur) */
   err = wait_for_control_socket(pid, socket_path, 30);
   if (err != NOX_OK) {
-    NOX_ERROR(LOG_MOD_NET, "control.sock dosyası oluşturulamadı veya Tor çöktü");
+    NOX_ERROR(LOG_MOD_NET,
+              "control.sock dosyası oluşturulamadı veya Tor çöktü");
     return NOX_ERR_TOR;
   }
 
@@ -952,7 +973,6 @@ void frame_header_encode(const struct frame_header *hdr, uint8_t *wire) {
   wire[10] = (uint8_t)(hdr->len >> 16);
   wire[11] = (uint8_t)(hdr->len >> 8);
   wire[12] = (uint8_t)(hdr->len);
-  memcpy(wire + 13, hdr->nonce, NOX_NONCE_LEN);
 }
 
 nox_err_t frame_header_decode(const uint8_t *wire, struct frame_header *hdr) {
@@ -963,7 +983,6 @@ nox_err_t frame_header_decode(const uint8_t *wire, struct frame_header *hdr) {
              ((uint32_t)wire[7] << 8) | (uint32_t)wire[8];
   hdr->len = ((uint32_t)wire[9] << 24) | ((uint32_t)wire[10] << 16) |
              ((uint32_t)wire[11] << 8) | (uint32_t)wire[12];
-  memcpy(hdr->nonce, wire + 13, NOX_NONCE_LEN);
 
   if (hdr->magic != NOX_FRAME_MAGIC) {
     NOX_ERROR(LOG_MOD_NET, "frame magic hatalı: 0x%08x", hdr->magic);
