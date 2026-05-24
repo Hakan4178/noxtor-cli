@@ -690,6 +690,10 @@ nox_err_t handshake_split(struct noise_handshake *hs,
     /* Ephemeral key'leri sil */
     explicit_bzero(hs->e, NOX_KEY_LEN);
     explicit_bzero(hs->e_pub, NOX_KEY_LEN);
+    explicit_bzero(hs->s,     NOX_KEY_LEN);  
+    explicit_bzero(hs->s_pub, NOX_KEY_LEN);  
+    explicit_bzero(hs->re,    NOX_KEY_LEN);  
+    explicit_bzero(hs->rs,    NOX_KEY_LEN);  
     memory_barrier();
 
     NOX_INFO(LOG_MOD_NOISE, "handshake tamamlandı — transport hazır");
