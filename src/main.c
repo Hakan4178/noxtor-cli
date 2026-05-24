@@ -47,7 +47,14 @@
 
 /* ================================================================
  * GLOBAL SHUTDOWN FLAG — async-signal-safe
+ *
+ * F-2 FIX: g_shutdown tanımı log.c'den main.c'ye taşındı.
+ * Signal handler'lar için async-signal-safe flag.
  * ================================================================ */
+
+/* Global shutdown flag — tanım burada, extern types.h'de */
+volatile sig_atomic_t g_shutdown = 0;
+
 static struct termios g_orig_termios;
 static bool g_termios_saved = false;
 
@@ -141,6 +148,12 @@ static nox_err_t resolve_config_paths(struct app_state *state) {
   memcpy(state->contacts_path, state->config_dir, dir_len);
   memcpy(state->contacts_path + dir_len, "/contacts.db", 13);
 
+  /* downloads dizini yolu */
+  memcpy(state->downloads_dir, state->config_dir, dir_len);
+  memcpy(state->downloads_dir + dir_len, "/downloads", 11);
+
+  state->downloads_dir_fd = -1;
+
   return NOX_OK;
 }
 
@@ -181,6 +194,17 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
       }
     }
     NOX_INFO(LOG_MOD_MAIN, "config dizini oluşturuldu: %s", state->config_dir);
+  }
+
+  if (mkdir(state->downloads_dir, 0700) != 0 && errno != EEXIST) {
+    NOX_ERROR(LOG_MOD_MAIN, "downloads dizini oluşturulamadı: %s", strerror(errno));
+    return NOX_ERR_CONFIG;
+  }
+  
+  state->downloads_dir_fd = open(state->downloads_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (state->downloads_dir_fd < 0) {
+    NOX_ERROR(LOG_MOD_MAIN, "downloads dizini açılamadı: %s", strerror(errno));
+    return NOX_ERR_CONFIG;
   }
 
   /*
@@ -375,6 +399,10 @@ static void cleanup(struct app_state *state) {
     close(state->epoll_fd);
     state->epoll_fd = -1;
   }
+  if (state->downloads_dir_fd >= 0) {
+    close(state->downloads_dir_fd);
+    state->downloads_dir_fd = -1;
+  }
 
   NOX_INFO(LOG_MOD_MAIN, "temizlik tamamlandı");
 }
@@ -488,18 +516,21 @@ static void event_loop(struct app_state *state) {
           if (frame_header_decode(wire, &fh) != NOX_OK)
             continue;
 
-          if (fh.len > 4096 + NOX_MAC_LEN)
+          /* A-1 FIX: Boyut sınırı kontrolü */
+          if (fh.len == 0 || fh.len > 4096 + NOX_MAC_LEN) {
+            NOX_WARN(LOG_MOD_NET, "geçersiz frame boyutu: %u", fh.len);
             continue;
+          }
 
-          /* Güvenli Heap Allocation — Stack/BSS yerine */
-          uint8_t *payload = malloc(4096 + NOX_MAC_LEN);
+          /* A-1 FIX: sodium_malloc — swap koruması + guard page */
+          uint8_t *payload = sodium_malloc(fh.len);
           if (!payload)
             continue;
 
           /* Payload'u tam oku (partial read koruması) */
           if (read_full(fd, payload, fh.len) != NOX_OK) {
             NOX_ERROR(LOG_MOD_NET, "frame payload eksik okundu");
-            free(payload);
+            sodium_free(payload);
             continue;
           }
 
@@ -518,8 +549,7 @@ static void event_loop(struct app_state *state) {
               state->hs = NULL;
               state->active_peer_onion[0] = '\0';
               arena_restore(&state->arena, state->session_arena_mark);
-              explicit_bzero(payload, 4096 + NOX_MAC_LEN);
-              free(payload);
+              sodium_free(payload);
               continue;
             }
 
@@ -557,8 +587,7 @@ static void event_loop(struct app_state *state) {
                 state->hs = NULL;
                 state->active_peer_onion[0] = '\0';
                 arena_restore(&state->arena, state->session_arena_mark);
-                explicit_bzero(payload, 4096 + NOX_MAC_LEN);
-                free(payload);
+                sodium_free(payload);
                 continue;
               }
 
@@ -586,7 +615,8 @@ static void event_loop(struct app_state *state) {
               }
 
               if (db_err == NOX_OK && !zero_key) {
-                if (memcmp(stored_key, remote_pub, NOX_KEY_LEN) == 0) {
+                /* E-1 FIX: sodium_memcmp — sabit zamanlı karşılaştırma, timing saldırısı koruması */
+                if (sodium_memcmp(stored_key, remote_pub, NOX_KEY_LEN) == 0) {
                   state->session =
                       arena_alloc(&state->arena, sizeof(struct noise_session));
                   if (state->session) {
@@ -679,23 +709,24 @@ static void event_loop(struct app_state *state) {
               state->session = NULL;
               state->active_peer_onion[0] = '\0';
               arena_restore(&state->arena, state->session_arena_mark);
-              explicit_bzero(payload, 4096 + NOX_MAC_LEN);
-              free(payload);
+              sodium_free(payload);
               continue;
             }
             state->rx_seq++;
 
             if (fh.type == NOX_MSG_TEXT) {
-              uint8_t *pt = malloc(4096 + 1);
+              /* A-1 FIX: sodium_malloc ile swap koruması */
+              size_t max_pt = fh.len; /* MAC çıkarılmadan üst sınır */
+              uint8_t *pt = sodium_malloc(max_pt + 1);
               if (pt) {
                 ssize_t pt_len =
                     noise_decrypt(state->session, payload, fh.len, pt);
-                if (pt_len > 0) {
+                /* A-1 FIX: pt_len overflow kontrolü */
+                if (pt_len > 0 && (size_t)pt_len <= max_pt) {
                   pt[pt_len] = '\0';
                   ui_print_incoming(state, (const char *)pt);
                 }
-                explicit_bzero(pt, 4096 + 1);
-                free(pt);
+                sodium_free(pt); /* otomatik sıfırlar */
               }
             } else if (fh.type == NOX_MSG_FILE) {
               file_transfer_handle_rx(state, payload, fh.len);
@@ -703,8 +734,7 @@ static void event_loop(struct app_state *state) {
           }
 
           /* Payload Cleanup — Tüm mesaj tipleri için çalışır */
-          explicit_bzero(payload, 4096 + NOX_MAC_LEN);
-          free(payload);
+          sodium_free(payload);
         }
       }
     }
@@ -807,6 +837,8 @@ static void prompt_transport_selection(struct app_state *state) {
         .peer_fd = -1,
         .running = true,
         .first_run = false,
+        .tx_file = { .fd = -1, .active = false },  /* G-2 FIX */
+        .rx_file = { .fd = -1, .active = false },  /* G-2 FIX */
     };
 
     nox_err_t err;

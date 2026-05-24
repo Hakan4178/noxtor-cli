@@ -20,6 +20,9 @@
 #include <sys/stat.h>
 #include <sodium.h>
 
+/* F-2 FIX: g_shutdown test dosyalarında da tanımlı olmalı */
+volatile sig_atomic_t g_shutdown = 0;
+
 /* ================================================================
  * TEST MAKROLARI
  * ================================================================ */

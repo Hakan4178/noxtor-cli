@@ -223,6 +223,8 @@ struct app_state {
     char     obfs4_bridge_line[512];
 
     /* Asenkron Dosya İşlemleri */
+    int      downloads_dir_fd;
+    char     downloads_dir[NOX_PATH_MAX];
     struct file_rx_state rx_file;
     struct file_tx_state tx_file;
 };

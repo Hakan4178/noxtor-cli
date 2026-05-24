@@ -44,6 +44,34 @@ static void safe_nanosleep(const struct timespec *req) {
 }
 
 /* ================================================================
+ * ONION ADDRESS VALIDATION
+ *
+ * A-2 FIX: Onion v3 adres format doğrulaması
+ * Format: 56 karakter base32 + ".onion" = 62 karakter
+ * ================================================================ */
+static bool validate_onion_address(const char *addr) {
+  if (!addr)
+    return false;
+  
+  size_t len = strlen(addr);
+  if (len != NOX_ONION_LEN)
+    return false;
+  
+  /* ".onion" suffix kontrolü */
+  if (strcmp(addr + 56, ".onion") != 0)
+    return false;
+  
+  /* İlk 56 karakter base32 olmalı: a-z, 2-7 */
+  for (size_t i = 0; i < 56; i++) {
+    char c = addr[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7')))
+      return false;
+  }
+  
+  return true;
+}
+
+/* ================================================================
  * I/O HELPERS — EINTR + EAGAIN/EWOULDBLOCK koruması
  * ================================================================ */
 nox_err_t write_full(int fd, const void *buf, size_t len) {
@@ -691,10 +719,18 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
       return NOX_OK;
     }
 
+    /* H-1 FIX: atoi() → strtol() ile güvenli parse + aralık kontrolü */
     char *prog = strstr(resp, "PROGRESS=");
     if (prog) {
-      int pct = atoi(prog + 9);
-      NOX_INFO(LOG_MOD_NET, "Tor bootstrap: %%%d", pct);
+      char *endptr = NULL;
+      errno = 0;
+      long pct = strtol(prog + 9, &endptr, 10);
+      
+      if (errno == 0 && endptr != prog + 9 && pct >= 0 && pct <= 100) {
+        NOX_INFO(LOG_MOD_NET, "Tor bootstrap: %%%ld", pct);
+      } else {
+        NOX_WARN(LOG_MOD_NET, "Tor bootstrap PROGRESS parse hatası");
+      }
     }
 
     safe_nanosleep(&ts);
@@ -877,9 +913,22 @@ nox_err_t listener_create(uint16_t *port_out, int *listen_fd_out) {
     return NOX_ERR_NET;
   }
 
+  /* F-2 FIX: getsockname() hata kontrolü + port doğrulaması */
   socklen_t slen = sizeof(addr);
-  getsockname(fd, (struct sockaddr *)&addr, &slen);
-  *port_out = ntohs(addr.sin_port);
+  if (getsockname(fd, (struct sockaddr *)&addr, &slen) != 0) {
+    NOX_ERROR(LOG_MOD_NET, "getsockname başarısız: %s", strerror(errno));
+    close(fd);
+    return NOX_ERR_NET;
+  }
+
+  uint16_t bound_port = ntohs(addr.sin_port);
+  if (bound_port == 0) {
+    NOX_ERROR(LOG_MOD_NET, "bind(0) sıfır port döndürdü");
+    close(fd);
+    return NOX_ERR_NET;
+  }
+
+  *port_out = bound_port;
   *listen_fd_out = fd;
 
   NOX_INFO(LOG_MOD_NET, "listener: 127.0.0.1:%u", *port_out);
@@ -922,12 +971,14 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     return NOX_ERR_NET;
   }
 
-  /* CONNECT — full hostname (.onion dahil, Tor bunu bekler) */
-  size_t addr_len = strlen(onion_addr);
-  if (addr_len > 255 || addr_len == 0) {
+  /* A-2 FIX: Onion adres format doğrulaması */
+  if (!validate_onion_address(onion_addr)) {
+    NOX_ERROR(LOG_MOD_NET, "socks5_connect: geçersiz onion adresi");
     close(fd);
     return NOX_ERR_NET;
   }
+
+  size_t addr_len = strlen(onion_addr);
 
   uint8_t req[4 + 1 + 256 + 2];
   size_t pos = 0;

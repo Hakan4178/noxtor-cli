@@ -4,7 +4,26 @@ A minimalist CLI application. Aktif güvenlik açıkları ve bayram sebebi ile y
 
 Arena.c secure
 
-Crypto.c maybe secure
+Crypto.c secure
+
+Database.c secure
+
+file_tranfer 3 düşük öncelikli açık kaldı
+
+log.c 1 orta 3 düşük öncelikli açık kaldı
+
+main.c 3 Kritik 8 orta 5 düşük açık kaldı
+
+network.c 5 kritik 3 orta açık kaldı
+
+noise.c 1 kritik 2 orta 2 düşük açık kaldı
+
+stdin_handler.c 2 orta 3 düşük açık kaldı
+
+ui.c 2 kritik 2 orta 3 düşük açık kaldı
+
+NOT: Burdaki hiç bir açık komple kriptolojiyi kırmıyor.
+Ama zincir halinde kullanırsa metadata sızıntısı ve sqlite bozulması olabilir.
 
 ## Requirements
 - GCC 14+

@@ -16,12 +16,12 @@
 #include "common.h"
 #include "types.h"
 
-#include <stdio.h>
-
-/* Global shutdown flag — tanım burada, extern types.h'de */
-volatile sig_atomic_t g_shutdown = 0;
 #include <stdarg.h>
+#include <stdio.h>
 #include <time.h>
+
+/* F-2 FIX: g_shutdown tanımı main.c'ye taşındı, burada sadece extern */
+/* extern volatile sig_atomic_t g_shutdown; — types.h'de tanımlı */
 
 /* ================================================================
  * ANSI RENK KODLARI
@@ -76,14 +76,22 @@ static const struct level_info levels[] = {
 
 /* ================================================================
  * ZAMAN DAMGASI — monotonic olmayan ama okunabilir
+ *
+ * E-1 FIX: clock_gettime() ve localtime_r() hata kontrolü eklendi.
  * ================================================================ */
 static void print_timestamp(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        fprintf(stderr, "%s??:??:??.???%s", CLR_DIM, CLR_RESET);
+        return;
+    }
 
     struct tm tm_buf;
-    localtime_r(&ts.tv_sec, &tm_buf);
+    if (!localtime_r(&ts.tv_sec, &tm_buf)) {
+        fprintf(stderr, "%s??:??:??.???%s", CLR_DIM, CLR_RESET);
+        return;
+    }
 
     fprintf(stderr, "%s%02d:%02d:%02d.%03ld%s",
             CLR_DIM,
@@ -194,6 +202,9 @@ void nox_hexdump(log_module_t mod, const char *label,
 
 /* ================================================================
  * HATA KODU → STRING
+ *
+ * F-1 FIX: Tüm nox_err_t enum değerleri eklendi.
+ * NOT: default case yok — -Wswitch-enum ile tüm case'ler zorunlu.
  * ================================================================ */
 const char *nox_strerror(nox_err_t err)
 {
@@ -213,7 +224,8 @@ const char *nox_strerror(nox_err_t err)
     case NOX_ERR_OVERFLOW: return "taşma hatası";
     case NOX_ERR_STATE:    return "geçersiz durum geçişi";
     }
-    return "bilinmeyen hata";
+    /* enum dışı değer (cast ile üretilmiş olabilir) */
+    return "bilinmeyen hata kodu";
 }
 
 /* ================================================================
@@ -224,6 +236,9 @@ const char *nox_strerror(nox_err_t err)
  *   2. Maksimum NOX_PIN_MAX_LEN (128) byte
  *   3. Embedded null byte yasak (binary injection)
  *   4. Sadece printable ASCII + UTF-8 continuation bytes
+ *
+ * B-1 FIX: Sabit zamanlı karakter kontrolü — timing saldırısı koruması.
+ * Erken çıkış yok, tüm karakterler her zaman taranır.
  *
  * Terminal'e bağımlı DEĞİL — unit test edilebilir.
  * ================================================================ */
@@ -248,26 +263,27 @@ nox_err_t validate_pin(const char *pin, size_t raw_len)
     }
 
     /*
-     * Karakter kontrolü — embedded null ve kontrol karakterleri yasak.
-     * Tab hariç tüm kontrol karakterleri reddedilir.
-     * UTF-8 multi-byte devamları (0x80-0xFF) kabul edilir.
+     * B-1 FIX: Sabit zamanlı karakter kontrolü.
+     * Tüm karakterleri tara, erken çıkış yok.
+     * Timing saldırısı ile ilk geçersiz karakterin konumu belirlenemez.
      */
+    int bad = 0;
     for (size_t i = 0; i < raw_len; i++) {
         unsigned char c = (unsigned char)pin[i];
-        if (c == 0x00) {
-            NOX_ERROR(LOG_MOD_MAIN,
-                      "PIN'de null byte tespit edildi (offset %zu)", i);
-            return NOX_ERR_PIN;
-        }
-        if (c < 0x20 && c != '\t') {
-            NOX_ERROR(LOG_MOD_MAIN,
-                      "PIN'de geçersiz kontrol karakteri: 0x%02x", c);
-            return NOX_ERR_PIN;
-        }
-        if (c == 0x7F) {
-            NOX_ERROR(LOG_MOD_MAIN, "PIN'de DEL karakteri");
-            return NOX_ERR_PIN;
-        }
+        
+        /* Null byte kontrolü */
+        bad |= (c == 0x00) ? 1 : 0;
+        
+        /* Kontrol karakterleri (tab hariç) */
+        bad |= (c < 0x20 && c != '\t') ? 1 : 0;
+        
+        /* DEL karakteri */
+        bad |= (c == 0x7F) ? 1 : 0;
+    }
+
+    if (bad) {
+        NOX_ERROR(LOG_MOD_MAIN, "PIN geçersiz karakter içeriyor");
+        return NOX_ERR_PIN;
     }
 
     return NOX_OK;

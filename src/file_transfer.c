@@ -149,8 +149,8 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   crypto_generichash_final(&hash_st, file_hash, 32);
 
   /* Dosya başına geri sar */
-  if (lseek(file_fd, 0, SEEK_SET) != 0) {
-    ui_print_error(state, "lseek başarısız.");
+  if (lseek(file_fd, 0, SEEK_SET) == (off_t)-1) {
+    ui_print_error(state, "Dosya işaretçisi sıfırlanamadı: %s", strerror(errno));
     close(file_fd);
     return;
   }
@@ -300,13 +300,85 @@ void file_transfer_handle_tx(struct app_state *state) {
  * DOSYA ALIMI VE YAZIMI (RX HANDLER)
  * ================================================================ */
 
+/* F-1 FIX: Partial write korumalı dosya yazma
+ *
+ * write() POSIX'te kısmi yazım yapabilir:
+ *   - w > 0 ama w < len → kalan veriyi retry ile yaz
+ *   - w = -1, errno = EINTR → retry
+ *   - w = 0 → disk dolu veya quota aşımı
+ */
+static nox_err_t write_to_file(int fd, const uint8_t *data, size_t len) {
+  size_t written = 0;
+  while (written < len) {
+    ssize_t w = write(fd, data + written, len - written);
+    if (w < 0) {
+      if (errno == EINTR)
+        continue; /* retry */
+      return NOX_ERR_IO;
+    }
+    if (w == 0)
+      return NOX_ERR_IO; /* disk dolu? */
+    written += (size_t)w;
+  }
+  return NOX_OK;
+}
+
+
+static nox_err_t open_recv_file(struct app_state *state,
+                                const char *safe_name,
+                                int *fd_out)
+{
+    /* safe_name "/" icermemeli */
+    if (strchr(safe_name, '/') || strchr(safe_name, '\\')) {
+        NOX_ERROR(LOG_MOD_MAIN, "safe_name hala path ayirici iceriyor: %s", safe_name);
+        return NOX_ERR_CONFIG;
+    }
+
+    char local_name[300];
+    int n = snprintf(local_name, sizeof(local_name), "received_%s", safe_name);
+    if (n < 0 || (size_t)n >= sizeof(local_name))
+        return NOX_ERR_CONFIG;
+
+    if (state->downloads_dir_fd < 0) {
+        NOX_ERROR(LOG_MOD_MAIN, "downloads_dir_fd gecersiz");
+        return NOX_ERR_CONFIG;
+    }
+
+    int fd = openat(state->downloads_dir_fd, local_name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                    0600);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            uint32_t rnd = randombytes_random();
+            snprintf(local_name, sizeof(local_name), "received_%s.%08x", safe_name, rnd);
+            fd = openat(state->downloads_dir_fd, local_name,
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                        0600);
+        }
+        if (fd < 0) return NOX_ERR_IO;
+    }
+
+    *fd_out = fd;
+    return NOX_OK;
+}
+
 void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, uint32_t len) {
-  uint8_t *pt = malloc(4096);
+  if (len < NOX_MAC_LEN || len > 4096 + NOX_MAC_LEN) {
+    ui_print_error(state, "Gecersiz payload uzunlugu: %u", len);
+    return;
+  }
+
+  uint8_t *pt = sodium_malloc(len);
   if (!pt) {
+    ui_print_error(state, "Bellek tahsisi basarisiz.");
     return;
   }
 
   ssize_t pt_len = noise_decrypt(state->session, payload, len, pt);
+  if (pt_len <= 0) {
+    sodium_free(pt);
+    return;
+  }
   if (pt_len > 0) {
     if (!state->rx_file.active && pt_len == 305 && memcmp(pt, "METADATA", 9) == 0) {
       /* Yeni dosya transferi (Metadata) */
@@ -330,12 +402,9 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
         uint8_t file_hash[32];
         memcpy(file_hash, pt + 273, 32);
 
-        /* Dosyayı diske aç (received_ öneki ile) */
-        char recv_path[NOX_PATH_MAX];
-        snprintf(recv_path, sizeof(recv_path), "received_%s", safe_name);
-
-        int file_fd = open(recv_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (file_fd >= 0) {
+        int file_fd = -1;
+        nox_err_t err = open_recv_file(state, safe_name, &file_fd);
+        if (err == NOX_OK && file_fd >= 0) {
           explicit_bzero(&state->rx_file, sizeof(state->rx_file));
           state->rx_file.active = true;
           state->rx_file.fd = file_fd;
@@ -354,72 +423,90 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
         }
       }
     } else if (state->rx_file.active) {
-      /* Dosya verisi chunk'ı — beklenen boyuttan fazla veri yazılmasını önle (O3) */
-      size_t remaining = state->rx_file.expected_size - state->rx_file.received_bytes;
-      if ((size_t)pt_len > remaining) {
-        pt_len = (ssize_t)remaining;
+      /* Underflow koruması */
+      if (state->rx_file.received_bytes > state->rx_file.expected_size) {
+        NOX_ERROR(LOG_MOD_MAIN, "received_bytes > expected_size — state bozuk");
+        goto rx_abort;
       }
 
-      ssize_t w = write(state->rx_file.fd, pt, (size_t)pt_len);
-      if (w == pt_len) {
-        crypto_generichash_update(&state->rx_file.hash_state, pt, (size_t)pt_len);
-        state->rx_file.received_bytes += (size_t)pt_len;
+      size_t remaining = state->rx_file.expected_size - state->rx_file.received_bytes;
+      if (remaining == 0) {
+        NOX_WARN(LOG_MOD_MAIN, "Dosya tamamlandı ama chunk gelmeye devam ediyor");
+        goto rx_abort;
+      }
 
-        if (state->rx_file.received_bytes >= state->rx_file.expected_size) {
-          uint8_t final_hash[32];
-          crypto_generichash_final(&state->rx_file.hash_state, final_hash, 32);
+      size_t write_len = ((size_t)pt_len > remaining) ? remaining : (size_t)pt_len;
 
-          close(state->rx_file.fd);
+      if (write_to_file(state->rx_file.fd, pt, write_len) != NOX_OK) {
+        goto rx_abort;
+      }
 
-          if (memcmp(final_hash, state->rx_file.expected_hash, 32) == 0) {
-            ui_print_system(state, "[✓] Dosya başarıyla alındı: %s",
-                            state->rx_file.filename);
-          } else {
-            char bad_path[NOX_PATH_MAX];
-            snprintf(bad_path, sizeof(bad_path), "received_%s", state->rx_file.filename);
-            unlink(bad_path);
-            ui_print_error(state,
-                           "HATA: Alınan dosyanın (%s) hash'i uyuşmuyor! Dosya silindi (bütünlük doğrulaması başarısız).",
-                           state->rx_file.filename);
-          }
+      crypto_generichash_update(&state->rx_file.hash_state, pt, write_len);
+      state->rx_file.received_bytes += write_len;
 
-          explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-        } else {
-          ui_print_progress(state, state->rx_file.filename,
-                            state->rx_file.received_bytes,
-                            state->rx_file.expected_size, false);
-        }
-      } else {
-        char bad_path[NOX_PATH_MAX];
-        snprintf(bad_path, sizeof(bad_path), "received_%s", state->rx_file.filename);
+      if (state->rx_file.received_bytes >= state->rx_file.expected_size) {
+        uint8_t final_hash[32];
+        crypto_generichash_final(&state->rx_file.hash_state, final_hash, 32);
+
         close(state->rx_file.fd);
-        unlink(bad_path);
-        ui_print_error(state, "Dosyaya yazılamadı, transfer iptal edildi ve yarım kalan dosya silindi.");
+
+        if (memcmp(final_hash, state->rx_file.expected_hash, 32) == 0) {
+          ui_print_system(state, "[✓] Dosya başarıyla alındı: %s",
+                          state->rx_file.filename);
+        } else {
+          unlinkat(state->downloads_dir_fd, state->rx_file.filename, 0);
+          ui_print_error(state, "HATA: Alinan dosyanin (%s) hash'i uyusmuyor!", state->rx_file.filename);
+        }
+
         explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+      } else {
+        ui_print_progress(state, state->rx_file.filename,
+                          state->rx_file.received_bytes,
+                          state->rx_file.expected_size, false);
       }
     }
   }
-  explicit_bzero(pt, 4096);
-  free(pt);
+
+  sodium_free(pt);
+  return;
+
+rx_abort:
+  if (state->rx_file.fd >= 0) close(state->rx_file.fd);
+  unlinkat(state->downloads_dir_fd, state->rx_file.filename, 0);
+  ui_print_error(state, "Transfer iptal edildi ve yarım kalan dosya silindi.");
+  explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+  sodium_free(pt);
 }
 
 /* ================================================================
  * TEMİZLİK (CLEANUP)
+ *
+ * G-2 FIX: fd geçerlilik kontrolü eklendi.
+ *   - fd > 0 kontrolü (0 = stdin, -1 = invalid)
+ *   - explicit_bzero() sonrası fd = -1 işaretleme
+ *   - close(0) → stdin kapatma riskini önler
  * ================================================================ */
 
 void file_transfer_cleanup(struct app_state *state) {
   if (state->tx_file.active) {
-    close(state->tx_file.fd);
+    if (state->tx_file.fd > 0) {   /* 0 = stdin, -1 = invalid */
+      close(state->tx_file.fd);
+    }
     explicit_bzero(&state->tx_file, sizeof(state->tx_file));
+    state->tx_file.fd = -1;        /* explicit geçersiz işaret */
     ui_print_error(state, "Bağlantı koptuğu için dosya gönderimi iptal edildi.");
   }
 
   if (state->rx_file.active) {
     char bad_path[NOX_PATH_MAX];
     snprintf(bad_path, sizeof(bad_path), "received_%s", state->rx_file.filename);
-    close(state->rx_file.fd);
+    
+    if (state->rx_file.fd > 0) {
+      close(state->rx_file.fd);
+    }
     unlink(bad_path);
     explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+    state->rx_file.fd = -1;
     ui_print_error(state, "Bağlantı koptuğu için dosya alımı iptal edildi ve yarım kalan dosya silindi.");
   }
 }
