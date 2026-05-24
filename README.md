@@ -1,6 +1,6 @@
 # noxtor-cli
 
-A minimalist CLI application.
+A minimalist CLI application. Aktif güvenlik açıkları ve bayram sebebi ile yeni özellikler ertelenmiştir.
 
 ## Requirements
 - GCC 14+
