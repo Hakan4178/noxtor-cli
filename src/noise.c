@@ -16,6 +16,7 @@
 
 #include <string.h>
 #include <sodium.h>
+#include <stdatomic.h>
 
 /* ================================================================
  * DERLEME ZAMANI KONTROLLERİ
@@ -694,7 +695,7 @@ nox_err_t handshake_split(struct noise_handshake *hs,
     explicit_bzero(hs->s_pub, NOX_KEY_LEN);  
     explicit_bzero(hs->re,    NOX_KEY_LEN);  
     explicit_bzero(hs->rs,    NOX_KEY_LEN);  
-    memory_barrier();
+    atomic_thread_fence(memory_order_seq_cst); 
 
     NOX_INFO(LOG_MOD_NOISE, "handshake tamamlandı — transport hazır");
     return NOX_OK;
