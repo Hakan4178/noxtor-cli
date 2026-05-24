@@ -87,6 +87,17 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
             return NOX_ERR_ALLOC;
         }
 
+      /* ← YENİ: fallback branch */
+#ifdef MADV_DONTFORK
+         if (madvise(base, total, MADV_DONTFORK) != 0)
+            NOX_WARN(LOG_MOD_ARENA, "MADV_DONTFORK: %s", strerror(errno));
+  
+#endif
+#ifdef MADV_DONTDUMP
+        if (madvise(base, total, MADV_DONTDUMP) != 0)
+            NOX_WARN(LOG_MOD_ARENA, "MADV_DONTDUMP: %s", strerror(errno));
+#endif
+        
         /* Kısmi koruma — usable alanı kilitlemeye çalış */
         uint8_t *usable_start = (uint8_t *)base + page_size;
         if (mlock(usable_start, usable) != 0) {
@@ -95,6 +106,16 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
                      "Devam ediliyor, swap riski var.", strerror(errno));
             locked = false;
         }
+    }  else {
+        /* MAP_LOCKED başarılı branch — buraya da ekle */
+#ifdef MADV_DONTFORK
+        if (madvise(base, total, MADV_DONTFORK) != 0)
+            NOX_WARN(LOG_MOD_ARENA, "MADV_DONTFORK: %s", strerror(errno));
+#endif
+#ifdef MADV_DONTDUMP
+        if (madvise(base, total, MADV_DONTDUMP) != 0)
+            NOX_WARN(LOG_MOD_ARENA, "MADV_DONTDUMP: %s", strerror(errno));
+#endif
     }
 
     uint8_t *bptr = (uint8_t *)base;
