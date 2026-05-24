@@ -227,10 +227,10 @@ static void hmac_blake2b(const uint8_t *key,   size_t key_len,
     crypto_generichash_blake2b_final(&st, out, NOISE_HASHLEN);
 
     /* Temizlik */
-    explicit_bzero(k,     sizeof(k));
-    explicit_bzero(ipad,  sizeof(ipad));
-    explicit_bzero(opad,  sizeof(opad));
-    explicit_bzero(inner, sizeof(inner));
+    sodium_memzero(k,     sizeof(k));
+    sodium_memzero(ipad,  sizeof(ipad));
+    sodium_memzero(opad,  sizeof(opad));
+    sodium_memzero(inner, sizeof(inner));
 }
 
 /*
