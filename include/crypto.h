@@ -96,11 +96,11 @@ nox_err_t crypto_generate_identity(const char *identity_path,
  * Sonraki çalıştırmalar: disk'ten oku ve çöz
  * Çözülen private key secure arena'da kalmalı.
  */
-nox_err_t crypto_load_identity(const char *identity_path,
-                               const uint8_t unlock_key[NOX_KEY_LEN],
-                               uint8_t secret_key_out[64],
-                               uint8_t public_key_out[NOX_KEY_LEN]);
 
+nox_err_t crypto_load_identity(const char *identity_path,
+                                const uint8_t unlock_key[NOX_KEY_LEN],
+                                uint8_t secret_key_out[crypto_sign_SECRETKEYBYTES],
+                                uint8_t public_key_out[NOX_KEY_LEN]);
 /*
  * Ed25519 anahtar çiftini Curve25519 (X25519) anahtar çiftine dönüştür.
  * Noise XX handshake'i için kalıcı kimlik (static key) olarak kullanılır.
