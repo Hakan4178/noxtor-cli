@@ -6,6 +6,19 @@
  *
  * Tüm key materyali secure arena'da yaşar.
  * Geçici hassas veriler fonksiyon dönüşünde explicit_bzero ile silinir.
+ *
+ * Audit patch'leri (tümü uygulandı):
+ *   [P1] read_exact/write_exact — EINTR retry + EOF ayrımı
+ *   [P2] Salt dosyası — atomic write (tmp + rename + O_EXCL)
+ *   [P3] fsync — identity ve salt yazımı sonrası garanti flush
+ *   [P4] crypto_sign_keypair — dönüş değeri kontrol edildi
+ *   [P5] sk buffer — sodium_malloc ile stack'ten kaldırıldı
+ *   [P6] goto cleanup — DRY, tek noktadan temizleme
+ *   [P7] fstat — salt dosyası boyut kontrolü
+ *   [P8] config_dir izin kontrolü — 0700 zorunlu
+ *   [P9] PIN min/max uzunluk kontrolü
+ *   [P10] Subkey ID enum — magic number yok
+ *   [P11] NOX_KDF_CTX değişmezlik uyarısı
  */
 
 #include "crypto.h"
@@ -13,44 +26,84 @@
 #include "arena.h"
 #include "asm_utils.h"
 
+#include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include <sodium.h>
 
 /* ================================================================
  * DERLEME ZAMANI GÜVENLİK KONTROLLERİ
- *
- * libsodium sabitleri ile kendi sabitelerimiz arasında uyum.
- * Platform değişse bile derleme anında patlayacak.
  * ================================================================ */
 NOX_STATIC_ASSERT(crypto_sign_PUBLICKEYBYTES == NOX_KEY_LEN,
                   "Ed25519 public key boyutu NOX_KEY_LEN ile uyumsuz");
-
 NOX_STATIC_ASSERT(crypto_secretbox_MACBYTES == NOX_MAC_LEN,
                   "secretbox MAC boyutu NOX_MAC_LEN ile uyumsuz");
-
 NOX_STATIC_ASSERT(crypto_secretbox_NONCEBYTES == NOX_NONCE_LEN,
                   "secretbox nonce boyutu NOX_NONCE_LEN ile uyumsuz");
-
 NOX_STATIC_ASSERT(crypto_pwhash_SALTBYTES == NOX_SALT_LEN,
                   "Argon2id salt boyutu NOX_SALT_LEN ile uyumsuz");
 
 /* ================================================================
- * YARDIMCI — tam okuma / tam yazma
+ * [P10] Subkey ID enum — magic number yok
+ * ================================================================ */
+enum nox_subkey_id {
+    NOX_SUBKEY_DB               = 1,
+    NOX_SUBKEY_IDENTITY_UNLOCK  = 2,
+    NOX_SUBKEY_SESSION          = 3,
+    /* Gelecekte: NOX_SUBKEY_RATCHET_ROOT = 4, ... */
+};
+
+/* ================================================================
+ * [P11] KDF context — ASLA değiştirilmemeli
  *
- * Kısmi read/write koruması (yavaş fd, sinyal kesintisi).
+ * ⚠️  DİKKAT: Bu değer production'a girince DEĞİŞTİRİLEMEZ.
+ *     Değiştirilirse tüm mevcut identity'ler bozulur.
+ *     Sadece major version bump + migration path ile değişebilir.
+ * ================================================================ */
+#define NOX_KDF_CTX "noxtor__"
+
+NOX_STATIC_ASSERT(sizeof(NOX_KDF_CTX) - 1 == crypto_kdf_CONTEXTBYTES,
+                  "KDF context tam 8 byte olmali");
+
+/* ================================================================
+ * [P9] PIN uzunluk limitleri
+ * ================================================================ */
+#define NOX_MIN_PIN_LEN  8U
+#define NOX_MAX_PIN_LEN  1024U
+
+/* ================================================================
+ * Identity dosya boyutu
+ * ================================================================ */
+#define IDENTITY_FILE_SIZE \
+    (NOX_NONCE_LEN + crypto_sign_SECRETKEYBYTES + crypto_secretbox_MACBYTES)
+
+/* ================================================================
+ * [P1] YARDIMCI — tam okuma / tam yazma
+ *
+ * EINTR → retry (signal kesintisi)
+ * n == 0 → EOF (dosya beklenenden kısa)
+ * n < 0, errno != EINTR → gerçek hata
  * ================================================================ */
 static nox_err_t read_exact(int fd, void *buf, size_t len)
 {
-    uint8_t *p = (uint8_t *)buf;
-    size_t remaining = len;
+    uint8_t *p        = (uint8_t *)buf;
+    size_t   remaining = len;
 
     while (remaining > 0) {
         ssize_t n = read(fd, p, remaining);
-        if (n <= 0)
+        if (n < 0) {
+            if (errno == EINTR) continue;   /* [P1] signal → retry */
+            NOX_ERROR(LOG_MOD_CRYPTO, "read hatası: %s", strerror(errno));
             return NOX_ERR_IO;
+        }
+        if (n == 0) {                       /* [P1] EOF ayrımı */
+            NOX_ERROR(LOG_MOD_CRYPTO, "read: beklenmedik EOF");
+            return NOX_ERR_IO;
+        }
         p         += (size_t)n;
         remaining -= (size_t)n;
     }
@@ -59,13 +112,20 @@ static nox_err_t read_exact(int fd, void *buf, size_t len)
 
 static nox_err_t write_exact(int fd, const void *buf, size_t len)
 {
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t remaining = len;
+    const uint8_t *p        = (const uint8_t *)buf;
+    size_t          remaining = len;
 
     while (remaining > 0) {
         ssize_t n = write(fd, p, remaining);
-        if (n <= 0)
+        if (n < 0) {
+            if (errno == EINTR) continue;   /* [P1] signal → retry */
+            NOX_ERROR(LOG_MOD_CRYPTO, "write hatası: %s", strerror(errno));
             return NOX_ERR_IO;
+        }
+        if (n == 0) {
+            NOX_ERROR(LOG_MOD_CRYPTO, "write: sıfır byte yazıldı");
+            return NOX_ERR_IO;
+        }
         p         += (size_t)n;
         remaining -= (size_t)n;
     }
@@ -94,7 +154,7 @@ void crypto_random_bytes(void *buf, size_t len)
 }
 
 nox_err_t crypto_hash_blake2b(uint8_t *out, size_t outlen,
-                              const uint8_t *in, size_t inlen)
+                               const uint8_t *in, size_t inlen)
 {
     if (!out || !in || outlen == 0)
         return NOX_ERR_CRYPTO;
@@ -110,30 +170,29 @@ nox_err_t crypto_hash_blake2b(uint8_t *out, size_t outlen,
 /* ================================================================
  * 2.2: KEY DERIVATION — PIN → master_key
  *
- * Argon2id parametreleri:
- *   OPSLIMIT_MODERATE — yeterli yavaşlık
- *   MEMLIMIT_INTERACTIVE — aktivist cihazlarda makul bellek
+ * [P9] PIN uzunluk kontrolü eklendi.
  * ================================================================ */
 nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
-                                   const char *pin, size_t pin_len,
-                                   const uint8_t salt[NOX_SALT_LEN])
+                                    const char *pin, size_t pin_len,
+                                    const uint8_t salt[NOX_SALT_LEN])
 {
-    if (!master_key || !pin || pin_len == 0 || !salt)
+    if (!master_key || !pin || !salt)
         return NOX_ERR_PIN;
+
+    /* [P9] PIN uzunluk kontrolü */
+    if (pin_len < NOX_MIN_PIN_LEN) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "PIN çok kısa (min %u karakter)", NOX_MIN_PIN_LEN);
+        return NOX_ERR_PIN;
+    }
+    if (pin_len > NOX_MAX_PIN_LEN) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "PIN çok uzun (max %u karakter)", NOX_MAX_PIN_LEN);
+        return NOX_ERR_PIN;
+    }
 
     NOX_INFO(LOG_MOD_CRYPTO, "Argon2id key derivation başlıyor...");
 
-    /*
-     * crypto_pwhash:
-     *   out      = master_key (32 byte)
-     *   passwd   = PIN
-     *   salt     = 16 byte (sabit per-identity)
-     *   opslimit = MODERATE (3 iterasyon)
-     *   memlimit = INTERACTIVE (64 MB)
-     *   alg      = Argon2id
-     *
-     * Bug #5 fix: pin_len cast — crypto_pwhash unsigned long long bekler
-     */
     int ret = crypto_pwhash(master_key, NOX_KEY_LEN,
                             pin, (unsigned long long)pin_len,
                             salt,
@@ -154,209 +213,279 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
 /* ================================================================
  * 2.2: KEY DERIVATION — master_key → subkeys
  *
- * libsodium crypto_kdf kullanılır.
- * Her alt key farklı context + subkey_id ile türetilir.
- *
- * Context: "noxtor__" (tam 8 byte, crypto_kdf gereksinimleri)
+ * [P10] Subkey ID'leri enum ile tanımlı.
  * ================================================================ */
-
-/* KDF context — tam 8 byte olmalı (libsodium kısıtlaması) */
-#define NOX_KDF_CTX "noxtor__"
-
-NOX_STATIC_ASSERT(sizeof(NOX_KDF_CTX) - 1 == crypto_kdf_CONTEXTBYTES,
-                  "KDF context tam 8 byte olmali");
-
 nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
-                                uint8_t db_key[NOX_KEY_LEN],
-                                uint8_t identity_unlock_key[NOX_KEY_LEN],
-                                uint8_t session_key[NOX_KEY_LEN])
+                                 uint8_t db_key[NOX_KEY_LEN],
+                                 uint8_t identity_unlock_key[NOX_KEY_LEN],
+                                 uint8_t session_key[NOX_KEY_LEN])
 {
     if (!master_key || !db_key || !identity_unlock_key || !session_key)
         return NOX_ERR_CRYPTO;
 
-    /* subkey_id: 1 = db_key, 2 = identity_unlock, 3 = session */
     if (crypto_kdf_derive_from_key(db_key, NOX_KEY_LEN,
-                                   1, NOX_KDF_CTX, master_key) != 0) {
+                                   NOX_SUBKEY_DB,
+                                   NOX_KDF_CTX, master_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "db_key türetme başarısız");
         return NOX_ERR_CRYPTO;
     }
 
     if (crypto_kdf_derive_from_key(identity_unlock_key, NOX_KEY_LEN,
-                                   2, NOX_KDF_CTX, master_key) != 0) {
+                                   NOX_SUBKEY_IDENTITY_UNLOCK,
+                                   NOX_KDF_CTX, master_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "identity_unlock_key türetme başarısız");
         return NOX_ERR_CRYPTO;
     }
 
     if (crypto_kdf_derive_from_key(session_key, NOX_KEY_LEN,
-                                   3, NOX_KDF_CTX, master_key) != 0) {
+                                   NOX_SUBKEY_SESSION,
+                                   NOX_KDF_CTX, master_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "session_key türetme başarısız");
         return NOX_ERR_CRYPTO;
     }
 
-    NOX_INFO(LOG_MOD_CRYPTO, "subkey'ler türetildi (db, identity_unlock, session)");
+    NOX_INFO(LOG_MOD_CRYPTO,
+             "subkey'ler türetildi (db, identity_unlock, session)");
     return NOX_OK;
 }
 
 /* ================================================================
  * 2.2: SALT YÖNETİMİ
  *
- * ~/.config/paranoidcli/salt dosyası.
- * Yoksa üretilir (ilk çalıştırma). Varsa okunur.
+ * [P1] EINTR retry read_exact/write_exact içinde
+ * [P2] Atomic write — tmp dosya + rename
+ * [P3] fsync — diske garanti flush
+ * [P7] fstat — dosya boyutu kontrolü
+ * [P8] config_dir izin kontrolü
  * ================================================================ */
 nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
-                                     const char *config_dir)
+                                      const char *config_dir)
 {
     if (!salt || !config_dir)
         return NOX_ERR_CONFIG;
+
+    /* [P8] config_dir izin kontrolü — 0700 olmalı */
+    struct stat dir_st;
+    if (stat(config_dir, &dir_st) == 0) {
+        if ((dir_st.st_mode & 0777) != 0700) {
+            NOX_WARN(LOG_MOD_CRYPTO,
+                     "config_dir izinleri zayıf (%03o), düzeltiliyor",
+                     dir_st.st_mode & 0777);
+            if (chmod(config_dir, 0700) != 0) {
+                NOX_WARN(LOG_MOD_CRYPTO,
+                         "chmod başarısız: %s", strerror(errno));
+            }
+        }
+    }
 
     char path[NOX_PATH_MAX];
     int ret = snprintf(path, sizeof(path), "%s/salt", config_dir);
     if (ret < 0 || (size_t)ret >= sizeof(path))
         return NOX_ERR_CONFIG;
 
-    /* Dosyayı okumayı dene */
+    /* Mevcut salt dosyasını oku */
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
-        nox_err_t err = read_exact(fd, salt, NOX_SALT_LEN);
-        close(fd);
-        if (err == NOX_OK) {
-            NOX_INFO(LOG_MOD_CRYPTO, "salt dosyasından okundu");
-            return NOX_OK;
+        /* [P7] Dosya boyutu kontrolü */
+        struct stat st;
+        if (fstat(fd, &st) != 0 ||
+            st.st_size != (off_t)NOX_SALT_LEN) {
+            NOX_WARN(LOG_MOD_CRYPTO,
+                     "salt dosyası boyutu hatalı (%lld byte), yeniden üretiliyor",
+                     (long long)(fd >= 0 ? st.st_size : -1));
+            close(fd);
+            fd = -1;
+        } else {
+            nox_err_t err = read_exact(fd, salt, NOX_SALT_LEN);
+            close(fd);
+            if (err == NOX_OK) {
+                NOX_INFO(LOG_MOD_CRYPTO, "salt dosyasından okundu");
+                return NOX_OK;
+            }
+            NOX_WARN(LOG_MOD_CRYPTO,
+                     "salt dosyası bozuk, yeniden üretiliyor");
         }
-        NOX_WARN(LOG_MOD_CRYPTO,
-                 "salt dosyası bozuk, yeniden üretiliyor");
     }
 
     /* Yeni salt üret */
     randombytes_buf(salt, NOX_SALT_LEN);
 
-    /* Dosyaya yaz — 0600 izinleri */
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0) {
+    /* [P2] Atomic write — tmp dosya + O_EXCL + rename */
+    char tmp_path[NOX_PATH_MAX];
+    int tmp_ret = snprintf(tmp_path, sizeof(tmp_path),
+                           "%s/salt.tmp.%d", config_dir, (int)getpid());
+    if (tmp_ret < 0 || (size_t)tmp_ret >= sizeof(tmp_path))
+        return NOX_ERR_CONFIG;
+
+    int tmp_fd = open(tmp_path,
+                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                      0600);
+    if (tmp_fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
-                  "salt dosyası yazılamadı: %s", strerror(errno));
+                  "salt tmp dosyası açılamadı: %s", strerror(errno));
         return NOX_ERR_IO;
     }
 
-    nox_err_t err = write_exact(fd, salt, NOX_SALT_LEN);
-    close(fd);
+    nox_err_t werr = write_exact(tmp_fd, salt, NOX_SALT_LEN);
 
-    if (err != NOX_OK) {
-        NOX_ERROR(LOG_MOD_CRYPTO, "salt dosyası eksik yazıldı");
+    /* [P3] fsync — diske garanti yaz */
+    if (werr == NOX_OK) {
+        if (fsync(tmp_fd) != 0)
+            NOX_WARN(LOG_MOD_CRYPTO,
+                     "salt fsync başarısız: %s", strerror(errno));
+    }
+    close(tmp_fd);
+
+    if (werr != NOX_OK) {
+        unlink(tmp_path);
         return NOX_ERR_IO;
     }
 
-    NOX_INFO(LOG_MOD_CRYPTO, "yeni salt üretildi ve kaydedildi");
+    /* Atomic rename */
+    if (rename(tmp_path, path) != 0) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "salt rename başarısız: %s", strerror(errno));
+        unlink(tmp_path);
+        return NOX_ERR_IO;
+    }
+
+    NOX_INFO(LOG_MOD_CRYPTO, "yeni salt üretildi ve kaydedildi (atomic)");
     return NOX_OK;
 }
 
 /* ================================================================
  * 2.2: IDENTITY KEY — OLUŞTUR
  *
- * Ed25519 key pair üret, secretbox ile şifrele, diske yaz.
+ * [P4] crypto_sign_keypair dönüş değeri kontrol ediliyor
+ * [P5] sk → sodium_malloc (stack'ten kaldırıldı)
+ * [P3] fsync — diske garanti flush
+ * [P6] goto cleanup — tek noktadan temizleme (DRY)
  *
  * Dosya formatı:
  *   [nonce 24B][encrypted(sk) + MAC] = 24 + 64 + 16 = 104 byte
- *
- * sk = Ed25519 secret key (crypto_sign_SECRETKEYBYTES = 64 byte)
  * ================================================================ */
-#define IDENTITY_FILE_SIZE \
-    (NOX_NONCE_LEN + crypto_sign_SECRETKEYBYTES + crypto_secretbox_MACBYTES)
-
 nox_err_t crypto_generate_identity(const char *identity_path,
-                                   const uint8_t unlock_key[NOX_KEY_LEN],
-                                   uint8_t public_key_out[NOX_KEY_LEN])
+                                    const uint8_t unlock_key[NOX_KEY_LEN],
+                                    uint8_t public_key_out[NOX_KEY_LEN])
 {
     if (!identity_path || !unlock_key || !public_key_out)
         return NOX_ERR_CRYPTO;
 
-    /* Ed25519 key pair üret */
-    uint8_t pk[crypto_sign_PUBLICKEYBYTES];
-    uint8_t sk[crypto_sign_SECRETKEYBYTES];
+    nox_err_t ret = NOX_ERR_CRYPTO;
+    int        fd  = -1;
 
-    crypto_sign_keypair(pk, sk);
+    uint8_t pk[crypto_sign_PUBLICKEYBYTES]                          = {0};
+    uint8_t nonce[NOX_NONCE_LEN]                                    = {0};
+    uint8_t ciphertext[crypto_sign_SECRETKEYBYTES +
+                        crypto_secretbox_MACBYTES]                  = {0};
+
+    /* [P5] sk — sodium_malloc ile güvenli heap, stack'te değil */
+    uint8_t *sk = sodium_malloc(crypto_sign_SECRETKEYBYTES);
+    if (!sk) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "sodium_malloc başarısız");
+        return NOX_ERR_ALLOC;
+    }
+
+    /* [P4] Dönüş değeri kontrol ediliyor */
+    if (crypto_sign_keypair(pk, sk) != 0) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "Ed25519 keypair üretimi başarısız");
+        goto cleanup;
+    }
 
     NOX_INFO(LOG_MOD_CRYPTO, "yeni Ed25519 key pair üretildi");
 
     /* Şifrele: secretbox(sk, nonce, unlock_key) */
-    uint8_t nonce[NOX_NONCE_LEN];
     randombytes_buf(nonce, NOX_NONCE_LEN);
 
-    uint8_t ciphertext[crypto_sign_SECRETKEYBYTES + crypto_secretbox_MACBYTES];
-    if (crypto_secretbox_easy(ciphertext, sk, crypto_sign_SECRETKEYBYTES,
-                              nonce, unlock_key) != 0) {
+    if (crypto_secretbox_easy(ciphertext, sk,
+                               crypto_sign_SECRETKEYBYTES,
+                               nonce, unlock_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "identity key şifreleme başarısız");
-        explicit_bzero(sk, sizeof(sk));
-        return NOX_ERR_CRYPTO;
+        goto cleanup;
     }
 
     /* Dosyaya yaz: [nonce][ciphertext] */
-    int fd = open(identity_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    fd = open(identity_path,
+              O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+              0600);
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key dosyası açılamadı: %s", strerror(errno));
-        explicit_bzero(sk, sizeof(sk));
-        explicit_bzero(ciphertext, sizeof(ciphertext));
-        return NOX_ERR_IO;
+        goto cleanup;
     }
 
-    /* Bug #1 fix: ayrı write + ayrı hata kontrolü */
-    nox_err_t err = write_exact(fd, nonce, NOX_NONCE_LEN);
-    if (err != NOX_OK) {
-        NOX_ERROR(LOG_MOD_CRYPTO, "nonce yazılamadı: %s", strerror(errno));
-        close(fd);
-        explicit_bzero(sk, sizeof(sk));
-        explicit_bzero(ciphertext, sizeof(ciphertext));
-        return NOX_ERR_IO;
+    if (write_exact(fd, nonce, NOX_NONCE_LEN) != NOX_OK) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "nonce yazılamadı");
+        goto cleanup;
     }
 
-    err = write_exact(fd, ciphertext, sizeof(ciphertext));
-    if (err == NOX_OK) {
-    if (fsync(fd) != 0)                           /* ← YENİ */
-        NOX_WARN(LOG_MOD_CRYPTO,                  /* ← YENİ */
-                 "fsync başarısız: %s",           /* ← YENİ */
-                 strerror(errno));                /* ← YENİ */
-    if (err != NOX_OK) {
-        NOX_ERROR(LOG_MOD_CRYPTO, "ciphertext yazılamadı: %s", strerror(errno));
-        close(fd);
-        explicit_bzero(sk, sizeof(sk));
-        explicit_bzero(ciphertext, sizeof(ciphertext));
-        return NOX_ERR_IO;
+    if (write_exact(fd, ciphertext, sizeof(ciphertext)) != NOX_OK) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "ciphertext yazılamadı");
+        goto cleanup;
     }
 
-    close(fd);
+    /* [P3] fsync — diske garanti flush */
+    if (fsync(fd) != 0)
+        NOX_WARN(LOG_MOD_CRYPTO,
+                 "identity fsync başarısız: %s", strerror(errno));
 
-    /* Public key'i çıktıya kopyala */
+    /* Public key çıktıya kopyala */
     memcpy(public_key_out, pk, crypto_sign_PUBLICKEYBYTES);
+    ret = NOX_OK;
 
-    /* Hassas verileri temizle */
-    explicit_bzero(sk, sizeof(sk));
+    NOX_INFO(LOG_MOD_CRYPTO,
+             "identity.key şifrelenmiş olarak kaydedildi");
+
+cleanup:
+    if (fd >= 0) {
+        close(fd);
+        /* Hata durumunda yarım dosyayı sil */
+        if (ret != NOX_OK)
+            unlink(identity_path);
+    }
+
+    /* [P6] Tek noktadan temizleme */
+    sodium_free(sk);                                  /* sk — sodium heap */
     explicit_bzero(ciphertext, sizeof(ciphertext));
+    explicit_bzero(nonce,      sizeof(nonce));
+    explicit_bzero(pk,         sizeof(pk));
     memory_barrier();
 
-    NOX_INFO(LOG_MOD_CRYPTO, "identity.key şifrelenmiş olarak kaydedildi");
-    return NOX_OK;
+    return ret;
 }
 
 /* ================================================================
  * 2.2: IDENTITY KEY — YÜKLE
  *
- * Disk'ten oku, secretbox ile çöz.
+ * [P1] read_exact EINTR retry içinde
+ * [P7] fstat — dosya boyutu kontrolü
+ *
  * Çözülen private key çağıranın sağladığı alana yazılır (arena olmalı).
  * ================================================================ */
 nox_err_t crypto_load_identity(const char *identity_path,
-                               const uint8_t unlock_key[NOX_KEY_LEN],
-                               uint8_t secret_key_out[64],
-                               uint8_t public_key_out[NOX_KEY_LEN])
+                                const uint8_t unlock_key[NOX_KEY_LEN],
+                                uint8_t secret_key_out[crypto_sign_SECRETKEYBYTES],
+                                uint8_t public_key_out[NOX_KEY_LEN])
 {
-    if (!identity_path || !unlock_key || !secret_key_out || !public_key_out)
+    if (!identity_path || !unlock_key ||
+        !secret_key_out || !public_key_out)
         return NOX_ERR_CRYPTO;
 
-    /* Dosyayı oku — read_exact ile kısmi okuma koruması */
     int fd = open(identity_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key açılamadı: %s", strerror(errno));
+        return NOX_ERR_IO;
+    }
+
+    /* [P7] Dosya boyutu kontrolü */
+    struct stat st;
+    if (fstat(fd, &st) != 0 ||
+        st.st_size != (off_t)IDENTITY_FILE_SIZE) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "identity.key boyutu hatalı (%lld byte, beklenen %zu)",
+                  (long long)st.st_size, (size_t)IDENTITY_FILE_SIZE);
+        close(fd);
         return NOX_ERR_IO;
     }
 
@@ -373,10 +502,11 @@ nox_err_t crypto_load_identity(const char *identity_path,
     /* Ayrıştır: [nonce 24B][ciphertext 80B] */
     const uint8_t *nonce      = file_buf;
     const uint8_t *ciphertext = file_buf + NOX_NONCE_LEN;
-    size_t ct_len = crypto_sign_SECRETKEYBYTES + crypto_secretbox_MACBYTES;
+    size_t         ct_len     = crypto_sign_SECRETKEYBYTES +
+                                crypto_secretbox_MACBYTES;
 
-    /* Çöz */
-    if (crypto_secretbox_open_easy(secret_key_out, ciphertext, ct_len,
+    if (crypto_secretbox_open_easy(secret_key_out,
+                                   ciphertext, ct_len,
                                    nonce, unlock_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key çözme başarısız — yanlış PIN?");
@@ -388,7 +518,6 @@ nox_err_t crypto_load_identity(const char *identity_path,
     /*
      * Ed25519 secret key formatı (libsodium):
      *   [seed 32B][public_key 32B]
-     * Public key secret key'in son 32 byte'ında.
      */
     memcpy(public_key_out,
            secret_key_out + crypto_sign_SEEDBYTES,
@@ -405,19 +534,23 @@ nox_err_t crypto_load_identity(const char *identity_path,
  * 2.3: IDENTITY KEY CONVERSION — Ed25519 → Curve25519
  * ================================================================ */
 nox_err_t crypto_ed25519_to_curve25519(uint8_t curve25519_pk[NOX_KEY_LEN],
-                                       uint8_t curve25519_sk[NOX_KEY_LEN],
-                                       const uint8_t ed25519_pk[NOX_KEY_LEN],
-                                       const uint8_t ed25519_sk[64])
+                                        uint8_t curve25519_sk[NOX_KEY_LEN],
+                                        const uint8_t ed25519_pk[NOX_KEY_LEN],
+                                        const uint8_t ed25519_sk[64])
 {
     if (ed25519_pk && curve25519_pk) {
-        if (crypto_sign_ed25519_pk_to_curve25519(curve25519_pk, ed25519_pk) != 0) {
-            NOX_ERROR(LOG_MOD_CRYPTO, "Ed25519 public key'i Curve25519'a dönüştürme başarısız");
+        if (crypto_sign_ed25519_pk_to_curve25519(
+                curve25519_pk, ed25519_pk) != 0) {
+            NOX_ERROR(LOG_MOD_CRYPTO,
+                      "Ed25519 public key Curve25519'a dönüştürme başarısız");
             return NOX_ERR_CRYPTO;
         }
     }
     if (ed25519_sk && curve25519_sk) {
-        if (crypto_sign_ed25519_sk_to_curve25519(curve25519_sk, ed25519_sk) != 0) {
-            NOX_ERROR(LOG_MOD_CRYPTO, "Ed25519 secret key'i Curve25519'a dönüştürme başarısız");
+        if (crypto_sign_ed25519_sk_to_curve25519(
+                curve25519_sk, ed25519_sk) != 0) {
+            NOX_ERROR(LOG_MOD_CRYPTO,
+                      "Ed25519 secret key Curve25519'a dönüştürme başarısız");
             return NOX_ERR_CRYPTO;
         }
     }
