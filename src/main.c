@@ -269,7 +269,7 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
       tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
     NOX_ERROR(LOG_MOD_MAIN, "PIN çok uzun: buffer aşıldı (maksimum %u byte)",
               NOX_PIN_MAX_LEN);
-    explicit_bzero(pin_buf, buf_size);
+    sodium_memzero(pin_buf, buf_size);
     return NOX_ERR_PIN;
   }
 
@@ -284,7 +284,7 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
   if (err != NOX_OK) {
     if (is_terminal)
       tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
-    explicit_bzero(pin_buf, buf_size);
+    sodium_memzero(pin_buf, buf_size);
     return err;
   }
 
@@ -311,8 +311,8 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
       if (is_terminal)
         tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
       NOX_ERROR(LOG_MOD_MAIN, "Onay PIN çok uzun: buffer aşıldı");
-      explicit_bzero(pin_buf, buf_size);
-      explicit_bzero(confirm_buf, sizeof(confirm_buf));
+      sodium_memzero(pin_buf, buf_size);
+      sodium_memzero(confirm_buf, sizeof(confirm_buf));
       return NOX_ERR_PIN;
     }
 
@@ -344,7 +344,7 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
       if (is_terminal)
         tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
       NOX_ERROR(LOG_MOD_MAIN, "PIN'ler eşleşmiyor");
-      explicit_bzero(pin_buf, buf_size);
+      sodium_memzero(pin_buf, buf_size);
       return NOX_ERR_PIN;
     }
   }
@@ -574,7 +574,7 @@ static void event_loop(struct app_state *state) {
 
             if (state->hs->msg_index >= 3) {
               char peer_onion[NOX_ONION_LEN + 1];
-              explicit_bzero(peer_onion, sizeof(peer_onion));
+              sodium_memzero(peer_onion, sizeof(peer_onion));
 
               if (pl_len == NOX_ONION_LEN + 1 && pl[NOX_ONION_LEN] == '\0') {
                 memcpy(peer_onion, pl, NOX_ONION_LEN + 1);
