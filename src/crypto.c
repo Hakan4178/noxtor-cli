@@ -311,6 +311,11 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     }
 
     err = write_exact(fd, ciphertext, sizeof(ciphertext));
+    if (err == NOX_OK) {
+    if (fsync(fd) != 0)                           /* ← YENİ */
+        NOX_WARN(LOG_MOD_CRYPTO,                  /* ← YENİ */
+                 "fsync başarısız: %s",           /* ← YENİ */
+                 strerror(errno));                /* ← YENİ */
     if (err != NOX_OK) {
         NOX_ERROR(LOG_MOD_CRYPTO, "ciphertext yazılamadı: %s", strerror(errno));
         close(fd);
