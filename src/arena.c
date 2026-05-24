@@ -272,7 +272,8 @@ size_t arena_bytes_used(const struct secure_arena *a)
 
 size_t arena_bytes_free(const struct secure_arena *a)
 {
-    return a ? (a->usable_size - a->offset) : 0;
+    return (a && a->offset <= a->usable_size)
+       ? (a->usable_size - a->offset) : 0;
 }
 
 /* ================================================================
