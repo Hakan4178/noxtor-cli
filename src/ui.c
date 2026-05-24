@@ -54,10 +54,16 @@ void ui_init(const struct nox_theme *theme) {
  * ================================================================ */
 static void print_timestamp(void) {
   struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
+memset(&ts, 0, sizeof(ts));
 
-  struct tm tm_buf;
-  localtime_r(&ts.tv_sec, &tm_buf);
+if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+  ts.tv_sec = 0;
+}
+
+struct tm tm_buf;
+memset(&tm_buf, 0, sizeof(tm_buf));
+
+localtime_r(&ts.tv_sec, &tm_buf);
 
   fprintf(stderr, "%s[%02d:%02d:%02d]%s ", g_theme->clr_timestamp,
           tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, g_theme->clr_reset);
@@ -224,7 +230,7 @@ void ui_print_progress(struct app_state *state, const char *filename,
   if (total == 0)
     return;
 
-  unsigned pct = (unsigned)((done * 100) / total);
+  unsigned pct = (unsigned)((done * 100ULL) / total);
   if (pct > 100)
     pct = 100;
 
