@@ -743,8 +743,9 @@ static void process_line(struct app_state *state, const char *line) {
     }
 
     uint8_t cpriv[NOX_KEY_LEN], cpub[NOX_KEY_LEN];
-    crypto_box_keypair(cpub, cpriv);
-    handshake_init(state->hs, true, cpriv, cpub);
+    handshake_init(state->hs, true,
+               state->my_static_priv,
+               state->my_static_pub);    
     explicit_bzero(cpriv, sizeof(cpriv));
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
@@ -1063,8 +1064,9 @@ static void event_loop(struct app_state *state) {
         }
 
         uint8_t cpriv[NOX_KEY_LEN], cpub[NOX_KEY_LEN];
-        crypto_box_keypair(cpub, cpriv);
-        handshake_init(state->hs, false, cpriv, cpub);
+        handshake_init(state->hs, false,
+               state->my_static_priv,
+               state->my_static_pub);    
         explicit_bzero(cpriv, sizeof(cpriv));
 
         NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi");
