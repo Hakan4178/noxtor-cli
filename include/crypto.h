@@ -108,6 +108,6 @@ nox_err_t crypto_load_identity(const char *identity_path,
 nox_err_t crypto_ed25519_to_curve25519(uint8_t curve25519_pk[NOX_KEY_LEN],
                                        uint8_t curve25519_sk[NOX_KEY_LEN],
                                        const uint8_t ed25519_pk[NOX_KEY_LEN],
-                                       const uint8_t ed25519_sk[64]);
+                                       const uint8_t ed25519_sk[crypto_sign_SECRETKEYBYTES]);
 
 #endif /* PARANOID_CRYPTO_H */

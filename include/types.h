@@ -24,6 +24,9 @@ struct secure_arena {
     size_t   total_size;    /* guard page'ler dahil toplam boyut       */
     size_t   usable_size;   /* kullanılabilir alan (guard page'siz)    */
     size_t   offset;        /* sonraki alloc pozisyonu (bump)          */
+    size_t   page_size;     /* sistem sayfa boyutu (cache)             */
+    bool     fork_safe;     /* MADV_DONTFORK durumu                    */
+    bool     dump_safe;     /* MADV_DONTDUMP durumu                    */
     uint8_t  canary[NOX_CANARY_LEN]; /* taşma tespiti için            */
 };
 

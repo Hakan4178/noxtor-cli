@@ -19,6 +19,13 @@
  *   [P9] PIN min/max uzunluk kontrolü
  *   [P10] Subkey ID enum — magic number yok
  *   [P11] NOX_KDF_CTX değişmezlik uyarısı
+ *   [B-1] crypto_load_identity — file_buf sodium_malloc'a taşındı,
+ *         fstat hata ayrımı (UB önleme), sodium_free otomatik sıfırlama
+ *   [A-1] crypto_generate_identity — O_TRUNC→atomic write (tmp+rename)
+ *   [A-2] crypto_ed25519_to_curve25519 — kısmi dönüşüm koruması,
+ *         NULL kaynak kontrolü, ed25519_sk boyutu crypto_sign_SECRETKEYBYTES
+ *   [F-1] crypto_load_or_create_salt — TOCTOU: stat+chmod→fstat+fchmod
+ *   [F-2] crypto_load_or_create_salt — PID race: random suffix eklendi
  */
 
 #include "crypto.h"
@@ -264,18 +271,21 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
     if (!salt || !config_dir)
         return NOX_ERR_CONFIG;
 
-    /* [P8] config_dir izin kontrolü — 0700 olmalı */
-    struct stat dir_st;
-    if (stat(config_dir, &dir_st) == 0) {
-        if ((dir_st.st_mode & 0777) != 0700) {
-            NOX_WARN(LOG_MOD_CRYPTO,
-                     "config_dir izinleri zayıf (%03o), düzeltiliyor",
-                     dir_st.st_mode & 0777);
-            if (chmod(config_dir, 0700) != 0) {
+    /* [F-1] TOCTOU koruması — fd tabanlı izin kontrolü */
+    int dir_fd = open(config_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+        struct stat dir_st;
+        if (fstat(dir_fd, &dir_st) == 0) {
+            if ((dir_st.st_mode & 0777) != 0700) {
                 NOX_WARN(LOG_MOD_CRYPTO,
-                         "chmod başarısız: %s", strerror(errno));
+                         "config_dir izinleri zayıf (%03o), düzeltiliyor",
+                         dir_st.st_mode & 0777);
+                if (fchmod(dir_fd, 0700) != 0)
+                    NOX_WARN(LOG_MOD_CRYPTO,
+                             "fchmod başarısız: %s", strerror(errno));
             }
         }
+        close(dir_fd);
     }
 
     char path[NOX_PATH_MAX];
@@ -310,10 +320,14 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
     /* Yeni salt üret */
     randombytes_buf(salt, NOX_SALT_LEN);
 
-    /* [P2] Atomic write — tmp dosya + O_EXCL + rename */
+    /* [F-2] PID + random suffix — PID race koruması */
     char tmp_path[NOX_PATH_MAX];
+    uint8_t rnd[4];
+    randombytes_buf(rnd, sizeof(rnd));
     int tmp_ret = snprintf(tmp_path, sizeof(tmp_path),
-                           "%s/salt.tmp.%d", config_dir, (int)getpid());
+                           "%s/salt.tmp.%d.%02x%02x%02x%02x",
+                           config_dir, (int)getpid(),
+                           rnd[0], rnd[1], rnd[2], rnd[3]);
     if (tmp_ret < 0 || (size_t)tmp_ret >= sizeof(tmp_path))
         return NOX_ERR_CONFIG;
 
@@ -379,6 +393,19 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     uint8_t ciphertext[crypto_sign_SECRETKEYBYTES +
                         crypto_secretbox_MACBYTES]                  = {0};
 
+    /* [A-1] Atomic write — tmp yolu hazırla */
+    char tmp_path[NOX_PATH_MAX];
+    uint8_t rnd[4];
+    randombytes_buf(rnd, sizeof(rnd));
+    int tmp_ret = snprintf(tmp_path, sizeof(tmp_path),
+                           "%s.tmp.%d.%02x%02x%02x%02x",
+                           identity_path, (int)getpid(),
+                           rnd[0], rnd[1], rnd[2], rnd[3]);
+    if (tmp_ret < 0 || (size_t)tmp_ret >= sizeof(tmp_path)) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "identity tmp yolu çok uzun");
+        return NOX_ERR_CONFIG;
+    }
+
     /* [P5] sk — sodium_malloc ile güvenli heap, stack'te değil */
     uint8_t *sk = sodium_malloc(crypto_sign_SECRETKEYBYTES);
     if (!sk) {
@@ -404,13 +431,13 @@ nox_err_t crypto_generate_identity(const char *identity_path,
         goto cleanup;
     }
 
-    /* Dosyaya yaz: [nonce][ciphertext] */
-    fd = open(identity_path,
-              O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+    /* [A-1] Dosyaya yaz: tmp + O_EXCL (atomic write) */
+    fd = open(tmp_path,
+              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
               0600);
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
-                  "identity.key dosyası açılamadı: %s", strerror(errno));
+                  "identity tmp dosyası açılamadı: %s", strerror(errno));
         goto cleanup;
     }
 
@@ -429,6 +456,15 @@ nox_err_t crypto_generate_identity(const char *identity_path,
         NOX_WARN(LOG_MOD_CRYPTO,
                  "identity fsync başarısız: %s", strerror(errno));
 
+    close(fd); fd = -1;
+
+    /* [A-1] Atomic rename */
+    if (rename(tmp_path, identity_path) != 0) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "identity rename başarısız: %s", strerror(errno));
+        goto cleanup;
+    }
+
     /* Public key çıktıya kopyala */
     memcpy(public_key_out, pk, crypto_sign_PUBLICKEYBYTES);
     ret = NOX_OK;
@@ -439,9 +475,9 @@ nox_err_t crypto_generate_identity(const char *identity_path,
 cleanup:
     if (fd >= 0) {
         close(fd);
-        /* Hata durumunda yarım dosyayı sil */
-        if (ret != NOX_OK)
-            unlink(identity_path);
+        unlink(tmp_path);   /* başarısız tmp'yi temizle */
+    } else if (ret != NOX_OK) {
+        unlink(tmp_path);   /* fd kapatılmıştı ama rename başarısız */
     }
 
     /* [P6] Tek noktadan temizleme */
@@ -478,10 +514,15 @@ nox_err_t crypto_load_identity(const char *identity_path,
         return NOX_ERR_IO;
     }
 
-    /* [P7] Dosya boyutu kontrolü */
+    /* [B-1] fstat hata ayrımı — UB önleme */
     struct stat st;
-    if (fstat(fd, &st) != 0 ||
-        st.st_size != (off_t)IDENTITY_FILE_SIZE) {
+    if (fstat(fd, &st) != 0) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "fstat başarısız: %s", strerror(errno));
+        close(fd);
+        return NOX_ERR_IO;
+    }
+    if (st.st_size != (off_t)IDENTITY_FILE_SIZE) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key boyutu hatalı (%lld byte, beklenen %zu)",
                   (long long)st.st_size, (size_t)IDENTITY_FILE_SIZE);
@@ -489,13 +530,20 @@ nox_err_t crypto_load_identity(const char *identity_path,
         return NOX_ERR_IO;
     }
 
-    uint8_t file_buf[IDENTITY_FILE_SIZE];
-    nox_err_t err = read_exact(fd, file_buf, sizeof(file_buf));
+    /* [B-1] sodium_malloc — swap koruması + guard page */
+    uint8_t *file_buf = sodium_malloc(IDENTITY_FILE_SIZE);
+    if (!file_buf) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "sodium_malloc başarısız");
+        close(fd);
+        return NOX_ERR_ALLOC;
+    }
+
+    nox_err_t err = read_exact(fd, file_buf, IDENTITY_FILE_SIZE);
     close(fd);
 
     if (err != NOX_OK) {
         NOX_ERROR(LOG_MOD_CRYPTO, "identity.key okunamadı veya bozuk");
-        explicit_bzero(file_buf, sizeof(file_buf));
+        sodium_free(file_buf);   /* otomatik sıfırlar */
         return NOX_ERR_IO;
     }
 
@@ -505,13 +553,15 @@ nox_err_t crypto_load_identity(const char *identity_path,
     size_t         ct_len     = crypto_sign_SECRETKEYBYTES +
                                 crypto_secretbox_MACBYTES;
 
-    if (crypto_secretbox_open_easy(secret_key_out,
-                                   ciphertext, ct_len,
-                                   nonce, unlock_key) != 0) {
+    int open_ret = crypto_secretbox_open_easy(
+        secret_key_out, ciphertext, ct_len, nonce, unlock_key);
+
+    sodium_free(file_buf);   /* her durumda — sodium_free sıfırlar */
+
+    if (open_ret != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key çözme başarısız — yanlış PIN?");
-        explicit_bzero(file_buf, sizeof(file_buf));
-        explicit_bzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
         return NOX_ERR_AUTH;
     }
 
@@ -523,9 +573,7 @@ nox_err_t crypto_load_identity(const char *identity_path,
            secret_key_out + crypto_sign_SEEDBYTES,
            crypto_sign_PUBLICKEYBYTES);
 
-    explicit_bzero(file_buf, sizeof(file_buf));
     memory_barrier();
-
     NOX_INFO(LOG_MOD_CRYPTO, "identity.key başarıyla çözüldü");
     return NOX_OK;
 }
@@ -533,26 +581,41 @@ nox_err_t crypto_load_identity(const char *identity_path,
 /* ================================================================
  * 2.3: IDENTITY KEY CONVERSION — Ed25519 → Curve25519
  * ================================================================ */
-nox_err_t crypto_ed25519_to_curve25519(uint8_t curve25519_pk[NOX_KEY_LEN],
-                                        uint8_t curve25519_sk[NOX_KEY_LEN],
-                                        const uint8_t ed25519_pk[NOX_KEY_LEN],
-                                        const uint8_t ed25519_sk[64])
+nox_err_t crypto_ed25519_to_curve25519(
+    uint8_t       curve25519_pk[NOX_KEY_LEN],
+    uint8_t       curve25519_sk[NOX_KEY_LEN],
+    const uint8_t ed25519_pk[NOX_KEY_LEN],
+    const uint8_t ed25519_sk[crypto_sign_SECRETKEYBYTES])
 {
+    /* [A-2] En az bir dönüşüm yapılmalı */
+    if (!ed25519_pk && !ed25519_sk) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "ed25519_to_curve25519: her iki kaynak NULL");
+        return NOX_ERR_CRYPTO;
+    }
+
     if (ed25519_pk && curve25519_pk) {
         if (crypto_sign_ed25519_pk_to_curve25519(
                 curve25519_pk, ed25519_pk) != 0) {
             NOX_ERROR(LOG_MOD_CRYPTO,
                       "Ed25519 public key Curve25519'a dönüştürme başarısız");
+            sodium_memzero(curve25519_pk, NOX_KEY_LEN);
             return NOX_ERR_CRYPTO;
         }
     }
+
     if (ed25519_sk && curve25519_sk) {
         if (crypto_sign_ed25519_sk_to_curve25519(
                 curve25519_sk, ed25519_sk) != 0) {
             NOX_ERROR(LOG_MOD_CRYPTO,
                       "Ed25519 secret key Curve25519'a dönüştürme başarısız");
+            /* [A-2] Kısmi başarı → pk'yı da sıfırla */
+            if (ed25519_pk && curve25519_pk)
+                sodium_memzero(curve25519_pk, NOX_KEY_LEN);
+            sodium_memzero(curve25519_sk, NOX_KEY_LEN);
             return NOX_ERR_CRYPTO;
         }
     }
+
     return NOX_OK;
 }

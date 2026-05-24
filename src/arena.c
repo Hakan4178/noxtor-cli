@@ -76,6 +76,10 @@ static size_t get_page_size(void)
  */
 static size_t page_align(size_t size, size_t page_size)
 {
+    /* page_size 2'nin kuvveti olmak zorunda */
+    if (page_size == 0 || (page_size & (page_size - 1U)) != 0)
+        return 0;
+
     /* P1 — page_size - 1 eklenmesindeki overflow kontrolü */
     if (size > SIZE_MAX - (page_size - 1U))
         return 0; /* overflow sinyali */
@@ -88,7 +92,7 @@ static size_t page_align(size_t size, size_t page_size)
  * P6: Core dump üretimini kapatır, ardından abort() çağırır.
  * PR_SET_DUMPABLE=0 → /proc/PID/mem erişimini de engeller.
  * ================================================================ */
-static void COLD_ATTR secure_abort(const char *msg)
+static void secure_abort(const struct secure_arena *a, const char *msg)
 {
     /* Core dump'ı kapat */
 #ifdef PR_SET_DUMPABLE
@@ -101,6 +105,11 @@ static void COLD_ATTR secure_abort(const char *msg)
             msg);
     fflush(stderr);
 
+    /* Canary bozulduysa base ve size'a güvenme, sanity check ile wipe yap */
+    if (a && a->base && a->total_size > 0 && a->total_size < 10 * 1024 * 1024) {
+        sodium_memzero(a->base, a->total_size);
+    }
+
     abort(); /* SIGABRT — signal handler'lar yine de tetiklenebilir */
 }
 
@@ -112,7 +121,7 @@ static void COLD_ATTR secure_abort(const char *msg)
 nox_err_t arena_init(struct secure_arena *a, size_t size)
 {
     if (!a || size == 0)
-        return NOX_ERR_INVAL;
+        return NOX_ERR_ALLOC;
 
     /* P7 — sodium_init() guard
      *
@@ -223,16 +232,23 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
      * 2. Bellek önerileri — her iki branch için ortak
      *    Fork sırasında ve core dump'ta hassas belleği gizle.
      * ---------------------------------------------------------------- */
+    a->fork_safe = true;
+    a->dump_safe = true;
+
 #ifdef MADV_DONTFORK
-    if (madvise(base, total, MADV_DONTFORK) != 0)
+    if (madvise(base, total, MADV_DONTFORK) != 0) {
         NOX_WARN(LOG_MOD_ARENA,
                  "MADV_DONTFORK başarısız: %s", strerror(errno));
+        a->fork_safe = false; /* caller karar versin */
+    }
 #endif
 
 #ifdef MADV_DONTDUMP
-    if (madvise(base, total, MADV_DONTDUMP) != 0)
+    if (madvise(base, total, MADV_DONTDUMP) != 0) {
         NOX_WARN(LOG_MOD_ARENA,
                  "MADV_DONTDUMP başarısız: %s", strerror(errno));
+        a->dump_safe = false; /* caller karar versin */
+    }
 #endif
 
     uint8_t *bptr = (uint8_t *)base;
@@ -272,6 +288,7 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
     a->total_size  = total;
     a->usable_size = usable - NOX_CANARY_LEN;
     a->offset      = 0;
+    a->page_size   = page_size;
 
     /* ----------------------------------------------------------------
      * 6. Canary üret ve usable alanın hemen ardına yaz
@@ -319,7 +336,7 @@ void *arena_alloc(struct secure_arena *a, size_t size)
                   "alloc hizalama taşması: size=%zu", size);
         return NULL;
     }
-    size_t aligned_size = (size + 15U) & ~15UL;
+    size_t aligned_size = (size + 15U) & ~(size_t)15;
 
     /* ----------------------------------------------------------------
      * P2 — offset + aligned_size overflow koruması
@@ -345,7 +362,7 @@ void *arena_alloc(struct secure_arena *a, size_t size)
         return NULL;
     }
 
-    size_t page_size = get_page_size();
+    size_t page_size = a->page_size;
     uint8_t *bptr    = (uint8_t *)a->base;
     void    *ptr     = bptr + page_size + a->offset;
     a->offset       += aligned_size;
@@ -371,7 +388,7 @@ void arena_check_canary(const struct secure_arena *a)
     if (!a || !a->base)
         return;
 
-    size_t         page_size  = get_page_size();
+    size_t         page_size  = a->page_size;
     const uint8_t *bptr       = (const uint8_t *)a->base;
     const uint8_t *canary_pos = bptr + page_size + a->usable_size;
 
@@ -381,7 +398,7 @@ void arena_check_canary(const struct secure_arena *a)
      */
     if (sodium_memcmp(canary_pos, a->canary, NOX_CANARY_LEN) != 0) {
         /* P6 — secure_abort(): önce dumpable=0, sonra abort() */
-        secure_abort("Arena canary bozulmuş! Buffer overflow tespit edildi.");
+        secure_abort(a, "Arena canary bozulmuş! Buffer overflow tespit edildi.");
         /* NOTREACHED */
     }
 }
@@ -409,7 +426,7 @@ void arena_destroy(struct secure_arena *a)
     /* 1. Son canary kontrolü */
     arena_check_canary(a);
 
-    size_t   page_size    = get_page_size();
+    size_t   page_size    = a->page_size;
     uint8_t *bptr         = (uint8_t *)a->base;
     uint8_t *usable_start = bptr + page_size;
 
@@ -508,6 +525,14 @@ void arena_restore(struct secure_arena *a, size_t saved_offset)
     /* P4 — Restore öncesi canary kontrolü */
     arena_check_canary(a);
 
+    /* Alignment kontrolü: 16 byte hizalı olmayan offset reddedilir */
+    if (saved_offset % 16 != 0) {
+        NOX_WARN(LOG_MOD_ARENA,
+                 "arena_restore: saved_offset (%zu) 16-byte hizalı değil!",
+                 saved_offset);
+        return;
+    }
+
     /* saved_offset geçerlilik kontrolü */
     if (saved_offset > a->offset) {
         NOX_WARN(LOG_MOD_ARENA,
@@ -523,12 +548,9 @@ void arena_restore(struct secure_arena *a, size_t saved_offset)
     }
 
     /*
-     * P3: get_page_size() kullanılıyor.
-     *     Eski kod: (uint8_t *)a->base + sysconf(_SC_PAGESIZE)
-     *     sysconf() -1 döndürseydi pointer aritmetiği tanımsız davranış
-     *     üretirdi. get_page_size() her zaman geçerli pozitif değer döner.
+     * P3: a->page_size kullanılıyor.
      */
-    size_t   page_size = get_page_size();
+    size_t   page_size = a->page_size;
     uint8_t *usable    = (uint8_t *)a->base + page_size;
 
     size_t wipe_len = a->offset - saved_offset;

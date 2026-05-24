@@ -26,6 +26,8 @@
 #include "noise.h"
 #include "types.h"
 #include "ui.h"
+#include "stdin_handler.h"
+#include "file_transfer.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -158,9 +160,18 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
 
     if (mkdir(state->config_dir, 0700) != 0) {
       /* Üst dizin (.config) olmayabilir — onu da oluştur */
+      const char *home = getenv("HOME");
+      if (!home || home[0] == '\0') {
+        struct passwd *pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : "";
+      }
+      
       char parent[NOX_PATH_MAX];
-      snprintf(parent, sizeof(parent), "%s/.config",
-               getenv("HOME") ? getenv("HOME") : "");
+      int r = snprintf(parent, sizeof(parent), "%s/.config", home);
+      if (r < 0 || (size_t)r >= sizeof(parent)) {
+        NOX_ERROR(LOG_MOD_MAIN, "parent dizin yolu çok uzun veya hatalı");
+        return NOX_ERR_CONFIG;
+      }
       mkdir(parent, 0700); /* zaten varsa hata önemsiz */
 
       if (mkdir(state->config_dir, 0700) != 0) {
@@ -227,14 +238,8 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
   }
   fprintf(stderr, "\n");
 
-  /* Newline'ı kaldır */
-  size_t len = strlen(pin_buf);
-  if (len > 0 && pin_buf[len - 1] == '\n') {
-    pin_buf[len - 1] = '\0';
-    len--;
-  }
-
   /* Truncation tespiti — fgets buffer'ı doldurmuşsa PIN kesilmiş */
+  size_t len = strlen(pin_buf);
   if (len == buf_size - 1 && pin_buf[len - 1] != '\n') {
     if (is_terminal)
       tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
@@ -242,6 +247,12 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
               NOX_PIN_MAX_LEN);
     explicit_bzero(pin_buf, buf_size);
     return NOX_ERR_PIN;
+  }
+
+  /* Newline'ı kaldır */
+  if (len > 0 && pin_buf[len - 1] == '\n') {
+    pin_buf[len - 1] = '\0';
+    len--;
   }
 
   /* Doğrulama — test edilebilir fonksiyon */
@@ -270,8 +281,18 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
     }
     fprintf(stderr, "\n");
 
-    /* Newline kaldır */
+    /* Truncation tespiti — confirm_buf için */
     size_t clen = strlen(confirm_buf);
+    if (clen == sizeof(confirm_buf) - 1 && confirm_buf[clen - 1] != '\n') {
+      if (is_terminal)
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+      NOX_ERROR(LOG_MOD_MAIN, "Onay PIN çok uzun: buffer aşıldı");
+      explicit_bzero(pin_buf, buf_size);
+      explicit_bzero(confirm_buf, sizeof(confirm_buf));
+      return NOX_ERR_PIN;
+    }
+
+    /* Newline kaldır */
     if (clen > 0 && confirm_buf[clen - 1] == '\n')
       confirm_buf[clen - 1] = '\0';
 
@@ -358,662 +379,6 @@ static void cleanup(struct app_state *state) {
   NOX_INFO(LOG_MOD_MAIN, "temizlik tamamlandı");
 }
 
-static nox_err_t send_queued_callback(const char *text, void *ctx) {
-  struct app_state *state = (struct app_state *)ctx;
-  if (state->peer_fd < 0 || !state->session)
-    return NOX_ERR_NET;
-
-  size_t pt_len = strlen(text) + 1;
-  uint8_t payload[4096 + NOX_MAC_LEN];
-  ssize_t ct_len =
-      noise_encrypt(state->session, (const uint8_t *)text, pt_len, payload);
-  if (ct_len < 0)
-    return NOX_ERR_CRYPTO;
-
-  struct frame_header fh = {
-      .magic = NOX_FRAME_MAGIC,
-      .type = NOX_MSG_TEXT,
-      .seq = state->tx_seq++,
-      .len = (uint32_t)ct_len,
-  };
-  uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-  frame_header_encode(&fh, wire);
-
-  if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK)
-    return NOX_ERR_IO;
-  if (write_full(state->peer_fd, payload, (size_t)ct_len) != NOX_OK)
-    return NOX_ERR_IO;
-
-  return NOX_OK;
-}
-
-/* UTF-8 multi-byte karakter sınırına göre bir sonraki güvenli bölme boyutunu
- * bulur */
-static size_t get_next_chunk_size(const char *msg, size_t offset,
-                                  size_t total_len) {
-  size_t chunk_limit = 4000;
-  if (total_len - offset <= chunk_limit) {
-    return total_len - offset;
-  }
-
-  size_t size = chunk_limit;
-  /* UTF-8 devam byte'ları 10xxxxxx (0x80 - 0xBF) formatındadır */
-  while (size > 0 && ((uint8_t)msg[offset + size] & 0xC0) == 0x80) {
-    size--;
-  }
-
-  /* Fallback safety guard */
-  if (size == 0) {
-    return chunk_limit;
-  }
-  return size;
-}
-
-/* Uzun bir mesajı güvenli chunk'lara ayırıp sırayla şifreleyerek sokete yazar
- */
-static nox_err_t send_segmented_message(struct app_state *state,
-                                        const char *msg) {
-  if (!state->session || state->peer_fd < 0)
-    return NOX_ERR_NET;
-
-  size_t total_len = strlen(msg);
-  size_t offset = 0;
-
-  uint8_t *ct = malloc(4096 + NOX_MAC_LEN);
-  char *chunk = malloc(4096);
-  if (!ct || !chunk) {
-    free(ct);
-    free(chunk);
-    return NOX_ERR_CONFIG;
-  }
-
-  while (offset < total_len) {
-    size_t chunk_len = get_next_chunk_size(msg, offset, total_len);
-    memcpy(chunk, msg + offset, chunk_len);
-    chunk[chunk_len] = '\0';
-
-    size_t pt_len = chunk_len + 1;
-    ssize_t ct_len =
-        noise_encrypt(state->session, (const uint8_t *)chunk, pt_len, ct);
-    if (ct_len < 0) {
-      explicit_bzero(chunk, 4096);
-      explicit_bzero(ct, 4096 + NOX_MAC_LEN);
-      free(chunk);
-      free(ct);
-      return NOX_ERR_CRYPTO;
-    }
-
-    struct frame_header fh = {
-        .magic = NOX_FRAME_MAGIC,
-        .type = NOX_MSG_TEXT,
-        .seq = state->tx_seq++,
-        .len = (uint32_t)ct_len,
-    };
-    uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-    frame_header_encode(&fh, wire);
-
-    if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
-        write_full(state->peer_fd, ct, (size_t)ct_len) != NOX_OK) {
-      explicit_bzero(chunk, 4096);
-      explicit_bzero(ct, 4096 + NOX_MAC_LEN);
-      free(chunk);
-      free(ct);
-      return NOX_ERR_IO;
-    }
-
-    offset += chunk_len;
-  }
-
-  explicit_bzero(chunk, 4096);
-  explicit_bzero(ct, 4096 + NOX_MAC_LEN);
-  free(chunk);
-  free(ct);
-  return NOX_OK;
-}
-
-/* Uzun bir mesajı güvenli chunk'lara ayırıp SQLite veritabanı kuyruğuna yazar
- */
-static nox_err_t queue_segmented_message(const char *recipient_onion,
-                                         const char *msg) {
-  size_t total_len = strlen(msg);
-  size_t offset = 0;
-
-  char *chunk = malloc(4096);
-  if (!chunk)
-    return NOX_ERR_CONFIG;
-
-  while (offset < total_len) {
-    size_t chunk_len = get_next_chunk_size(msg, offset, total_len);
-    memcpy(chunk, msg + offset, chunk_len);
-    chunk[chunk_len] = '\0';
-
-    nox_err_t err = db_queue_message(recipient_onion, chunk);
-    if (err != NOX_OK) {
-      explicit_bzero(chunk, 4096);
-      free(chunk);
-      return err;
-    }
-
-    offset += chunk_len;
-  }
-
-  explicit_bzero(chunk, 4096);
-  free(chunk);
-  return NOX_OK;
-}
-
-/* ================================================================
- * DOSYA ADI SANİTİZASYONU — Path Traversal Koruması (K2)
- *
- * Saldırgan "../../etc/cron.d/backdoor" gibi dosya adı gönderebilir.
- * Whitelist yaklaşımı: sadece [a-zA-Z0-9._-] karakterlere izin verilir.
- * Birden fazla ardışık nokta ("..") engellenir.
- * Sonuç boş veya tehlikeli ise rastgele hex ID atanır.
- * ================================================================ */
-static void sanitize_filename(char *name, size_t max_len) {
-  if (!name || max_len == 0)
-    return;
-
-  /* 1. Yol ayırıcılarını kes — sadece basename'i al */
-  char *slash = strrchr(name, '/');
-  if (slash) {
-    size_t remain = strlen(slash + 1) + 1;
-    memmove(name, slash + 1, remain);
-  }
-
-  /* 2. Whitelist filtresi — izin verilmeyen her karakter '_' olur */
-  size_t len = strlen(name);
-  for (size_t i = 0; i < len; i++) {
-    char c = name[i];
-    bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
-    if (!allowed) {
-      name[i] = '_';
-    }
-  }
-
-  /* 3. Ardışık nokta ("..") engelle — her ".." → "__" */
-  for (size_t i = 0; i + 1 < len; i++) {
-    if (name[i] == '.' && name[i + 1] == '.') {
-      name[i] = '_';
-      name[i + 1] = '_';
-    }
-  }
-
-  /* 4. Baştaki nokta ("gizli dosya" veya "." / "..") engelle */
-  if (len > 0 && name[0] == '.') {
-    name[0] = '_';
-  }
-
-  /* 5. Boş ad kontrolü — rastgele hex ID ata */
-  len = strlen(name);
-  if (len == 0) {
-    uint32_t rnd = randombytes_random();
-    snprintf(name, max_len, "file_%08x", rnd);
-  }
-}
-
-static void process_line(struct app_state *state, const char *line) {
-  /* ── TOFU Onay Modu ─────────────────── */
-  if (state->tofu_pending) {
-    if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
-      db_add_contact(state->tofu_onion, state->tofu_name, state->tofu_new_key);
-      ui_print_system(state, "[✓] Akran onaylandı ve kaydedildi: %s",
-                      state->tofu_name);
-
-      state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
-      if (state->session) {
-        handshake_split(state->hs, state->session);
-        state->tx_seq = 0;
-        state->rx_seq = 0;
-        strncpy(state->active_peer_onion, state->tofu_onion, NOX_ONION_LEN);
-        state->active_peer_onion[NOX_ONION_LEN] = '\0';
-
-        NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
-        ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)",
-                        state->tofu_name);
-
-        /* Kuyruktaki bekleyen mesajları gönder */
-        db_process_queue(state->active_peer_onion, send_queued_callback, state);
-      } else {
-        ui_print_error(state, "Arena bellek hatası");
-        close(state->tofu_peer_fd);
-        state->peer_fd = -1;
-        arena_restore(&state->arena, state->tofu_arena_mark);
-      }
-      state->hs = NULL;
-      state->tofu_pending = false;
-    } else if (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0) {
-      ui_print_system(state, "[*] Bağlantı reddedildi.");
-      close(state->tofu_peer_fd);
-      state->peer_fd = -1;
-      state->hs = NULL;
-      state->session = NULL;
-      arena_restore(&state->arena, state->tofu_arena_mark);
-      state->tofu_pending = false;
-    } else {
-      fprintf(
-          stderr,
-          "  [?] Lütfen 'y' veya 'n' giriniz (y/n): "); /* raw — prompt değil */
-    }
-    return;
-  }
-
-  /* ── Session aktifken: her satır mesaj ─── */
-  if (state->session && state->peer_fd >= 0) {
-    nox_err_t err = send_segmented_message(state, line);
-    if (err == NOX_OK) {
-      ui_print_outgoing(state, line);
-    } else {
-      ui_print_error(state, "Şifreleme/Gönderim hatası");
-    }
-    return;
-  }
-
-  /* ── Session yokken: komut modu ─────── */
-  if (state->peer_fd < 0 && line[0] != '/') {
-    ui_print_error(state, "bağlantı yok — önce /connect kullan veya çevrimdışı "
-                          "mesaj için /msg kullan");
-    return;
-  }
-
-  if (strcmp(line, "/addr") == 0) {
-    ui_print_system(state, "%s", state->onion_addr);
-    return;
-  }
-
-  if (strncmp(line, "/add ", 5) == 0) {
-    const char *p = line + 5;
-    while (*p == ' ')
-      p++;
-
-    const char *onion_start = p;
-    while (*p && *p != ' ')
-      p++;
-    size_t onion_len = (size_t)(p - onion_start);
-
-    if (onion_len != NOX_ONION_LEN || *p == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>");
-      return;
-    }
-
-    char onion[NOX_ONION_LEN + 1];
-    memcpy(onion, onion_start, NOX_ONION_LEN);
-    onion[NOX_ONION_LEN] = '\0';
-
-    while (*p == ' ')
-      p++;
-    const char *name_start = p;
-    if (*name_start == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>");
-      return;
-    }
-
-    char name[NOX_CONTACT_NAME_LEN + 1];
-    strncpy(name, name_start, NOX_CONTACT_NAME_LEN);
-    name[NOX_CONTACT_NAME_LEN] = '\0';
-
-    uint8_t zero_key[NOX_KEY_LEN];
-    explicit_bzero(zero_key, sizeof(zero_key));
-
-    nox_err_t err = db_add_contact(onion, name, zero_key);
-    if (err == NOX_OK) {
-      ui_print_system(state, "[✓] Rehbere kaydedildi: %s (%s)", name, onion);
-    } else {
-      ui_print_error(state, "Veritabanı hatası");
-    }
-    return;
-  }
-
-  if (strncmp(line, "/msg ", 5) == 0) {
-    const char *p = line + 5;
-    while (*p == ' ')
-      p++;
-
-    const char *onion_start = p;
-    while (*p && *p != ' ')
-      p++;
-    size_t onion_len = (size_t)(p - onion_start);
-
-    if (onion_len != NOX_ONION_LEN || *p == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>");
-      return;
-    }
-
-    char onion[NOX_ONION_LEN + 1];
-    memcpy(onion, onion_start, NOX_ONION_LEN);
-    onion[NOX_ONION_LEN] = '\0';
-
-    while (*p == ' ')
-      p++;
-    const char *msg_start = p;
-    if (*msg_start == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>");
-      return;
-    }
-
-    if (state->session && state->peer_fd >= 0 &&
-        strcmp(state->active_peer_onion, onion) == 0) {
-      nox_err_t err = send_segmented_message(state, msg_start);
-      if (err == NOX_OK) {
-        ui_print_outgoing(state, msg_start);
-      } else {
-        ui_print_error(state, "Şifreleme/Gönderim hatası");
-      }
-    } else {
-      nox_err_t err = queue_segmented_message(onion, msg_start);
-      if (err == NOX_OK) {
-        ui_print_system(state, "[*] Mesaj kuyruğa eklendi (akran çevrimdışı)");
-      } else {
-        ui_print_error(state, "Kuyruğa ekleme başarısız");
-      }
-    }
-    return;
-  }
-
-  if (strncmp(line, "/connect ", 9) == 0) {
-    const char *target = line + 9;
-    while (*target == ' ')
-      target++;
-
-    if (state->peer_fd >= 0) {
-      ui_print_error(state, "zaten bağlı");
-      return;
-    }
-
-    NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
-    int peer_fd = -1;
-    nox_err_t err =
-        socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_port, &peer_fd);
-    if (err != NOX_OK) {
-      ui_print_error(state, "bağlantı başarısız");
-      return;
-    }
-
-    state->peer_fd = peer_fd;
-    epoll_add_fd(state->epoll_fd, peer_fd);
-    NOX_INFO(LOG_MOD_MAIN, "peer bağlandı");
-
-    /* Noise handshake — initiator */
-    state->session_arena_mark = arena_save(&state->arena);
-    state->hs = arena_alloc(&state->arena, sizeof(struct noise_handshake));
-    if (!state->hs) {
-      ui_print_error(state, "arena dolu");
-      return;
-    }
-
-    uint8_t cpriv[NOX_KEY_LEN], cpub[NOX_KEY_LEN];
-    handshake_init(state->hs, true,
-               state->my_static_priv,
-               state->my_static_pub);    
-    explicit_bzero(cpriv, sizeof(cpriv));
-
-    uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
-    size_t hslen = sizeof(hsbuf);
-    handshake_write(state->hs, NULL, 0, hsbuf, &hslen);
-
-    struct frame_header fh = {
-        .magic = NOX_FRAME_MAGIC,
-        .type = NOX_MSG_CTRL,
-        .seq = state->tx_seq++,
-        .len = (uint32_t)hslen,
-    };
-    uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-    frame_header_encode(&fh, wire);
-    write_full(peer_fd, wire, FRAME_HEADER_WIRE_SIZE);
-    write_full(peer_fd, hsbuf, hslen);
-
-    NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi");
-    ui_print_system(state, "[*] handshake başlatıldı");
-    return;
-  }
-
-  /* ── /file <path> — Güvenli dosya gönderimi (Faz 6.2) ── */
-  if (strncmp(line, "/file ", 6) == 0) {
-    const char *filepath = line + 6;
-    while (*filepath == ' ')
-      filepath++;
-
-    /* Çevrimdışı dosya gönderimi desteklenmiyor */
-    if (state->peer_fd < 0 || !state->session) {
-      ui_print_error(
-          state,
-          "Çevrimdışı dosyalar kuyruğa alınamaz. Aktif bir bağlantı gerekir.");
-      return;
-    }
-
-    /* Zaten aktif bir dosya transferi var mı? */
-    if (state->tx_file.active) {
-      ui_print_error(state, "Zaten aktif bir dosya transferi var.");
-      return;
-    }
-
-    /* Dosya path kopyası oluştur (basename mutate edebilir) */
-    char path_copy[NOX_PATH_MAX];
-    size_t path_len = strlen(filepath);
-    if (path_len == 0 || path_len >= sizeof(path_copy)) {
-      ui_print_error(state, "Geçersiz dosya yolu.");
-      return;
-    }
-    memcpy(path_copy, filepath, path_len + 1);
-
-    /* Dosya var mı, okunabilir mi? */
-    struct stat st;
-    if (stat(path_copy, &st) != 0) {
-      ui_print_error(state, "Dosya bulunamadı: %s", strerror(errno));
-      return;
-    }
-    if (!S_ISREG(st.st_mode)) {
-      ui_print_error(state, "Düzenli dosya değil.");
-      return;
-    }
-    if (st.st_size == 0) {
-      ui_print_error(state, "Boş dosya gönderilemez.");
-      return;
-    }
-
-    /* Dosyayı aç */
-    int file_fd = open(path_copy, O_RDONLY | O_CLOEXEC);
-    if (file_fd < 0) {
-      ui_print_error(state, "Dosya açılamadı: %s", strerror(errno));
-      return;
-    }
-
-    /* basename al, sonra mutlak yolu hemen sil (crash/coredump koruması) */
-    char *bname = basename(path_copy);
-    char safe_name[256];
-    size_t bname_len = strlen(bname);
-    if (bname_len >= sizeof(safe_name))
-      bname_len = sizeof(safe_name) - 1;
-    memcpy(safe_name, bname, bname_len);
-    safe_name[bname_len] = '\0';
-    explicit_bzero(path_copy, sizeof(path_copy));
-
-    /* Streaming BLAKE2b hash — dosyayı 4KB parçalarla hash'le */
-    crypto_generichash_state hash_st;
-    crypto_generichash_init(&hash_st, NULL, 0, 32);
-
-    uint8_t hash_buf[4096];
-    for (;;) {
-      ssize_t r = read(file_fd, hash_buf, sizeof(hash_buf));
-      if (r < 0) {
-        if (errno == EINTR)
-          continue;
-        ui_print_error(state, "Dosya okuma hatası: %s", strerror(errno));
-        explicit_bzero(hash_buf, sizeof(hash_buf));
-        close(file_fd);
-        return;
-      }
-      if (r == 0)
-        break;
-      crypto_generichash_update(&hash_st, hash_buf, (size_t)r);
-    }
-    explicit_bzero(hash_buf, sizeof(hash_buf));
-
-    uint8_t file_hash[32];
-    crypto_generichash_final(&hash_st, file_hash, 32);
-
-    /* Dosya başına geri sar */
-    if (lseek(file_fd, 0, SEEK_SET) != 0) {
-      ui_print_error(state, "lseek başarısız.");
-      close(file_fd);
-      return;
-    }
-
-    /* tx_file state'ini kur */
-    explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-    state->tx_file.active = true;
-    state->tx_file.fd = file_fd;
-    state->tx_file.total_size = (uint64_t)st.st_size;
-    state->tx_file.sent_bytes = 0;
-    memcpy(state->tx_file.hash, file_hash, 32);
-    memcpy(state->tx_file.filename, safe_name, bname_len + 1);
-
-    /*
-     * METADATA frame gönder:
-     *   "METADATA\0" (9) + filename (256) + size (8) + hash (32) = 305 byte
-     */
-    uint8_t meta[305];
-    memset(meta, 0, sizeof(meta));
-    memcpy(meta, "METADATA", 9);
-    memcpy(meta + 9, safe_name, bname_len + 1);
-    uint64_t net_size = state->tx_file.total_size;
-    /* Big-endian encode */
-    meta[265] = (uint8_t)(net_size >> 56);
-    meta[266] = (uint8_t)(net_size >> 48);
-    meta[267] = (uint8_t)(net_size >> 40);
-    meta[268] = (uint8_t)(net_size >> 32);
-    meta[269] = (uint8_t)(net_size >> 24);
-    meta[270] = (uint8_t)(net_size >> 16);
-    meta[271] = (uint8_t)(net_size >> 8);
-    meta[272] = (uint8_t)(net_size);
-    memcpy(meta + 273, file_hash, 32);
-
-    /* Şifrele ve gönder */
-    uint8_t meta_ct[305 + NOX_MAC_LEN];
-    ssize_t meta_ct_len =
-        noise_encrypt(state->session, meta, sizeof(meta), meta_ct);
-    explicit_bzero(meta, sizeof(meta));
-    if (meta_ct_len < 0) {
-      ui_print_error(state, "Metadata şifreleme hatası.");
-      close(file_fd);
-      explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-      return;
-    }
-
-    struct frame_header mfh = {
-        .magic = NOX_FRAME_MAGIC,
-        .type = NOX_MSG_FILE,
-        .seq = state->tx_seq++,
-        .len = (uint32_t)meta_ct_len,
-    };
-    uint8_t mwire[FRAME_HEADER_WIRE_SIZE];
-    frame_header_encode(&mfh, mwire);
-
-    if (write_full(state->peer_fd, mwire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
-        write_full(state->peer_fd, meta_ct, (size_t)meta_ct_len) != NOX_OK) {
-      ui_print_error(state, "Metadata gönderim hatası.");
-      close(file_fd);
-      explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-      return;
-    }
-
-    /* peer_fd'yi EPOLLIN | EPOLLOUT olarak değiştir */
-    epoll_modify_fd(state->epoll_fd, state->peer_fd, EPOLLIN | EPOLLOUT);
-
-    ui_print_system(state, "[*] Dosya transferi başlatıldı: %s (%lu byte)",
-                    safe_name, (unsigned long)state->tx_file.total_size);
-    return;
-  }
-
-  ui_print_system(state, "komutlar: /addr  /connect <onion>  /add <onion> "
-                         "<isim>  /msg <onion> <mesaj>  /file <dosya>  Ctrl+P");
-}
-
-static void process_stdin_events(struct app_state *state) {
-  for (;;) {
-    if (state->stdin_len + 512 >= state->stdin_cap) {
-      size_t new_cap = state->stdin_cap == 0 ? 512 : state->stdin_cap * 2;
-      char *new_buf = realloc(state->stdin_buf, new_cap);
-      if (!new_buf) {
-        NOX_ERROR(LOG_MOD_MAIN, "stdin buffer realloc failed");
-        return;
-      }
-      state->stdin_buf = new_buf;
-      state->stdin_cap = new_cap;
-    }
-
-    ssize_t r = read(STDIN_FILENO, state->stdin_buf + state->stdin_len,
-                     state->stdin_cap - state->stdin_len - 1);
-    if (r < 0) {
-      if (errno == EINTR)
-        continue;
-#if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        break;
-#else
-      if (errno == EAGAIN)
-        break;
-#endif
-      NOX_ERROR(LOG_MOD_MAIN, "stdin read error: %s", strerror(errno));
-      break;
-    }
-    if (r == 0) {
-      if (state->stdin_len > 0) {
-        process_line(state, state->stdin_buf);
-        explicit_bzero(state->stdin_buf, state->stdin_cap);
-        state->stdin_len = 0;
-      }
-      epoll_remove_fd(state->epoll_fd, STDIN_FILENO);
-      break;
-    }
-    state->stdin_len += (size_t)r;
-    state->stdin_buf[state->stdin_len] = '\0';
-  }
-
-  char *newline;
-  while ((newline = memchr(state->stdin_buf, '\n', state->stdin_len)) != NULL) {
-    size_t line_len = (size_t)(newline - state->stdin_buf);
-    char *line = malloc(line_len + 1);
-    if (!line) {
-      NOX_ERROR(LOG_MOD_MAIN, "line allocation failed");
-      return;
-    }
-    memcpy(line, state->stdin_buf, line_len);
-    line[line_len] = '\0';
-
-    size_t consumed = line_len + 1;
-    size_t remaining = state->stdin_len - consumed;
-    if (remaining > 0) {
-      memmove(state->stdin_buf, state->stdin_buf + consumed, remaining);
-    }
-    state->stdin_len = remaining;
-    state->stdin_buf[state->stdin_len] = '\0';
-
-    // Clean trailing carriage return
-    size_t trimmed_len = line_len;
-    if (trimmed_len > 0 && line[trimmed_len - 1] == '\r') {
-      line[trimmed_len - 1] = '\0';
-      trimmed_len--;
-    }
-
-    // Clean trailing spaces/tabs
-    while (trimmed_len > 0 &&
-           (line[trimmed_len - 1] == ' ' || line[trimmed_len - 1] == '\t')) {
-      line[trimmed_len - 1] = '\0';
-      trimmed_len--;
-    }
-
-    if (trimmed_len == 0) {
-      ui_print_prompt(state);
-    } else {
-      process_line(state, line);
-    }
-
-    explicit_bzero(line, line_len + 1);
-    free(line);
-  }
-}
 
 /* ================================================================
  * EVENT LOOP — epoll tabanlı async I/O
@@ -1063,11 +428,9 @@ static void event_loop(struct app_state *state) {
           continue;
         }
 
-        uint8_t cpriv[NOX_KEY_LEN], cpub[NOX_KEY_LEN];
         handshake_init(state->hs, false,
                state->my_static_priv,
                state->my_static_pub);    
-        explicit_bzero(cpriv, sizeof(cpriv));
 
         NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi");
         ui_print_system(state, "[*] gelen bağlantı — handshake bekleniyor");
@@ -1076,76 +439,7 @@ static void event_loop(struct app_state *state) {
         /* ── Peer'a Veri Gönderimi (EPOLLOUT) ────── */
         if (events[i].events & EPOLLOUT) {
           if (state->tx_file.active) {
-            /* Buffer'da kalan veri varsa önce onu gönder */
-            if (state->tx_file.tx_len > 0) {
-              ssize_t w =
-                  write(fd, state->tx_file.tx_buf + state->tx_file.tx_offset,
-                        state->tx_file.tx_len - state->tx_file.tx_offset);
-              if (w > 0) {
-                state->tx_file.tx_offset += (size_t)w;
-                if (state->tx_file.tx_offset == state->tx_file.tx_len) {
-                  state->tx_file.tx_len = 0;
-                  state->tx_file.tx_offset = 0;
-                  state->tx_file.sent_bytes +=
-                      state->tx_file.current_chunk_size;
-                  state->tx_file.current_chunk_size = 0;
-
-                  if (state->tx_file.sent_bytes >= state->tx_file.total_size) {
-                    ui_print_system(state,
-                                    "[✓] Dosya gönderimi tamamlandı (%lu byte)",
-                                    (unsigned long)state->tx_file.total_size);
-                    close(state->tx_file.fd);
-                    explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-                    epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-                  } else {
-                    ui_print_progress(state, state->tx_file.filename,
-                                      state->tx_file.sent_bytes,
-                                      state->tx_file.total_size, true);
-                  }
-                }
-              } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                         errno != EINTR) {
-                ui_print_error(state, "Dosya gönderimi koptu (%s)",
-                               strerror(errno));
-                close(state->tx_file.fd);
-                explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-                epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-              }
-            } else {
-              /* Yeni chunk oku ve şifrele */
-              uint8_t plain[4096];
-              ssize_t r = read(state->tx_file.fd, plain, sizeof(plain));
-              if (r > 0) {
-                state->tx_file.current_chunk_size = (size_t)r;
-                ssize_t ct_len = noise_encrypt(state->session, plain, (size_t)r,
-                                               state->tx_file.tx_buf +
-                                                   FRAME_HEADER_WIRE_SIZE);
-                explicit_bzero(plain, sizeof(plain));
-
-                if (ct_len > 0) {
-                  struct frame_header fh = {
-                      .magic = NOX_FRAME_MAGIC,
-                      .type = NOX_MSG_FILE,
-                      .seq = state->tx_seq++,
-                      .len = (uint32_t)ct_len,
-                  };
-                  frame_header_encode(&fh, state->tx_file.tx_buf);
-                  state->tx_file.tx_len =
-                      FRAME_HEADER_WIRE_SIZE + (size_t)ct_len;
-                  state->tx_file.tx_offset = 0;
-                } else {
-                  ui_print_error(state, "Chunk şifreleme başarısız");
-                  close(state->tx_file.fd);
-                  explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-                  epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-                }
-              } else if (r < 0 && errno != EINTR) {
-                ui_print_error(state, "Yerel dosya okuma başarısız");
-                close(state->tx_file.fd);
-                explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-                epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-              }
-            }
+            file_transfer_handle_tx(state);
           } else {
             epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
           }
@@ -1178,22 +472,7 @@ static void event_loop(struct app_state *state) {
             arena_restore(&state->arena, state->session_arena_mark);
 
             /* Faz 6.2 Step 7: Aktif dosya transferlerini temizle */
-            if (state->tx_file.active) {
-              close(state->tx_file.fd);
-              explicit_bzero(&state->tx_file, sizeof(state->tx_file));
-              ui_print_error(
-                  state, "Bağlantı koptuğu için dosya gönderimi iptal edildi.");
-            }
-            if (state->rx_file.active) {
-              char bad_path[NOX_PATH_MAX];
-              snprintf(bad_path, sizeof(bad_path), "received_%s",
-                       state->rx_file.filename);
-              close(state->rx_file.fd);
-              unlink(bad_path);
-              explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-              ui_print_error(state, "Bağlantı koptuğu için dosya alımı iptal "
-                                    "edildi ve yarım kalan dosya silindi.");
-            }
+            file_transfer_cleanup(state);
 
             ui_print_system(state, "[*] peer ayrıldı");
             continue;
@@ -1419,133 +698,13 @@ static void event_loop(struct app_state *state) {
                 free(pt);
               }
             } else if (fh.type == NOX_MSG_FILE) {
-              uint8_t *pt = malloc(4096);
-              if (pt) {
-                ssize_t pt_len =
-                    noise_decrypt(state->session, payload, fh.len, pt);
-                if (pt_len > 0) {
-                  if (!state->rx_file.active && pt_len == 305 &&
-                      memcmp(pt, "METADATA", 9) == 0) {
-                    /* Yeni dosya transferi (Metadata) */
-                    char safe_name[256];
-                    memcpy(safe_name, pt + 9, 256);
-                    safe_name[255] = '\0';
-                    sanitize_filename(safe_name, sizeof(safe_name));
-
-                    uint64_t net_size;
-                    net_size =
-                        ((uint64_t)pt[265] << 56) | ((uint64_t)pt[266] << 48) |
-                        ((uint64_t)pt[267] << 40) | ((uint64_t)pt[268] << 32) |
-                        ((uint64_t)pt[269] << 24) | ((uint64_t)pt[270] << 16) |
-                        ((uint64_t)pt[271] << 8) | ((uint64_t)pt[272]);
-
-/* Dosya boyut sınırı kontrolü (O1) - Maksimum 100 GB */
-#define NOX_MAX_FILE_SIZE (100ULL * 1024 * 1024 * 1024)
-                    if (net_size == 0 || net_size > NOX_MAX_FILE_SIZE) {
-                      ui_print_error(state,
-                                     "Gelen dosya reddedildi: Geçersiz veya "
-                                     "çok büyük dosya boyutu (%lu byte)",
-                                     (unsigned long)net_size);
-                    } else {
-                      uint8_t file_hash[32];
-                      memcpy(file_hash, pt + 273, 32);
-
-                      /* Dosyayı diske aç (received_ öneki ile) */
-                      char recv_path[NOX_PATH_MAX];
-                      snprintf(recv_path, sizeof(recv_path), "received_%s",
-                               safe_name);
-
-                      int file_fd =
-                          open(recv_path,
-                               O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-                      if (file_fd >= 0) {
-                        explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-                        state->rx_file.active = true;
-                        state->rx_file.fd = file_fd;
-                        state->rx_file.expected_size = net_size;
-                        state->rx_file.received_bytes = 0;
-                        memcpy(state->rx_file.expected_hash, file_hash, 32);
-                        strncpy(state->rx_file.filename, safe_name, 255);
-                        state->rx_file.filename[255] = '\0';
-
-                        crypto_generichash_init(&state->rx_file.hash_state,
-                                                NULL, 0, 32);
-
-                        ui_print_system(state, "[⬇] Gelen dosya: %s (%lu byte)",
-                                        safe_name, (unsigned long)net_size);
-                      } else {
-                        ui_print_error(state, "Gelen dosya (%s) oluşturulamadı",
-                                       safe_name);
-                      }
-                    }
-                  } else if (state->rx_file.active) {
-                    /* Dosya verisi chunk'ı — beklenen boyuttan fazla veri
-                     * yazılmasını önle (O3) */
-                    size_t remaining = state->rx_file.expected_size -
-                                       state->rx_file.received_bytes;
-                    if ((size_t)pt_len > remaining) {
-                      pt_len = (ssize_t)remaining;
-                    }
-
-                    ssize_t w = write(state->rx_file.fd, pt, (size_t)pt_len);
-                    if (w == pt_len) {
-                      crypto_generichash_update(&state->rx_file.hash_state, pt,
-                                                (size_t)pt_len);
-                      state->rx_file.received_bytes += (size_t)pt_len;
-
-                      if (state->rx_file.received_bytes >=
-                          state->rx_file.expected_size) {
-                        uint8_t final_hash[32];
-                        crypto_generichash_final(&state->rx_file.hash_state,
-                                                 final_hash, 32);
-
-                        close(state->rx_file.fd);
-
-                        if (memcmp(final_hash, state->rx_file.expected_hash,
-                                   32) == 0) {
-                          ui_print_system(state,
-                                          "[✓] Dosya başarıyla alındı: %s",
-                                          state->rx_file.filename);
-                        } else {
-                          char bad_path[NOX_PATH_MAX];
-                          snprintf(bad_path, sizeof(bad_path), "received_%s",
-                                   state->rx_file.filename);
-                          unlink(bad_path);
-                          ui_print_error(
-                              state,
-                              "HATA: Alınan dosyanın (%s) hash'i uyuşmuyor! "
-                              "Dosya silindi (bütünlük doğrulaması başarısız).",
-                              state->rx_file.filename);
-                        }
-
-                        explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-                      } else {
-                        ui_print_progress(state, state->rx_file.filename,
-                                          state->rx_file.received_bytes,
-                                          state->rx_file.expected_size, false);
-                      }
-                    } else {
-                      char bad_path[NOX_PATH_MAX];
-                      snprintf(bad_path, sizeof(bad_path), "received_%s",
-                               state->rx_file.filename);
-                      close(state->rx_file.fd);
-                      unlink(bad_path);
-                      ui_print_error(state,
-                                     "Dosyaya yazılamadı, transfer iptal "
-                                     "edildi ve yarım kalan dosya silindi.");
-                      explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-                    }
-                  }
-                }
-                explicit_bzero(pt, 4096);
-                free(pt);
-              }
+              file_transfer_handle_rx(state, payload, fh.len);
             }
-
-            /* Cleanup */
-            explicit_bzero(payload, 4096 + NOX_MAC_LEN);
-            free(payload);
           }
+
+          /* Payload Cleanup — Tüm mesaj tipleri için çalışır */
+          explicit_bzero(payload, 4096 + NOX_MAC_LEN);
+          free(payload);
         }
       }
     }

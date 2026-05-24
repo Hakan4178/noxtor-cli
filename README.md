@@ -2,6 +2,10 @@
 
 A minimalist CLI application. Aktif güvenlik açıkları ve bayram sebebi ile yeni özellikler ertelenmiştir.
 
+Arena.c secure
+
+Crypto.c maybe secure
+
 ## Requirements
 - GCC 14+
 - Linux Kernel

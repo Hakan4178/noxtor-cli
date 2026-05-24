@@ -17,6 +17,10 @@
 #include <string.h>
 #include <time.h>
 
+/* ── Magic number sabitleri ───────────────────── */
+#define SHORT_ID_SIZE       12
+#define PROGRESS_BAR_WIDTH  16
+
 /* ================================================================
  * VARSAYILAN TEMA — Kullanıcı paleti (truecolor 24-bit)
  *
@@ -95,9 +99,11 @@ void ui_restore_input(struct app_state *state) {
   /* Prompt'u yeniden bas */
   ui_print_prompt(state);
 
-  /* Kullanıcının yarım kalan girdisini geri yaz */
-  if (state->stdin_len > 0 && state->stdin_buf) {
-    fwrite(state->stdin_buf, 1, state->stdin_len, stderr);
+  /* Kullanıcının yarım kalan girdisini geri yaz (TOCTOU koruması) */
+  const char *buf = state->stdin_buf;
+  size_t len = state->stdin_len;
+  if (len > 0 && buf != NULL) {
+    fwrite(buf, 1, len, stderr);
   }
   fflush(stderr);
 }
@@ -116,7 +122,7 @@ void ui_print_prompt(struct app_state *state) {
     /* Onion kısaltma: ilk 4 + ".." + son 4 (toplam 10 karakter) */
     size_t olen = strlen(state->active_peer_onion);
     /* .onion kısmını çıkar — sadece hash'in ilk/son 4'ü */
-    char short_id[12];
+    char short_id[SHORT_ID_SIZE];
     if (olen > 10) {
       /* onion adresinden .onion'u çıkar */
       size_t hash_len = olen;
@@ -124,21 +130,29 @@ void ui_print_prompt(struct app_state *state) {
           strcmp(state->active_peer_onion + olen - 6, ".onion") == 0) {
         hash_len = olen - 6;
       }
-      snprintf(short_id, sizeof(short_id), "%.4s..%.4s",
-               state->active_peer_onion,
-               state->active_peer_onion + hash_len - 4);
+      /* hash_len underflow koruması: en az 8 karakter (4 baş + 4 son) */
+      if (hash_len >= 8) {
+        snprintf(short_id, sizeof(short_id), "%.4s..%.4s",
+                 state->active_peer_onion,
+                 state->active_peer_onion + hash_len - 4);
+      } else {
+        snprintf(short_id, sizeof(short_id), "%.*s",
+                 (int)hash_len, state->active_peer_onion);
+      }
     } else {
       snprintf(short_id, sizeof(short_id), "%.11s", state->active_peer_onion);
     }
 
     /* Dosya transferi progress göstergesi */
     if (state->tx_file.active && state->tx_file.total_size > 0) {
-      unsigned pct = (unsigned)((state->tx_file.sent_bytes * 100) /
+      unsigned pct = (unsigned)((state->tx_file.sent_bytes * 100ULL) /
                                 state->tx_file.total_size);
+      if (pct > 100) pct = 100;
       fprintf(stderr, "[%s ⬆%u%%]", short_id, pct);
     } else if (state->rx_file.active && state->rx_file.expected_size > 0) {
-      unsigned pct = (unsigned)((state->rx_file.received_bytes * 100) /
+      unsigned pct = (unsigned)((state->rx_file.received_bytes * 100ULL) /
                                 state->rx_file.expected_size);
+      if (pct > 100) pct = 100;
       fprintf(stderr, "[%s ⬇%u%%]", short_id, pct);
     } else {
       fprintf(stderr, "[%s]", short_id);
@@ -225,22 +239,22 @@ static void format_size(uint64_t bytes, char *buf, size_t buf_sz) {
 
 void ui_print_progress(struct app_state *state, const char *filename,
                        uint64_t done, uint64_t total, bool is_upload) {
-  (void)state; /* ileride save/restore gerekirse kullanılır */
-
   if (total == 0)
     return;
+
+  ui_save_input(state);
 
   unsigned pct = (unsigned)((done * 100ULL) / total);
   if (pct > 100)
     pct = 100;
 
-  /* 16 karakterlik ASCII bar */
-  int filled = (int)(pct * 16 / 100);
-  char bar[17];
-  for (int i = 0; i < 16; i++) {
+  /* Progress bar */
+  int filled = (int)(pct * PROGRESS_BAR_WIDTH / 100);
+  char bar[PROGRESS_BAR_WIDTH + 1];
+  for (int i = 0; i < PROGRESS_BAR_WIDTH; i++) {
     bar[i] = (i < filled) ? '=' : '-';
   }
-  bar[16] = '\0';
+  bar[PROGRESS_BAR_WIDTH] = '\0';
 
   char done_str[32], total_str[32];
   format_size(done, done_str, sizeof(done_str));
@@ -251,4 +265,6 @@ void ui_print_progress(struct app_state *state, const char *filename,
   fprintf(stderr, "\r\033[K  %s%s %s [%s] %u%% %s/%s%s", g_theme->clr_progress,
           arrow, filename, bar, pct, done_str, total_str, g_theme->clr_reset);
   fflush(stderr);
+
+  ui_restore_input(state);
 }

@@ -21,10 +21,27 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <limits.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <poll.h>
+
+/* ── Timeout sabitleri ────────────────────────── */
+#define NOX_READ_TIMEOUT_MS       10000
+#define NOX_CTRL_TIMEOUT_MS       5000
+#define NOX_BOOTSTRAP_TIMEOUT_MAX 3600
+#define NOX_CTRL_SOCK_WAIT_SEC    30
+#define NOX_CTRL_CONNECT_RETRIES  10
+
+/* ── EINTR-safe nanosleep ─────────────────────── */
+static void safe_nanosleep(const struct timespec *req) {
+  struct timespec ts = *req;
+  struct timespec rem;
+  while (nanosleep(&ts, &rem) == -1 && errno == EINTR) {
+    ts = rem;
+  }
+}
 
 /* ================================================================
  * I/O HELPERS — EINTR + EAGAIN/EWOULDBLOCK koruması
@@ -69,7 +86,7 @@ nox_err_t read_full(int fd, void *buf, size_t len) {
       if (errno == EAGAIN) {
 #endif
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int poller = poll(&pfd, 1, 10000); /* 10s timeout */
+        int poller = poll(&pfd, 1, NOX_READ_TIMEOUT_MS);
         if (poller <= 0) {
           return NOX_ERR_IO; /* Timeout veya hata */
         }
@@ -169,32 +186,114 @@ static nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
   return NOX_OK;
 }
 
+/* d_name güvenlik kontrolü — path traversal koruması */
+static bool is_safe_filename(const char *name) {
+  if (name[0] == '\0') return false;
+  if (strchr(name, '/') != NULL) return false;
+  if (strcmp(name, ".") == 0) return false;
+  if (strcmp(name, "..") == 0) return false;
+  return true;
+}
+
+/* Symlink-safe recursive delete.
+ * lstat() + O_NOFOLLOW + fstatat(AT_SYMLINK_NOFOLLOW) + unlinkat()
+ * ile symlink saldırılarını engeller. */
 static void rm_rf(const char *path) {
-  DIR *d = opendir(path);
-  if (!d) {
+  struct stat st;
+  if (lstat(path, &st) != 0)
+    return;
+
+  /* Symlink ise takip etmeden sil */
+  if (S_ISLNK(st.st_mode)) {
     unlink(path);
     return;
   }
+
+  /* Düz dosya */
+  if (!S_ISDIR(st.st_mode)) {
+    unlink(path);
+    return;
+  }
+
+  /* Dizin — O_NOFOLLOW ile aç */
+  int dirfd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dirfd < 0)
+    return;
+
+  DIR *d = fdopendir(dirfd);
+  if (!d) {
+    close(dirfd);
+    return;
+  }
+
   struct dirent *p;
   while ((p = readdir(d))) {
-    if (strcmp(p->d_name, ".") == 0 || strcmp(p->d_name, "..") == 0) {
+    if (!is_safe_filename(p->d_name))
       continue;
-    }
-    char buf[NOX_PATH_MAX];
-    int n = snprintf(buf, sizeof(buf), "%s/%s", path, p->d_name);
-    if (n > 0 && (size_t)n < sizeof(buf)) {
-      struct stat statbuf;
-      if (stat(buf, &statbuf) == 0) {
-        if (S_ISDIR(statbuf.st_mode)) {
-          rm_rf(buf);
-        } else {
-          unlink(buf);
-        }
+
+    struct stat statbuf;
+    if (fstatat(dirfd, p->d_name, &statbuf, AT_SYMLINK_NOFOLLOW) != 0)
+      continue;
+
+    if (S_ISDIR(statbuf.st_mode)) {
+      char subpath[NOX_PATH_MAX];
+      int n = snprintf(subpath, sizeof(subpath), "%s/%s", path, p->d_name);
+      if (n > 0 && (size_t)n < sizeof(subpath)) {
+        rm_rf(subpath);
       }
+    } else {
+      unlinkat(dirfd, p->d_name, 0);
     }
   }
-  closedir(d);
+  closedir(d); /* fdopendir'den sonra closedir dirfd'yi de kapatır */
   rmdir(path);
+}
+
+/* Stale PID'yi güvenli parse et (atoi yerine strtol + hata kontrolü) */
+static long safe_parse_pid(const char *str) {
+  char *endptr;
+  errno = 0;
+  long pid = strtol(str, &endptr, 10);
+  if (errno != 0 || *endptr != '\0' || pid <= 0 || pid > INT_MAX)
+    return -1;
+  return pid;
+}
+
+/* Stale Tor dizininin bizim UID'mize ait olduğunu ve
+ * ilişkili PID'nin artık çalışmadığını (veya Tor olmadığını) doğrula */
+static bool is_our_stale_entry(const char *full_path, long pid) {
+  struct stat st;
+  if (lstat(full_path, &st) != 0)
+    return false;
+
+  /* Sadece bizim UID'mize ait dosyaları temizle */
+  if (st.st_uid != getuid())
+    return false;
+
+  /* PID hâlâ çalışıyor mu kontrol et */
+  if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) {
+    /* Process var — Tor mu kontrol et (/proc/<pid>/comm) */
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%ld/comm", pid);
+    FILE *f = fopen(proc_path, "r");
+    if (f) {
+      char comm[32] = {0};
+      if (fgets(comm, sizeof(comm), f)) {
+        /* Trailing newline kaldır */
+        comm[strcspn(comm, "\n")] = '\0';
+        fclose(f);
+        if (strcmp(comm, "tor") == 0)
+          return false; /* Canlı Tor — silme */
+      } else {
+        fclose(f);
+      }
+    }
+    /* /proc okunamazsa da silme (process hâlâ canlı olabilir) */
+    if (kill((pid_t)pid, 0) == 0)
+      return false;
+  }
+
+  return true;
 }
 
 static void cleanup_stale_tor_dirs(const char *config_dir) {
@@ -204,28 +303,36 @@ static void cleanup_stale_tor_dirs(const char *config_dir) {
 
   struct dirent *p;
   while ((p = readdir(d))) {
+    if (!is_safe_filename(p->d_name))
+      continue;
+
+    long pid = -1;
+    bool is_data_dir = false;
+
     if (strncmp(p->d_name, "tor_data_", 9) == 0) {
-      int pid = atoi(p->d_name + 9);
-      if (pid > 0) {
-        if (kill(pid, 0) != 0 && errno == ESRCH) {
-          char path[NOX_PATH_MAX];
-          int n = snprintf(path, sizeof(path), "%s/%s", config_dir, p->d_name);
-          if (n > 0 && (size_t)n < sizeof(path)) {
-            rm_rf(path);
-          }
-        }
-      }
+      pid = safe_parse_pid(p->d_name + 9);
+      is_data_dir = true;
     } else if (strncmp(p->d_name, "torrc_", 6) == 0) {
-      int pid = atoi(p->d_name + 6);
-      if (pid > 0) {
-        if (kill(pid, 0) != 0 && errno == ESRCH) {
-          char path[NOX_PATH_MAX];
-          int n = snprintf(path, sizeof(path), "%s/%s", config_dir, p->d_name);
-          if (n > 0 && (size_t)n < sizeof(path)) {
-            unlink(path);
-          }
-        }
-      }
+      pid = safe_parse_pid(p->d_name + 6);
+    } else {
+      continue;
+    }
+
+    if (pid <= 0)
+      continue;
+
+    char path[NOX_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", config_dir, p->d_name);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+      continue;
+
+    if (!is_our_stale_entry(path, pid))
+      continue;
+
+    if (is_data_dir) {
+      rm_rf(path);
+    } else {
+      unlink(path);
     }
   }
   closedir(d);
@@ -361,7 +468,7 @@ static nox_err_t generate_torrc(struct app_state *state) {
 /* control.sock dosyasının oluşmasını bekler, Tor sürecini takip eder */
 static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
                                          int timeout_sec) {
-  struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; /* 100 ms */
+  const struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; /* 100 ms */
   int max_tries = timeout_sec * 10;
 
   for (int i = 0; i < max_tries; i++) {
@@ -389,7 +496,7 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
       return NOX_OK;
     }
 
-    nanosleep(&ts, NULL);
+    safe_nanosleep(&ts);
   }
 
   return NOX_ERR_TOR;
@@ -453,10 +560,10 @@ nox_err_t tor_spawn(struct app_state *state) {
   state->tor_pid = pid;
   NOX_INFO(LOG_MOD_NET, "Tor başlatıldı (PID=%d)", pid);
 
-  struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+  const struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
 
   /* Control soket dosyasını bekle (Tor async oluşturur) */
-  err = wait_for_control_socket(pid, socket_path, 30);
+  err = wait_for_control_socket(pid, socket_path, NOX_CTRL_SOCK_WAIT_SEC);
   if (err != NOX_OK) {
     NOX_ERROR(LOG_MOD_NET,
               "control.sock dosyası oluşturulamadı veya Tor çöktü");
@@ -478,12 +585,12 @@ nox_err_t tor_spawn(struct app_state *state) {
   strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
   int connected = 0;
-  for (int retry = 0; retry < 10; retry++) {
+  for (int retry = 0; retry < NOX_CTRL_CONNECT_RETRIES; retry++) {
     if (connect(ctrl_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
       connected = 1;
       break;
     }
-    nanosleep(&ts, NULL);
+    safe_nanosleep(&ts);
   }
 
   if (!connected) {
@@ -546,7 +653,7 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
     return err;
 
   char resp[256];
-  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), 5000);
+  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_CTRL_TIMEOUT_MS);
   if (err != NOX_OK)
     return err;
 
@@ -558,7 +665,7 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
  * TOR BOOTSTRAP BEKLEMESİ
  * ================================================================ */
 nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
-  if (timeout_sec <= 0 || timeout_sec > 3600) {
+  if (timeout_sec <= 0 || timeout_sec > NOX_BOOTSTRAP_TIMEOUT_MAX) {
     NOX_ERROR(LOG_MOD_NET, "timeout_sec geçersiz: %d", timeout_sec);
     return NOX_ERR_TOR;
   }
@@ -566,7 +673,7 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
   NOX_INFO(LOG_MOD_NET, "Tor bootstrap bekleniyor (timeout=%ds)...",
            timeout_sec);
 
-  struct timespec ts = {.tv_sec = 2, .tv_nsec = 0};
+  const struct timespec ts = {.tv_sec = 2, .tv_nsec = 0};
 
   for (int elapsed = 0; elapsed < timeout_sec; elapsed += 2) {
     nox_err_t err =
@@ -575,7 +682,7 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
       return err;
 
     char resp[512];
-    err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), 5000);
+    err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_CTRL_TIMEOUT_MS);
     if (err != NOX_OK)
       return err;
 
@@ -590,7 +697,7 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
       NOX_INFO(LOG_MOD_NET, "Tor bootstrap: %%%d", pct);
     }
 
-    nanosleep(&ts, NULL);
+    safe_nanosleep(&ts);
   }
 
   NOX_ERROR(LOG_MOD_NET, "Tor bootstrap timeout (%ds)", timeout_sec);
@@ -614,7 +721,7 @@ nox_err_t tor_create_hidden_service(int ctrl_fd, uint16_t local_port,
     return err;
 
   char resp[512];
-  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), 10000);
+  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_READ_TIMEOUT_MS);
   if (err != NOX_OK)
     return err;
 
@@ -662,7 +769,7 @@ nox_err_t tor_get_socks_port(int ctrl_fd, uint16_t *port_out) {
     return err;
 
   char resp[512];
-  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), 5000);
+  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_CTRL_TIMEOUT_MS);
   if (err != NOX_OK)
     return err;
 
@@ -713,8 +820,8 @@ void tor_shutdown(struct app_state *state) {
           stopped = true;
           break;
         }
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000};
-        nanosleep(&ts, NULL);
+        const struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000};
+        safe_nanosleep(&ts);
       }
       if (!stopped) {
         kill(state->tor_pid, SIGKILL);
