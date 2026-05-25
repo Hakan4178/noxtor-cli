@@ -453,12 +453,11 @@ static nox_err_t write_msg1(struct noise_handshake *hs,
 
     /* Generate ephemeral key pair */
 #ifndef NOISE_TEST_DETERMINISTIC
-    crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
+    crypto_box_keypair(hs->e_pub, hs->e);
 #else
     /* Test: inject edilmişse onu kullan, yoksa rastgele üret */
     if (sodium_is_zero(hs->e, NOX_KEY_LEN))
-        crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
-    else
+          crypto_box_keypair(hs->e_pub, hs->e);
         crypto_scalarmult_base(hs->e_pub, hs->e);
 #endif
 
