@@ -18,7 +18,7 @@ network.c 5 kritik 3 orta açık kaldı
 
 noise.c 1 kritik 2 orta 2 düşük açık kaldı
 
-stdin_handler.c 2 orta 3 düşük açık kaldı
+stdin_handler.c 3 düşük açık kaldı
 
 ui.c 2 kritik 2 orta 3 düşük açık kaldı
 
