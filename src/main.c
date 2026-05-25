@@ -298,8 +298,8 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
     if (!fgets(confirm_buf, (int)sizeof(confirm_buf), stdin)) {
       if (is_terminal)
         tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
-      explicit_bzero(pin_buf, buf_size);
-      explicit_bzero(confirm_buf, sizeof(confirm_buf));
+      sodium_memzero(pin_buf, buf_size);
+      sodium_memzero(confirm_buf, sizeof(confirm_buf));
       fprintf(stderr, "\n");
       return NOX_ERR_PIN;
     }
@@ -329,16 +329,16 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
      */
     char pad_a[NOX_PIN_MAX_LEN + 2];
     char pad_b[NOX_PIN_MAX_LEN + 2];
-    explicit_bzero(pad_a, sizeof(pad_a));
-    explicit_bzero(pad_b, sizeof(pad_b));
+    sodium_memzero(pad_a, sizeof(pad_a));
+    sodium_memzero(pad_b, sizeof(pad_b));
     memcpy(pad_a, pin_buf, len);
     memcpy(pad_b, confirm_buf, strlen(confirm_buf));
 
     int match = sodium_memcmp(pad_a, pad_b, sizeof(pad_a));
 
-    explicit_bzero(pad_a, sizeof(pad_a));
-    explicit_bzero(pad_b, sizeof(pad_b));
-    explicit_bzero(confirm_buf, sizeof(confirm_buf));
+    sodium_memzero(pad_a, sizeof(pad_a));
+    sodium_memzero(pad_b, sizeof(pad_b));
+    sodium_memzero(confirm_buf, sizeof(confirm_buf));
 
     if (match != 0) {
       if (is_terminal)
@@ -376,7 +376,7 @@ static void cleanup(struct app_state *state) {
 
   /* Async stdin buffer scrubbing and free */
   if (state->stdin_buf) {
-    explicit_bzero(state->stdin_buf, state->stdin_cap);
+    sodium_memzero(state->stdin_buf, state->stdin_cap);
     free(state->stdin_buf);
     state->stdin_buf = NULL;
     state->stdin_len = 0;
@@ -593,8 +593,8 @@ static void event_loop(struct app_state *state) {
 
               char name[NOX_CONTACT_NAME_LEN + 1];
               uint8_t stored_key[NOX_KEY_LEN];
-              explicit_bzero(name, sizeof(name));
-              explicit_bzero(stored_key, sizeof(stored_key));
+              sodium_memzero(name, sizeof(name));
+              sodium_memzero(stored_key, sizeof(stored_key));
 
               nox_err_t db_err =
                   db_get_contact(peer_onion, name, sizeof(name), stored_key);
@@ -966,7 +966,7 @@ static void prompt_transport_selection(struct app_state *state) {
     err = read_pin(pin_buf, sizeof(pin_buf), state.first_run);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "PIN hatası: %s", nox_strerror(err));
-      explicit_bzero(pin_buf, sizeof(pin_buf));
+      sodium_memzero(pin_buf, sizeof(pin_buf));
       return 1;
     }
 
@@ -974,7 +974,7 @@ static void prompt_transport_selection(struct app_state *state) {
     err = arena_init(&state.arena, NOX_ARENA_DEFAULT_SIZE);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "arena başlatılamadı: %s", nox_strerror(err));
-      explicit_bzero(pin_buf, sizeof(pin_buf));
+      sodium_memzero(pin_buf, sizeof(pin_buf));
       return 1;
     }
 
@@ -983,7 +983,7 @@ static void prompt_transport_selection(struct app_state *state) {
     err = crypto_load_or_create_salt(salt, state.config_dir);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "salt hatası: %s", nox_strerror(err));
-      explicit_bzero(pin_buf, sizeof(pin_buf));
+      sodium_memzero(pin_buf, sizeof(pin_buf));
       arena_destroy(&state.arena);
       return 1;
     }
@@ -992,7 +992,7 @@ static void prompt_transport_selection(struct app_state *state) {
     state.master_key = arena_alloc(&state.arena, NOX_KEY_LEN);
     if (!state.master_key) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (master_key)");
-      explicit_bzero(pin_buf, sizeof(pin_buf));
+      sodium_memzero(pin_buf, sizeof(pin_buf));
       arena_destroy(&state.arena);
       return 1;
     }
@@ -1001,8 +1001,8 @@ static void prompt_transport_selection(struct app_state *state) {
                                    salt);
 
     /* PIN artık gerekli değil — hemen sil */
-    explicit_bzero(pin_buf, sizeof(pin_buf));
-    explicit_bzero(salt, sizeof(salt));
+    sodium_memzero(pin_buf, sizeof(pin_buf));
+    sodium_memzero(salt, sizeof(salt));
     memory_barrier();
     NOX_INFO(LOG_MOD_MAIN, "PIN ve salt bellekten silindi");
 
@@ -1045,8 +1045,8 @@ static void prompt_transport_selection(struct app_state *state) {
     /* Geçici Ed25519 tamponları */
     uint8_t ed_pub[32];
     uint8_t ed_sk[64];
-    explicit_bzero(ed_pub, sizeof(ed_pub));
-    explicit_bzero(ed_sk, sizeof(ed_sk));
+    sodium_memzero(ed_pub, sizeof(ed_pub));
+    sodium_memzero(ed_sk, sizeof(ed_sk));
 
     if (state.first_run) {
       /* İlk çalıştırma: yeni key pair üret ve kaydet */
@@ -1087,15 +1087,15 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     /* Hassas geçici Ed25519 verileri sıfırla */
-    explicit_bzero(ed_pub, sizeof(ed_pub));
-    explicit_bzero(ed_sk, sizeof(ed_sk));
+    sodium_memzero(ed_pub, sizeof(ed_pub));
+    sodium_memzero(ed_sk, sizeof(ed_sk));
     memory_barrier();
 
     /*
      * identity_unlock artık gerekli değil — hemen sil.
      * Bu en hassas subkey: identity.key'i açan anahtar.
      */
-    explicit_bzero(identity_unlock, NOX_KEY_LEN);
+    sodium_memzero(identity_unlock, NOX_KEY_LEN);
     memory_barrier();
     identity_unlock = NULL;
     NOX_DEBUG(LOG_MOD_MAIN, "identity_unlock bellekten silindi");
@@ -1186,10 +1186,11 @@ static void prompt_transport_selection(struct app_state *state) {
                pt_len);
 
       /* Temizle */
-      explicit_bzero(&sa, sizeof(sa));
-      explicit_bzero(&sb, sizeof(sb));
-      explicit_bzero(alice_priv, sizeof(alice_priv));
-      explicit_bzero(bob_priv, sizeof(bob_priv));
+      sodium_memzero(&sa, sizeof(sa));
+      sodium_memzero(&sb, sizeof(sb));
+      sodium_memzero(alice_priv, sizeof(alice_priv));
+      sodium_memzero(bob_priv, sizeof(bob_priv));
+      
     }
     NOX_INFO(LOG_MOD_MAIN, "=== Noise demo tamamlandı ===");
 
