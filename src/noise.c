@@ -648,7 +648,7 @@ nox_err_t handshake_read(struct noise_handshake *hs,
                          uint8_t *payload_out, size_t *pl_len)
 {
     if (!hs || !msg || !pl_len) return NOX_ERR_PROTO;
-    if (!payload_out) { size_t dummy = 0; pl_len = &dummy; }
+    if (!payload_out) return NOX_ERR_PROTO;
 
     nox_err_t err;
 
