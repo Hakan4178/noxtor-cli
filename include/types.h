@@ -131,6 +131,9 @@ enum tor_transport_type {
     TRANSPORT_OBFS4
 };
 
+/* CRIT-1: tx_buf için güvenli kapasite sabiti */
+#define TX_BUF_CAPACITY (FRAME_HEADER_WIRE_SIZE + 4096 + NOX_MAC_LEN)
+
 struct file_rx_state {
     bool     active;
     int      fd;                  /* hedef dosya tanımlayıcısı */
@@ -139,6 +142,9 @@ struct file_rx_state {
     uint64_t received_bytes;
     uint8_t  expected_hash[32];   /* 256-bit BLAKE2b */
     crypto_generichash_state hash_state;
+
+    /* B-1 FIX: unlinkat için gerçek dosya adı */
+    char     local_name[300];
 };
 
 struct file_tx_state {
@@ -149,8 +155,11 @@ struct file_tx_state {
     uint64_t sent_bytes;
     uint8_t  hash[32];            /* önceden hesaplanan BLAKE2b */
     
-    /* Kısmi yazım için frame tamponu */
-    uint8_t  tx_buf[4096 + 13 + NOX_MAC_LEN]; /* frame_header(13) + payload + MAC */
+    /* D-1 FIX: önceden ayrılmış şifresiz tampon (stack yerine heap) */
+    uint8_t *plain_buf;
+
+    /* Kısmi yazım için frame tamponu — boyut TX_BUF_CAPACITY ile sabit */
+    uint8_t  tx_buf[TX_BUF_CAPACITY];
     size_t   tx_len;              /* mevcut frame'in toplam boyutu */
     size_t   tx_offset;           /* şimdiye dek yazılan byte */
     size_t   current_chunk_size;  /* mevcut şifrelenmemiş dosya boyutu */
