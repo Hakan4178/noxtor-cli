@@ -15,6 +15,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sodium.h>
+#include <stdbool.h>
 
 /* ================================================================
  * YARDIMCI METOTLAR
@@ -22,22 +24,43 @@
 
 /* UTF-8 multi-byte karakter sınırına göre bir sonraki güvenli bölme boyutunu bulur */
 static size_t get_next_chunk_size(const char *msg, size_t offset, size_t total_len) {
-  size_t chunk_limit = 4000;
-  if (total_len - offset <= chunk_limit) {
-    return total_len - offset;
-  }
+  /* Underflow koruması */
+  if (offset >= total_len) return 0;
+
+  const size_t chunk_limit = 4000U;
+  size_t remaining = total_len - offset;
+
+  if (remaining <= chunk_limit) return remaining;
+
+  /* Overflow koruması: offset + chunk_limit */
+  if (offset > SIZE_MAX - chunk_limit) return chunk_limit;
 
   size_t size = chunk_limit;
-  /* UTF-8 devam byte'ları 10xxxxxx (0x80 - 0xBF) formatındadır */
   while (size > 0 && ((uint8_t)msg[offset + size] & 0xC0) == 0x80) {
     size--;
   }
 
-  /* Fallback safety guard */
-  if (size == 0) {
-    return chunk_limit;
+  return (size == 0) ? chunk_limit : size;
+}
+
+/* ================================================================
+ * ONION ADRES DOĞRULAMA
+ * ================================================================ */
+
+static bool validate_onion_input(const char *onion, size_t len) {
+  if (len != NOX_ONION_LEN) return false;   /* 56 + ".onion" = 62 */
+
+  /* 56 base32 karakter */
+  for (size_t i = 0; i < 56; i++) {
+    char c = onion[i];
+    bool ok = (c >= 'a' && c <= 'z') ||
+              (c >= 'A' && c <= 'Z') ||
+              (c >= '2' && c <= '7');
+    if (!ok) return false;
   }
-  return size;
+
+  /* .onion suffix */
+  return memcmp(onion + 56, ".onion", 6) == 0;
 }
 
 /* ================================================================
@@ -46,15 +69,29 @@ static size_t get_next_chunk_size(const char *msg, size_t offset, size_t total_l
 
 nox_err_t send_queued_callback(const char *text, void *ctx) {
   struct app_state *state = (struct app_state *)ctx;
-  if (state->peer_fd < 0 || !state->session)
+  if (!state || state->peer_fd < 0 || !state->session)
     return NOX_ERR_NET;
 
   size_t pt_len = strlen(text) + 1;
-  uint8_t payload[4096 + NOX_MAC_LEN];
-  ssize_t ct_len =
-      noise_encrypt(state->session, (const uint8_t *)text, pt_len, payload);
-  if (ct_len < 0)
+
+  /* Boyut kontrolü */
+  if (pt_len > 4096) {
+    NOX_WARN(LOG_MOD_MAIN,
+             "queued mesaj çok uzun (%zu), atlanıyor", pt_len);
+    return NOX_ERR_PROTO;
+  }
+
+  /* sodium_malloc — swap koruması */
+  uint8_t *payload = sodium_malloc(4096 + NOX_MAC_LEN);
+  if (!payload) return NOX_ERR_ALLOC;
+
+  ssize_t ct_len = noise_encrypt(state->session,
+                                 (const uint8_t *)text,
+                                 pt_len, payload);
+  if (ct_len < 0) {
+    sodium_free(payload);
     return NOX_ERR_CRYPTO;
+  }
 
   struct frame_header fh = {
       .magic = NOX_FRAME_MAGIC,
@@ -65,12 +102,14 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
   uint8_t wire[FRAME_HEADER_WIRE_SIZE];
   frame_header_encode(&fh, wire);
 
-  if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK)
-    return NOX_ERR_IO;
-  if (write_full(state->peer_fd, payload, (size_t)ct_len) != NOX_OK)
-    return NOX_ERR_IO;
+  nox_err_t err = NOX_OK;
+  if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
+      write_full(state->peer_fd, payload, (size_t)ct_len) != NOX_OK) {
+    err = NOX_ERR_IO;
+  }
 
-  return NOX_OK;
+  sodium_free(payload);   /* her durumda, otomatik sıfırlar */
+  return err;
 }
 
 /* Uzun bir mesajı güvenli chunk'lara ayırıp sırayla şifreleyerek sokete yazar */
@@ -81,12 +120,12 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
   size_t total_len = strlen(msg);
   size_t offset = 0;
 
-  uint8_t *ct = malloc(4096 + NOX_MAC_LEN);
-  char *chunk = malloc(4096);
+  uint8_t *ct    = sodium_malloc(4096 + NOX_MAC_LEN);
+  char    *chunk = sodium_malloc(4096 + 1);   /* NUL için +1 */
   if (!ct || !chunk) {
-    free(ct);
-    free(chunk);
-    return NOX_ERR_CONFIG;
+    sodium_free(ct);
+    sodium_free(chunk);
+    return NOX_ERR_ALLOC;
   }
 
   while (offset < total_len) {
@@ -98,10 +137,8 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
     ssize_t ct_len =
         noise_encrypt(state->session, (const uint8_t *)chunk, pt_len, ct);
     if (ct_len < 0) {
-      explicit_bzero(chunk, 4096);
-      explicit_bzero(ct, 4096 + NOX_MAC_LEN);
-      free(chunk);
-      free(ct);
+      sodium_free(chunk);
+      sodium_free(ct);
       return NOX_ERR_CRYPTO;
     }
 
@@ -116,20 +153,16 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
 
     if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
         write_full(state->peer_fd, ct, (size_t)ct_len) != NOX_OK) {
-      explicit_bzero(chunk, 4096);
-      explicit_bzero(ct, 4096 + NOX_MAC_LEN);
-      free(chunk);
-      free(ct);
+      sodium_free(chunk);
+      sodium_free(ct);
       return NOX_ERR_IO;
     }
 
     offset += chunk_len;
   }
 
-  explicit_bzero(chunk, 4096);
-  explicit_bzero(ct, 4096 + NOX_MAC_LEN);
-  free(chunk);
-  free(ct);
+  sodium_free(chunk);
+  sodium_free(ct);
   return NOX_OK;
 }
 
@@ -138,9 +171,9 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
   size_t total_len = strlen(msg);
   size_t offset = 0;
 
-  char *chunk = malloc(4096);
+  char *chunk = sodium_malloc(4096 + 1);   /* NUL için +1 */
   if (!chunk)
-    return NOX_ERR_CONFIG;
+    return NOX_ERR_ALLOC;
 
   while (offset < total_len) {
     size_t chunk_len = get_next_chunk_size(msg, offset, total_len);
@@ -149,16 +182,14 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
 
     nox_err_t err = db_queue_message(recipient_onion, chunk);
     if (err != NOX_OK) {
-      explicit_bzero(chunk, 4096);
-      free(chunk);
+      sodium_free(chunk);
       return err;
     }
 
     offset += chunk_len;
   }
 
-  explicit_bzero(chunk, 4096);
-  free(chunk);
+  sodium_free(chunk);
   return NOX_OK;
 }
 
@@ -170,9 +201,22 @@ void process_line(struct app_state *state, const char *line) {
   /* ── TOFU Onay Modu ─────────────────── */
   if (state->tofu_pending) {
     if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
-      db_add_contact(state->tofu_onion, state->tofu_name, state->tofu_new_key);
-      ui_print_system(state, "[✓] Akran onaylandı ve kaydedildi: %s",
-                      state->tofu_name);
+      /* hs geçerlilik kontrolü */
+      if (!state->hs) {
+        ui_print_error(state,
+            "Handshake durumu geçersiz (peer ayrılmış olabilir)");
+        state->tofu_pending = false;
+        state->peer_fd = -1;
+        return;
+      }
+
+      /* db_add_contact dönüş kontrolü */
+      nox_err_t db_err = db_add_contact(
+          state->tofu_onion, state->tofu_name, state->tofu_new_key);
+      if (db_err != NOX_OK) {
+        ui_print_error(state, "Rehbere kaydetme başarısız");
+        /* devam et — session yine kurulabilir */
+      }
 
       state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
       if (state->session) {
@@ -249,6 +293,13 @@ void process_line(struct app_state *state, const char *line) {
       return;
     }
 
+    /* Onion adres format doğrulaması */
+    if (!validate_onion_input(onion_start, onion_len)) {
+      ui_print_error(state,
+          "Geçersiz onion adresi formatı (56 base32 karakter + .onion)");
+      return;
+    }
+
     char onion[NOX_ONION_LEN + 1];
     memcpy(onion, onion_start, NOX_ONION_LEN);
     onion[NOX_ONION_LEN] = '\0';
@@ -288,6 +339,13 @@ void process_line(struct app_state *state, const char *line) {
 
     if (onion_len != NOX_ONION_LEN || *p == '\0') {
       ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>");
+      return;
+    }
+
+    /* Onion adres format doğrulaması */
+    if (!validate_onion_input(onion_start, onion_len)) {
+      ui_print_error(state,
+          "Geçersiz onion adresi (56 base32 karakter + .onion)");
       return;
     }
 
@@ -332,6 +390,14 @@ void process_line(struct app_state *state, const char *line) {
       return;
     }
 
+    /* Onion adres doğrulaması */
+    size_t target_len = strlen(target);
+    if (!validate_onion_input(target, target_len)) {
+      ui_print_error(state,
+          "Geçersiz onion adresi (sadece .onion adresleri desteklenir)");
+      return;
+    }
+
     NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
     int peer_fd = -1;
     nox_err_t err =
@@ -353,11 +419,9 @@ void process_line(struct app_state *state, const char *line) {
       return;
     }
 
-    uint8_t cpriv[NOX_KEY_LEN];
     handshake_init(state->hs, true,
                state->my_static_priv,
-               state->my_static_pub);    
-    explicit_bzero(cpriv, sizeof(cpriv));
+               state->my_static_pub);
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
     size_t hslen = sizeof(hsbuf);
@@ -394,19 +458,43 @@ void process_line(struct app_state *state, const char *line) {
 }
 
 void process_stdin_events(struct app_state *state) {
+#define STDIN_BUF_MAX  (64 * 1024U)   /* 64 KB üst sınır */
+#define STDIN_BUF_INIT 512U
+
   for (;;) {
     if (state->stdin_len + 512 >= state->stdin_cap) {
-      size_t new_cap = state->stdin_cap == 0 ? 512 : state->stdin_cap * 2;
-      char *new_buf = malloc(new_cap);
+      /* Overflow koruması ve üst sınır */
+      if (state->stdin_cap > STDIN_BUF_MAX / 2) {
+        if (state->stdin_cap >= STDIN_BUF_MAX) {
+          NOX_WARN(LOG_MOD_MAIN,
+                   "stdin buffer limit aşıldı (%u KB), satır bekleniyor",
+                   STDIN_BUF_MAX / 1024);
+          sodium_memzero(state->stdin_buf, state->stdin_cap);
+          state->stdin_len = 0;
+          return;
+        }
+      }
+
+      size_t new_cap = state->stdin_cap == 0
+                       ? STDIN_BUF_INIT
+                       : state->stdin_cap * 2;
+
+      if (new_cap > STDIN_BUF_MAX) new_cap = STDIN_BUF_MAX;
+
+      char *new_buf = sodium_malloc(new_cap);
       if (!new_buf) {
-        NOX_ERROR(LOG_MOD_MAIN, "stdin buffer malloc failed");
+        NOX_ERROR(LOG_MOD_MAIN, "stdin buffer genişletme başarısız");
         return;
       }
-      if (state->stdin_buf) {
+
+      if (state->stdin_buf && state->stdin_len > 0) {
         memcpy(new_buf, state->stdin_buf, state->stdin_len);
-        explicit_bzero(state->stdin_buf, state->stdin_cap);
-        free(state->stdin_buf);
       }
+
+      if (state->stdin_buf) {
+        sodium_free(state->stdin_buf);   /* otomatik sıfırlar */
+      }
+
       state->stdin_buf = new_buf;
       state->stdin_cap = new_cap;
     }
@@ -433,7 +521,7 @@ void process_stdin_events(struct app_state *state) {
     if (r == 0) {
       if (state->stdin_len > 0) {
         process_line(state, state->stdin_buf);
-        explicit_bzero(state->stdin_buf, state->stdin_cap);
+        sodium_memzero(state->stdin_buf, state->stdin_cap);
         state->stdin_len = 0;
       }
       return;
@@ -445,8 +533,9 @@ void process_stdin_events(struct app_state *state) {
     char *newline;
     while ((newline = memchr(state->stdin_buf, '\n', state->stdin_len)) != NULL) {
       size_t line_len = (size_t)(newline - state->stdin_buf);
-      char *line = malloc(line_len + 1);
+      char *line = sodium_malloc(line_len + 1);
       if (!line) {
+        NOX_ERROR(LOG_MOD_MAIN, "line buffer alloc başarısız");
         return;
       }
       memcpy(line, state->stdin_buf, line_len);
@@ -476,7 +565,7 @@ void process_stdin_events(struct app_state *state) {
         ui_restore_input(state);
       }
 
-      free(line);
+      sodium_free(line);
     }
   }
 }
