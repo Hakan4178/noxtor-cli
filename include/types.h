@@ -132,7 +132,7 @@ enum tor_transport_type {
 };
 
 /* CRIT-1: tx_buf için güvenli kapasite sabiti */
-#define TX_BUF_CAPACITY (FRAME_HEADER_WIRE_SIZE + 4096 + NOX_MAC_LEN)
+#define TX_BUF_CAPACITY (13 + 4096 + NOX_MAC_LEN)
 
 struct file_rx_state {
     bool     active;
