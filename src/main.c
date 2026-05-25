@@ -377,7 +377,7 @@ static void cleanup(struct app_state *state) {
   /* Async stdin buffer scrubbing and free */
   if (state->stdin_buf) {
     sodium_memzero(state->stdin_buf, state->stdin_cap);
-    free(state->stdin_buf);
+    sodium_free(state->stdin_buf);
     state->stdin_buf = NULL;
     state->stdin_len = 0;
     state->stdin_cap = 0;
