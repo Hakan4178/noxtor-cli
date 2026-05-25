@@ -316,7 +316,7 @@ void process_line(struct app_state *state, const char *line) {
     snprintf(name, sizeof(name), "%s", name_start);
 
     uint8_t zero_key[NOX_KEY_LEN];
-    explicit_bzero(zero_key, sizeof(zero_key));
+    sodium_memzero(zero_key, sizeof(zero_key));
 
     nox_err_t err = db_add_contact(onion, name, zero_key);
     if (err == NOX_OK) {
