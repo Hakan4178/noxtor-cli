@@ -106,10 +106,14 @@ static void secure_abort(const struct secure_arena *a, const char *msg)
     fflush(stderr);
 
     /* Canary bozulduysa base ve size'a güvenme, sanity check ile wipe yap */
-    if (a && a->base && a->total_size > 0 && a->total_size < 10 * 1024 * 1024) {
-        sodium_memzero(a->base, a->total_size);
+    if (a && a->base && a->page_size > 0 && a->total_size > 2 * a->page_size) {
+    uint8_t *usable = (uint8_t *)a->base + a->page_size;
+    size_t   wipe   = a->total_size - 2 * a->page_size;
+        
+    sodium_memzero(usable, wipe);
+        
     }
-
+    
     abort(); /* SIGABRT — signal handler'lar yine de tetiklenebilir */
 }
 
