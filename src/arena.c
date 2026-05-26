@@ -92,31 +92,36 @@ static size_t page_align(size_t size, size_t page_size)
  * P6: Core dump üretimini kapatır, ardından abort() çağırır.
  * PR_SET_DUMPABLE=0 → /proc/PID/mem erişimini de engeller.
  * ================================================================ */
-static void secure_abort(const struct secure_arena *a, const char *msg)
-{
-    /* Core dump'ı kapat */
+static void secure_abort(const struct secure_arena *a, const char *msg {
+    
 #ifdef PR_SET_DUMPABLE
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 #endif
-
     fprintf(stderr,
             "\n[FATAL] %s\n"
-            "[FATAL] Güvenlik ihlali — program sonlandırılıyor.\n",
-            msg);
+            "[FATAL] Güvenlik ihlali — program sonlandırılıyor.\n", msg);
     fflush(stderr);
 
-    /* Canary bozulduysa base ve size'a güvenme, sanity check ile wipe yap */
-    if (a && a->base && a->page_size > 0 && a->total_size > 2 * a->page_size) {
-    uint8_t *usable = (uint8_t *)a->base + a->page_size;
-    size_t   wipe   = a->total_size - 2 * a->page_size;
-        
-    sodium_memzero(usable, wipe);
-        
-    }
-    
-    abort(); /* SIGABRT — signal handler'lar yine de tetiklenebilir */
-}
+    if (a && a->base && a->page_size > 0 && a->usable_size > 0) {
+        /*
+         * total_size yerine usable_size + NOX_CANARY_LEN kullan.
+         * Bu değerler struct içinde bağımsız tutulduğundan
+         * total_size kirlenmesi wipe sınırını etkilemez.
+         *
+         * Ek koruma: wipe'ı makul bir üst sınırla kırp.
+         */
+        size_t wipe = a->usable_size + NOX_CANARY_LEN;
 
+        /* Savunmacı üst sınır: 256 MB'dan fazlasını silme */
+        const size_t MAX_WIPE = 256U * 1024U * 1024U;
+        if (wipe > MAX_WIPE) wipe = MAX_WIPE;
+
+        uint8_t *usable_start = (uint8_t *)a->base + a->page_size;
+        sodium_memzero(usable_start, wipe);
+    }
+
+    abort();
+}
 /* ================================================================
  * arena_init — Güvenli arena oluştur
  *
