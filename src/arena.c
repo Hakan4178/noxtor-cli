@@ -92,7 +92,7 @@ static size_t page_align(size_t size, size_t page_size)
  * P6: Core dump üretimini kapatır, ardından abort() çağırır.
  * PR_SET_DUMPABLE=0 → /proc/PID/mem erişimini de engeller.
  * ================================================================ */
-static void secure_abort(const struct secure_arena *a, const char *msg {
+static void secure_abort(const struct secure_arena *a, const char *msg) {
     
 #ifdef PR_SET_DUMPABLE
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
