@@ -214,7 +214,7 @@ nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
 void db_close(void) {
   DB_LOCK();
   if (g_state.db) {
-    sqlite3_close(g_state.db);
+    sqlite3_close_v2(g_state.db);
     g_state.db = NULL;
   }
   g_state.db_key = NULL;
