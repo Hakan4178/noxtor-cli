@@ -203,10 +203,10 @@ static nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
         line[3] == ' ')
       break;
 
-    if (llen >= 3 && line[0] >= '4') {
-      buf[total] = '\0';
-      NOX_ERROR(LOG_MOD_NET, "Tor hatası: %s", line);
-      return NOX_ERR_TOR;
+     if (llen >= 3 && (line[0] == '4' || line[0] == '5')) {
+       buf[total] = '\0';
+       NOX_ERROR(LOG_MOD_NET, "Tor hatası: %s", line);
+       return NOX_ERR_TOR;
     }
   }
 
