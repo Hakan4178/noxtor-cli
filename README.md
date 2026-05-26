@@ -6,15 +6,15 @@ Arena.c secure
 
 Crypto.c secure
 
-Database.c secure
+Database.c 2 düşük açık kaldı.
 
 file_tranfer 3 düşük öncelikli açık kaldı
 
 log.c 1 orta 3 düşük öncelikli açık kaldı
 
-main.c 3 Kritik 7 orta 5 düşük açık kaldı
+main.c 3 Kritik 6 orta 4 düşük açık kaldı
 
-network.c 4 kritik 3 orta açık kaldı
+network.c 3 kritik 3 orta açık kaldı
 
 noise.c 1 kritik 1 orta 2 düşük açık kaldı
 
