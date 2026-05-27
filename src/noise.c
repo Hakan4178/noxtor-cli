@@ -41,7 +41,7 @@ NOX_STATIC_ASSERT(crypto_scalarmult_curve25519_BYTES == NOX_KEY_LEN,
 
 void cipher_init(struct noise_cipher_state *cs)
 {
-    explicit_bzero(cs, sizeof(*cs));
+    sodium_memzero(cs, sizeof(*cs));
     cs->has_key = false;
     cs->n = 0;
 }
@@ -152,7 +152,7 @@ void symmetric_init(struct noise_symmetric_state *ss,
 
     if (name_len <= NOISE_HASHLEN) {
         /* Pad with zeros */
-        memset(ss->h, 0, NOISE_HASHLEN);
+        sodium_memzero(ss->h, 0, NOISE_HASHLEN);
         memcpy(ss->h, protocol_name, name_len);
     } else {
         /* Hash the name */
