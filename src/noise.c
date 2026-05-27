@@ -260,8 +260,8 @@ static void hkdf_blake2b(const uint8_t ck[NOISE_HASHLEN],
     buf[NOISE_HASHLEN] = 0x02;
     hmac_blake2b(temp_key, NOISE_HASHLEN, buf, sizeof(buf), out2);
 
-    explicit_bzero(temp_key, sizeof(temp_key));
-    explicit_bzero(buf, sizeof(buf));
+    sodium_memzero(temp_key, sizeof(temp_key));
+    sodium_memzero(buf, sizeof(buf));
 }
 
 /*
@@ -278,7 +278,7 @@ void symmetric_mix_key(struct noise_symmetric_state *ss,
                  ss->ck, temp_k);
 
     cipher_init_key(&ss->cs, temp_k);
-    explicit_bzero(temp_k, sizeof(temp_k));
+    sodium_memzero(temp_k, sizeof(temp_k));
 }
 
 /*
@@ -323,7 +323,7 @@ ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                     ciphertext, ct_len,
                                     out);
 
-    explicit_bzero(h_backup, sizeof(h_backup));
+    sodium_memzero(h_backup, sizeof(h_backup));
 
     if (pt_len < 0) {
         /* MAC failed — h durumu bozulmuş, ama handshake zaten abort */
@@ -456,9 +456,11 @@ static nox_err_t write_msg1(struct noise_handshake *hs,
     crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
 #else
     /* Test: inject edilmişse onu kullan, yoksa rastgele üret */
-    if (sodium_is_zero(hs->e, NOX_KEY_LEN))
-          crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
+    if (sodium_is_zero(hs->e, NOX_KEY_LEN))  {
+       crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
+    } else {
         crypto_scalarmult_base(hs->e_pub, hs->e);
+    }
 #endif
 
     /* ← e */
@@ -481,7 +483,7 @@ static nox_err_t write_msg1(struct noise_handshake *hs,
     /* es: DH(s, re) */
     if (noise_dh(dh_out, hs->s, hs->re) != NOX_OK) return NOX_ERR_CRYPTO;
     symmetric_mix_key(&hs->ss, dh_out, NOX_KEY_LEN);
-    explicit_bzero(dh_out, sizeof(dh_out));
+    sodium_memzero(dh_out, sizeof(dh_out));
 
     /* payload */
     ct = symmetric_encrypt_and_hash(&hs->ss, payload, pl_len, out + offset);
@@ -510,7 +512,7 @@ static nox_err_t write_msg2(struct noise_handshake *hs,
     /* se: DH(s, re) */
     if (noise_dh(dh_out, hs->s, hs->re) != NOX_OK) return NOX_ERR_CRYPTO;
     symmetric_mix_key(&hs->ss, dh_out, NOX_KEY_LEN);
-    explicit_bzero(dh_out, sizeof(dh_out));
+    sodium_memzero(dh_out, sizeof(dh_out));
 
     /* payload */
     ct = symmetric_encrypt_and_hash(&hs->ss, payload, pl_len, out + offset);
@@ -587,7 +589,7 @@ static nox_err_t read_msg1(struct noise_handshake *hs,
     /* ee: DH(e, re) */
     if (noise_dh(dh_out, hs->e, hs->re) != NOX_OK) return NOX_ERR_CRYPTO;
     symmetric_mix_key(&hs->ss, dh_out, NOX_KEY_LEN);
-    explicit_bzero(dh_out, sizeof(dh_out));
+    sodium_memzero(dh_out, sizeof(dh_out));
 
     /* s: DecryptAndHash → rs */
     ssize_t pt = symmetric_decrypt_and_hash(&hs->ss,
@@ -630,7 +632,7 @@ static nox_err_t read_msg2(struct noise_handshake *hs,
     /* se: DH(e, rs) */
     if (noise_dh(dh_out, hs->e, hs->rs) != NOX_OK) return NOX_ERR_CRYPTO;
     symmetric_mix_key(&hs->ss, dh_out, NOX_KEY_LEN);
-    explicit_bzero(dh_out, sizeof(dh_out));
+    sodium_memzero(dh_out, sizeof(dh_out));
 
     /* payload */
     pt = symmetric_decrypt_and_hash(&hs->ss,
@@ -688,12 +690,12 @@ nox_err_t handshake_split(struct noise_handshake *hs,
     memcpy(session->remote_static, hs->rs, NOX_KEY_LEN);
 
     /* Ephemeral key'leri sil */
-    explicit_bzero(hs->e, NOX_KEY_LEN);
-    explicit_bzero(hs->e_pub, NOX_KEY_LEN);
-    explicit_bzero(hs->s,     NOX_KEY_LEN);  
-    explicit_bzero(hs->s_pub, NOX_KEY_LEN);  
-    explicit_bzero(hs->re,    NOX_KEY_LEN);  
-    explicit_bzero(hs->rs,    NOX_KEY_LEN);  
+    sodium_memzero(hs->e, NOX_KEY_LEN);
+    sodium_memzero(hs->e_pub, NOX_KEY_LEN);
+    sodium_memzero(hs->s,     NOX_KEY_LEN);  
+    sodium_memzero(hs->s_pub, NOX_KEY_LEN);  
+    sodium_memzero(hs->re,    NOX_KEY_LEN);  
+    sodium_memzero(hs->rs,    NOX_KEY_LEN);  
     atomic_thread_fence(memory_order_seq_cst); 
 
     NOX_INFO(LOG_MOD_NOISE, "handshake tamamlandı — transport hazır");
