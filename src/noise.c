@@ -152,7 +152,7 @@ void symmetric_init(struct noise_symmetric_state *ss,
 
     if (name_len <= NOISE_HASHLEN) {
         /* Pad with zeros */
-        sodium_memzero(ss->h, 0, NOISE_HASHLEN);
+        sodium_memzero(ss->h, NOISE_HASHLEN);
         memcpy(ss->h, protocol_name, name_len);
     } else {
         /* Hash the name */
