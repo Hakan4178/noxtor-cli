@@ -25,6 +25,23 @@ ui.c 2 düşük açık kaldı
 NOT: Burdaki hiç bir açık komple kriptolojiyi kırmıyor.
 Ama zincir halinde kullanırsa metadata sızıntısı ve sqlite bozulması olabilir.
 
+###TODO
+
+-Sertleştirme önlemleri alınmadı
+-TOFU önlemleri ve qr desteği 
+-Ncurses TUİ
+-Kişi ekleme rehber düzenleme modu
+-Sqlite denetlenecek
+-5 kişiye kadar grup desteği
+-Minimal seccomp denenecek 
+-resmi stable termux sürümü
+-kritik 7 key için memfd_secret() yapısına geçilecek. 
+-İnstall.sh yazılacak hem x86 hem termux için.
+
+-Linux kernel 5.15 altı için fallback eklenecek
+
+
+
 ## Requirements
 - GCC 14+
 - Linux Kernel
