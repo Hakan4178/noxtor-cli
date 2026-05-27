@@ -16,7 +16,7 @@ main.c 3 Kritik 4 orta 4 düşük açık kaldı
 
 network.c 3 kritik 3 orta açık kaldı
 
-noise.c 2 düşük açık kaldı
+noise.c secure
 
 stdin_handler.c 3 düşük açık kaldı
 
