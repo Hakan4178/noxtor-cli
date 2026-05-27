@@ -350,11 +350,11 @@ void symmetric_split(struct noise_symmetric_state *ss,
     cipher_init_key(c1, temp_k1);
     cipher_init_key(c2, temp_k2);
 
-    explicit_bzero(temp_k1, sizeof(temp_k1));
-    explicit_bzero(temp_k2, sizeof(temp_k2));
+    sodium_memzero(temp_k1, sizeof(temp_k1));
+    sodium_memzero(temp_k2, sizeof(temp_k2));
 
     /* ck ve cs artık gerekli değil */
-    explicit_bzero(ss->ck, sizeof(ss->ck));
+    sodium_memzero(ss->ck, sizeof(ss->ck));
     cipher_init(&ss->cs);
 }
 
@@ -387,7 +387,7 @@ nox_err_t handshake_init(struct noise_handshake *hs,
     if (!hs || !s_priv || !s_pub)
         return NOX_ERR_PROTO;
 
-    explicit_bzero(hs, sizeof(*hs));
+    sodium_memzero(hs, sizeof(*hs));
 
     /* Initialize SymmetricState */
     symmetric_init(&hs->ss, NOISE_PROTOCOL_NAME);
@@ -469,7 +469,7 @@ static nox_err_t write_msg1(struct noise_handshake *hs,
     /* ee: DH(e, re) */
     if (noise_dh(dh_out, hs->e, hs->re) != NOX_OK) return NOX_ERR_CRYPTO;
     symmetric_mix_key(&hs->ss, dh_out, NOX_KEY_LEN);
-    explicit_bzero(dh_out, sizeof(dh_out));
+    sodium_memzero(dh_out, sizeof(dh_out));
 
     /* s: EncryptAndHash(s_pub) */
     ssize_t ct = symmetric_encrypt_and_hash(&hs->ss,
@@ -599,7 +599,7 @@ static nox_err_t read_msg1(struct noise_handshake *hs,
     /* es: DH(e, rs) */
     if (noise_dh(dh_out, hs->e, hs->rs) != NOX_OK) return NOX_ERR_CRYPTO;
     symmetric_mix_key(&hs->ss, dh_out, NOX_KEY_LEN);
-    explicit_bzero(dh_out, sizeof(dh_out));
+    sodium_memzero(dh_out, sizeof(dh_out));
 
     /* payload */
     pt = symmetric_decrypt_and_hash(&hs->ss,
@@ -746,7 +746,7 @@ nox_err_t handshake_init_with_prologue(struct noise_handshake *hs,
 {
     if (!hs || !s_priv || !s_pub) return NOX_ERR_PROTO;
 
-    explicit_bzero(hs, sizeof(*hs));
+    sodium_memzero(hs, sizeof(*hs));
     symmetric_init(&hs->ss, NOISE_PROTOCOL_NAME);
 
     memcpy(hs->s, s_priv, NOX_KEY_LEN);
