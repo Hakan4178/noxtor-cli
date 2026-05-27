@@ -399,9 +399,9 @@ nox_err_t handshake_init(struct noise_handshake *hs,
     hs->initiator = initiator;
     hs->msg_index = 0;
 
-    /* XX pattern has no pre-messages — prologue is empty */
-    /* MixHash("") — boş prologue */
-    symmetric_mix_hash(&hs->ss, (const uint8_t *)"", 0);
+    /* XX pattern has no pre-messages — prologue is used */
+    /* MixHash("") — dolu prologue */
+    symmetric_mix_hash(&hs->ss, (const uint8_t *)"Mustafa Kemal Atatürk", strlen("Mustafa Kemal Atatürk"));
 
     NOX_DEBUG(LOG_MOD_NOISE, "handshake başlatıldı (%s)",
               initiator ? "initiator" : "responder");
