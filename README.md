@@ -2,6 +2,9 @@
 
 A minimalist CLI application. Aktif güvenlik açıkları ve bayram sebebi ile yeni özellikler ertelenmiştir.
 
+NOT: Bizce noxtor'u çalıştırdığın terminal uygulaması da özgür yazılım ve güvenli olmalıdır eğer ortama ve modern terminallere güvenmıyorsan noxtor'u doğrudan TTY'de çalıştırabilirsin. 
+
+
 Arena.c secure
 
 Crypto.c secure
