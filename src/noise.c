@@ -356,6 +356,9 @@ void symmetric_split(struct noise_symmetric_state *ss,
     /* ck ve cs artık gerekli değil */
     sodium_memzero(ss->ck, sizeof(ss->ck));
     cipher_init(&ss->cs);
+    sodium_memzero(ss->h, sizeof(ss->h));
+
+  
 }
 
 /* ================================================================
