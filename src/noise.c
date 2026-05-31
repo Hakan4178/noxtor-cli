@@ -304,29 +304,27 @@ ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
 
 /*
  * DecryptAndHash(ciphertext):
- *   plaintext = Decrypt(k, n, h, ciphertext)
- *   MixHash(ciphertext)
- *   return plaintext
+ *   1. MixHash(ciphertext)          — h güncellenir
+ *   2. plaintext = Decrypt(k, n, h, ciphertext)
+ *   3. MAC hatası → h sıfırlanır    — Noise spec §9.3
+ *   4. Başarılı → plaintext döner
  */
 ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *ciphertext, size_t ct_len,
                                    uint8_t *out)
 {
-    /* MixHash ciphertext'i kullanır — çözmeden önce hash'e ekle */
-    uint8_t h_backup[NOISE_HASHLEN];
-    memcpy(h_backup, ss->h, NOISE_HASHLEN);
-
+    /* 1. MixHash — h'yi güncelle (doğru sıra: önce hash, sonra decrypt) */
     symmetric_mix_hash(ss, ciphertext, ct_len);
 
+    /* 2. h ile decrypt */
     ssize_t pt_len = cipher_decrypt(&ss->cs,
-                                    h_backup, NOISE_HASHLEN,
+                                    ss->h, NOISE_HASHLEN,
                                     ciphertext, ct_len,
                                     out);
 
-    sodium_memzero(h_backup, sizeof(h_backup));
-
+    /* 3. MAC doğrulaması başarısız → h'yi sıfırla */
     if (pt_len < 0) {
-        /* MAC failed — h durumu bozulmuş, ama handshake zaten abort */
+        sodium_memzero(ss->h, NOISE_HASHLEN);
         return -1;
     }
 
