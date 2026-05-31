@@ -15,9 +15,9 @@ file_tranfer 2 düşük öncelikli açık kaldı
 
 log.c 1 orta 3 düşük öncelikli açık kaldı
 
-main.c 3 Kritik 4 orta 4 düşük açık kaldı
+main.c 3 orta 2 düşük açık kaldı
 
-network.c 3 kritik 3 orta açık kaldı
+network.c 2 orta açık kaldı
 
 noise.c secure
 
