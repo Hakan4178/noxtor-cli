@@ -2,14 +2,14 @@
  * main.c — noxtor-cli giriş noktası
  *
  * Init sırası:
- *   1. Log sistemi (ilk — geri kalan her şey log'a bağlı)
+ *   1. Log sistemi 
  *   2. libsodium init
  *   3. Config dizin kontrolü / bootstrap
  *   4. PIN oku (echo kapalı)
  *   5. Secure arena init
- *   6. Key derivation (Faz 2'de doldurulacak)
- *   7. Tor spawn (Faz 3'te)
- *   8. epoll event loop (Faz 4'te)
+ *   6. Key derivation 
+ *   7. Tor spawn 
+ *   8. epoll event loop 
  *   9. Cleanup: arena_destroy, tor kill, exit
  *
  * Signal handling:
