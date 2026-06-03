@@ -20,8 +20,8 @@
 #include <stdio.h>
 #include <time.h>
 
-/* F-2 FIX: g_shutdown tanımı main.c'ye taşındı, burada sadece extern */
-/* extern volatile sig_atomic_t g_shutdown; — types.h'de tanımlı */
+/* Global shutdown flag — tanım burada, extern types.h'de */
+volatile sig_atomic_t g_shutdown = 0;
 
 /* ================================================================
  * ANSI RENK KODLARI

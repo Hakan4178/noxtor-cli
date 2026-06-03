@@ -193,13 +193,22 @@ static void hmac_blake2b(const uint8_t *key,   size_t key_len,
                          const uint8_t *data,  size_t data_len,
                          uint8_t        out[NOISE_HASHLEN])
 {
-    uint8_t k[BLAKE2B_BLOCK_SIZE];
-    uint8_t ipad[BLAKE2B_BLOCK_SIZE];
-    uint8_t opad[BLAKE2B_BLOCK_SIZE];
-    uint8_t inner[NOISE_HASHLEN];
+    uint8_t *k = sodium_malloc(BLAKE2B_BLOCK_SIZE);
+    uint8_t *ipad = sodium_malloc(BLAKE2B_BLOCK_SIZE);
+    uint8_t *opad = sodium_malloc(BLAKE2B_BLOCK_SIZE);
+    uint8_t *inner = sodium_malloc(NOISE_HASHLEN);
+
+    if (!k || !ipad || !opad || !inner) {
+        sodium_free(k);
+        sodium_free(ipad);
+        sodium_free(opad);
+        sodium_free(inner);
+        sodium_memzero(out, NOISE_HASHLEN);
+        return;
+    }
 
     /* 1. key normalize */
-    memset(k, 0, sizeof(k));
+    memset(k, 0, BLAKE2B_BLOCK_SIZE);
     if (key_len > BLAKE2B_BLOCK_SIZE) {
         crypto_generichash_blake2b(k, NOISE_HASHLEN,
                                    key, key_len,
@@ -228,10 +237,10 @@ static void hmac_blake2b(const uint8_t *key,   size_t key_len,
     crypto_generichash_blake2b_final(&st, out, NOISE_HASHLEN);
 
     /* Temizlik */
-    sodium_memzero(k,     sizeof(k));
-    sodium_memzero(ipad,  sizeof(ipad));
-    sodium_memzero(opad,  sizeof(opad));
-    sodium_memzero(inner, sizeof(inner));
+    sodium_free(k);
+    sodium_free(ipad);
+    sodium_free(opad);
+    sodium_free(inner);
 }
 
 /*
@@ -245,8 +254,16 @@ static void hkdf_blake2b(const uint8_t ck[NOISE_HASHLEN],
                          uint8_t out1[NOISE_HASHLEN],
                          uint8_t out2[NOISE_HASHLEN])
 {
-    uint8_t temp_key[NOISE_HASHLEN];
-    uint8_t buf[NOISE_HASHLEN + 1];
+    uint8_t *temp_key = sodium_malloc(NOISE_HASHLEN);
+    uint8_t *buf = sodium_malloc(NOISE_HASHLEN + 1);
+
+    if (!temp_key || !buf) {
+        sodium_free(temp_key);
+        sodium_free(buf);
+        sodium_memzero(out1, NOISE_HASHLEN);
+        sodium_memzero(out2, NOISE_HASHLEN);
+        return;
+    }
 
     /* temp_key = HMAC-BLAKE2b(ck, ikm) */
     hmac_blake2b(ck, NOISE_HASHLEN, ikm, ikm_len, temp_key);
@@ -258,10 +275,10 @@ static void hkdf_blake2b(const uint8_t ck[NOISE_HASHLEN],
     /* output2 = HMAC-BLAKE2b(temp_key, output1 || 0x02) */
     memcpy(buf, out1, NOISE_HASHLEN);
     buf[NOISE_HASHLEN] = 0x02;
-    hmac_blake2b(temp_key, NOISE_HASHLEN, buf, sizeof(buf), out2);
+    hmac_blake2b(temp_key, NOISE_HASHLEN, buf, NOISE_HASHLEN + 1, out2);
 
-    sodium_memzero(temp_key, sizeof(temp_key));
-    sodium_memzero(buf, sizeof(buf));
+    sodium_free(temp_key);
+    sodium_free(buf);
 }
 
 /*

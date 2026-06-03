@@ -48,12 +48,9 @@
 /* ================================================================
  * GLOBAL SHUTDOWN FLAG — async-signal-safe
  *
- * F-2 FIX: g_shutdown tanımı log.c'den main.c'ye taşındı.
- * Signal handler'lar için async-signal-safe flag.
+ * g_shutdown tanımı log.c'de yaşar (test build'lerde main.c
+ * hariç tutulduğundan). extern types.h'de bildirilmiş.
  * ================================================================ */
-
-/* Global shutdown flag — tanım burada, extern types.h'de */
-volatile sig_atomic_t g_shutdown = 0;
 
 static struct termios g_orig_termios;
 static bool g_termios_saved = false;
@@ -603,7 +600,7 @@ static void event_loop(struct app_state *state) {
 
               char fp_str[NOX_KEY_LEN * 2 + 1];
               for (size_t k = 0; k < NOX_KEY_LEN; k++) {
-                sprintf(&fp_str[k * 2], "%02x", remote_pub[k]);
+                snprintf(&fp_str[k * 2], sizeof(fp_str) - (k * 2), "%02x", remote_pub[k]);
               }
 
               bool zero_key = true;
@@ -1043,10 +1040,17 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     /* Geçici Ed25519 tamponları */
-    uint8_t ed_pub[32];
-    uint8_t ed_sk[64];
-    sodium_memzero(ed_pub, sizeof(ed_pub));
-    sodium_memzero(ed_sk, sizeof(ed_sk));
+    uint8_t *ed_pub = sodium_malloc(32);
+    uint8_t *ed_sk = sodium_malloc(64);
+    if (!ed_pub || !ed_sk) {
+      NOX_FATAL(LOG_MOD_MAIN, "bellek tahsisi başarısız (Ed25519 buffers)");
+      sodium_free(ed_pub);
+      sodium_free(ed_sk);
+      arena_destroy(&state.arena);
+      return 1;
+    }
+    memset(ed_pub, 0, 32);
+    memset(ed_sk, 0, 64);
 
     if (state.first_run) {
       /* İlk çalıştırma: yeni key pair üret ve kaydet */
@@ -1055,6 +1059,8 @@ static void prompt_transport_selection(struct app_state *state) {
       if (err != NOX_OK) {
         NOX_FATAL(LOG_MOD_MAIN, "identity key üretimi başarısız: %s",
                   nox_strerror(err));
+        sodium_free(ed_pub);
+        sodium_free(ed_sk);
         arena_destroy(&state.arena);
         return 1;
       }
@@ -1066,12 +1072,16 @@ static void prompt_transport_selection(struct app_state *state) {
                                ed_pub);
     if (err == NOX_ERR_AUTH) {
       NOX_FATAL(LOG_MOD_MAIN, "yanlış PIN — identity key çözülemedi");
+      sodium_free(ed_pub);
+      sodium_free(ed_sk);
       arena_destroy(&state.arena);
       return 1;
     }
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "identity key yükleme hatası: %s",
                 nox_strerror(err));
+      sodium_free(ed_pub);
+      sodium_free(ed_sk);
       arena_destroy(&state.arena);
       return 1;
     }
@@ -1082,13 +1092,15 @@ static void prompt_transport_selection(struct app_state *state) {
                                        state.my_static_priv, ed_pub, ed_sk);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "anahtar dönüştürme başarısız");
+      sodium_free(ed_pub);
+      sodium_free(ed_sk);
       arena_destroy(&state.arena);
       return 1;
     }
 
     /* Hassas geçici Ed25519 verileri sıfırla */
-    sodium_memzero(ed_pub, sizeof(ed_pub));
-    sodium_memzero(ed_sk, sizeof(ed_sk));
+    sodium_free(ed_pub);
+    sodium_free(ed_sk);
     memory_barrier();
 
     /*
@@ -1123,6 +1135,7 @@ static void prompt_transport_selection(struct app_state *state) {
         (arena_bytes_used(&state.arena) + arena_bytes_free(&state.arena)) /
             1024);
 
+#ifdef DEBUG
     /* ── 12. Noise XX loopback demo (geçici — Tor gelince kalkacak) ── */
     NOX_INFO(LOG_MOD_MAIN, "=== Noise XX loopback demo ===");
     {
@@ -1193,6 +1206,7 @@ static void prompt_transport_selection(struct app_state *state) {
       
     }
     NOX_INFO(LOG_MOD_MAIN, "=== Noise demo tamamlandı ===");
+#endif
 
     /* ── 13. Tor spawn → bootstrap → HS ─────────────── */
     err = tor_spawn(&state);
