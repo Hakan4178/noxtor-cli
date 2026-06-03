@@ -11,17 +11,17 @@ Crypto.c secure
 
 Database.c 2 düşük açık kaldı.
 
-file_tranfer 2 düşük öncelikli açık kaldı
+file_tranfer 1 düşük öncelikli açık kaldı
 
-log.c 1 orta 3 düşük öncelikli açık kaldı
+log.c 3 düşük öncelikli açık kaldı
 
-main.c 3 orta 2 düşük açık kaldı
+main.c 2 orta 2 düşük açık kaldı
 
 network.c 2 orta açık kaldı
 
 noise.c secure
 
-stdin_handler.c 3 düşük açık kaldı
+stdin_handler.c 2 düşük açık kaldı
 
 ui.c 2 düşük açık kaldı
 
