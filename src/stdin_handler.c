@@ -40,7 +40,7 @@ static size_t get_next_chunk_size(const char *msg, size_t offset, size_t total_l
     size--;
   }
 
-  return (size == 0) ? chunk_limit : size;
+  return (size == 0) ? 1 : size;
 }
 
 /* ================================================================

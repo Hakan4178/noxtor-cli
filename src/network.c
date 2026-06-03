@@ -393,7 +393,12 @@ static nox_err_t generate_torrc(struct app_state *state) {
     NOX_ERROR(LOG_MOD_NET, "tor_data_dir oluşturulamadı: %s", strerror(errno));
     return NOX_ERR_TOR;
   }
-  chmod(state->tor_data_dir, 0700);
+  
+  int dd = open(state->tor_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dd >= 0) {
+    fchmod(dd, 0700);
+    close(dd);
+  }
 
   /* torrc yaz */
   int fd =
