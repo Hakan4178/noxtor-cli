@@ -211,11 +211,15 @@ void process_line(struct app_state *state, const char *line) {
       }
 
       /* db_add_contact dönüş kontrolü */
-      nox_err_t db_err = db_add_contact(
-          state->tofu_onion, state->tofu_name, state->tofu_new_key);
-      if (db_err != NOX_OK) {
-        ui_print_error(state, "Rehbere kaydetme başarısız");
-        /* devam et — session yine kurulabilir */
+      if (!state->ghost_mode) {
+        nox_err_t db_err = db_add_contact(
+            state->tofu_onion, state->tofu_name, state->tofu_new_key);
+        if (db_err != NOX_OK) {
+          ui_print_error(state, "Rehbere kaydetme başarısız");
+          /* devam et — session yine kurulabilir */
+        }
+      } else {
+        NOX_INFO(LOG_MOD_MAIN, "ghost mod aktif — rehber kaydı atlandı");
       }
 
       state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
@@ -230,7 +234,9 @@ void process_line(struct app_state *state, const char *line) {
                         state->tofu_name);
 
         /* Kuyruktaki bekleyen mesajları gönder */
-        db_process_queue(state->active_peer_onion, send_queued_callback, state);
+        if (!state->ghost_mode) {
+          db_process_queue(state->active_peer_onion, send_queued_callback, state);
+        }
       } else {
         ui_print_error(state, "Arena bellek hatası");
         close(state->tofu_peer_fd);
@@ -268,8 +274,12 @@ void process_line(struct app_state *state, const char *line) {
 
   /* ── Session yokken: komut modu ─────── */
   if (state->peer_fd < 0 && line[0] != '/') {
-    ui_print_error(state, "bağlantı yok — önce /connect kullan veya çevrimdışı "
-                          "mesaj için /msg kullan");
+    if (state->ghost_mode) {
+      ui_print_error(state, "bağlantı yok — önce /connect kullan");
+    } else {
+      ui_print_error(state, "bağlantı yok — önce /connect kullan veya çevrimdışı "
+                            "mesaj için /msg kullan");
+    }
     return;
   }
 
@@ -279,6 +289,10 @@ void process_line(struct app_state *state, const char *line) {
   }
 
   if (strncmp(line, "/add ", 5) == 0) {
+    if (state->ghost_mode) {
+      ui_print_error(state, "ghost mod aktif — rehbere kişi eklenemez");
+      return;
+    }
     const char *p = line + 5;
     while (*p == ' ')
       p++;
@@ -370,6 +384,10 @@ void process_line(struct app_state *state, const char *line) {
         ui_print_error(state, "Şifreleme/Gönderim hatası");
       }
     } else {
+      if (state->ghost_mode) {
+        ui_print_error(state, "ghost mod aktif — çevrimdışı mesaj kuyruğa alınamaz");
+        return;
+      }
       nox_err_t err = queue_segmented_message(onion, msg_start);
       if (err == NOX_OK) {
         ui_print_system(state, "[*] Mesaj kuyruğa eklendi (akran çevrimdışı)");
@@ -422,6 +440,7 @@ void process_line(struct app_state *state, const char *line) {
     handshake_init(state->hs, true,
                state->my_static_priv,
                state->my_static_pub);
+    state->handshake_start = time(NULL);
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
     size_t hslen = sizeof(hsbuf);

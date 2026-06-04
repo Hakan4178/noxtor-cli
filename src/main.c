@@ -359,7 +359,9 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
 static void cleanup(struct app_state *state) {
   NOX_INFO(LOG_MOD_MAIN, "temizlik başlıyor...");
   restore_terminal();
-  db_close();
+  if (!state->ghost_mode) {
+    db_close();
+  }
 
   /* Key materyali — arena'da yaşar, arena_destroy sıfırlar */
   state->master_key = NULL;
@@ -415,6 +417,21 @@ static void event_loop(struct app_state *state) {
   struct epoll_event events[4];
 
   while (state->running && !g_shutdown) {
+    /* Handshake timeout kontrolü (slot yorulması ve kilitlenmeyi önler) */
+    if (state->hs && state->peer_fd >= 0) {
+      if (time(NULL) - state->handshake_start > 30) {
+        NOX_WARN(LOG_MOD_NOISE, "Handshake zaman aşımına uğradı");
+        ui_print_error(state, "Akran ile handshake zaman aşımına uğradı.");
+        int fd = state->peer_fd;
+        epoll_remove_fd(state->epoll_fd, fd);
+        close(fd);
+        state->peer_fd = -1;
+        state->hs = NULL;
+        state->active_peer_onion[0] = '\0';
+        arena_restore(&state->arena, state->session_arena_mark);
+      }
+    }
+
     int nfds = epoll_wait(state->epoll_fd, events, 4, 2000);
 
     if (nfds < 0) {
@@ -456,6 +473,7 @@ static void event_loop(struct app_state *state) {
         handshake_init(state->hs, false,
                state->my_static_priv,
                state->my_static_pub);    
+        state->handshake_start = time(NULL);
 
         NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi");
         ui_print_system(state, "[*] gelen bağlantı — handshake bekleniyor");
@@ -593,8 +611,10 @@ static void event_loop(struct app_state *state) {
               sodium_memzero(name, sizeof(name));
               sodium_memzero(stored_key, sizeof(stored_key));
 
-              nox_err_t db_err =
-                  db_get_contact(peer_onion, name, sizeof(name), stored_key);
+              nox_err_t db_err = NOX_ERR_DB;
+              if (!state->ghost_mode) {
+                db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key);
+              }
               uint8_t remote_pub[NOX_KEY_LEN];
               memcpy(remote_pub, state->hs->rs, NOX_KEY_LEN);
 
@@ -629,8 +649,10 @@ static void event_loop(struct app_state *state) {
                     ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)",
                                     name);
 
-                    db_process_queue(state->active_peer_onion,
-                                     send_queued_callback, state);
+                    if (!state->ghost_mode) {
+                      db_process_queue(state->active_peer_onion,
+                                       send_queued_callback, state);
+                    }
                   } else {
                     ui_print_error(state, "Arena bellek hatası");
                     close(fd);
@@ -841,7 +863,15 @@ static void prompt_transport_selection(struct app_state *state) {
     nox_err_t err;
 
     /* ── 0. Komut satırı argümanları ───────────────────── */
-    if (argc == 2 && strcmp(argv[1], "--full_cleankeys") == 0) {
+    bool ghost_mode = false;
+    for (int i = 1; i < argc; i++) {
+      if (strcmp(argv[i], "--ghost") == 0 || strcmp(argv[i], "-ghost") == 0) {
+        ghost_mode = true;
+      }
+    }
+    state.ghost_mode = ghost_mode;
+
+    if (argc >= 2 && strcmp(argv[1], "--full_cleankeys") == 0) {
       /*
        * Hesap silme — tüm key materyalini güvenli şekilde yok et.
        *
@@ -1120,12 +1150,16 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     /* SQLite veritabanını başlat */
-    err = db_init(state.config_dir, state.db_key);
-    if (err != NOX_OK) {
-      NOX_FATAL(LOG_MOD_MAIN, "veritabanı başlatılamadı: %s",
-                nox_strerror(err));
-      arena_destroy(&state.arena);
-      return 1;
+    if (!state.ghost_mode) {
+      err = db_init(state.config_dir, state.db_key);
+      if (err != NOX_OK) {
+        NOX_FATAL(LOG_MOD_MAIN, "veritabanı başlatılamadı: %s",
+                  nox_strerror(err));
+        arena_destroy(&state.arena);
+        return 1;
+      }
+    } else {
+      NOX_INFO(LOG_MOD_MAIN, "ghost mod aktif — veritabanı başlatılmadı");
     }
 
     NOX_INFO(LOG_MOD_MAIN, "public key hazır");
@@ -1271,22 +1305,38 @@ static void prompt_transport_selection(struct app_state *state) {
              (arena_bytes_used(&state.arena) + arena_bytes_free(&state.arena)) /
                  1024);
 
-    fprintf(
-        stderr,
-        "\n  Komutlar:\n"
-        "    \033[38;2;210;24;38m/addr               — .onion adresini "
-        "göster\033[0m\n"
-        "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
-        "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi "
-        "ekle\033[0m\n"
-        "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu "
-        "mesaj gönder\033[0m\n"
-        "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
-        "(aktif bağlantı gerektirir)\033[0m\n"
-        "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
-        "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
-        "gönderilir.\n\n"
-        "> ");
+    if (state.ghost_mode) {
+      fprintf(
+          stderr,
+          "\n  [👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı\n\n"
+          "  Komutlar:\n"
+          "    \033[38;2;210;24;38m/addr               — .onion adresini "
+          "göster\033[0m\n"
+          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+          "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
+          "(aktif bağlantı gerektirir)\033[0m\n"
+          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+          "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
+          "gönderilir.\n\n"
+          "> ");
+    } else {
+      fprintf(
+          stderr,
+          "\n  Komutlar:\n"
+          "    \033[38;2;210;24;38m/addr               — .onion adresini "
+          "göster\033[0m\n"
+          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+          "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi "
+          "ekle\033[0m\n"
+          "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu "
+          "mesaj gönder\033[0m\n"
+          "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
+          "(aktif bağlantı gerektirir)\033[0m\n"
+          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+          "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
+          "gönderilir.\n\n"
+          "> ");
+    }
 
     event_loop(&state);
 

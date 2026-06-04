@@ -11,6 +11,8 @@
 #include "common.h"
 #include <sodium.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <time.h>
 
 /* ================================================================
  * SECURE ARENA — Güvenli bellek havuzu
@@ -82,7 +84,7 @@ struct contact {
  * ================================================================ */
 struct noise_cipher_state {
     uint8_t  k[NOX_KEY_LEN];   /* şifreleme anahtarı              */
-    uint64_t n;                 /* nonce counter — monoton artan   */
+    _Atomic uint64_t n;        /* nonce counter — monoton artan   */
     bool     has_key;           /* key set edilmiş mi               */
 };
 
@@ -185,6 +187,7 @@ struct app_state {
     /* Noise session (aktif bağlantı varsa) */
     struct noise_session *session; /* arena'da veya NULL              */
     struct noise_handshake *hs;  /* aktif handshake veya NULL         */
+    time_t   handshake_start;    /* handshake başlangıç zamanı        */
 
     /* Tor */
     int      tor_ctrl_fd;        /* Tor Control Protocol fd          */
@@ -206,6 +209,7 @@ struct app_state {
     /* Durum */
     bool     running;            /* false olunca event loop çıkar    */
     bool     first_run;          /* ilk çalıştırma mı                */
+    bool     ghost_mode;         /* --ghost veya -ghost: SQLite yok  */
 
     /* Config yolları — NOX_PATH_MAX yeterli, PATH_MAX stack'i taşırır */
     char     config_dir[NOX_PATH_MAX];
