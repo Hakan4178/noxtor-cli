@@ -4,6 +4,8 @@ A minimalist CLI application. Aktif güvenlik açıkları ve bayram sebebi ile y
 
 NOT: Bizce noxtor'u çalıştırdığın terminal uygulaması da özgür yazılım ve güvenli olmalıdır eğer ortama ve modern terminallere güvenmıyorsan noxtor'u doğrudan TTY'de çalıştırabilirsin. 
 
+--ghost modu eklendi sqlite devre dışı 
+
 
 Arena.c secure
 

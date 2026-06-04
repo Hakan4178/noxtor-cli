@@ -12,6 +12,9 @@
 #define NOX_MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL * 1024ULL)
 #endif
 
+/* Dosya adını temizleyerek path traversal açıklarını önler */
+void sanitize_filename(char *name, size_t max_len);
+
 /* Dosya gönderim sürecini (METADATA hazırlama, okuma, şifreleme ve iletim) başlatır */
 void file_transfer_start(struct app_state *state, const char *filepath);
 

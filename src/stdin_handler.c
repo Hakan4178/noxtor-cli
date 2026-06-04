@@ -509,6 +509,7 @@ void process_stdin_events(struct app_state *state) {
       if (state->stdin_buf && state->stdin_len > 0) {
         memcpy(new_buf, state->stdin_buf, state->stdin_len);
       }
+      new_buf[state->stdin_len] = '\0';
 
       if (state->stdin_buf) {
         sodium_free(state->stdin_buf);   /* otomatik sıfırlar */

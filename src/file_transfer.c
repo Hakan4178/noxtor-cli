@@ -21,7 +21,7 @@
  * ================================================================ */
 
 /* PATCH: HIGH‑2 — max_len sınırı ve null garantisi eklenmiş sanitize */
-static void sanitize_filename(char *name, size_t max_len) {
+void sanitize_filename(char *name, size_t max_len) {
   if (!name || max_len == 0)
     return;
 

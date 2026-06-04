@@ -1,0 +1,8 @@
+# environment variables:
+AFL_CUSTOM_INFO_PROGRAM=./fuzz/fuzz_stdin
+AFL_CUSTOM_INFO_PROGRAM_ARGV=
+AFL_CUSTOM_INFO_OUT=fuzz/findings_stdin/default
+AFL_PATH=/tmp/aflpp-build
+AFL_SKIP_CPUFREQ=1
+# command line:
+'/tmp/aflpp-build/afl-fuzz' '-i' 'fuzz/corpus/stdin' '-o' 'fuzz/findings_stdin' '--' './fuzz/fuzz_stdin'
