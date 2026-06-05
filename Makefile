@@ -69,8 +69,9 @@ LIBS_BASE := -lsodium -lsqlite3 -lseccomp
 # ncurses — make TUI=1 ile etkinleşir
 TUI ?= 0
 ifeq ($(TUI),1)
-    LIBS_TUI := -lncursesw
-    TUI_DEF  := -DENABLE_TUI
+    NCURSES_CFLAGS := $(shell pkg-config --cflags ncursesw 2>/dev/null)
+    LIBS_TUI := $(shell pkg-config --libs ncursesw 2>/dev/null)
+    TUI_DEF  := -DHAVE_NCURSES $(NCURSES_CFLAGS)
 else
     LIBS_TUI :=
     TUI_DEF  := -DANSI_ONLY

@@ -28,6 +28,7 @@
 #include "ui.h"
 #include "stdin_handler.h"
 #include "file_transfer.h"
+#include "tui.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -358,6 +359,7 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
  * ================================================================ */
 static void cleanup(struct app_state *state) {
   NOX_INFO(LOG_MOD_MAIN, "temizlik başlıyor...");
+  tui_shutdown();
   restore_terminal();
   if (!state->ghost_mode) {
     db_close();
@@ -613,7 +615,7 @@ static void event_loop(struct app_state *state) {
 
               nox_err_t db_err = NOX_ERR_DB;
               if (!state->ghost_mode) {
-                db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key);
+                db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key, NULL, 0, NULL, NULL);
               }
               uint8_t remote_pub[NOX_KEY_LEN];
               memcpy(remote_pub, state->hs->rs, NOX_KEY_LEN);
@@ -1245,44 +1247,60 @@ static void prompt_transport_selection(struct app_state *state) {
     /* ── 13. Tor spawn → bootstrap → HS ─────────────── */
     err = tor_spawn(&state);
     if (err != NOX_OK) {
+      if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Tor başlatılamadı: %s", nox_strerror(err));
       cleanup(&state);
       return 1;
     }
 
+    if (g_shutdown) goto shutdown_clean;
+
     err = tor_authenticate(state.tor_ctrl_fd, state.tor_data_dir);
     if (err != NOX_OK) {
+      if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Tor auth başarısız: %s", nox_strerror(err));
       cleanup(&state);
       return 1;
     }
 
+    if (g_shutdown) goto shutdown_clean;
+
     err = tor_wait_bootstrap(state.tor_ctrl_fd, 120);
     if (err != NOX_OK) {
+      if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Tor bootstrap başarısız: %s", nox_strerror(err));
       cleanup(&state);
       return 1;
     }
 
+    if (g_shutdown) goto shutdown_clean;
+
     /* SOCKS port'unu öğren (auto port) */
     err = tor_get_socks_port(state.tor_ctrl_fd, &state.socks_port);
     if (err != NOX_OK) {
+      if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "SOCKS port öğrenilemedi: %s", nox_strerror(err));
       cleanup(&state);
       return 1;
     }
 
+    if (g_shutdown) goto shutdown_clean;
+
     /* ── 14. TCP listener + Hidden Service ─────────── */
     err = listener_create(&state.listen_port, &state.listen_fd);
     if (err != NOX_OK) {
+      if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "listener başarısız: %s", nox_strerror(err));
       cleanup(&state);
       return 1;
     }
 
+    if (g_shutdown) goto shutdown_clean;
+
     err = tor_create_hidden_service(state.tor_ctrl_fd, state.listen_port,
                                     state.onion_addr, sizeof(state.onion_addr));
     if (err != NOX_OK) {
+      if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Hidden Service başarısız: %s",
                 nox_strerror(err));
       cleanup(&state);
@@ -1291,9 +1309,12 @@ static void prompt_transport_selection(struct app_state *state) {
 
     NOX_INFO(LOG_MOD_MAIN, "adresiniz: %s", state.onion_addr);
 
+    if (g_shutdown) goto shutdown_clean;
+
     /* ── 15. epoll event loop ─────────────────────────── */
     err = epoll_setup(&state, state.listen_fd);
     if (err != NOX_OK) {
+      if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "epoll setup başarısız: %s", nox_strerror(err));
       cleanup(&state);
       return 1;
@@ -1305,43 +1326,50 @@ static void prompt_transport_selection(struct app_state *state) {
              (arena_bytes_used(&state.arena) + arena_bytes_free(&state.arena)) /
                  1024);
 
-    if (state.ghost_mode) {
-      fprintf(
-          stderr,
-          "\n  [👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı\n\n"
-          "  Komutlar:\n"
-          "    \033[38;2;210;24;38m/addr               — .onion adresini "
-          "göster\033[0m\n"
-          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
-          "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
-          "(aktif bağlantı gerektirir)\033[0m\n"
-          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
-          "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
-          "gönderilir.\n\n"
-          "> ");
-    } else {
-      fprintf(
-          stderr,
-          "\n  Komutlar:\n"
-          "    \033[38;2;210;24;38m/addr               — .onion adresini "
-          "göster\033[0m\n"
-          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
-          "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi "
-          "ekle\033[0m\n"
-          "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu "
-          "mesaj gönder\033[0m\n"
-          "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
-          "(aktif bağlantı gerektirir)\033[0m\n"
-          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
-          "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
-          "gönderilir.\n\n"
-          "> ");
+    tui_init();
+    tui_print_welcome(&state);
+    tui_refresh_all(&state);
+
+    if (!tui_is_active()) {
+        if (state.ghost_mode) {
+          fprintf(
+              stderr,
+              "\n  [👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı\n\n"
+              "  Komutlar:\n"
+              "    \033[38;2;210;24;38m/addr               — .onion adresini "
+              "göster\033[0m\n"
+              "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+              "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
+              "(aktif bağlantı gerektirir)\033[0m\n"
+              "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+              "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
+              "gönderilir.\n\n"
+              "> ");
+        } else {
+          fprintf(
+              stderr,
+              "\n  Komutlar:\n"
+              "    \033[38;2;210;24;38m/addr               — .onion adresini "
+              "göster\033[0m\n"
+              "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+              "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi "
+              "ekle\033[0m\n"
+              "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu "
+              "mesaj gönder\033[0m\n"
+              "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
+              "(aktif bağlantı gerektirir)\033[0m\n"
+              "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+              "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
+              "gönderilir.\n\n"
+              "> ");
+        }
     }
 
     event_loop(&state);
 
     NOX_INFO(LOG_MOD_MAIN, "shutdown sinyali alındı");
 
+shutdown_clean:
     /* ── Cleanup ───────────────────────────────────────── */
     cleanup(&state);
 

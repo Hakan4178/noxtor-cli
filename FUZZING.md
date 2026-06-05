@@ -64,7 +64,7 @@ Gelecekte sisteme entegre edilmesi planlanan fuzz hedefleri listesi:
 
 *   `[ ]` **`handshake_read(struct noise_handshake *hs, const uint8_t *msg, ...)`**
     *   **Dosya:** `src/noise.c`
-    *   **Açıklama:** Ağdan gelen şifrelenmemiş/yarı-şifreli el sıkışma payload'larını (Noise IK_25519) işler.
+    *   **Açıklama:** Ağdan gelen şifrelenmemiş/yarı-şifreli el sıkışma payload'larını (Noise XX_25519) işler.
     *   **Fuzz Nedeni:** Kötü niyetli akranların göndereceği bozuk kriptografik mesajların durum makinesini (state machine) bozmasını veya bellek sızıntısına yol açmasını engellemek.
 
 ---

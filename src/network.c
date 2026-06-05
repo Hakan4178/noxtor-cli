@@ -145,6 +145,9 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
   size_t pos = 0;
 
   while (pos < buf_size - 1) {
+    if (g_shutdown)
+      return NOX_ERR_TOR;
+
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
     int ret = poll(&pfd, 1, timeout_ms);
     if (ret < 0) {
@@ -619,6 +622,10 @@ nox_err_t tor_spawn(struct app_state *state) {
 
   int connected = 0;
   for (int retry = 0; retry < NOX_CTRL_CONNECT_RETRIES; retry++) {
+    if (g_shutdown) {
+      close(ctrl_fd);
+      return NOX_ERR_TOR;
+    }
     if (connect(ctrl_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
       connected = 1;
       break;
@@ -709,6 +716,11 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
   const struct timespec ts = {.tv_sec = 2, .tv_nsec = 0};
 
   for (int elapsed = 0; elapsed < timeout_sec; elapsed += 2) {
+    if (g_shutdown) {
+      NOX_INFO(LOG_MOD_NET, "Tor bootstrap iptal edildi (kullanıcı isteği)");
+      return NOX_ERR_TOR;
+    }
+
     nox_err_t err =
         ctrl_send_command(ctrl_fd, "GETINFO status/bootstrap-phase\r\n");
     if (err != NOX_OK)

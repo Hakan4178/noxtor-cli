@@ -69,14 +69,14 @@ int main(void) {
   snprintf(state.onion_addr, sizeof(state.onion_addr),
            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567.onion");
 
-  /* Stdin'i non-blocking moda alalım */
-  int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-  if (flags >= 0) {
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-  }
-
   /* Persistent loop başlangıcı */
   while (__AFL_LOOP(10000)) {
+    /* Stdin'i non-blocking moda alalım (AFL++ her iterasyonda resetlediği için loop içinde olmalı) */
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    }
+
     /* Durum değişkenlerini ve stdin buffer'ını her iterasyonda temizleyelim */
     state.hs = NULL;
     state.session = NULL;

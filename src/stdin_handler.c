@@ -10,6 +10,7 @@
 #include "network.h"
 #include "noise.h"
 #include "ui.h"
+#include "tui.h"
 
 #include <errno.h>
 #include <string.h>
@@ -213,7 +214,7 @@ void process_line(struct app_state *state, const char *line) {
       /* db_add_contact dönüş kontrolü */
       if (!state->ghost_mode) {
         nox_err_t db_err = db_add_contact(
-            state->tofu_onion, state->tofu_name, state->tofu_new_key);
+            state->tofu_onion, state->tofu_name, state->tofu_new_key, NULL, NULL, 0);
         if (db_err != NOX_OK) {
           ui_print_error(state, "Rehbere kaydetme başarısız");
           /* devam et — session yine kurulabilir */
@@ -332,7 +333,7 @@ void process_line(struct app_state *state, const char *line) {
     uint8_t zero_key[NOX_KEY_LEN];
     sodium_memzero(zero_key, sizeof(zero_key));
 
-    nox_err_t err = db_add_contact(onion, name, zero_key);
+    nox_err_t err = db_add_contact(onion, name, zero_key, NULL, NULL, 0);
     if (err == NOX_OK) {
       ui_print_system(state, "[✓] Rehbere kaydedildi: %s (%s)", name, onion);
     } else {
@@ -477,6 +478,28 @@ void process_line(struct app_state *state, const char *line) {
 }
 
 void process_stdin_events(struct app_state *state) {
+  if (tui_is_active()) {
+#ifdef HAVE_NCURSES
+    for (;;) {
+      int ch = wgetch(g_tui.input_win);
+      if (ch == ERR) {
+        break;
+      }
+      if (ch == KEY_RESIZE) {
+        tui_resize();
+        tui_refresh_all(state);
+        continue;
+      }
+      const char *line = tui_handle_input(state, ch);
+      if (line) {
+        process_line(state, line);
+        tui_refresh_all(state);
+      }
+    }
+#endif
+    return;
+  }
+
 #define STDIN_BUF_MAX  (64 * 1024U)   /* 64 KB üst sınır */
 #define STDIN_BUF_INIT 512U
 

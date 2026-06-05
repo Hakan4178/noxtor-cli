@@ -18,6 +18,7 @@
 #include "ui.h"
 #include "common.h"
 #include "types.h"
+#include "tui.h"
 
 #include <inttypes.h>  /* PRIu64 — [F4] */
 #include <stdarg.h>
@@ -105,6 +106,8 @@ static void print_timestamp(void)
  * ================================================================ */
 void ui_save_input(struct app_state *state)
 {
+    if (tui_is_active())
+        return;
     if (state->input_saved)
         return;  /* zaten kaydedilmiş */
     state->input_saved = true;
@@ -116,6 +119,8 @@ void ui_save_input(struct app_state *state)
 
 void ui_restore_input(struct app_state *state)
 {
+    if (tui_is_active())
+        return;
     if (!state->input_saved)
         return;  /* kaydedilmemiş, restore gereksiz */
     state->input_saved = false;
@@ -144,6 +149,8 @@ void ui_restore_input(struct app_state *state)
  * ================================================================ */
 void ui_print_prompt(struct app_state *state)
 {
+    if (tui_is_active())
+        return;
     fprintf(stderr, "%s", g_theme->clr_prompt);
 
     if (state->peer_fd >= 0 && state->active_peer_onion[0] != '\0') {
@@ -202,6 +209,19 @@ void ui_print_prompt(struct app_state *state)
 
 void ui_print_incoming(struct app_state *state, const char *msg)
 {
+    if (tui_is_active()) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
+        struct tm tm_buf;
+        localtime_r(&ts.tv_sec, &tm_buf);
+        char buf[8192];
+        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] [Peer] %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                 ts.tv_nsec / 1000000L, msg);
+        tui_chat_append(buf);
+        tui_refresh_all(state);
+        return;
+    }
     ui_save_input(state);
     print_timestamp();
     fprintf(stderr, "%s[Peer]%s %s\n",
@@ -211,6 +231,19 @@ void ui_print_incoming(struct app_state *state, const char *msg)
 
 void ui_print_outgoing(struct app_state *state, const char *msg)
 {
+    if (tui_is_active()) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
+        struct tm tm_buf;
+        localtime_r(&ts.tv_sec, &tm_buf);
+        char buf[8192];
+        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] [Sen] %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                 ts.tv_nsec / 1000000L, msg);
+        tui_chat_append(buf);
+        tui_refresh_all(state);
+        return;
+    }
     /*
      * [F3] Terminal wrap kırılganlığı:
      *
@@ -239,6 +272,25 @@ void ui_print_outgoing(struct app_state *state, const char *msg)
 
 void ui_print_system(struct app_state *state, const char *fmt, ...)
 {
+    if (tui_is_active()) {
+        char msg[4096];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(msg, sizeof(msg), fmt, ap);
+        va_end(ap);
+
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
+        struct tm tm_buf;
+        localtime_r(&ts.tv_sec, &tm_buf);
+        char buf[8192];
+        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                 ts.tv_nsec / 1000000L, msg);
+        tui_chat_append(buf);
+        tui_refresh_all(state);
+        return;
+    }
     ui_save_input(state);
 
     fprintf(stderr, "  %s", g_theme->clr_system);
@@ -253,6 +305,25 @@ void ui_print_system(struct app_state *state, const char *fmt, ...)
 
 void ui_print_error(struct app_state *state, const char *fmt, ...)
 {
+    if (tui_is_active()) {
+        char msg[4096];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(msg, sizeof(msg), fmt, ap);
+        va_end(ap);
+
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
+        struct tm tm_buf;
+        localtime_r(&ts.tv_sec, &tm_buf);
+        char buf[8192];
+        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] [!] %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                 ts.tv_nsec / 1000000L, msg);
+        tui_chat_append(buf);
+        tui_refresh_all(state);
+        return;
+    }
     ui_save_input(state);
 
     fprintf(stderr, "  %s[!] ", g_theme->clr_error);
@@ -298,6 +369,10 @@ static void format_size(uint64_t bytes, char *buf, size_t buf_sz)
 void ui_print_progress(struct app_state *state, const char *filename,
                        uint64_t done, uint64_t total, bool is_upload)
 {
+    if (tui_is_active()) {
+        tui_refresh_all(state);
+        return;
+    }
     if (total == 0)
         return;
 

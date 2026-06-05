@@ -51,6 +51,7 @@
 /* Onion adresi */
 #define NOX_ONION_LEN          62U       /* 56 + ".onion" */
 #define NOX_VIRTUAL_PORT       9876U     /* HS virtual port (sabit) */
+#define NOX_ONION_KEY_B64_LEN  88U       /* ED25519-V3 private key base64 */
 
 /* Contact */
 #define NOX_CONTACT_NAME_LEN   64U

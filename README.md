@@ -1,10 +1,12 @@
 # noxtor-cli
 
-A minimalist CLI application. Aktif güvenlik açıkları ve bayram sebebi ile yeni özellikler ertelenmiştir.
+A minimalist CLI application.
 
 NOT: Bizce noxtor'u çalıştırdığın terminal uygulaması da özgür yazılım ve güvenli olmalıdır eğer ortama ve modern terminallere güvenmıyorsan noxtor'u doğrudan TTY'de çalıştırabilirsin. 
 
 --ghost modu eklendi sqlite devre dışı 
+
+Dış dünyadan veri alan parserler tek tek dakikalarca fuzz edildi.
 
 
 Arena.c secure
@@ -39,8 +41,7 @@ Ama zincir halinde kullanırsa metadata sızıntısı ve sqlite bozulması olabi
 - Sqlite denetlenecek
 - 5 kişiye kadar grup desteği
 - Minimal seccomp denenecek 
-- Resmi stable termux sürümü
-- Kritik 7 key için memfd_secret() yapısına geçilecek. 
+- Resmi stable termux sürümü 
 - İnstall.sh yazılacak hem x86 hem termux için.
 
 - Linux kernel 5.15 altı için fallback eklenecek
