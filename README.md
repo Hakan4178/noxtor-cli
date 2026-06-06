@@ -1,6 +1,6 @@
 # noxtor-cli
 
-A minimalist CLI application.
+A minimalist CLI application.0 errors under ASAN/UBSAN -fanalzyer. The noise XX implementation used was based on libsodium primitifves and successfully passed the Cacophony test vectors.
 
 NOT: Bizce noxtor'u çalıştırdığın terminal uygulaması da özgür yazılım ve güvenli olmalıdır eğer ortama ve modern terminallere güvenmıyorsan noxtor'u doğrudan TTY'de çalıştırabilirsin. 
 
