@@ -359,8 +359,14 @@ $(FUZZ_DIR)/fuzz_socks5: $(FUZZ_DIR)/fuzz_socks5.c $(FUZZ_OBJS)
 	$(Q)AFL_PATH=/tmp/aflpp-build $(FUZZ_CC) $(FUZZ_CFLAGS) $^ -o $@ $(FUZZ_LDFLAGS)
 	@echo "[*] Fuzzer binary hazır: $@"
 
-fuzz: $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5
-	@echo "[*] Fuzzerlar derlendi. Çalıştırmak için: make fuzz-run, make fuzz-run-sanitize, make fuzz-run-arena, make fuzz-run-stdin, make fuzz-run-file_transfer, make fuzz-run-stdin_events, make fuzz-run-ctrl veya make fuzz-run-socks5"
+# handshake_read (Noise XX state machine) fuzzer hedefi
+$(FUZZ_DIR)/fuzz_handshake: $(FUZZ_DIR)/fuzz_handshake.c $(FUZZ_OBJS)
+	$(MSG) 'FUZZ' '$@'
+	$(Q)AFL_PATH=/tmp/aflpp-build $(FUZZ_CC) $(FUZZ_CFLAGS) $^ -o $@ $(FUZZ_LDFLAGS)
+	@echo "[*] Fuzzer binary hazır: $@"
+
+fuzz: $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5 $(FUZZ_DIR)/fuzz_handshake
+	@echo "[*] Fuzzerlar derlendi. Çalıştırmak için: make fuzz-run, make fuzz-run-sanitize, make fuzz-run-arena, make fuzz-run-stdin, make fuzz-run-file_transfer, make fuzz-run-stdin_events, make fuzz-run-ctrl, make fuzz-run-socks5 veya make fuzz-run-handshake"
 
 fuzz-run: fuzz
 	@echo "[*] AFL++ başlatılıyor (frame_decode)... Durdurmak için Ctrl+C"
@@ -426,6 +432,14 @@ fuzz-run-socks5: fuzz
 	         -o $(FUZZ_DIR)/findings_socks5 \
 	         -- ./$(FUZZ_DIR)/fuzz_socks5
 
+fuzz-run-handshake: fuzz
+	@echo "[*] AFL++ başlatılıyor (handshake_read state machine)... Durdurmak için Ctrl+C"
+	AFL_SKIP_CPUFREQ=1 \
+	AFL_PATH=/tmp/aflpp-build \
+	/tmp/aflpp-build/afl-fuzz -i $(FUZZ_DIR)/corpus/handshake \
+	         -o $(FUZZ_DIR)/findings_handshake \
+	         -- ./$(FUZZ_DIR)/fuzz_handshake
+
 # ----------------------------------------------------------------
 # TEMİZLİK
 # ----------------------------------------------------------------
@@ -434,6 +448,6 @@ clean:
 	rm -f $(OBJS) $(DEPS)
 	rm -f $(SRC_DIR)/*.test.o $(SRC_DIR)/*.test.d
 	rm -f $(TEST_BINS) $(TEST_DEPS)
-	rm -f $(FUZZ_DIR)/*.fuzz.o $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5
+	rm -f $(FUZZ_DIR)/*.fuzz.o $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5 $(FUZZ_DIR)/fuzz_handshake
 	rm -rf $(FUZZ_DIR)/tmp_downloads
 	@echo "[*] Temizlendi."

@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -569,6 +571,18 @@ nox_err_t tor_spawn(struct app_state *state) {
 
   if (pid == 0) {
     /* Child — tor'u başlat */
+
+    /* S1 (threat-model): Tor child'ı crash olursa core dump
+     * üretmesin. RLIMIT_CORE=0 kernel-level engel; PR_SET_DUMPABLE=0
+     * ptrace ve /proc/PID/mem erişimini de kapatır. Tor belleğinde
+     * HS private key + cookie + circuit bilgisi var — diske
+     * yazılmamalı. */
+    struct rlimit no_core = {0, 0};
+    (void)setrlimit(RLIMIT_CORE, &no_core);
+#ifdef PR_SET_DUMPABLE
+    (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+
     setsid();
     int devnull = open("/dev/null", O_RDWR);
     if (devnull >= 0) {

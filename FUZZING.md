@@ -54,7 +54,13 @@ Bu belgede projedeki fuzzer altyapısı, aktif olarak fuzz edilen fonksiyonlar v
     *   **Dosya:** `src/network.c`
     *   **Harness:** `fuzz/fuzz_socks5.c`
     *   **Açıklama:** SOCKS5 proxy (Tor) el sıkışma yanıtlarını (`VER`, `REP`, `ATYP` ve domain/IP uzunlukları) okur, doğrular ve arta kalan veriyi arabellekten temizler.
-    *   **Amaç:** SOCKS5 yanıtlarında gelebilecek hatalı uzunluk bilgileri (domain length) veya tanımsız adres tiplerinin (ATYP) yol açabileceği bellek sınır aşımlarını test etmek.
+    *   **Amaç:** SOCKS5 yanıtlarında gelebilecek hatalı uzunluk bilgileri (domain length) veya tanımsız adres tiplerinin (ATYP) yol açabilecek bellek sınır aşımlarını test etmek.
+
+*   **Noise XX State Machine (`handshake_read`)**
+    *   **Dosya:** `src/noise.c`
+    *   **Harness:** `fuzz/fuzz_handshake.c`
+    *   **Açıklama:** Noise XX el sıkışma mesajlarını (`msg0` / `msg1` / `msg2`) çözen state machine'in parser dayanıklılığını test eder. Girdinin ilk byte'ı kontrol bayrağıdır: initiator/responder, msg_index başlangıcı (0..3; 3 = invalid → STATE error), remote key injection. Production prologue (`"Mustafa Kemal Atatürk"`) kullanılarak code path eşleşmesi sağlanır.
+    *   **Amaç:** Truncation, length overflow, malformed token sırası, rastgele remote key, invalid msg_index gibi durumlarda DH hesaplama, MixKey/MixHash, AEAD decrypt ve state machine'in hata yollarının UB / OOB / leak üretmediğini doğrulamak.
 
 ---
 
@@ -62,10 +68,7 @@ Bu belgede projedeki fuzzer altyapısı, aktif olarak fuzz edilen fonksiyonlar v
 
 Gelecekte sisteme entegre edilmesi planlanan fuzz hedefleri listesi:
 
-*   `[ ]` **`handshake_read(struct noise_handshake *hs, const uint8_t *msg, ...)`**
-    *   **Dosya:** `src/noise.c`
-    *   **Açıklama:** Ağdan gelen şifrelenmemiş/yarı-şifreli el sıkışma payload'larını (Noise XX_25519) işler.
-    *   **Fuzz Nedeni:** Kötü niyetli akranların göndereceği bozuk kriptografik mesajların durum makinesini (state machine) bozmasını veya bellek sızıntısına yol açmasını engellemek.
+*   `[ ]` *(şu an boş — tüm aktif hedefler yukarıda)*
 
 ---
 
@@ -89,4 +92,5 @@ make fuzz-run-file_transfer  # file_transfer alıcısı fuzzing'i başlatır
 make fuzz-run-stdin_events   # stdin olay akışı ve tamponlama fuzzing'i başlatır
 make fuzz-run-ctrl           # Tor kontrol protokolü fuzzer'ını başlatır
 make fuzz-run-socks5         # socks5 protokol fuzzer'ını başlatır
+make fuzz-run-handshake      # Noise XX state machine (handshake_read) fuzzer'ını başlatır
 ```
