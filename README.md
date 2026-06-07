@@ -1,4 +1,4 @@
-```markdown
+
 <p align="center">
   <pre align="center">
   ███╗   ██╗ ██████╗ ██╗  ██╗████████╗ ██████╗ ██████╗
@@ -21,7 +21,7 @@
   <img src="https://img.shields.io/badge/license-GPL--3.0-green" />
 </p>
 
-```
+
 ---
 
 ## What is Noxtor?
