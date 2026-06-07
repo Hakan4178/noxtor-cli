@@ -462,7 +462,14 @@ static void event_loop(struct app_state *state) {
         }
 
         state->peer_fd = peer_fd;
-        epoll_add_fd(state->epoll_fd, peer_fd);
+        if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
+          /* S2: epoll_ctl başarısız (örn. EMFILE) — fd sızıntısını
+           * engelle, "bağlandı" yanılsamasını kır. */
+          NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı reddedildi");
+          close(peer_fd);
+          state->peer_fd = -1;
+          continue;
+        }
 
         state->session_arena_mark = arena_save(&state->arena);
         state->hs = arena_alloc(&state->arena, sizeof(struct noise_handshake));

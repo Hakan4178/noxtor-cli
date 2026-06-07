@@ -427,14 +427,26 @@ void process_line(struct app_state *state, const char *line) {
     }
 
     state->peer_fd = peer_fd;
-    epoll_add_fd(state->epoll_fd, peer_fd);
+    if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
+      /* S2: epoll_ctl başarısız — fd + state sızıntısını engelle. */
+      NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı iptal");
+      close(peer_fd);
+      state->peer_fd = -1;
+      ui_print_error(state, "bağlantı kayıt hatası");
+      return;
+    }
     NOX_INFO(LOG_MOD_MAIN, "peer bağlandı");
 
     /* Noise handshake — initiator */
     state->session_arena_mark = arena_save(&state->arena);
     state->hs = arena_alloc(&state->arena, sizeof(struct noise_handshake));
     if (!state->hs) {
+      /* S2: arena_alloc başarısız — fd + peer_fd + epoll kaydını temizle.
+       * Linux close() fd'yi epoll'den otomatik çıkarır, ayrıca
+       * epoll_remove_fd gerekmez. */
       ui_print_error(state, "arena dolu");
+      close(peer_fd);
+      state->peer_fd = -1;
       return;
     }
 

@@ -50,8 +50,15 @@ static void safe_nanosleep(const struct timespec *req) {
  *
  * A-2 FIX: Onion v3 adres format doğrulaması
  * Format: 56 karakter base32 + ".onion" = 62 karakter
+ * Public: tor_create_hidden_service (S3 — kendi HS adresimiz) ve
+ *         socks5_connect (peer adresi) tarafından çağrılır.
+ *
+ * S3 notu: v3 checksum (SHA3-256 truncated) doğrulaması YAPILMAZ.
+ *   libsodium SHA3-256 sunmaz, ek kütüphane ekleme maliyeti
+ *   defense-in-depth'e değmez. Tor ADD_ONION yanıtı zaten
+ *   geçerli v3 adres üretir (deterministik ED25519-V3).
  * ================================================================ */
-static bool validate_onion_address(const char *addr) {
+bool validate_onion_address(const char *addr) {
   if (!addr)
     return false;
   
@@ -820,8 +827,25 @@ nox_err_t tor_create_hidden_service(int ctrl_fd, uint16_t local_port,
   if (onion_len < 63)
     return NOX_ERR_OVERFLOW;
 
-  memcpy(onion_out, sid, 56);
-  memcpy(onion_out + 56, ".onion", 7);
+  /* S3 (threat-model): Tor'dan gelen ServiceID'yi validate et.
+   * Yanlış formatlı yanıt (compromised tor binary, control socket
+   * manipülasyonu, vb.) peer handshake payload'umuza kirli veri
+   * sızdırmadan reddedilmeli. Peer tarafında da aynı kontrolden
+   * geçen adres artık bizim HS adresimiz de aynı sıkılıkta
+   * doğrulanıyor. */
+  char candidate[63];
+  memcpy(candidate, sid, 56);
+  memcpy(candidate + 56, ".onion", 7);
+  candidate[62] = '\0';
+
+  if (!validate_onion_address(candidate)) {
+    NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtı geçersiz format");
+    sodium_memzero(candidate, sizeof(candidate));
+    return NOX_ERR_TOR;
+  }
+
+  memcpy(onion_out, candidate, 63);
+  sodium_memzero(candidate, sizeof(candidate));
 
   NOX_INFO(LOG_MOD_NET, "Hidden Service: %s", onion_out);
   return NOX_OK;

@@ -44,6 +44,12 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec);
 nox_err_t tor_create_hidden_service(int ctrl_fd, uint16_t local_port,
                                      char *onion_out, size_t onion_len);
 
+/* Onion v3 adres doğrulaması — base32 + ".onion" suffix.
+ * 62 karakter tam v3 .onion adresi için true döner.
+ * socks5_connect (peer) ve tor_create_hidden_service (S3 — kendi HS)
+ * tarafından çağrılır. */
+bool validate_onion_address(const char *addr);
+
 /* Tor process'ini düzgün kapat */
 void tor_shutdown(struct app_state *state);
 
