@@ -1,6 +1,11 @@
 # noxtor-cli
 
-A minimalist CLI application. 0 errors under ASAN/UBSAN -fanalzyer. The noise XX implementation used was based on libsodium primitifves and successfully passed the Cacophony test vectors.
+A minimalist CLI application. 
+
+This project has NOT been audited yet.
+Security researchers are invited to review the codebase.
+
+0 errors under ASAN/UBSAN -fanalzyer. The noise XX implementation used was based on libsodium primitifves and successfully passed the Cacophony test vectors.
 
 NOT: Bizce noxtor'u çalıştırdığın terminal uygulaması da özgür yazılım ve güvenli olmalıdır eğer ortama ve modern terminallere güvenmıyorsan noxtor'u doğrudan TTY'de çalıştırabilirsin. 
 
@@ -51,6 +56,10 @@ No central server.
 
 End-to-end encryption via the Noise XX protocol (with forward secrecy, and it’s quite robust).
 
+## Contributing
+- Good first issues: Parser fuzzing tests coverage or crashed
+- Help wanted: obfs4 or snowflake implementation 
+
 
 
 Compliant with C23 standards, tested under ASan/UBSan—also tested with fanalyser.
@@ -65,6 +74,5 @@ This project doesn’t touch anything centralized.
 It is still in an early stage and not ready for production use. 
 I welcome feedback on code quality, architectural decisions, or the threat model, as well as your feature ideas.
 
-
-
-To try it out, clone the repository, run `make clean && make release` and then type `./noxtor-cli`
+git clone https://github.com/Hakan4178/noxtor-cli
+cd noxtor-cli && make clean && make release  and ./noxtor-cli 
