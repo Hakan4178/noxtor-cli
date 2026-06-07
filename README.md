@@ -31,10 +31,10 @@ activists, journalists, and individuals under censorship.
 
 It routes all traffic through **Tor**, uses the **Noise XX handshake**
 (with forward secrecy) for end-to-end encryption, and requires
-**no central server** — not even for key exchange.
+**no central server** not even for key exchange.
 
 > **⚠️ Early Stage:** Core messaging works and has been tested against
-> official Noise XX (Cacophony) test vectors. Security hardening is
+> non-official Noise XX (Cacophony) test vectors. Security hardening is
 > still in progress. **This project has NOT been independently audited.**
 
 ---
@@ -51,7 +51,7 @@ It routes all traffic through **Tor**, uses the **Noise XX handshake**
 | Trust model | Trust Signal Inc. | Trust the code only |
 
 Signal is great for most people. Noxtor is for those who **can't afford
-to trust any server** — not even Signal's.
+to trust any server** not even Signal's.
 
 ---
 
@@ -95,7 +95,7 @@ cd noxtor-cli && make clean && make release
 - 🌉 **Censorship evasion** — obfs4 and Snowflake bridge support
 - 🧪 **Fuzz-tested parsers** — All external-input parsers individually
   fuzzed for memory safety
-- 📏 **C23 · ASan/UBSan · -fanalyzer** — Zero errors across all
+- 📏 **C23 · ASan/UBSan · -fanalyzer** Zero errors across all
   sanitizers
 
 ---
