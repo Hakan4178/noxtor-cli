@@ -21,6 +21,7 @@
   <img src="https://img.shields.io/badge/license-GPL--3.0-green" />
 </p>
 
+```
 ---
 
 ## What is Noxtor?
@@ -161,6 +162,4 @@ Contributions are welcome — especially in these areas:
 ## License
 
 GPL-3.0
-```
 
----
