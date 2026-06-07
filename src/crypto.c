@@ -615,6 +615,10 @@ nox_err_t crypto_ed25519_to_curve25519(
             sodium_memzero(curve25519_sk, NOX_KEY_LEN);
             return NOX_ERR_CRYPTO;
         }
+        /* crypto_sign_ed25519_sk_to_curve25519 zaten clamp uygular:
+         * h[0] &= 248; h[31] &= 127; h[31] |= 64;
+         * Ek manuel clamp gerekmez — libsodium kaynak koduyla doğrulanmış.
+         * noise_dh()RFC 7748 §6 compliant all-zero output check uygular. */
     }
 
     return NOX_OK;

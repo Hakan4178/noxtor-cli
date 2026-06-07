@@ -667,16 +667,16 @@ static void event_loop(struct app_state *state) {
                     close(fd);
                     state->peer_fd = -1;
                     state->active_peer_onion[0] = '\0';
+                    state->hs = NULL;
                     arena_restore(&state->arena, state->session_arena_mark);
                   }
-                  state->hs = NULL;
                 } else {
                   ui_save_input(state);
                   fprintf(stderr, "\n\033[31m  [!] UYARI: AKRANIN ANAHTARI "
                                   "DEĞİŞMİŞ! (MITM RİSKİ)\033[0m\n");
                   fprintf(stderr, "      Adres: %s\n", peer_onion);
                   fprintf(stderr, "      Kayıtlı İsim: %s\n", name);
-                  fprintf(stderr, "      Yeni Fingerprint: %s\n", fp_str);
+                  fprintf(stderr, "      \033[1;31mYeni Fingerprint: %s\033[0m\n", fp_str);
                   fprintf(stderr,
                           "  [?] Yeni anahtarı onaylıyor musunuz? (y/n): ");
                   fflush(stderr);
@@ -691,12 +691,12 @@ static void event_loop(struct app_state *state) {
                   memcpy(state->tofu_new_key, remote_pub, NOX_KEY_LEN);
                   state->tofu_arena_mark = state->session_arena_mark;
                 }
-              } else {
+               } else {
                 ui_save_input(state);
                 fprintf(stderr,
                         "\n\033[33m  [!] TOFU: Yeni peer bağlantısı\033[0m\n");
                 fprintf(stderr, "      Adres: %s\n", peer_onion);
-                fprintf(stderr, "      Fingerprint: %s\n", fp_str);
+                fprintf(stderr, "      \033[1;36mFingerprint: %s\033[0m\n", fp_str);
                 fprintf(stderr, "  [?] Bu bağlantıyı onaylıyor ve rehbere "
                                 "kaydediyor musunuz? (y/n): ");
                 fflush(stderr);

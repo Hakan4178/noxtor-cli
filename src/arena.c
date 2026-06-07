@@ -50,7 +50,7 @@
  *      Tanımsızsa: uyarı verilir, devam edilir (swap riski belgelenir).
  *
  * ================================================================ */
-/* #define NOX_ARENA_STRICT_LOCK */
+#define NOX_ARENA_STRICT_LOCK
 
 /* ================================================================
  * YARDIMCI — Sayfa boyutu

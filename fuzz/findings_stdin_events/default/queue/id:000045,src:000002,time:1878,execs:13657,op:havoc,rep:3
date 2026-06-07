@@ -1,0 +1,10 @@
+/help
+/m
+/msg test
+/addr
+g test
+ap
+/mselp
+/msg test
+/addr
+g

@@ -83,7 +83,7 @@ void symmetric_init(struct noise_symmetric_state *ss,
                     const char *protocol_name);
 
 /* MixKey — DH çıktısını chaining key'e karıştır */
-nox_err_t symmetric_mix_key(struct noise_symmetric_state *ss,
+__attribute__((strub)) nox_err_t symmetric_mix_key(struct noise_symmetric_state *ss,
                             const uint8_t *input_key_material, size_t len);
 
 /* MixHash — Veriyi handshake hash'e karıştır */
@@ -101,7 +101,7 @@ ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                    uint8_t *out);
 
 /* Split — Handshake bitince iki CipherState döndür */
-nox_err_t symmetric_split(struct noise_symmetric_state *ss,
+__attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *ss,
                           struct noise_cipher_state *c1,
                           struct noise_cipher_state *c2);
 

@@ -242,9 +242,9 @@ void process_line(struct app_state *state, const char *line) {
         ui_print_error(state, "Arena bellek hatası");
         close(state->tofu_peer_fd);
         state->peer_fd = -1;
+        state->hs = NULL;
         arena_restore(&state->arena, state->tofu_arena_mark);
       }
-      state->hs = NULL;
       state->tofu_pending = false;
     } else if (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0) {
       ui_print_system(state, "[*] Bağlantı reddedildi.");

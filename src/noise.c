@@ -307,7 +307,7 @@ cleanup:
  *   ck, temp_k = HKDF(ck, ikm)
  *   InitializeKey(temp_k)
  */
-nox_err_t symmetric_mix_key(struct noise_symmetric_state *ss,
+__attribute__((strub)) nox_err_t symmetric_mix_key(struct noise_symmetric_state *ss,
                             const uint8_t *input_key_material, size_t len) {
   uint8_t temp_k[NOISE_HASHLEN];
 
@@ -364,7 +364,7 @@ ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
  *   c1 = InitializeKey(temp_k1)
  *   c2 = InitializeKey(temp_k2)
  */
-nox_err_t symmetric_split(struct noise_symmetric_state *ss,
+__attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *ss,
                           struct noise_cipher_state *c1,
                           struct noise_cipher_state *c2) {
   uint8_t temp_k1[NOISE_HASHLEN], temp_k2[NOISE_HASHLEN];
@@ -405,9 +405,11 @@ nox_err_t symmetric_split(struct noise_symmetric_state *ss,
  *   1. Karşı tarafın public key'i all-zero ise reddet (weak key)
  *   2. DH çıktısı all-zero ise reddet (small-subgroup / contributory)
  *
- * libsodium ≥1.0.16 crypto_scalarmult zaten bazı low-order
- * noktaları reddeder, ama all-zero kontrolü garanti değil —
- * defense-in-depth olarak burada da yapıyoruz.
+ * RFC 7748 §6 modeli: clamp + all-zero output check.
+ * Low-order noktaları tek tek blacklist'lemek gerekmez —
+ * clamp (multiple of 8) tüm torsion noktalarında output=0 üretir.
+ * libsodium ≥1.0.16 crypto_scalarmult zaten identity (0) noktasını
+ * reddeder.
  */
 static nox_err_t noise_dh(uint8_t out[NOX_KEY_LEN],
                           const uint8_t priv[NOX_KEY_LEN],
@@ -425,7 +427,9 @@ static nox_err_t noise_dh(uint8_t out[NOX_KEY_LEN],
     return NOX_ERR_CRYPTO;
   }
 
-  /* Contributory behaviour: DH çıktısı da sıfır olmamalı */
+  /* RFC 7748 §6 contributory behaviour: DH çıktısı sıfır olmamalı.
+   * Clamp edilmiş scalar (multiple of 8) tüm torsion noktalarında
+   * output=0 üretir; sodium_is_zero() tüm low-order girdileri yakalar. */
   if (sodium_is_zero(out, NOX_KEY_LEN)) {
     NOX_ERROR(LOG_MOD_NOISE,
               "DH reddedildi: paylaşılan sır sıfır (small-subgroup?)");
