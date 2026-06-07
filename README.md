@@ -92,7 +92,7 @@ cd noxtor-cli && make clean && make release
   immediately after use
 - 👻 **Ghost mode** — Disable SQLite entirely; leave zero forensic trace
 - 🛡️ **Seccomp sandboxing** — Minimal syscall surface via libseccomp
-- 🌉 **Censorship evasion** — obfs4 and Snowflake bridge support
+- ✊️ **Censorship evasion** — obfs4 and Snowflake bridge support
 - 🧪 **Fuzz-tested parsers** — All external-input parsers individually
   fuzzed for memory safety
 - 📏 **C23 · ASan/UBSan · -fanalyzer** Zero errors across all
@@ -104,7 +104,7 @@ cd noxtor-cli && make clean && make release
 
 ```
 🔴 THIS SOFTWARE HAS NOT BEEN AUDITED.
-   Do not rely on it in life-threatening situations — yet.
+   Do not rely on it in life-threatening situation yet.
 ```
 
 Security researchers are warmly invited to review the codebase.
@@ -149,7 +149,7 @@ in a **Linux TTY** for maximum isolation.
 
 ## Contributing
 
-Contributions are welcome — especially in these areas:
+Contributions are welcome especially in these areas:
 
 | Area | Difficulty |
 |---|---|
