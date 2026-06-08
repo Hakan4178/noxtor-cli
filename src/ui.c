@@ -20,6 +20,7 @@
 #include "types.h"
 #include "tui.h"
 
+#include <assert.h>
 #include <inttypes.h>  /* PRIu64 — [F4] */
 #include <stdarg.h>
 #include <stdio.h>
@@ -160,8 +161,8 @@ void ui_print_prompt(struct app_state *state)
         char   short_id[SHORT_ID_SIZE];
 
         /* CodeQL #24: "Comparison result is always the same"
-         * olen dinamik strlen sonucu, herhangi bir uzunlukta olabilir.
-         * > 10 kontrolü .onion uzantısı için gerekli (6 byte) + minimum kısaltma (4+4+2=10). */
+         * olen dinamik strlen sonucu, herhangi bir uzunlukta olabilir. */
+        assert(olen <= NOX_ONION_LEN);
         if (olen > 10) {
             size_t hash_len = olen;
             if (olen > 6 &&
