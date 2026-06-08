@@ -88,7 +88,7 @@ cd noxtor-cli && make clean && make release
 - 🧅 **Tor-native P2P** — All traffic routed through Tor onion services
 - 🔐 **Noise XX + libsodium** — Forward-secret E2E encryption, verified
   against Cacophony test vectors
-- 🧹 **Memory hygiene** — Critical keys and data are wiped from RAM
+- 🕳 **Memory hygiene** — Critical keys and data are wiped from RAM
   immediately after use
 - 👻 **Ghost mode** — Disable SQLite entirely; leave zero forensic trace
 - 🛡️ **Seccomp sandboxing** — Minimal syscall surface via libseccomp
@@ -104,7 +104,7 @@ cd noxtor-cli && make clean && make release
 
 ```
 🔴 THIS SOFTWARE HAS NOT BEEN AUDITED.
-   Do not rely on it in life-threatening situation yet.
+   Do not rely on it in life threatening situation yet.
 ```
 
 Security researchers are warmly invited to review the codebase.
@@ -127,7 +127,7 @@ Please report vulnerabilities responsibly.
 ## Trust Note
 
 The terminal emulator you run Noxtor in is also part of your attack
-surface. Use a trusted, open-source terminal — or run Noxtor directly
+surface. Use a trusted, open-source terminal or run Noxtor directly
 in a **Linux TTY** for maximum isolation.
 
 ---
