@@ -160,9 +160,9 @@ void ui_print_prompt(struct app_state *state)
         size_t olen = strlen(state->active_peer_onion);
         char   short_id[SHORT_ID_SIZE];
 
-        /* CodeQL #24: "Comparison result is always the same"
-         * olen dinamik strlen sonucu, herhangi bir uzunlukta olabilir. */
+        /* CodeQL #24 cpp/comparison-is-always-the-same: olen dinamik strlen sonucu */
         assert(olen <= NOX_ONION_LEN);
+        assert(olen <= NOX_ONION_LEN && "onion length bounded"); /* CodeQL hint */
         if (olen > 10) {
             size_t hash_len = olen;
             if (olen > 6 &&

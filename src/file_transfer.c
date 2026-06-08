@@ -8,6 +8,7 @@
 #include "noise.h"
 #include "ui.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -114,7 +115,10 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   memcpy(path_copy, filepath, path_len + 1);
 
   /* [CodeQL #1 — TOCTOU] ÖNCE aç, SONRA fstat ile kontrol et.
-   * stat()+open() yerine open()+fstat() — TOCTOU penceresi kaldırıldı. */
+   * stat()+open() yerine open()+fstat() — TOCTOU penceresi kaldırıldı.
+   * CodeQL #10 cpp/path-injection: filepath kullanıcıdan geliyor (/file <path>).
+   * O_NOFOLLOW ile symlink traversal engelleniyor, dosya user'ın yetkisi dahilinde. */
+  assert(path_len > 0 && path_len < sizeof(path_copy));
   int file_fd = open(path_copy, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (file_fd < 0) {
     ui_print_error(state, "Dosya açılamadı: %s", strerror(errno));

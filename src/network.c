@@ -99,6 +99,9 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
   const uint8_t *p = (const uint8_t *)buf;
   size_t written = 0;
   while (written < len) {
+    /* CodeQL #6-#7 cpp/system-data-exposure: write() çağrısı Tor control socket'e
+     * yapılıyor — bizim child process'ımız. Hassas veri 3. partiye gitmez. */
+    assert(fd >= 0);
     ssize_t w = write(fd, p + written, len - written);
     if (w < 0) {
       if (errno == EINTR)

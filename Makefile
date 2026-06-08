@@ -52,8 +52,8 @@ SRCS     := $(wildcard $(SRC_DIR)/*.c)
 OBJS     := $(SRCS:%.c=%.o)
 DEPS     := $(OBJS:%.o=%.d)
 
-# Test binary'leri
-TEST_SRCS := $(wildcard $(TEST_DIR)/*.c)
+# Test binary'leri — cbmc_ dosyaları hariç (CBMC harness, GCC ile derlenmez)
+TEST_SRCS := $(filter-out $(TEST_DIR)/cbmc_%.c, $(wildcard $(TEST_DIR)/*.c))
 TEST_BINS := $(TEST_SRCS:%.c=%)
 TEST_DEPS := $(TEST_SRCS:%.c=%.d)
 

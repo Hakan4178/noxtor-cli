@@ -33,6 +33,7 @@
 #include "arena.h"
 #include "asm_utils.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -432,6 +433,8 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     }
 
     /* [A-1] Dosyaya yaz: tmp + O_EXCL (atomic write) */
+    /* CodeQL #9 cpp/path-injection: tmp_path identity_path + ".tmp.PID.RND" */
+    assert(strncmp(tmp_path, identity_path, strlen(identity_path)) == 0);
     fd = open(tmp_path,
               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
               0600);

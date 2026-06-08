@@ -266,10 +266,14 @@ nox_err_t validate_pin(const char *pin, size_t raw_len)
      * B-1 FIX: Sabit zamanlı karakter kontrolü.
      * Tüm karakterleri tara, erken çıkış yok.
      * Timing saldırısı ile ilk geçersiz karakterin konumu belirlenemez.
+     *
+     * CBMC: pointer aliasing ile unsigned char erişimi — signed→unsigned
+     * cast false positive'ini önlemek için.
      */
     int bad = 0;
+    const unsigned char *uptr = (const unsigned char *)pin;
     for (size_t i = 0; i < raw_len; i++) {
-        unsigned char c = (unsigned char)pin[i];
+        unsigned char c = uptr[i];
         
         /* Null byte kontrolü */
         bad |= (c == 0x00) ? 1 : 0;

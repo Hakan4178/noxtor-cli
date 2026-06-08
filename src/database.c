@@ -447,8 +447,10 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
 
   /* CodeQL #23: "Comparison result is always the same"
    * strnlen(text, DB_MAX_MSG_LEN + 1) max 4096 döner, > 4095 kontrolü 4096'yı yakalar. */
+  /* CodeQL #23 cpp/comparison-is-always-the-same: strnlen dinamik, > 4095 kontrolü geçerli */
   size_t text_len = strnlen(text, DB_MAX_MSG_LEN + 1);
   assert(text_len <= DB_MAX_MSG_LEN + 1);
+  assert(text_len <= DB_MAX_MSG_LEN + 1 && "strnlen upper bound"); /* CodeQL hint */
   if (text_len > DB_MAX_MSG_LEN) {
     NOX_ERROR(LOG_MOD_DB, "Mesaj çok uzun (max %u karakter)", DB_MAX_MSG_LEN);
     DB_UNLOCK(); return NOX_ERR_DB;

@@ -92,6 +92,7 @@ nox_err_t validate_pin(const char *pin, size_t raw_len);
  * LOG SİSTEMİ — prototip ve makrolar
  *
  * Release build'de LOG_LEVEL_DEBUG tamamen derlenmeden çıkar.
+ * CBMC: __VA_OPT__ ve __builtin_c23_va_start C23 sorunlarını bypass eder.
  * ================================================================ */
 typedef enum {
     LOG_LEVEL_DEBUG = 0,
@@ -131,28 +132,42 @@ void nox_hexdump(log_module_t mod, const char *label,
  * DEBUG seviyesi release'de derlenmeden çıkar.
  */
 #ifdef DEBUG
-  #define NOX_DEBUG(mod, fmt, ...) \
-      nox_log_impl(LOG_LEVEL_DEBUG, (mod), __FILE__, __LINE__, \
-                   fmt __VA_OPT__(,) __VA_ARGS__)
+  #ifdef __CPROVER__
+    /* CBMC: __VA_OPT__ desteklemiyor, basit variadic makro */
+    #define NOX_DEBUG(mod, fmt, ...) \
+        nox_log_impl(LOG_LEVEL_DEBUG, (mod), __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+  #else
+    #define NOX_DEBUG(mod, fmt, ...) \
+        nox_log_impl(LOG_LEVEL_DEBUG, (mod), __FILE__, __LINE__, \
+                     fmt __VA_OPT__(,) __VA_ARGS__)
+  #endif
 #else
   #define NOX_DEBUG(mod, fmt, ...)  /* sıfır overhead */
 #endif
 
-#define NOX_INFO(mod, fmt, ...) \
-    nox_log_impl(LOG_LEVEL_INFO, (mod), __FILE__, __LINE__, \
-                 fmt __VA_OPT__(,) __VA_ARGS__)
-
-#define NOX_WARN(mod, fmt, ...) \
-    nox_log_impl(LOG_LEVEL_WARN, (mod), __FILE__, __LINE__, \
-                 fmt __VA_OPT__(,) __VA_ARGS__)
-
-#define NOX_ERROR(mod, fmt, ...) \
-    nox_log_impl(LOG_LEVEL_ERROR, (mod), __FILE__, __LINE__, \
-                 fmt __VA_OPT__(,) __VA_ARGS__)
-
-#define NOX_FATAL(mod, fmt, ...) \
-    nox_log_impl(LOG_LEVEL_FATAL, (mod), __FILE__, __LINE__, \
-                 fmt __VA_OPT__(,) __VA_ARGS__)
+#ifdef __CPROVER__
+  #define NOX_INFO(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_INFO, (mod), __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+  #define NOX_WARN(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_WARN, (mod), __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+  #define NOX_ERROR(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_ERROR, (mod), __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+  #define NOX_FATAL(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_FATAL, (mod), __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#else
+  #define NOX_INFO(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_INFO, (mod), __FILE__, __LINE__, \
+                   fmt __VA_OPT__(,) __VA_ARGS__)
+  #define NOX_WARN(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_WARN, (mod), __FILE__, __LINE__, \
+                   fmt __VA_OPT__(,) __VA_ARGS__)
+  #define NOX_ERROR(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_ERROR, (mod), __FILE__, __LINE__, \
+                   fmt __VA_OPT__(,) __VA_ARGS__)
+  #define NOX_FATAL(mod, fmt, ...) \
+      nox_log_impl(LOG_LEVEL_FATAL, (mod), __FILE__, __LINE__, \
+                   fmt __VA_OPT__(,) __VA_ARGS__)
+#endif
 
 /* ================================================================
  * UTILITY MAKROLARI
@@ -165,12 +180,23 @@ void nox_hexdump(log_module_t mod, const char *label,
 #define UNUSED(x)        ((void)(x))
 
 /* Compile-time assert (C23 static_assert zaten var ama alias) */
-#define NOX_STATIC_ASSERT(cond, msg)  static_assert((cond), msg)
+#ifdef __CPROVER__
+  /* CBMC: static_assert C23'ü parse edemiyor — skip */
+  #define NOX_STATIC_ASSERT(cond, msg)  extern int __CPROVER_constant_time_0[(cond) ? 1 : -1]
+#else
+  #define NOX_STATIC_ASSERT(cond, msg)  static_assert((cond), msg)
+#endif
 
 /* Güvenli minimum/maksimum — çift değerlendirme yok (C23 typeof) */
-#define NOX_MIN(a, b)  ({ typeof(a) _a = (a); typeof(b) _b = (b); \
-                          _a < _b ? _a : _b; })
-#define NOX_MAX(a, b)  ({ typeof(a) _a = (a); typeof(b) _b = (b); \
-                          _a > _b ? _a : _b; })
+#ifdef __CPROVER__
+  /* CBMC: typeof GCC extension'ını parse edemiyor — basit makro */
+  #define NOX_MIN(a, b)  ((a) < (b) ? (a) : (b))
+  #define NOX_MAX(a, b)  ((a) > (b) ? (a) : (b))
+#else
+  #define NOX_MIN(a, b)  ({ typeof(a) _a = (a); typeof(b) _b = (b); \
+                            _a < _b ? _a : _b; })
+  #define NOX_MAX(a, b)  ({ typeof(a) _a = (a); typeof(b) _b = (b); \
+                            _a > _b ? _a : _b; })
+#endif
 
 #endif /* PARANOID_COMMON_H */
