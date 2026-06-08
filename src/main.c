@@ -129,7 +129,7 @@ static nox_err_t resolve_config_paths(struct app_state *state) {
   }
 
   /* HOME'u realpath ile normalize et, symlink traversal'i engelle */
-  char resolved_home[NOX_PATH_MAX];
+  char resolved_home[PATH_MAX];
   if (realpath(home, resolved_home) == NULL) {
     NOX_ERROR(LOG_MOD_MAIN, "HOME dizini resolve edilemedi: %s", strerror(errno));
     return NOX_ERR_CONFIG;

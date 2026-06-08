@@ -97,7 +97,7 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
       if (errno == EAGAIN) {
 #endif
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        poll(&pfd, 1, -1);
+        poll(&pfd, 1, 3000);
         continue;
       }
       return NOX_ERR_IO;
