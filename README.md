@@ -24,6 +24,9 @@
 
 ---
 
+![CBMC Başarı](Ekran Görüntüsü 2026-06-08 23-39-54.png)
+
+
 ## What is Noxtor?
 
 Noxtor is a **Linux-exclusive, terminal-based messaging tool** built for
