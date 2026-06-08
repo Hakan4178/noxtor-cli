@@ -8,7 +8,7 @@
   ██║ ╚████║╚██████╔╝██╔╝ ██╗   ██║   ╚██████╔╝██║  ██║
   ╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
   </pre>
-  <b>Tor-native · P2P · No metadata · No server · No compromise</b><br>
+  <b>Tor-native · P2P · Minimal metadata · No server · No compromise</b><br>
   A serverless, encrypted messaging tool for those who need it most.
 </p>
 
