@@ -94,7 +94,7 @@ jobs:
       if: matrix.build-mode == 'manual'
       run: |
         sudo apt update
-        sudo apt install -y gcc-14 g++-14
+        sudo apt install -y gcc-14 g++-14 make libsodium-dev libsqlite3-dev libseccomp-dev tor obfs4proxy
 
     - name: Run manual build steps
       if: matrix.build-mode == 'manual'
