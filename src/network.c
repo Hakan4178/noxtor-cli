@@ -7,6 +7,7 @@
 #include "types.h"
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -91,6 +92,10 @@ bool validate_onion_address(const char *addr) {
  * - SOCKS5 greeting (sabit byte'lar)
  * Hassas veri 3. partiye gitmez — FP. */
 nox_err_t write_full(int fd, const void *buf, size_t len) {
+  /* CodeQL #6-#7 cpp/system-data-exposure: getenv("HOME") → config_dir → torrc zincirini
+   * takip ediyor. Bu fonksiyon sadece bizim process'larımız tarafından çağrılır
+   * (Tor control socket, torrc dosyası, SOCKS5). Hassas veri 3. partiye gitmez. */
+  assert(buf != NULL || len == 0);
   const uint8_t *p = (const uint8_t *)buf;
   size_t written = 0;
   while (written < len) {
