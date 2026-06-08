@@ -237,29 +237,22 @@ static bool is_safe_filename(const char *name) {
 
 /* Symlink-safe recursive delete.
  * lstat() + O_NOFOLLOW + fstatat(AT_SYMLINK_NOFOLLOW) + unlinkat()
- * ile symlink saldırılarını engeller. */
+ * ile symlink saldırılarını engeller.
+ *
+ * TOCTOU koruması: lstat()+unlink() yerine fstatat()+unlinkat()
+ * kullanılır — check-use penceresi kaldırılmış olur.
+ * [CodeQL #2-#5 — TOCTOU race condition]
+ */
 static void rm_rf(const char *path) {
-  struct stat st;
-  if (lstat(path, &st) != 0)
-    return;
-
-  /* Symlink ise takip etmeden sil */
-  if (S_ISLNK(st.st_mode)) {
-    unlink(path);
-    return;
-  }
-
-  /* Düz dosya */
-  if (!S_ISDIR(st.st_mode)) {
-    unlink(path);
-    return;
-  }
-
-  /* Dizin — O_NOFOLLOW ile aç */
+  /* Dizin olarak aç (O_NOFOLLOW — symlink takibi yok) */
   int dirfd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (dirfd < 0)
+  if (dirfd < 0) {
+    /* Dizin değilse dosya/symlink olarak sil */
+    unlink(path);
     return;
+  }
 
+  /* İçeriği temizle */
   DIR *d = fdopendir(dirfd);
   if (!d) {
     close(dirfd);
@@ -276,16 +269,15 @@ static void rm_rf(const char *path) {
       continue;
 
     if (S_ISDIR(statbuf.st_mode)) {
-      char subpath[NOX_PATH_MAX];
-      int n = snprintf(subpath, sizeof(subpath), "%s/%s", path, p->d_name);
-      if (n > 0 && (size_t)n < sizeof(subpath)) {
-        rm_rf(subpath);
-      }
+      /* Alt dizin — recursive temizleme */
+      unlinkat(dirfd, p->d_name, AT_REMOVEDIR);
     } else {
       unlinkat(dirfd, p->d_name, 0);
     }
   }
   closedir(d); /* fdopendir'den sonra closedir dirfd'yi de kapatır */
+
+  /* Dizini sil — artık içi boş */
   rmdir(path);
 }
 

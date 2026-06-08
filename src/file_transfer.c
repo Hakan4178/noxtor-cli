@@ -113,33 +113,37 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   }
   memcpy(path_copy, filepath, path_len + 1);
 
-  /* Dosya var mı, okunabilir mi? */
+  /* [CodeQL #1 — TOCTOU] ÖNCE aç, SONRA fstat ile kontrol et.
+   * stat()+open() yerine open()+fstat() — TOCTOU penceresi kaldırıldı. */
+  int file_fd = open(path_copy, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (file_fd < 0) {
+    ui_print_error(state, "Dosya açılamadı: %s", strerror(errno));
+    return;
+  }
+
   struct stat st;
-  if (stat(path_copy, &st) != 0) {
-    ui_print_error(state, "Dosya bulunamadı: %s", strerror(errno));
+  if (fstat(file_fd, &st) != 0) {
+    ui_print_error(state, "Dosya bilgisi alınamadı.");
+    close(file_fd);
     return;
   }
   if (!S_ISREG(st.st_mode)) {
     ui_print_error(state, "Düzenli dosya değil.");
+    close(file_fd);
     return;
   }
 
-  /* E-1 FIX: Negatif veya sıfır boyut kontrolü + maksimum boyut */
+  /* Negatif veya sıfır boyut kontrolü + maksimum boyut */
   if (st.st_size <= 0) {
     ui_print_error(state, "Geçersiz dosya boyutu.");
+    close(file_fd);
     return;
   }
   if ((uint64_t)st.st_size > NOX_MAX_FILE_SIZE) {
     ui_print_error(state,
         "Dosya çok büyük (maksimum %llu MB)",
         (unsigned long long)(NOX_MAX_FILE_SIZE / 1024 / 1024));
-    return;
-  }
-
-  /* Dosyayı aç */
-  int file_fd = open(path_copy, O_RDONLY | O_CLOEXEC);
-  if (file_fd < 0) {
-    ui_print_error(state, "Dosya açılamadı: %s", strerror(errno));
+    close(file_fd);
     return;
   }
 
