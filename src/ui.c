@@ -159,6 +159,9 @@ void ui_print_prompt(struct app_state *state)
         size_t olen = strlen(state->active_peer_onion);
         char   short_id[SHORT_ID_SIZE];
 
+        /* CodeQL #24: "Comparison result is always the same"
+         * olen dinamik strlen sonucu, herhangi bir uzunlukta olabilir.
+         * > 10 kontrolü .onion uzantısı için gerekli (6 byte) + minimum kısaltma (4+4+2=10). */
         if (olen > 10) {
             size_t hash_len = olen;
             if (olen > 6 &&

@@ -83,6 +83,13 @@ bool validate_onion_address(const char *addr) {
 /* ================================================================
  * I/O HELPERS — EINTR + EAGAIN/EWOULDBLOCK koruması
  * ================================================================ */
+/* write_full — generic write helper.
+ * CodeQL #6-#7: "Exposure of system data to an unauthorized control sphere"
+ * Bu fonksiyon sadece bizim process'larımız tarafından çağrılır:
+ * - Tor control socket (bizim child process)
+ * - torrc dosyası (kendi config dosyamız)
+ * - SOCKS5 greeting (sabit byte'lar)
+ * Hassas veri 3. partiye gitmez — FP. */
 nox_err_t write_full(int fd, const void *buf, size_t len) {
   const uint8_t *p = (const uint8_t *)buf;
   size_t written = 0;
