@@ -559,7 +559,8 @@ static void event_loop(struct app_state *state) {
             continue;
           }
 
-          /* A-1 FIX: sodium_malloc — swap koruması + guard page */
+          /* A-1 FIX: sodium_malloc — swap koruması + guard page
+           * fh.len zaten 0 < fh.len <= 4096+NOX_MAC_LEN olarak sınırlandırıldı */
           uint8_t *payload = sodium_malloc(fh.len);
           if (!payload)
             continue;

@@ -358,6 +358,11 @@ static void cleanup_stale_tor_dirs(const char *config_dir) {
     if (n <= 0 || (size_t)n >= sizeof(path))
       continue;
 
+    /* CodeQL cpp/path-injection: path'in config_dir ile başladığını garanti et
+     * (is_safe_filename + snprintf zaten bunu sağlıyor, ama CodeQL data flow'u takip edemiyor) */
+    if (strncmp(path, config_dir, strlen(config_dir)) != 0)
+      continue;
+
     if (!is_our_stale_entry(path, pid))
       continue;
 
