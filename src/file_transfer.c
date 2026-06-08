@@ -268,9 +268,6 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
  * DOSYA PARÇASI GÖNDERİMİ (TX HANDLER)
  * ================================================================ */
 
-/* PATCH: CRIT‑1 — tx_buf boyutu için sabit ve kapasite kontrolü */
-// #define TX_BUF_CAPACITY (FRAME_HEADER_WIRE_SIZE + 4096 + NOX_MAC_LEN)
-
 void file_transfer_handle_tx(struct app_state *state) {
   int fd = state->peer_fd;
   if (fd < 0 || !state->tx_file.active) {

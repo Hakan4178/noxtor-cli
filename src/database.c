@@ -502,6 +502,27 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
   DB_UNLOCK(); return NOX_OK;
 }
 
+/**
+ * db_process_queue — Kuyruktaki şifreli mesajları işler ve gönderir.
+ *
+ * @recipient_onion: Hedef onion adresi (null-terminated, v3 format).
+ * @send_fn:         Mesaj gönderme callback'i. Parametre: (şifreli metin, ctx).
+ *                   Başarılı gönderimde NOX_OK döndürmeli.
+ * @ctx:             send_fn'e geçirilen özel veri (ör. peer fd, tor config).
+ *
+ * Akış:
+ *   1. recipient_onion'ı BLAKE2b ile hash'le (DB'de onion_hash olarak saklanır).
+ *   2. queue tablosundan bu hash'e ait tüm mesajları id ASC sırasıyla çek.
+ *   3. Her mesajı send_fn ile gönder.
+ *   4. Başarılı gönderimden sonra mesajı sil (DELETE WHERE id = ?).
+ *   5. Silme başarısızsa bile gönderime devam et (partial failure tolerated).
+ *
+ * Mutex: DB_LOCK() / DB_UNLOCK() ile korunur. Çağrılan fonksiyonda lock
+ * tutulmamalı — send_fn callback'i kilit dışı çalışır.
+ *
+ * Hata yönetimi: İlk başarısız gönderimde durur ve hata kodu döner.
+ * Kalan mesajlar bir sonraki çağrida tekrar denenir.
+ */
 nox_err_t db_process_queue(const char *recipient_onion,
                            nox_err_t (*send_fn)(const char *text, void *ctx),
                            void *ctx) {
@@ -801,6 +822,28 @@ nox_err_t db_get_history(const char *peer_onion, int limit,
   return NOX_OK;
 }
 
+/**
+ * db_list_contacts_with_summary — Tüm contact'ları son mesaj özetiyle listeler.
+ *
+ * @visitor: Callback fonksiyonu. Her contact için çağrılır:
+ *           (name, onion_hash, last_msg_preview, last_msg_time, is_outgoing, ctx).
+ *           NOX_OK döndürmeye devam et, hata durumunda döngüyü durdurur.
+ * @ctx:     visitor'a geçirilen özel veri (ör. UI state, array).
+ *
+ * Akış:
+ *   1. contacts tablosunu tara (nonce, encrypted_payload, onion_hash).
+ *   2. Her contact için messages tablosundan son mesajı çek (timestamp DESC LIMIT 1).
+ *   3. last_msg_preview: Şifreli payload'un ilk 40 byte'ı (ham hex olarak).
+ *      Bu sadece önizleme — gerçek mesaj deşifre edilmez.
+ *   4. Visitor'ı çağır, eğer NOX_OK dönmezse döngüyü durdur.
+ *
+ * Mutex: DB_LOCK() / DB_UNLOCK() ile korunur. Visitor callback'i kilit
+ * altında çalışır — visitor içinde DB operasyonu yapmamalı (deadlock riski).
+ *
+ * Performans: O(N) contact sayısı kadar. Her contact için tek ek SQL sorgusu.
+ * Büyük contact listelerinde (100+) N+1 query problemi olabilir —
+ * gelecekte JOIN ile optimize edilebilir.
+ */
 nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, void *ctx) {
   DB_LOCK();
   if (!g_state.ready) { DB_UNLOCK(); return NOX_ERR_STATE; }

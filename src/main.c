@@ -128,6 +128,19 @@ static nox_err_t resolve_config_paths(struct app_state *state) {
     return NOX_ERR_CONFIG;
   }
 
+  /* HOME'u realpath ile normalize et, symlink traversal'i engelle */
+  char resolved_home[NOX_PATH_MAX];
+  if (realpath(home, resolved_home) == NULL) {
+    NOX_ERROR(LOG_MOD_MAIN, "HOME dizini resolve edilemedi: %s", strerror(errno));
+    return NOX_ERR_CONFIG;
+  }
+  ret = snprintf(state->config_dir, sizeof(state->config_dir), "%s/%s",
+                 resolved_home, PARANOID_CONFIG_DIR);
+  if (ret < 0 || (size_t)ret >= sizeof(state->config_dir)) {
+    NOX_ERROR(LOG_MOD_MAIN, "config dizin yolu çok uzun");
+    return NOX_ERR_CONFIG;
+  }
+
   /*
    * Alt dosya yolları config_dir + "/identity.key" (en uzun: 13 char).
    * config_dir 498 byte'tan uzunsa alt yollar sığmaz.
