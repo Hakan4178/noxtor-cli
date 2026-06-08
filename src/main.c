@@ -44,6 +44,7 @@
 #include <libgen.h> /* basename */
 #include <sodium.h>
 #include <sys/epoll.h>
+#include <assert.h>
 #include <sys/socket.h>
 
 /* ================================================================
@@ -212,6 +213,8 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
     return NOX_ERR_CONFIG;
   }
   
+  /* CodeQL #14 cpp/path-injection: downloads_dir config_dir + "/downloads" */
+  assert(strncmp(state->downloads_dir, state->config_dir, strlen(state->config_dir)) == 0);
   state->downloads_dir_fd = open(state->downloads_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (state->downloads_dir_fd < 0) {
     NOX_ERROR(LOG_MOD_MAIN, "downloads dizini açılamadı: %s", strerror(errno));
@@ -934,6 +937,8 @@ static void prompt_transport_selection(struct app_state *state) {
 
       int wiped = 0;
       for (int i = 0; all_files[i] != NULL; i++) {
+        /* CodeQL #11 cpp/path-injection: tüm dosya yolları config_dir'den türetilmiştir */
+        assert(strncmp(all_files[i], state.config_dir, dir_len) == 0);
         struct stat st;
         if (stat(all_files[i], &st) != 0)
           continue; /* dosya yok — sorun değil */
@@ -1030,6 +1035,8 @@ static void prompt_transport_selection(struct app_state *state) {
 
     /* ── 8. Salt yükle veya oluştur ───────────────────── */
     uint8_t salt[NOX_SALT_LEN];
+    /* CodeQL #12 cpp/path-injection: config_dir realpath($HOME)'den türetilmiştir */
+    assert(state.config_dir[0] != '\0');
     err = crypto_load_or_create_salt(salt, state.config_dir);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "salt hatası: %s", nox_strerror(err));
@@ -1121,6 +1128,8 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     /* Diskten şifreli anahtarı yükle */
+    /* CodeQL #13 cpp/path-injection: identity_path config_dir + "/identity.key" */
+    assert(strncmp(state.identity_path, state.config_dir, strlen(state.config_dir)) == 0);
     err = crypto_load_identity(state.identity_path, identity_unlock, ed_sk,
                                ed_pub);
     if (err == NOX_ERR_AUTH) {

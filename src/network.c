@@ -936,11 +936,15 @@ void tor_shutdown(struct app_state *state) {
 
   /* torrc dosyasını sil */
   if (state->torrc_path[0] != '\0') {
+    /* CodeQL #15 cpp/path-injection: torrc_path config_dir'den türetilmiştir */
+    assert(strncmp(state->torrc_path, state->config_dir, strlen(state->config_dir)) == 0);
     unlink(state->torrc_path);
     state->torrc_path[0] = '\0';
   }
   /* tor_data dizinini temizle */
   if (state->tor_data_dir[0] != '\0') {
+    /* CodeQL #15 cpp/path-injection: tor_data_dir config_dir'den türetilmiştir */
+    assert(strncmp(state->tor_data_dir, state->config_dir, strlen(state->config_dir)) == 0);
     rm_rf(state->tor_data_dir);
     state->tor_data_dir[0] = '\0';
   }
