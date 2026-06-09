@@ -27,7 +27,7 @@
 
 ![CBMC Succesfull](Ekran%20Görüntüsü%202026-06-08%2023-39-54.png)
 
-CBMC VERIFICATION SUCCESSFUL (only log.c)
+CBMC VERIFICATION SUCCESSFUL (only log.c and arena.c)
 
 
 ## What is Noxtor?

@@ -166,14 +166,37 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
     return NOX_ERR_CONFIG;
   }
 
+  /* A-1: Deadline tabanlı timeout — her byte'da timeout resetlenmez.
+   * Slow loris saldırısını engeller: tüm satır tek timeout_ms içinde
+   * tamamlanmalı, aksi takdirde NOX_ERR_TOR döner. */
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += timeout_ms / 1000;
+  deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+
   size_t pos = 0;
 
   while (pos < buf_size - 1) {
     if (g_shutdown)
       return NOX_ERR_TOR;
 
+    /* Kalan süre hesapla */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long remaining_ms = (long)(deadline.tv_sec - now.tv_sec) * 1000 +
+                        (long)(deadline.tv_nsec - now.tv_nsec) / 1000000L;
+    if (remaining_ms <= 0) {
+      NOX_ERROR(LOG_MOD_NET, "ctrl okuma timeout");
+      return NOX_ERR_TOR;
+    }
+
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    int ret = poll(&pfd, 1, timeout_ms);
+    int poll_timeout = (remaining_ms > INT_MAX) ? INT_MAX : (int)remaining_ms;
+    int ret = poll(&pfd, 1, poll_timeout);
     if (ret < 0) {
       if (errno == EINTR)
         continue;
@@ -464,6 +487,14 @@ static nox_err_t generate_torrc(struct app_state *state) {
       obfs4_path = "/usr/local/bin/obfs4proxy";
     }
     if (strlen(state->obfs4_bridge_line) > 0) {
+      /* C-1: Bridge line'daki \n karakterleri torrc'ye satır enjeksiyonu
+       * yapabilir. Tor config dosyasında her satır tek bir direktördür.
+       * Yeni satır karakteri varsa bridge line reddedilir. */
+      if (strchr(state->obfs4_bridge_line, '\n') != NULL) {
+        NOX_ERROR(LOG_MOD_NET, "obfs4 bridge line newline karakteri içeriyor");
+        close(fd);
+        return NOX_ERR_CONFIG;
+      }
       clen =
           snprintf(content, sizeof(content),
                    "SocksPort auto\n"
@@ -611,6 +642,16 @@ nox_err_t tor_spawn(struct app_state *state) {
       close(devnull);
     }
 
+    /* B-1: Tor child'ı parent FD'lerini miras alır. Bu FD'ler
+     * Tor sürecin açık kalmasına neden olur (epoll, peer, vb.)
+     * veya beklenmedik davranışa yol açar. stdin/stdout/stderr
+     * zaten /dev/null'a yönlendirildi, geri kalan her şeyi kapat. */
+    long max_fds = sysconf(_SC_OPEN_MAX);
+    if (max_fds < 0 || max_fds > 4096)
+      max_fds = 4096;
+    for (int fd_i = 3; fd_i < max_fds; fd_i++)
+      close(fd_i);
+
     char arg0[] = "tor";
     char arg1[] = "-f";
 
@@ -692,6 +733,24 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
   int fd = open(cookie_path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     NOX_ERROR(LOG_MOD_NET, "cookie dosyası okunamadı: %s", strerror(errno));
+    return NOX_ERR_TOR;
+  }
+
+  /* E-1: Cookie dosyası boyutunu fstat ile doğrula.
+   * Tor cookie her zaman 32 byte'tır. Farklı boyut (0, 16, 64)
+   * beklenmeyen durum: symlink manipülasyonu, kısmi yazma hatası,
+   * veya yanlış dosya. read_full EOF'ta zaten başarısız olur ama
+   * fstat ile açık hata mesajı vermek daha iyi. */
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    NOX_ERROR(LOG_MOD_NET, "cookie fstat hatası: %s", strerror(errno));
+    close(fd);
+    return NOX_ERR_TOR;
+  }
+  if (st.st_size != 32) {
+    NOX_ERROR(LOG_MOD_NET, "cookie boyutu beklenmeyen: %ld (32 bekleniyor)",
+              (long)st.st_size);
+    close(fd);
     return NOX_ERR_TOR;
   }
 
@@ -889,9 +948,20 @@ nox_err_t tor_get_socks_port(int ctrl_fd, uint16_t *port_out) {
     return NOX_ERR_TOR;
   }
 
-  long port = strtol(colon + 1, NULL, 10);
-  if (port <= 0 || port > 65535) {
+  /* D-1: strtol endptr ve errno doğrulaması.
+   * Tor yanıt formatı: "127.0.0.1:9050"\r\n
+   * endptr kapanış quote'a veya \r/\n'a işaret etmeli.
+   * errno ERANGE: port sayısı long aralığını aşıyor. */
+  errno = 0;
+  char *endptr = NULL;
+  long port = strtol(colon + 1, &endptr, 10);
+  if (errno == ERANGE || port <= 0 || port > 65535) {
     NOX_ERROR(LOG_MOD_NET, "SOCKS port geçersiz: %ld", port);
+    return NOX_ERR_TOR;
+  }
+  if (!endptr || (*endptr != '"' && *endptr != '\r' && *endptr != '\n' &&
+                  *endptr != '\0')) {
+    NOX_ERROR(LOG_MOD_NET, "SOCKS port parse hatası (geçersiz karakter)");
     return NOX_ERR_TOR;
   }
 

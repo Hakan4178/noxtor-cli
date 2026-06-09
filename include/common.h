@@ -180,9 +180,12 @@ void nox_hexdump(log_module_t mod, const char *label,
 #define UNUSED(x)        ((void)(x))
 
 /* Compile-time assert (C23 static_assert zaten var ama alias) */
-#ifdef __CPROVER__
+#if defined(__CPROVER__)
   /* CBMC: static_assert C23'ü parse edemiyor — skip */
   #define NOX_STATIC_ASSERT(cond, msg)  extern int __CPROVER_constant_time_0[(cond) ? 1 : -1]
+#elif defined(__ESBMC__)
+  /* ESBMC: static_assert (C23) desteklenmiyor — _Static_assert (C11) kullan */
+  #define NOX_STATIC_ASSERT(cond, msg)  _Static_assert((cond), msg)
 #else
   #define NOX_STATIC_ASSERT(cond, msg)  static_assert((cond), msg)
 #endif

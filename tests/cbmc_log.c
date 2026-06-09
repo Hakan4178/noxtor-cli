@@ -33,6 +33,11 @@ extern size_t __VERIFIER_nondet_size_t(void);
 extern char __VERIFIER_nondet_char(void);
 #endif
 
+#ifdef __ESBMC__
+extern size_t __VERIFIER_nondet_size_t(void);
+extern char __VERIFIER_nondet_char(void);
+#endif
+
 /* ================================================================
  * P1 + P2: nox_strerror穷举 — tüm enum değerleri
  * Geçerli enum sınırları: NOX_OK..NOX_ERR_STATE (14 değer)
@@ -123,8 +128,10 @@ static void test_validate_pin_chars(void) {
  * ================================================================ */
 static void test_validate_pin_fuzz(void) {
     size_t raw_len = __VERIFIER_nondet_size_t();
-#ifdef __CPROVER__
+#if defined(__CPROVER__)
     __CPROVER_assume(raw_len <= NOX_PIN_MAX_LEN);
+#elif defined(__ESBMC__)
+    __ESBMC_assume(raw_len <= NOX_PIN_MAX_LEN);
 #else
     if (raw_len > NOX_PIN_MAX_LEN) return;
 #endif
