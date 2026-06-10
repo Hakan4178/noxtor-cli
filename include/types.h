@@ -29,6 +29,7 @@ struct secure_arena {
     size_t   page_size;     /* sistem sayfa boyutu (cache)             */
     bool     fork_safe;     /* MADV_DONTFORK durumu                    */
     bool     dump_safe;     /* MADV_DONTDUMP durumu                    */
+    bool     locked;        /* MAP_LOCKED / mlock durumu               */
     uint8_t  canary[NOX_CANARY_LEN]; /* taşma tespiti için            */
 };
 

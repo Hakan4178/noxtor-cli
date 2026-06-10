@@ -1,0 +1,60 @@
+Query attacker_p1(msg_b(bob,alice,sid_b)) ==> event(LeakS(phase0,alice)) cannot be proved.
+
+Query event(RecvMsg(bob,alice,stagepack_c(sid_b),m)) ==> event(SendMsg(alice,bob,stagepack_c(sid_a),m)) cannot be proved.
+
+Query event(RecvMsg(bob,alice,stagepack_c(sid_b),m)) ==> event(SendMsg(alice,c,stagepack_c(sid_a),m)) || event(LeakS(phase0,alice)) || event(LeakS(phase0,bob)) is true.
+
+Query event(RecvMsg(bob,alice,stagepack_c(sid_b),m)) ==> event(SendMsg(alice,c,stagepack_c(sid_a),m)) || event(LeakS(phase0,alice)) is true.
+
+Query event(RecvMsg(bob,alice,stagepack_c(sid_b),m)) ==> event(SendMsg(alice,bob,stagepack_c(sid_a),m)) || event(LeakS(phase0,alice)) || event(LeakS(phase0,bob)) is true.
+
+Query event(RecvMsg(bob,alice,stagepack_c(sid_b),m)) ==> event(SendMsg(alice,bob,stagepack_c(sid_a),m)) || event(LeakS(phase0,alice)) is true.
+
+Query not attacker_p1(msg_c(alice,bob,sid_a)) cannot be proved.
+
+Query attacker_p1(msg_c(alice,bob,sid_a)) ==> event(LeakS(px,bob)) is true.
+
+Query attacker_p1(msg_c(alice,bob,sid_a)) ==> event(LeakS(phase0,bob)) || (event(LeakS(px,bob)) && event(LeakS(pz,alice))) is true.
+
+Query attacker_p1(msg_c(alice,bob,sid_a)) ==> event(LeakS(phase0,bob)) is true.
+
+Query event(RecvMsg(alice,bob,stagepack_d(sid_a),m)) ==> event(SendMsg(bob,alice,stagepack_d(sid_b),m)) cannot be proved.
+
+Query event(RecvMsg(alice,bob,stagepack_d(sid_a),m)) ==> event(SendMsg(bob,c,stagepack_d(sid_b),m)) || event(LeakS(phase0,bob)) || event(LeakS(phase0,alice)) is true.
+
+Query event(RecvMsg(alice,bob,stagepack_d(sid_a),m)) ==> event(SendMsg(bob,c,stagepack_d(sid_b),m)) || event(LeakS(phase0,bob)) is true.
+
+Query event(RecvMsg(alice,bob,stagepack_d(sid_a),m)) ==> event(SendMsg(bob,alice,stagepack_d(sid_b),m)) || event(LeakS(phase0,bob)) || event(LeakS(phase0,alice)) is true.
+
+Query event(RecvMsg(alice,bob,stagepack_d(sid_a),m)) ==> event(SendMsg(bob,alice,stagepack_d(sid_b),m)) || event(LeakS(phase0,bob)) is true.
+
+Query not attacker_p1(msg_d(bob,alice,sid_b)) cannot be proved.
+
+Query attacker_p1(msg_d(bob,alice,sid_b)) ==> event(LeakS(px,alice)) is true.
+
+Query attacker_p1(msg_d(bob,alice,sid_b)) ==> event(LeakS(phase0,alice)) || (event(LeakS(px,alice)) && event(LeakS(pz,bob))) is true.
+
+Query attacker_p1(msg_d(bob,alice,sid_b)) ==> event(LeakS(phase0,alice)) is true.
+
+Query event(RecvMsg(bob,alice,stagepack_e(sid_b),m)) ==> event(SendMsg(alice,bob,stagepack_e(sid_a),m)) cannot be proved.
+
+Query event(RecvMsg(bob,alice,stagepack_e(sid_b),m)) ==> event(SendMsg(alice,c,stagepack_e(sid_a),m)) || event(LeakS(phase0,alice)) || event(LeakS(phase0,bob)) is true.
+
+Query event(RecvMsg(bob,alice,stagepack_e(sid_b),m)) ==> event(SendMsg(alice,c,stagepack_e(sid_a),m)) || event(LeakS(phase0,alice)) is true.
+
+Query event(RecvMsg(bob,alice,stagepack_e(sid_b),m)) ==> event(SendMsg(alice,bob,stagepack_e(sid_a),m)) || event(LeakS(phase0,alice)) || event(LeakS(phase0,bob)) is true.
+
+Query event(RecvMsg(bob,alice,stagepack_e(sid_b),m)) ==> event(SendMsg(alice,bob,stagepack_e(sid_a),m)) || event(LeakS(phase0,alice)) is true.
+
+Query not attacker_p1(msg_e(alice,bob,sid_a)) cannot be proved.
+
+Query attacker_p1(msg_e(alice,bob,sid_a)) ==> event(LeakS(px,bob)) is true.
+
+Query attacker_p1(msg_e(alice,bob,sid_a)) ==> event(LeakS(phase0,bob)) || (event(LeakS(px,bob)) && event(LeakS(pz,alice))) is true.
+
+Query attacker_p1(msg_e(alice,bob,sid_a)) ==> event(LeakS(phase0,bob)) is true.
+
+Query not event(RecvEnd(true)) cannot be proved.
+
+--------------------------------------------------------------
+

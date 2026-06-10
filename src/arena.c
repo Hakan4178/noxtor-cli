@@ -99,17 +99,18 @@ static void secure_abort(const struct secure_arena *a, const char *msg) {
 #endif
     fprintf(stderr,
             "\n[FATAL] %s\n"
-            "[FATAL] Güvenlik ihlali — program sonlandırılıyor.\n", msg);
+            "[FATAL] Güvenlik ihlali — program sonlandırılıyor.\n",
+            msg ? msg : "(bilinmeyen hata)");
     fflush(stderr);
 
-    if (a && a->base && a->page_size > 0 && a->usable_size > 0) {
-        /*
-         * total_size yerine usable_size + NOX_CANARY_LEN kullan.
-         * Bu değerler struct içinde bağımsız tutulduğundan
-         * total_size kirlenmesi wipe sınırını etkilemez.
-         *
-         * Ek koruma: wipe'ı makul bir üst sınırla kırp.
-         */
+    /*
+     * Struct bozuksa wipe tehlikeli olabilir.
+     * Sanity check: total > 2*page_size, usable < total.
+     */
+    if (a && a->base && a->page_size > 0 && a->usable_size > 0
+        && a->total_size > a->page_size * 2
+        && a->usable_size < a->total_size)
+    {
         size_t wipe = a->usable_size + NOX_CANARY_LEN;
 
         /* Savunmacı üst sınır: 256 MB'dan fazlasını silme */
@@ -117,7 +118,11 @@ static void secure_abort(const struct secure_arena *a, const char *msg) {
         if (wipe > MAX_WIPE) wipe = MAX_WIPE;
 
         uint8_t *usable_start = (uint8_t *)a->base + a->page_size;
-        sodium_memzero(usable_start, wipe);
+
+        /* Wipe bölgesi total_size içine sığıyor mu? */
+        if (usable_start + wipe <= (uint8_t *)a->base + a->total_size) {
+            sodium_memzero(usable_start, wipe);
+        }
     }
 
     abort();
@@ -229,6 +234,7 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
                       "NOX_ARENA_STRICT_LOCK: mlock zorunlu, "
                       "arena başlatma iptal edildi.");
             munmap(base, total);
+            sodium_memzero(a, sizeof(*a));
             return NOX_ERR_ALLOC;
 #else
             locked = false;
@@ -271,6 +277,7 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
                   "lower guard page mprotect başarısız: %s",
                   strerror(errno));
         munmap(base, total);
+        sodium_memzero(a, sizeof(*a));
         return NOX_ERR_ALLOC;
     }
 
@@ -284,6 +291,7 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
                   "upper guard page mprotect başarısız: %s",
                   strerror(errno));
         munmap(base, total);
+        sodium_memzero(a, sizeof(*a));
         return NOX_ERR_ALLOC;
     }
 
@@ -298,6 +306,7 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
     a->usable_size = usable - NOX_CANARY_LEN;
     a->offset      = 0;
     a->page_size   = page_size;
+    a->locked      = locked;
 
     /* ----------------------------------------------------------------
      * 6. Canary üret ve usable alanın hemen ardına yaz
@@ -432,11 +441,20 @@ void arena_destroy(struct secure_arena *a)
     if (!a || !a->base)
         return;
 
-    /* 1. Son canary kontrolü */
-    arena_check_canary(a);
+    /* 1. Canary kontrolü — bozuksa logla ama devam et */
+    uint8_t *bptr         = (uint8_t *)a->base;
+    const uint8_t *canary_pos = bptr + a->page_size + a->usable_size;
+    bool canary_ok = (sodium_memcmp(canary_pos, a->canary, NOX_CANARY_LEN) == 0);
+
+    if (!canary_ok) {
+#ifdef PR_SET_DUMPABLE
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+        fprintf(stderr, "[FATAL] Arena canary bozulmuş!\n");
+        fflush(stderr);
+    }
 
     size_t   page_size    = a->page_size;
-    uint8_t *bptr         = (uint8_t *)a->base;
     uint8_t *usable_start = bptr + page_size;
 
     /*
@@ -470,6 +488,9 @@ void arena_destroy(struct secure_arena *a)
      *
      * P10: munmap() dönüş değeri kontrol ediliyor.
      *      Başarısız olması nadir ama mümkün (örn. çift-free).
+     *
+     * Not: Canary bozulmuş olsa bile munmap her durumda yapılır.
+     *      abort() öncesi bile olsa bellek OS'e iade edilir.
      */
     if (munmap(a->base, a->total_size) != 0) {
         NOX_WARN(LOG_MOD_ARENA,
@@ -484,6 +505,11 @@ void arena_destroy(struct secure_arena *a)
     sodium_memzero(a, sizeof(*a));
 
     NOX_INFO(LOG_MOD_ARENA, "arena yok edildi");
+
+    /* 6. Canary bozuksa şimdi öldür — önce her şeyi temizle */
+    if (!canary_ok) {
+        abort();
+    }
 }
 
 /* ================================================================
