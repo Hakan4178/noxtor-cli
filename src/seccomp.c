@@ -31,7 +31,9 @@ static const struct {
   const char *name;
 } blacklist[] = {
   /* Process manipulation — traced edilemez, clone/clone3 ile process oluşturma */
-  { .num = SCMP_SYS(ptrace),            .name = "ptrace" },
+#ifdef NDEBUG
+  { .num = SCMP_SYS(ptrace),            .name = "ptrace" },  /* production: LSan ile uyumsuz */
+#endif
   { .num = SCMP_SYS(execve),            .name = "execve" },
   { .num = SCMP_SYS(execveat),          .name = "execveat" },
   { .num = SCMP_SYS(fork),              .name = "fork" },
