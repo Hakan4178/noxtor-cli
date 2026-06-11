@@ -181,7 +181,7 @@ nox_err_t crypto_hash_blake2b(uint8_t *out, size_t outlen,
  * [P9] PIN uzunluk kontrolü eklendi.
  * ================================================================ */
 nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
-                                    const char *pin, size_t pin_len,
+                                    char *pin, size_t pin_len,
                                     const uint8_t salt[NOX_SALT_LEN])
 {
     if (!master_key || !pin || !salt)
@@ -211,6 +211,9 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
     if (ret != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "Argon2id başarısız (bellek yetersiz?)");
         explicit_bzero(master_key, NOX_KEY_LEN);
+        /* [P9] Hata durumunda PIN sil — core dump veya bellek sniffing
+         * sızmasını engeller. */
+        sodium_memzero(pin, pin_len);
         return NOX_ERR_CRYPTO;
     }
 
@@ -313,8 +316,12 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
                 NOX_INFO(LOG_MOD_CRYPTO, "salt dosyasından okundu");
                 return NOX_OK;
             }
-            NOX_WARN(LOG_MOD_CRYPTO,
-                     "salt dosyası bozuk, yeniden üretiliyor");
+            /* I/O hatası (disk dolu, NFS kopuk, EIO) — salt üretmeye çalışma!
+             * Eski salt ile türetilmiş master key hâlâ geçerli; yenisi tüm
+             * şifrelenmiş veriyi kalıcı olarak erişilmez kılar. */
+            NOX_ERROR(LOG_MOD_CRYPTO,
+                      "salt okunamadı (I/O hatası, dosya dokunulmuyor)");
+            return err;
         }
     }
 
@@ -594,6 +601,22 @@ nox_err_t crypto_ed25519_to_curve25519(
     if (!ed25519_pk && !ed25519_sk) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "ed25519_to_curve25519: her iki kaynak NULL");
+        return NOX_ERR_CRYPTO;
+    }
+
+    /* [A-2] Kısmi kaynak → hedef verilmişse hata.
+     * curve25519_* verilmiş ama karşılıklı ed25519_* kaynağı yoksa
+     * → başlatılmamış çıktı NOX_OK ile dönüyor. */
+    if (curve25519_pk && !ed25519_pk) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "ed25519_to_curve25519: curve25519_pk hedefi verilmiş ama ed25519_pk kaynağı yok");
+        sodium_memzero(curve25519_pk, NOX_KEY_LEN);
+        return NOX_ERR_CRYPTO;
+    }
+    if (curve25519_sk && !ed25519_sk) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "ed25519_to_curve25519: curve25519_sk hedefi verilmiş ama ed25519_sk kaynağı yok");
+        sodium_memzero(curve25519_sk, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 

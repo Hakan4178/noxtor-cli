@@ -29,6 +29,7 @@
 #include "stdin_handler.h"
 #include "file_transfer.h"
 #include "tui.h"
+#include "seccomp_policy.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -608,8 +609,17 @@ static void event_loop(struct app_state *state) {
               };
               uint8_t rwire[FRAME_HEADER_WIRE_SIZE];
               frame_header_encode(&rfh, rwire);
-              write_full(fd, rwire, FRAME_HEADER_WIRE_SIZE);
-              write_full(fd, hsbuf, hslen);
+              if (write_full(fd, rwire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
+                  write_full(fd, hsbuf, hslen) != NOX_OK) {
+                NOX_ERROR(LOG_MOD_NOISE, "handshake yanıtı gönderilemedi");
+                ui_print_error(state, "Handshake yanıtı gönderilemedi");
+                close(fd);
+                state->peer_fd = -1;
+                state->hs = NULL;
+                state->active_peer_onion[0] = '\0';
+                arena_restore(&state->arena, state->session_arena_mark);
+                continue;
+              }
               NOX_INFO(LOG_MOD_NOISE, "handshake yanıt");
             }
 
@@ -1338,6 +1348,15 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     NOX_INFO(LOG_MOD_MAIN, "adresiniz: %s", state.onion_addr);
+
+    /* ── 14b. Seccomp blacklist yükle ────────────────
+     * Tor ve Hidden Service hazır. Bundan sonra tehlikeli
+     * syscall'lar SIGSYS ile öldürmeli. */
+    if (seccomp_policy_load() != NOX_OK) {
+      NOX_FATAL(LOG_MOD_MAIN, "seccomp yüklenemedi — abort");
+      cleanup(&state);
+      return 1;
+    }
 
     if (g_shutdown) goto shutdown_clean;
 

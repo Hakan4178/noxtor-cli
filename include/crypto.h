@@ -55,7 +55,7 @@ nox_err_t crypto_hash_blake2b(uint8_t *out, size_t outlen,
  * PIN fonksiyon dönmeden ÖNCE çağıran tarafından silinmeli.
  */
 nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
-                                   const char *pin, size_t pin_len,
+                                   char *pin, size_t pin_len,
                                    const uint8_t salt[NOX_SALT_LEN]);
 
 /*

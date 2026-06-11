@@ -755,6 +755,9 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
     switch (hs->msg_index) {
     case 1:
       err = read_msg1(hs, msg, msg_len, payload_out, pl_len);
+      /* Initiator: read_msg1 sonrası hs->e artık kullanılmaz — sil */
+      if (err == NOX_OK)
+        sodium_memzero(hs->e, NOX_KEY_LEN);
       break;
     default:
       return NOX_ERR_STATE;
@@ -766,6 +769,9 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
       break;
     case 2:
       err = read_msg2(hs, msg, msg_len, payload_out, pl_len);
+      /* Responder: read_msg2 sonrası hs->e artık kullanılmaz — sil */
+      if (err == NOX_OK)
+        sodium_memzero(hs->e, NOX_KEY_LEN);
       break;
     default:
       return NOX_ERR_STATE;
@@ -872,6 +878,18 @@ nox_err_t handshake_init_with_prologue(struct noise_handshake *hs,
             initiator ? "initiator" : "responder", prologue_len);
 
   return NOX_OK;
+}
+
+void handshake_get_h(const struct noise_handshake *hs, uint8_t out[64]) {
+  memcpy(out, hs->ss.h, 64);
+}
+
+void handshake_get_ck(const struct noise_handshake *hs, uint8_t out[64]) {
+  memcpy(out, hs->ss.ck, 64);
+}
+
+void handshake_get_k(const struct noise_handshake *hs, uint8_t out[32]) {
+  memcpy(out, hs->ss.cs.k, 32);
 }
 
 #endif /* NOISE_TEST_DETERMINISTIC */

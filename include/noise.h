@@ -225,6 +225,23 @@ nox_err_t handshake_init_with_prologue(struct noise_handshake *hs,
                                         const uint8_t *prologue,
                                         size_t prologue_len);
 
+/*
+ * handshake_get_h — Handshake hash'i oku (test-only)
+ * SPLIT/COMPLETE sonrası geçerli.
+ */
+void handshake_get_h(const struct noise_handshake *hs, uint8_t out[64]);
+
+/*
+ * handshake_get_ck — Chaining key'i oku (test-only)
+ */
+void handshake_get_ck(const struct noise_handshake *hs, uint8_t out[64]);
+
+/*
+ * handshake_get_k — Cipher key'i oku (test-only)
+ * CipherState henüz key yoksa all-zero döner.
+ */
+void handshake_get_k(const struct noise_handshake *hs, uint8_t out[32]);
+
 #endif /* NOISE_TEST_DETERMINISTIC */
 
 #endif /* PARANOID_NOISE_H */

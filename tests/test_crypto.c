@@ -78,7 +78,7 @@ static int test_argon2id_derive(void)
     /* Sabit salt — tekrarlanabilir test */
     memset(salt, 0x42, NOX_SALT_LEN);
 
-    const char *pin = "testpassword1234";
+    char pin[] = "testpassword1234";
     nox_err_t err = crypto_derive_master_key(master_key, pin, strlen(pin), salt);
     TEST_ASSERT(err == NOX_OK);
 
@@ -94,7 +94,7 @@ static int test_argon2id_derive(void)
 
     /* Farklı PIN → farklı key */
     uint8_t master_key3[NOX_KEY_LEN] = {0};
-    const char *pin2 = "differentpin9999";
+    char pin2[] = "differentpin9999";
     err = crypto_derive_master_key(master_key3, pin2, strlen(pin2), salt);
     TEST_ASSERT(err == NOX_OK);
     TEST_ASSERT(sodium_memcmp(master_key, master_key3, NOX_KEY_LEN) != 0);
@@ -249,7 +249,8 @@ static int test_identity_wrong_pin(void)
  * ================================================================ */
 static int test_null_safety(void)
 {
-    TEST_ASSERT(crypto_derive_master_key(NULL, "x", 1, (uint8_t[16]){0})
+    char short_pin[] = "x";
+    TEST_ASSERT(crypto_derive_master_key(NULL, short_pin, 1, (uint8_t[16]){0})
                 == NOX_ERR_PIN);
 
     uint8_t key[NOX_KEY_LEN];
@@ -280,7 +281,7 @@ static int test_full_chain(void)
 {
     setup_test_dir();
 
-    const char *pin = "aktivist2024!";
+    char pin[] = "aktivist2024!";
     char id_path[256];
     snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);
 
@@ -352,7 +353,7 @@ static int test_salt_exists_no_identity(void)
     TEST_ASSERT(sodium_memcmp(salt1, salt2, NOX_SALT_LEN) == 0);
 
     /* identity.key üretimi hâlâ çalışmalı */
-    const char *pin = "recovery_pin12";
+    char pin[] = "recovery_pin12";
     uint8_t master[NOX_KEY_LEN];
     TEST_ASSERT(crypto_derive_master_key(master, pin, strlen(pin), salt2) == NOX_OK);
 
@@ -425,7 +426,7 @@ static int test_full_chain_wrong_pin(void)
     snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);
 
     /* Doğru PIN ile tam zincir */
-    const char *correct_pin = "correct_pin_2024";
+    char correct_pin[] = "correct_pin_2024";
     uint8_t salt[NOX_SALT_LEN];
     TEST_ASSERT(crypto_load_or_create_salt(salt, TEST_DIR) == NOX_OK);
 
@@ -440,7 +441,7 @@ static int test_full_chain_wrong_pin(void)
     TEST_ASSERT(crypto_generate_identity(id_path, unlock_ok, pub) == NOX_OK);
 
     /* Yanlış PIN ile tam zincir → AUTH hatası */
-    const char *wrong_pin = "totally_wrong_99";
+    char wrong_pin[] = "totally_wrong_99";
     uint8_t master_bad[NOX_KEY_LEN];
     TEST_ASSERT(crypto_derive_master_key(master_bad, wrong_pin,
                 strlen(wrong_pin), salt) == NOX_OK);

@@ -176,22 +176,25 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
   if (!chunk)
     return NOX_ERR_ALLOC;
 
+  nox_err_t first_err = NOX_OK;
+
   while (offset < total_len) {
     size_t chunk_len = get_next_chunk_size(msg, offset, total_len);
     memcpy(chunk, msg + offset, chunk_len);
     chunk[chunk_len] = '\0';
 
     nox_err_t err = db_queue_message(recipient_onion, chunk);
-    if (err != NOX_OK) {
-      sodium_free(chunk);
-      return err;
+    if (err != NOX_OK && first_err == NOX_OK) {
+      NOX_WARN(LOG_MOD_MAIN, "chunk %zu/%zu kuyruğa eklenemedi",
+               offset / 4096 + 1, (total_len + 4095) / 4096);
+      first_err = err;
     }
 
     offset += chunk_len;
   }
 
   sodium_free(chunk);
-  return NOX_OK;
+  return first_err;
 }
 
 /* ================================================================
@@ -206,8 +209,10 @@ void process_line(struct app_state *state, const char *line) {
       if (!state->hs) {
         ui_print_error(state,
             "Handshake durumu geçersiz (peer ayrılmış olabilir)");
-        state->tofu_pending = false;
+        close(state->tofu_peer_fd);
         state->peer_fd = -1;
+        arena_restore(&state->arena, state->tofu_arena_mark);
+        state->tofu_pending = false;
         return;
       }
 
@@ -467,8 +472,16 @@ void process_line(struct app_state *state, const char *line) {
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     frame_header_encode(&fh, wire);
-    write_full(peer_fd, wire, FRAME_HEADER_WIRE_SIZE);
-    write_full(peer_fd, hsbuf, hslen);
+    if (write_full(peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
+        write_full(peer_fd, hsbuf, hslen) != NOX_OK) {
+      NOX_ERROR(LOG_MOD_NOISE, "handshake msg0 gönderilemedi");
+      ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
+      close(peer_fd);
+      state->peer_fd = -1;
+      state->hs = NULL;
+      arena_restore(&state->arena, state->session_arena_mark);
+      return;
+    }
 
     NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi");
     ui_print_system(state, "[*] handshake başlatıldı");
@@ -590,8 +603,14 @@ void process_stdin_events(struct app_state *state) {
       size_t line_len = (size_t)(newline - state->stdin_buf);
       char *line = sodium_malloc(line_len + 1);
       if (!line) {
-        NOX_ERROR(LOG_MOD_MAIN, "line buffer alloc başarısız");
-        return;
+        NOX_ERROR(LOG_MOD_MAIN, "line buffer alloc başarısız — satır atlanıyor");
+        size_t consumed = line_len + 1;
+        size_t remaining = state->stdin_len - consumed;
+        if (remaining > 0)
+          memmove(state->stdin_buf, state->stdin_buf + consumed, remaining);
+        state->stdin_len = remaining;
+        state->stdin_buf[state->stdin_len] = '\0';
+        continue;
       }
       memcpy(line, state->stdin_buf, line_len);
       line[line_len] = '\0';

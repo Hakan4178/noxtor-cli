@@ -5,6 +5,7 @@
 #include "network.h"
 #include "common.h"
 #include "types.h"
+#include "seccomp_policy.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -1193,6 +1194,7 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
 
   *fd_out = fd;
   NOX_INFO(LOG_MOD_NET, "SOCKS5 bağlantı: %s:%u", onion_addr, port);
+
   return NOX_OK;
 }
 

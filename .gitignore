@@ -4,5 +4,6 @@ src/**/*.o
 **/*.d
 src/**/*.d
 *.d
+*.out
 memory-bank
 

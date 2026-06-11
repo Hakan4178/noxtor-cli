@@ -166,6 +166,9 @@ void nox_hexdump(log_module_t mod, const char *label,
                  const void *data, size_t len)
 {
 #ifdef DEBUG
+    if (!data || len == 0)
+        return;
+
     const uint8_t *p = (const uint8_t *)data;
 
     NOX_DEBUG(mod, "hexdump: %s (%zu bytes)", label, len);
@@ -237,8 +240,10 @@ const char *nox_strerror(nox_err_t err)
  *   3. Embedded null byte yasak (binary injection)
  *   4. Sadece printable ASCII + UTF-8 continuation bytes
  *
- * B-1 FIX: Sabit zamanlı karakter kontrolü — timing saldırısı koruması.
+ * B-1 FIX: Döngü düzeyinde sabit zamanlı karakter kontrolü.
  * Erken çıkış yok, tüm karakterler her zaman taranır.
+ * Not: Hata karar noktası (NOX_ERROR) sabit zamanlı değildir,
+ *       PIN validator için pratik risk oluşturmez.
  *
  * Terminal'e bağımlı DEĞİL — unit test edilebilir.
  * ================================================================ */
@@ -263,9 +268,14 @@ nox_err_t validate_pin(const char *pin, size_t raw_len)
     }
 
     /*
-     * B-1 FIX: Sabit zamanlı karakter kontrolü.
+     * B-1 FIX: Döngü düzeyinde sabit zamanlı karakter kontrolü.
      * Tüm karakterleri tara, erken çıkış yok.
-     * Timing saldırısı ile ilk geçersiz karakterin konumu belirlenemez.
+     * Karar noktası NOX_ERROR sabit zamanlı değildir — PIN context'inde
+     * exploit edilebilirliği tartışmalıdır.
+     *
+     * UTF-8: 0x80-0xFF arası byte'lara dokunulmaz (UTF-8 passthrough).
+     * Geçersiz UTF-8 başlangıç byte'ları (0xC0, 0xC1, 0xFE, 0xFF)
+     * kontrol edilmez — PIN için prati risk yok.
      *
      * CBMC: pointer aliasing ile unsigned char erişimi — signed→unsigned
      * cast false positive'ini önlemek için.
