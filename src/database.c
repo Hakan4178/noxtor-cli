@@ -523,8 +523,9 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
  *   4. Başarılı gönderimden sonra mesajı sil (DELETE WHERE id = ?).
  *   5. Silme başarısızsa bile gönderime devam et (partial failure tolerated).
  *
- * Mutex: DB_LOCK() / DB_UNLOCK() ile korunur. Çağrılan fonksiyonda lock
- * tutulmamalı — send_fn callback'i kilit dışı çalışır.
+ * Mutex: DB_LOCK() / DB_UNLOCK() ile korunur. send_fn callback'i kilit
+ * DIŞINDA çalışır — kilit tutularak soket I/O yapılması deadlock riski taşır.
+ * akış: DB_UNLOCK() → send_fn() → DB_LOCK() → DELETE → DB_UNLOCK().
  *
  * Hata yönetimi: İlk başarısız gönderimde durur ve hata kodu döner.
  * Kalan mesajlar bir sonraki çağrida tekrar denenir.
@@ -540,6 +541,7 @@ nox_err_t db_process_queue(const char *recipient_onion,
   nox_err_t err = hash_onion(recipient_onion, hash);
   if (err != NOX_OK) { DB_UNLOCK(); return err; }
 
+  /* 1. Tüm kuyruk mesajlarını hafızaya çek (lock altında) */
   sqlite3_stmt *stmt = NULL;
   const char *sql = "SELECT id, nonce, encrypted_payload FROM queue WHERE recipient_hash = ? ORDER BY id ASC;";
   int rc = sqlite3_prepare_v2(g_state.db, sql, -1, &stmt, NULL);
@@ -551,25 +553,19 @@ nox_err_t db_process_queue(const char *recipient_onion,
   rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
   if (rc != SQLITE_OK) { sqlite3_finalize(stmt); DB_UNLOCK(); return NOX_ERR_DB; }
 
-  sqlite3_stmt *del_stmt = NULL;
-  const char *del_sql = "DELETE FROM queue WHERE id = ?;";
-  rc = sqlite3_prepare_v2(g_state.db, del_sql, -1, &del_stmt, NULL);
-  if (rc != SQLITE_OK) {
-    sqlite3_finalize(stmt);
-    NOX_ERROR(LOG_MOD_DB, "Silme statement hazırlanamadı");
-    DB_UNLOCK(); return NOX_ERR_DB;
-  }
+  /* Mesajları basit diziye çek — 256 mesaj limiti (1MB kuyruk) */
+  #define QUEUE_BATCH_LIMIT 256
+  struct {
+    int64_t id;
+    uint8_t nonce[NOX_NONCE_LEN];
+    uint8_t *cipher;
+    int      cipher_len;
+  } batch[QUEUE_BATCH_LIMIT];
+  int batch_count = 0;
 
-  nox_err_t process_err = NOX_OK;
-  int sent_count = 0;
-
-  sqlite3_exec(g_state.db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-
-  while (sqlite3_step(stmt) == SQLITE_ROW) {
+  while (sqlite3_step(stmt) == SQLITE_ROW && batch_count < QUEUE_BATCH_LIMIT) {
     int64_t msg_id = sqlite3_column_int64(stmt, 0);
-    const void *nonce_ptr = sqlite3_column_blob(stmt, 1);
     int nonce_bytes = sqlite3_column_bytes(stmt, 1);
-    const void *cipher_ptr = sqlite3_column_blob(stmt, 2);
     int cipher_bytes_int = sqlite3_column_bytes(stmt, 2);
 
     if (nonce_bytes != NOX_NONCE_LEN) continue;
@@ -577,62 +573,94 @@ nox_err_t db_process_queue(const char *recipient_onion,
     if (cipher_bytes_int <= (int)crypto_secretbox_MACBYTES ||
         cipher_bytes_int > 4096 + (int)crypto_secretbox_MACBYTES) {
         NOX_WARN(LOG_MOD_DB, "Geçersiz cipher boyutu: %d — kayıt atlanıyor", cipher_bytes_int);
-        sqlite3_reset(del_stmt);
-        sqlite3_bind_int64(del_stmt, 1, msg_id);
-        int del_rc = sqlite3_step(del_stmt);
-        if (del_rc != SQLITE_DONE) {
-            NOX_WARN(LOG_MOD_DB, "Bozuk kayıt silinemedi: %s", sqlite3_errmsg(g_state.db));
-            process_err = NOX_ERR_DB; break;
-        }
         continue;
     }
 
-    size_t cipher_bytes = (size_t)cipher_bytes_int;
-    size_t expected_plain = cipher_bytes - crypto_secretbox_MACBYTES;
+    batch[batch_count].id = msg_id;
+    memcpy(batch[batch_count].nonce, sqlite3_column_blob(stmt, 1), NOX_NONCE_LEN);
+    batch[batch_count].cipher_len = cipher_bytes_int;
+    batch[batch_count].cipher = sodium_malloc((size_t)cipher_bytes_int);
+    if (!batch[batch_count].cipher) {
+        for (int j = 0; j < batch_count; j++) sodium_free(batch[j].cipher);
+        sqlite3_finalize(stmt);
+        DB_UNLOCK(); return NOX_ERR_ALLOC;
+    }
+    memcpy(batch[batch_count].cipher, sqlite3_column_blob(stmt, 2), (size_t)cipher_bytes_int);
+    batch_count++;
+  }
+  sqlite3_finalize(stmt);
+  DB_UNLOCK();
 
+  /* 2. Kilidi açık olarak mesajları çöz ve gönder */
+  nox_err_t process_err = NOX_OK;
+  int sent_count = 0;
+
+  for (int i = 0; i < batch_count; i++) {
+    size_t expected_plain = (size_t)batch[i].cipher_len - crypto_secretbox_MACBYTES;
     char *plain = sodium_malloc(expected_plain + 1);
     if (!plain) {
-        process_err = NOX_ERR_ALLOC;
-        break;
+      process_err = NOX_ERR_ALLOC;
+      break;
     }
 
     size_t plain_len_out = 0;
-    err = decrypt_payload((const uint8_t *)cipher_ptr, cipher_bytes,
-                          (const uint8_t *)nonce_ptr, (uint8_t *)plain,
+    err = decrypt_payload(batch[i].cipher, (size_t)batch[i].cipher_len,
+                          batch[i].nonce, (uint8_t *)plain,
                           expected_plain, &plain_len_out);
 
     if (err != NOX_OK) {
       sodium_free(plain);
-      sqlite3_reset(del_stmt);
-      sqlite3_bind_int64(del_stmt, 1, msg_id);
-      int del_rc = sqlite3_step(del_stmt);
-      if (del_rc != SQLITE_DONE) {
-          NOX_WARN(LOG_MOD_DB, "Bozuk kayıt silinemedi: %s", sqlite3_errmsg(g_state.db));
-          process_err = NOX_ERR_DB; break;
+      /* Bozuk mesajı sil — DB_LOCK/DB_UNLOCK içinde */
+      DB_LOCK();
+      if (g_state.ready) {
+        sqlite3_stmt *del = NULL;
+        if (sqlite3_prepare_v2(g_state.db, "DELETE FROM queue WHERE id = ?;", -1, &del, NULL) == SQLITE_OK) {
+          sqlite3_bind_int64(del, 1, batch[i].id);
+          sqlite3_step(del);
+          sqlite3_finalize(del);
+        }
       }
+      DB_UNLOCK();
       continue;
     }
 
     plain[plain_len_out] = '\0';
     if (plain_len_out == 0 || plain[plain_len_out - 1] != '\0') {
-        NOX_WARN(LOG_MOD_DB, "Plaintext NUL-terminate eksik");
+        NOX_WARN(LOG_MOD_DB, "Plaintext NUL-terminate eksik — kayıt siliniyor");
         sodium_free(plain);
+        DB_LOCK();
+        if (g_state.ready) {
+          sqlite3_stmt *del = NULL;
+          if (sqlite3_prepare_v2(g_state.db, "DELETE FROM queue WHERE id = ?;", -1, &del, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(del, 1, batch[i].id);
+            sqlite3_step(del);
+            sqlite3_finalize(del);
+          }
+        }
+        DB_UNLOCK();
         continue;
     }
 
-    nox_err_t send_err = send_fn(plain, ctx);
+    nox_err_t send_err;
+    send_err = send_fn(plain, ctx);
     sodium_free(plain);
 
     if (send_err == NOX_OK) {
-      sqlite3_reset(del_stmt);
-      sqlite3_bind_int64(del_stmt, 1, msg_id);
-      int del_rc = sqlite3_step(del_stmt);
-      if (del_rc == SQLITE_DONE) {
-        sent_count++;
-      } else {
-        NOX_WARN(LOG_MOD_DB, "Kayıt silinemedi: %s", sqlite3_errmsg(g_state.db));
-        process_err = NOX_ERR_DB; break;
+      DB_LOCK();
+      if (g_state.ready) {
+        sqlite3_stmt *del = NULL;
+        if (sqlite3_prepare_v2(g_state.db, "DELETE FROM queue WHERE id = ?;", -1, &del, NULL) == SQLITE_OK) {
+          sqlite3_bind_int64(del, 1, batch[i].id);
+          if (sqlite3_step(del) == SQLITE_DONE) {
+            sent_count++;
+          } else {
+            NOX_WARN(LOG_MOD_DB, "Kayıt silinemedi: %s", sqlite3_errmsg(g_state.db));
+            process_err = NOX_ERR_DB;
+          }
+          sqlite3_finalize(del);
+        }
       }
+      DB_UNLOCK();
     } else {
       NOX_WARN(LOG_MOD_DB, "Kuyruktaki mesaj gönderilemedi, işlem durduruldu");
       process_err = send_err;
@@ -640,15 +668,14 @@ nox_err_t db_process_queue(const char *recipient_onion,
     }
   }
 
-  sqlite3_exec(g_state.db, "COMMIT;", NULL, NULL, NULL);
-
-  sqlite3_finalize(stmt);
-  sqlite3_finalize(del_stmt);
+  /* Batch cipher'ları temizle */
+  for (int i = 0; i < batch_count; i++) {
+    sodium_free(batch[i].cipher);
+  }
 
   if (sent_count > 0) {
     NOX_INFO(LOG_MOD_DB, "Kuyruktan %d mesaj gönderildi ve temizlendi", sent_count);
   }
-  DB_UNLOCK();
   return process_err;
 }
 
@@ -704,6 +731,10 @@ nox_err_t db_save_message(const char *peer_onion, const char *text,
   if (!peer_onion || !text) { DB_UNLOCK(); return NOX_ERR_DB; }
 
   size_t text_len = strlen(text);
+  if (text_len > DB_MAX_MSG_LEN) {
+      NOX_ERROR(LOG_MOD_DB, "Kaydedilecek mesaj çok uzun: %zu byte (maksimum %d)", text_len, DB_MAX_MSG_LEN);
+      DB_UNLOCK(); return NOX_ERR_DB;
+  }
   size_t payload_len = text_len + 1;
   size_t cipher_len = payload_len + crypto_secretbox_MACBYTES;
 
@@ -906,7 +937,11 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
     time_t last_msg_timestamp = 0;
 
     sqlite3_reset(msg_stmt);
-    sqlite3_bind_blob(msg_stmt, 1, hash_ptr, hash_bytes, SQLITE_TRANSIENT);
+    rc = sqlite3_bind_blob(msg_stmt, 1, hash_ptr, hash_bytes, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) {
+      NOX_WARN(LOG_MOD_DB, "Message bind başarısız: %s", sqlite3_errmsg(g_state.db));
+      continue;
+    }
 
     if (sqlite3_step(msg_stmt) == SQLITE_ROW) {
       const void *msg_nonce_ptr = sqlite3_column_blob(msg_stmt, 0);

@@ -108,7 +108,8 @@ static void secure_abort(const struct secure_arena *a, const char *msg) {
      * Sanity check: total > 2*page_size, usable < total.
      */
     if (a && a->base && a->page_size > 0 && a->usable_size > 0
-        && a->total_size > a->page_size * 2
+        && a->total_size > a->page_size
+        && a->total_size - a->page_size > a->page_size
         && a->usable_size < a->total_size)
     {
         size_t wipe = a->usable_size + NOX_CANARY_LEN;
@@ -468,15 +469,32 @@ void arena_destroy(struct secure_arena *a)
      *
      * wipe_size: usable_size (bump alanı) + NOX_CANARY_LEN
      * Sayfa hizası garantili, guard page'e taşmaz.
+     *
+     * Yapısal bütünlük kontrolü: struct bozuksa wipe → SIGSEGV
+     * → munmap atlanır → veri sızar. Bozuksa wipe'ı atla.
      */
-    size_t wipe_size = a->usable_size + NOX_CANARY_LEN;
-    sodium_memzero(usable_start, wipe_size);
+    bool struct_ok = (page_size > 0 && a->usable_size > 0 &&
+                      a->total_size > page_size &&
+                      a->total_size - page_size > page_size &&
+                      a->usable_size < a->total_size);
+
+    if (struct_ok) {
+        size_t wipe_size = a->usable_size + NOX_CANARY_LEN;
+        /* Savunmacı üst sınır: 256 MB'dan fazlasını silme */
+        const size_t MAX_WIPE = 256U * 1024U * 1024U;
+        if (wipe_size > MAX_WIPE) wipe_size = MAX_WIPE;
+        if (usable_start + wipe_size <= bptr + a->total_size) {
+            sodium_memzero(usable_start, wipe_size);
+        }
+    } else {
+        NOX_WARN(LOG_MOD_ARENA, "arena struct bozuk — wipe atlanıyor, munmap deneniyor");
+    }
 
     /* 3. Memory barrier — sıfırlama tamamlanmadan munmap() olmaz */
     __asm__ __volatile__("" ::: "memory");
 
     NOX_DEBUG(LOG_MOD_ARENA,
-              "arena sıfırlandı: %zu byte", wipe_size);
+              "arena yıkılıyor: %zu byte", a->total_size);
 
     /*
      * 4. munmap — tüm alanı (guard page'ler dahil) serbest bırak.

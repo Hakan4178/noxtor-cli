@@ -45,6 +45,7 @@
 #include <libgen.h> /* basename */
 #include <sodium.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <assert.h>
 #include <sys/socket.h>
@@ -377,8 +378,15 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
  * ================================================================ */
 static void cleanup(struct app_state *state) {
   NOX_INFO(LOG_MOD_MAIN, "temizlik başlıyor...");
+  bool was_tui = tui_is_active();
   tui_shutdown();
   restore_terminal();
+
+  if (!was_tui) {
+    printf("\033[2J\033[3J\033[H");
+    fflush(stdout);
+  }
+
   if (!state->ghost_mode) {
     db_close();
   }
@@ -454,26 +462,6 @@ static void event_loop(struct app_state *state) {
       }
     }
 
-    /* Handshake rate limiting — 60 saniyede max 5 deneme */
-    {
-      time_t now = time(NULL);
-      if (now - state->hs_window_start >= 60) {
-        state->hs_attempt_count = 0;
-        state->hs_window_start = now;
-      }
-      if (state->hs_attempt_count >= 5 && !state->hs) {
-        NOX_WARN(LOG_MOD_NOISE,
-                 "Handshake rate limit aşıldı (5/60s) — bağlantı reddediliyor");
-        ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin.");
-        int fd = state->peer_fd;
-        epoll_remove_fd(state->epoll_fd, fd);
-        close(fd);
-        state->peer_fd = -1;
-        state->hs_attempt_count = 0;
-        continue;
-      }
-    }
-
     int nfds = epoll_wait(state->epoll_fd, events, 4, 2000);
 
     if (nfds < 0) {
@@ -499,6 +487,24 @@ static void event_loop(struct app_state *state) {
           NOX_WARN(LOG_MOD_MAIN, "zaten peer var — reddedildi");
           close(peer_fd);
           continue;
+        }
+
+        /* Handshake rate limiting — 60 saniyede max 5 deneme.
+         * Sadece yeni bağlantı kabulunda kontrol et, aktif oturumu
+         * kesmesin. */
+        {
+          time_t now = time(NULL);
+          if (now - state->hs_window_start >= 60) {
+            state->hs_attempt_count = 0;
+            state->hs_window_start = now;
+          }
+          if (state->hs_attempt_count >= 5) {
+            NOX_WARN(LOG_MOD_NOISE,
+                     "Handshake rate limit aşıldı (5/60s) — bağlantı reddedildi");
+            ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin.");
+            close(peer_fd);
+            continue;
+          }
         }
 
         state->peer_fd = peer_fd;
@@ -540,20 +546,36 @@ static void event_loop(struct app_state *state) {
 
         /* ── Peer'dan Veri Alımı (EPOLLIN) ───────── */
         if (events[i].events & EPOLLIN) {
-          uint8_t wire[FRAME_HEADER_WIRE_SIZE];
+          /*
+           * TODO (gelecek refactor): Gerçek bir ring buffer + state machine.
+           *   State: RECV_MAGIC → RECV_HEADER → RECV_PAYLOAD
+           *   Her EPOLLIN'de recv() ile hazır olan kadar oku,
+           *   state makinesinde ilerle, eksikse bir sonraki event'e dön.
+           *
+           * Pragmatik fix: Static recv buffer ile biriktirme.
+           * Bloke eden read_full() kaldırıldı — eksik veri gelirse
+           * EPOLLIN tekrar tetiklenir ve kaldığı yerden devam eder.
+           */
+          static uint8_t recv_buf[1 + FRAME_HEADER_WIRE_SIZE + 4096 + NOX_MAC_LEN];
+          static size_t  recv_pos = 0;  /* buffer'da mevcut byte sayısı */
 
-          /* İlk byte'ı oku — bağlantı durumunu kontrol et */
-          ssize_t r = read(fd, wire, 1);
+          /* Buffer'a mümkün olduğunca çok oku */
+          int avail = 0;
+          if (ioctl(fd, FIONREAD, &avail) < 0) avail = 0;
+          size_t space = sizeof(recv_buf) - recv_pos;
+          size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
+          if (to_read == 0) to_read = 1; /* en az 1 byte dene */
+
+          ssize_t r = recv(fd, recv_buf + recv_pos, to_read, MSG_DONTWAIT);
           if (r <= 0) {
-            if (errno == EINTR)
-              continue;
 #if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-              break;
 #else
             if (r < 0 && (errno == EAGAIN))
-              break;
 #endif
+              break; /* veri henüz hazır değil, bir sonraki epoll event'ine dön */
+            if (r < 0 && errno == EINTR)
+              continue;
 
             NOX_INFO(LOG_MOD_MAIN, "peer bağlantısı kapandı");
             epoll_remove_fd(state->epoll_fd, fd);
@@ -563,42 +585,42 @@ static void event_loop(struct app_state *state) {
             state->hs = NULL;
             state->active_peer_onion[0] = '\0';
             arena_restore(&state->arena, state->session_arena_mark);
-
-            /* Faz 6.2 Step 7: Aktif dosya transferlerini temizle */
             file_transfer_cleanup(state);
-
+            recv_pos = 0;
             ui_print_system(state, "[*] peer ayrıldı");
             continue;
           }
+          recv_pos += (size_t)r;
 
-          /* Kalan header byte'larını tam oku (partial read koruması) */
-          if (read_full(fd, wire + 1, FRAME_HEADER_WIRE_SIZE - 1) != NOX_OK) {
-            NOX_ERROR(LOG_MOD_NET, "frame header eksik okundu");
-            continue;
-          }
+          /* Frame header tamamlandı mı? (1 magic + 12 header = 13 byte) */
+          if (recv_pos < 1 + FRAME_HEADER_WIRE_SIZE)
+            break; /* eksik, bir sonraki EPOLLIN'de devam */
 
           struct frame_header fh;
-          if (frame_header_decode(wire, &fh) != NOX_OK)
+          if (frame_header_decode(recv_buf, &fh) != NOX_OK) {
+            recv_pos = 0; /* bozuk header — buffer'ı sıfırla */
             continue;
+          }
 
           /* A-1 FIX: Boyut sınırı kontrolü */
           if (fh.len == 0 || fh.len > 4096 + NOX_MAC_LEN) {
             NOX_WARN(LOG_MOD_NET, "geçersiz frame boyutu: %u", fh.len);
+            recv_pos = 0;
             continue;
           }
 
-          /* A-1 FIX: sodium_malloc — swap koruması + guard page
-           * fh.len zaten 0 < fh.len <= 4096+NOX_MAC_LEN olarak sınırlandırıldı */
+          size_t frame_total = 1 + FRAME_HEADER_WIRE_SIZE + fh.len;
+          if (recv_pos < frame_total)
+            break; /* payload henüz tamamlanmadı, bir sonraki EPOLLIN'de devam */
+
+          /* Frame tamamlandı — payload'ı ayıkla */
           uint8_t *payload = sodium_malloc(fh.len);
-          if (!payload)
-            continue;
-
-          /* Payload'u tam oku (partial read koruması) */
-          if (read_full(fd, payload, fh.len) != NOX_OK) {
-            NOX_ERROR(LOG_MOD_NET, "frame payload eksik okundu");
-            sodium_free(payload);
+          if (!payload) {
+            recv_pos = 0;
             continue;
           }
+          memcpy(payload, recv_buf + 1 + FRAME_HEADER_WIRE_SIZE, fh.len);
+          recv_pos = 0; /* buffer'ı sıfırla — bir sonraki frame'e hazır */
 
           if (fh.type == NOX_MSG_CTRL && state->hs) {
             uint8_t pl[64];
@@ -642,6 +664,7 @@ static void event_loop(struct app_state *state) {
                 state->hs = NULL;
                 state->active_peer_onion[0] = '\0';
                 arena_restore(&state->arena, state->session_arena_mark);
+                sodium_free(payload);
                 continue;
               }
               NOX_INFO(LOG_MOD_NOISE, "handshake yanıt");
@@ -700,6 +723,7 @@ static void event_loop(struct app_state *state) {
                     handshake_split(state->hs, state->session);
                     state->tx_seq = 0;
                     state->rx_seq = 0;
+                    state->hs_attempt_count = 0; /* başarılı handshake — sayacı sıfırla */
                     strncpy(state->active_peer_onion, peer_onion,
                             NOX_ONION_LEN);
                     state->active_peer_onion[NOX_ONION_LEN] = '\0';
@@ -720,6 +744,7 @@ static void event_loop(struct app_state *state) {
                     state->active_peer_onion[0] = '\0';
                     state->hs = NULL;
                     arena_restore(&state->arena, state->session_arena_mark);
+                    sodium_free(payload);
                   }
                 } else {
                   ui_save_input(state);
@@ -1112,11 +1137,11 @@ static void prompt_transport_selection(struct app_state *state) {
     err = crypto_derive_master_key(state.master_key, pin_buf, strlen(pin_buf),
                                    salt);
 
-    /* PIN artık gerekli değil — hemen sil */
-    sodium_memzero(pin_buf, sizeof(pin_buf));
+    /* Kontrat: crypto_derive_master_key pin_buf'ı kendi siler (P9).
+     * Main'de tekrar silmeye gerek yok — idempotent ama gereksiz. */
     sodium_memzero(salt, sizeof(salt));
     memory_barrier();
-    NOX_INFO(LOG_MOD_MAIN, "PIN ve salt bellekten silindi");
+    NOX_INFO(LOG_MOD_MAIN, "Salt bellekten silindi");
 
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "key derivation başarısız: %s",

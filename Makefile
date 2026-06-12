@@ -155,14 +155,14 @@ DEBUG_FLAGS := \
 RELEASE_FLAGS := \
     -O2 \
     -g \
-    -flto \
+    -flto=auto \
     -fno-omit-frame-pointer \
     -fcf-protection=full \
     -fhardened \
     -DNDEBUG
 
 RELEASE_LINK := \
-    -flto \
+    -flto=auto \
     $(LINK_COMMON) \
     -Wl,-z,shstk
 

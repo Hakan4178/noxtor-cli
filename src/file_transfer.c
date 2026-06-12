@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <string.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
@@ -133,6 +134,15 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   }
   if (!S_ISREG(st.st_mode)) {
     ui_print_error(state, "Düzenli dosya değil.");
+    close(file_fd);
+    return;
+  }
+
+  /* TOCTOU koruması: hash hesaplama ve gönderim arasında dosya
+   * değiştirilmesin. LOCK_SH (paylaşımlı kilit) — diğer okumalara
+   * izin verir ama yazmayı/truncate'ı engeller. */
+  if (flock(file_fd, LOCK_SH) != 0) {
+    ui_print_error(state, "Dosya kilitlenemedi: %s", strerror(errno));
     close(file_fd);
     return;
   }
@@ -474,9 +484,10 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
       memcpy(file_hash, pt + 273, 32);
 
       int file_fd = -1;
+      /* Bzero öncesi: open_recv_file local_name'i temiz struct'a yazar */
+      explicit_bzero(&state->rx_file, sizeof(state->rx_file));
       nox_err_t err = open_recv_file(state, safe_name, &file_fd);
       if (err == NOX_OK && file_fd >= 0) {
-        explicit_bzero(&state->rx_file, sizeof(state->rx_file));
         state->rx_file.active = true;
         state->rx_file.fd = file_fd;
         state->rx_file.expected_size = net_size;

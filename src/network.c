@@ -308,8 +308,14 @@ static void rm_rf(const char *path) {
       continue;
 
     if (S_ISDIR(statbuf.st_mode)) {
-      /* Alt dizin — recursive temizleme */
-      unlinkat(dirfd, p->d_name, AT_REMOVEDIR);
+      /* Alt dizin — gerçekten recursive temizleme.
+       * unlinkat(AT_REMOVEDIR) sadece boş dizinleri siler,
+       * dolu dizinler ENOTEMPTY ile başarısız olur → anahtarlar sızar. */
+      char subpath[NOX_PATH_MAX];
+      int n = snprintf(subpath, sizeof(subpath), "%s/%s", path, p->d_name);
+      if (n > 0 && (size_t)n < sizeof(subpath)) {
+        rm_rf(subpath);
+      }
     } else {
       unlinkat(dirfd, p->d_name, 0);
     }
@@ -693,7 +699,14 @@ nox_err_t tor_spawn(struct app_state *state) {
   struct sockaddr_un addr = {
       .sun_family = AF_UNIX,
   };
-  strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+  /* socket_path NOX_PATH_MAX (511) kadar olabilir, sun_path 108 byte.
+   * Kasıtlı truncation —Unix socket path uzunluğu sınırı. */
+  size_t copy_len = strlen(socket_path);
+  assert(copy_len < NOX_PATH_MAX);
+  if (copy_len >= sizeof(addr.sun_path))
+      copy_len = sizeof(addr.sun_path) - 1;
+  memcpy(addr.sun_path, socket_path, copy_len);
+  addr.sun_path[copy_len] = '\0';
 
   int connected = 0;
   for (int retry = 0; retry < NOX_CTRL_CONNECT_RETRIES; retry++) {
@@ -1012,14 +1025,22 @@ void tor_shutdown(struct app_state *state) {
   if (state->torrc_path[0] != '\0') {
     /* CodeQL #15 cpp/path-injection: torrc_path config_dir'den türetilmiştir */
     assert(strncmp(state->torrc_path, state->config_dir, strlen(state->config_dir)) == 0);
-    unlink(state->torrc_path);
+    if (strncmp(state->torrc_path, state->config_dir, strlen(state->config_dir)) != 0) {
+      NOX_ERROR(LOG_MOD_MAIN, "torrc_path config_dir altında değil — silme engellendi");
+    } else {
+      unlink(state->torrc_path);
+    }
     state->torrc_path[0] = '\0';
   }
   /* tor_data dizinini temizle */
   if (state->tor_data_dir[0] != '\0') {
     /* CodeQL #15 cpp/path-injection: tor_data_dir config_dir'den türetilmiştir */
     assert(strncmp(state->tor_data_dir, state->config_dir, strlen(state->config_dir)) == 0);
-    rm_rf(state->tor_data_dir);
+    if (strncmp(state->tor_data_dir, state->config_dir, strlen(state->config_dir)) != 0) {
+      NOX_ERROR(LOG_MOD_MAIN, "tor_data_dir config_dir altında değil — silme engellendi");
+    } else {
+      rm_rf(state->tor_data_dir);
+    }
     state->tor_data_dir[0] = '\0';
   }
 }

@@ -15,6 +15,7 @@
 #include "common.h"
 #include "seccomp_policy.h"
 
+#include <errno.h>
 #include <seccomp.h>
 
 /* ── Blacklist tablosu ── */
@@ -30,7 +31,7 @@ static const struct {
   int num;
   const char *name;
 } blacklist[] = {
-  /* Process manipulation — traced edilemez, clone/clone3 ile process oluşturma */
+  /* Process manipulation — traced edilemez */
 #ifdef NDEBUG
   { .num = SCMP_SYS(ptrace),            .name = "ptrace" },  /* production: LSan ile uyumsuz */
 #endif
@@ -38,8 +39,7 @@ static const struct {
   { .num = SCMP_SYS(execveat),          .name = "execveat" },
   { .num = SCMP_SYS(fork),              .name = "fork" },
   { .num = SCMP_SYS(vfork),             .name = "vfork" },
-  { .num = SCMP_SYS(clone3),            .name = "clone3" },
-  { .num = SCMP_SYS(clone),             .name = "clone" },
+  /* clone/clone3: argument filtering — thread creation'a izin ver, process creation'ı öldür */
   { .num = SCMP_SYS(pidfd_open),        .name = "pidfd_open" },
   { .num = SCMP_SYS(process_madvise),   .name = "process_madvise" },
   { .num = SCMP_SYS(process_vm_readv),  .name = "process_vm_readv" },
@@ -58,6 +58,9 @@ static const struct {
   { .num = SCMP_SYS(sethostname),       .name = "sethostname" },
   { .num = SCMP_SYS(setdomainname),     .name = "setdomainname" },
   { .num = SCMP_SYS(kexec_load),        .name = "kexec_load" },
+
+  /* Profiling / Timing attack koruması */
+  { .num = SCMP_SYS(perf_event_open),   .name = "perf_event_open" },
 
   /* Kernel module */
   { .num = SCMP_SYS(init_module),       .name = "init_module" },
@@ -82,6 +85,10 @@ static const struct {
   /* Other */
   { .num = SCMP_SYS(nfsservctl),        .name = "nfsservctl" },
   { .num = SCMP_SYS(quotactl),          .name = "quotactl" },
+
+  /* Security bypass engelleme — saldırgan PR_SET_DUMPABLE=1 ile
+   * core dump / /proc/self/mem erişimini yeniden aktif edemez */
+  { .num = SCMP_SYS(prctl),             .name = "prctl" },
 };
 
 /* ================================================================
@@ -96,8 +103,55 @@ nox_err_t seccomp_policy_load(void) {
 
   size_t n_blocked = 0;
   for (size_t i = 0; i < sizeof(blacklist) / sizeof(blacklist[0]); i++) {
-    if (seccomp_rule_add(ctx, SCMP_ACT_KILL, blacklist[i].num, 0) == 0)
+    int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, blacklist[i].num, 0);
+    if (rc == 0) {
       n_blocked++;
+    } else if (rc != -EDOM) {
+      /* EDOM: syscall bu arch'ta yok — kabul edilebilir.
+       * Diğer hatalar: kural eklenemedi — güvenlik açığı. */
+      NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi (rc=%d)",
+                blacklist[i].name, rc);
+      seccomp_release(ctx);
+      return NOX_ERR_CRYPTO;
+    }
+  }
+
+  /* ── clone/clone3 Argument Filtering ──────────────────────────────
+   * pthread_create clone(flags=CLONE_VM|CLONE_THREAD|...) çağırır.
+   * clone'ı tamamen yasaklamak pthread_create'i öldürür → SQLite, glibc,
+   * ncurses crash. Çözüm: sadece process creation'ı öldür.
+   *
+   * clone:  3. argüman flags. CLONE_THREAD = 0x00100000.
+   * clone3: 1. argüman clone_args* → flags offset 16.
+   * ─────────────────────────────────────────────────────────────── */
+  #define CLONE_THREAD 0x00100000
+
+  /* clone: flags argümanı (3. argüman, index 2) */
+  if (seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 1,
+        SCMP_A2(SCMP_CMP_MASKED_EQ, CLONE_THREAD, CLONE_THREAD)) != 0) {
+    NOX_ERROR(LOG_MOD_MAIN, "seccomp: clone thread kuralı eklenemedi");
+    seccomp_release(ctx);
+    return NOX_ERR_CRYPTO;
+  }
+  /* clone: flags CLONE_THREAD içermiyorsa öldür (tüm diğer durumlar) */
+  if (seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 1,
+        SCMP_A2(SCMP_CMP_MASKED_EQ, CLONE_THREAD, 0)) != 0) {
+    NOX_ERROR(LOG_MOD_MAIN, "seccomp: clone process kuralı eklenemedi");
+    seccomp_release(ctx);
+    return NOX_ERR_CRYPTO;
+  }
+
+  /* clone3: flags 1. argümanın (clone_args*) offset 16'sında.
+   * Seccomp argument komutları pointer arithmetic desteklemez →
+   * clone3 tamamen yasak. clone3 kullanan kütüphane yok, glibc
+   * hâlâ clone kullanır. */
+  if (seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone3), 0) != 0) {
+    int e = errno;
+    if (e != EDOM) {
+      NOX_ERROR(LOG_MOD_MAIN, "seccomp: clone3 kuralı eklenemedi");
+      seccomp_release(ctx);
+      return NOX_ERR_CRYPTO;
+    }
   }
 
   int rc = seccomp_load(ctx);

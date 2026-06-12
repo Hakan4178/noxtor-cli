@@ -270,6 +270,8 @@ void process_line(struct app_state *state, const char *line) {
 
   /* ── Session aktifken: her satır mesaj ─── */
   if (state->session && state->peer_fd >= 0) {
+    if (line[0] == '\0')
+      return; /* boş satır gönderme */
     nox_err_t err = send_segmented_message(state, line);
     if (err == NOX_OK) {
       ui_print_outgoing(state, line);
@@ -460,6 +462,24 @@ void process_line(struct app_state *state, const char *line) {
                state->my_static_priv,
                state->my_static_pub);
     clock_gettime(CLOCK_MONOTONIC, &state->handshake_start);
+
+    /* Handshake rate limiting — outbound connect */
+    {
+      time_t now = time(NULL);
+      if (now - state->hs_window_start >= 60) {
+        state->hs_attempt_count = 0;
+        state->hs_window_start = now;
+      }
+      if (state->hs_attempt_count >= 5) {
+        NOX_WARN(LOG_MOD_NOISE,
+                 "Handshake rate limit aşıldı (5/60s) — outbound connect engellendi");
+        ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin.");
+        close(peer_fd);
+        state->peer_fd = -1;
+        state->hs = NULL;
+        return;
+      }
+    }
     state->hs_attempt_count++;
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];

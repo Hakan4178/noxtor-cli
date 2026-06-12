@@ -73,6 +73,9 @@ ssize_t cipher_encrypt(struct noise_cipher_state *cs, const uint8_t *ad,
     return (ssize_t)pt_len;
   }
 
+  /* atomic_fetch_add eski değeri döndürüp artırır.
+   * current_n == UINT64_MAX → counter taştı (UINT64_MAX nonce'u asla
+   * kullanılmaz, çünkü fetch_add önce döndürür sonra artırır). */
   uint64_t current_n = atomic_fetch_add(&cs->n, 1);
   if (current_n >= UINT64_MAX) {
     atomic_store(&cs->n, UINT64_MAX);
@@ -106,6 +109,7 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
   if (ct_len < NOX_MAC_LEN)
     return -1;
 
+  /* atomic_fetch_add eski değeri döndürüp artırır — encrypt ile aynı mantık */
   uint64_t current_n = atomic_fetch_add(&cs->n, 1);
   if (current_n >= UINT64_MAX) {
     atomic_store(&cs->n, UINT64_MAX);

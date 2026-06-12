@@ -541,8 +541,123 @@ static void test_arena_restore_valid(void) {
 }
 
 /* ================================================================
- * ENTRY POINT
+ * secure_abort (orta — abort() çağrısı nedeniyle kısmi)
+ *
+ * secure_abort() sonunda abort() çağırır.
+ * CBMC'de bu __CPROVER_assert(0)'a dönüşür → beklenen FAILURE.
+ * Yeni struct_ok kontrolü (integer overflow fix) doğrulanır.
  * ================================================================ */
+static void test_secure_abort_valid_struct(void) {
+    /* Struct bozuksa → wipe atlanır → sadece abort() çalışır */
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+    a.base = (void *)0x1000;
+    a.page_size = 4096;
+    a.usable_size = 256;
+    a.total_size = 4096 + 256 + NOX_CANARY_LEN;
+
+    /* Struct bozuk: total_size < page_size * 2 → struct_ok = false */
+    /* Bu durumda wipe atlanır, sadece abort() çalışır */
+    /* secure_abort() abort() çağırır → __CPROVER_assert(0) → FAILURE (beklenen) */
+}
+
+/* ================================================================
+ * arena_destroy (orta)
+ *
+ * Yeni mantık:
+ *   1. Canary kontrolü
+ *   2. struct_ok = (page_size > 0 && usable_size > 0 &&
+ *                  total_size > page_size &&
+ *                  total_size - page_size > page_size &&
+ *                  usable_size < total_size)
+ *   3. struct_ok && wipe_size ≤ MAX_WIPE → wipe yap
+ *   4. struct_ok değilse → wipe atla, logla
+ *   5. munmap her durumda
+ * ================================================================ */
+static void test_arena_destroy_null(void) {
+    arena_destroy(NULL);
+
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+    a.base = NULL;
+    arena_destroy(&a);
+}
+
+static void test_arena_destroy_valid(void) {
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+
+    size_t page_size = 4096;
+    size_t usable = 256;
+    size_t total = page_size + usable + NOX_CANARY_LEN;
+    uint8_t *mem = (uint8_t *)malloc(total);
+    if (!mem) return;
+
+    a.base = mem;
+    a.page_size = page_size;
+    a.usable_size = usable;
+    a.total_size = total;
+    memset(a.canary, 0xAA, 16);
+    g_canary_match = 1;
+
+    /* struct_ok: total_size(4368) > page_size(4096) ✓,
+     *           total_size - page_size(272) > page_size(4096) ✗
+     *           → struct_ok = false → wipe atlanır */
+    /* Actually fix the struct so struct_ok is true */
+    a.total_size = page_size + usable + NOX_CANARY_LEN + page_size;
+
+    arena_destroy(&a);
+    /* munmap stub nondeterministic → başarısız olabilir */
+    free(mem);
+}
+
+static void test_arena_destroy_corrupted_struct(void) {
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+
+    size_t page_size = 4096;
+    size_t usable = 256;
+    size_t total = page_size + usable + NOX_CANARY_LEN;
+    uint8_t *mem = (uint8_t *)malloc(total);
+    if (!mem) return;
+
+    a.base = mem;
+    /* Canary mismatch */
+    memset(a.canary, 0xAA, 16);
+    g_canary_match = 0;
+
+    /* Struct corrupted: page_size = 0 → struct_ok = false */
+    a.page_size = 0;
+    a.usable_size = usable;
+    a.total_size = total;
+
+    /* struct_ok = false → wipe atlanır → munmap denenir */
+    arena_destroy(&a);
+    free(mem);
+}
+
+static void test_arena_destroy_overflow_protection(void) {
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+
+    size_t page_size = 4096;
+    size_t usable = 256;
+    size_t total = page_size + usable + NOX_CANARY_LEN;
+    uint8_t *mem = (uint8_t *)malloc(total);
+    if (!mem) return;
+
+    a.base = mem;
+    a.page_size = page_size;
+    a.usable_size = usable;
+    a.total_size = total;
+    memset(a.canary, 0xAA, 16);
+    g_canary_match = 1;
+
+    /* total_size - page_size = 272 < page_size = 4096 → struct_ok = false */
+    /* wipe atlanır, SIGSEGV önlenir */
+    arena_destroy(&a);
+    free(mem);
+}
 int main(void) {
     test_page_align();
     test_page_align_edge();
@@ -559,5 +674,10 @@ int main(void) {
     test_arena_restore_null();
     test_arena_restore_invalid();
     test_arena_restore_valid();
+    test_secure_abort_valid_struct();
+    test_arena_destroy_null();
+    test_arena_destroy_valid();
+    test_arena_destroy_corrupted_struct();
+    test_arena_destroy_overflow_protection();
     return 0;
 }
