@@ -39,6 +39,7 @@ static const struct {
   { .num = SCMP_SYS(fork),              .name = "fork" },
   { .num = SCMP_SYS(vfork),             .name = "vfork" },
   { .num = SCMP_SYS(clone3),            .name = "clone3" },
+  { .num = SCMP_SYS(clone),             .name = "clone" },
   { .num = SCMP_SYS(pidfd_open),        .name = "pidfd_open" },
   { .num = SCMP_SYS(process_madvise),   .name = "process_madvise" },
   { .num = SCMP_SYS(process_vm_readv),  .name = "process_vm_readv" },

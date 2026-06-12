@@ -13,6 +13,7 @@
 #include "tui.h"
 
 #include <errno.h>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -458,7 +459,8 @@ void process_line(struct app_state *state, const char *line) {
     handshake_init(state->hs, true,
                state->my_static_priv,
                state->my_static_pub);
-    state->handshake_start = time(NULL);
+    clock_gettime(CLOCK_MONOTONIC, &state->handshake_start);
+    state->hs_attempt_count++;
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
     size_t hslen = sizeof(hsbuf);

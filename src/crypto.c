@@ -314,10 +314,10 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
         /* [P7] Dosya boyutu kontrolü — fstat hata ayrımı UB önler */
         struct stat st;
         if (fstat(fd, &st) != 0) {
-            NOX_WARN(LOG_MOD_CRYPTO,
-                     "salt dosyası fstat başarısız, yeniden üretiliyor");
+            NOX_ERROR(LOG_MOD_CRYPTO,
+                      "salt dosyası fstat başarısız — dosya dokunulmuyor");
             close(fd);
-            fd = -1;
+            return NOX_ERR_IO;
         } else if (st.st_size != (off_t)NOX_SALT_LEN) {
             NOX_WARN(LOG_MOD_CRYPTO,
                      "salt dosyası boyutu hatalı (%lld byte), yeniden üretiliyor",
@@ -457,6 +457,11 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     /* [A-1] Dosyaya yaz: tmp + O_EXCL (atomic write) */
     /* CodeQL #9 cpp/path-injection: tmp_path identity_path + ".tmp.PID.RND" */
     assert(strncmp(tmp_path, identity_path, strlen(identity_path)) == 0);
+    if (strncmp(tmp_path, identity_path, strlen(identity_path)) != 0) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "path sanitization hatası — tmp_path güvenli değil");
+        sodium_free(sk);
+        return NOX_ERR_CONFIG;
+    }
     fd = open(tmp_path,
               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
               0600);

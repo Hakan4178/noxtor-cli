@@ -570,7 +570,7 @@ rx_abort:
 
 void file_transfer_cleanup(struct app_state *state) {
   if (state->tx_file.active) {
-    if (state->tx_file.fd > 0) {
+    if (state->tx_file.fd >= 0) {
       close(state->tx_file.fd);
     }
     /* D-1 FIX: plain_buf temizliği */

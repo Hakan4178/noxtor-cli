@@ -439,7 +439,9 @@ static void event_loop(struct app_state *state) {
   while (state->running && !g_shutdown) {
     /* Handshake timeout kontrolü (slot yorulması ve kilitlenmeyi önler) */
     if (state->hs && state->peer_fd >= 0) {
-      if (time(NULL) - state->handshake_start > 30) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (now.tv_sec - state->handshake_start.tv_sec > 30) {
         NOX_WARN(LOG_MOD_NOISE, "Handshake zaman aşımına uğradı");
         ui_print_error(state, "Akran ile handshake zaman aşımına uğradı.");
         int fd = state->peer_fd;
@@ -449,6 +451,26 @@ static void event_loop(struct app_state *state) {
         state->hs = NULL;
         state->active_peer_onion[0] = '\0';
         arena_restore(&state->arena, state->session_arena_mark);
+      }
+    }
+
+    /* Handshake rate limiting — 60 saniyede max 5 deneme */
+    {
+      time_t now = time(NULL);
+      if (now - state->hs_window_start >= 60) {
+        state->hs_attempt_count = 0;
+        state->hs_window_start = now;
+      }
+      if (state->hs_attempt_count >= 5 && !state->hs) {
+        NOX_WARN(LOG_MOD_NOISE,
+                 "Handshake rate limit aşıldı (5/60s) — bağlantı reddediliyor");
+        ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin.");
+        int fd = state->peer_fd;
+        epoll_remove_fd(state->epoll_fd, fd);
+        close(fd);
+        state->peer_fd = -1;
+        state->hs_attempt_count = 0;
+        continue;
       }
     }
 
@@ -500,7 +522,8 @@ static void event_loop(struct app_state *state) {
         handshake_init(state->hs, false,
                state->my_static_priv,
                state->my_static_pub);    
-        state->handshake_start = time(NULL);
+        clock_gettime(CLOCK_MONOTONIC, &state->handshake_start);
+        state->hs_attempt_count++;
 
         NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi");
         ui_print_system(state, "[*] gelen bağlantı — handshake bekleniyor");

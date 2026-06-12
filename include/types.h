@@ -188,7 +188,11 @@ struct app_state {
     /* Noise session (aktif bağlantı varsa) */
     struct noise_session *session; /* arena'da veya NULL              */
     struct noise_handshake *hs;  /* aktif handshake veya NULL         */
-    time_t   handshake_start;    /* handshake başlangıç zamanı        */
+    struct timespec handshake_start; /* handshake başlangıç zamanı     */
+
+    /* Handshake rate limiting — 60 saniyede max 5 deneme */
+    int      hs_attempt_count;   /* penceredeki deneme sayısı         */
+    time_t   hs_window_start;    /* pencere başlangıcı                */
 
     /* Tor */
     int      tor_ctrl_fd;        /* Tor Control Protocol fd          */
