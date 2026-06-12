@@ -214,7 +214,7 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
 
     if (ret != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "Argon2id başarısız (bellek yetersiz?)");
-        explicit_bzero(master_key, NOX_KEY_LEN);
+        sodium_memzero(master_key, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 

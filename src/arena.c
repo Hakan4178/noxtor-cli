@@ -31,7 +31,6 @@
 #include "common.h"
 
 #include <sys/mman.h>
-#include <sys/prctl.h>   /* PR_SET_DUMPABLE — P6 */
 #include <unistd.h>
 #include <stdlib.h>      /* abort */
 #include <string.h>      /* strerror, memcpy */
@@ -89,14 +88,12 @@ static size_t page_align(size_t size, size_t page_size)
 /* ================================================================
  * YARDIMCI — Güvenli abort
  *
- * P6: Core dump üretimini kapatır, ardından abort() çağırır.
- * PR_SET_DUMPABLE=0 → /proc/PID/mem erişimini de engeller.
+ * Core dump üretimi zaten main'de PR_SET_DUMPABLE=0 ile engellendi.
+ * Bu fonksiyon wipe + abort gerçekleştirir.
  * ================================================================ */
 static void secure_abort(const struct secure_arena *a, const char *msg) {
-    
-#ifdef PR_SET_DUMPABLE
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
+    /* PR_SET_DUMPABLE=0 zaten main'de seccomp ÖNCESİ ayarlandı.
+     * Burada tekrar çağa gerek yok — seccomp prctl'ı engeller. */
     fprintf(stderr,
             "\n[FATAL] %s\n"
             "[FATAL] Güvenlik ihlali — program sonlandırılıyor.\n",
@@ -459,9 +456,6 @@ void arena_destroy(struct secure_arena *a)
                       a->usable_size < a->total_size);
 
     if (!struct_ok) {
-#ifdef PR_SET_DUMPABLE
-        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
         fprintf(stderr, "[FATAL] Arena struct bozuk — güvenli kapanış!\n");
         fflush(stderr);
         abort(); /* munmap ve wipe atlanır, OS process ölünce temizler */
@@ -473,9 +467,6 @@ void arena_destroy(struct secure_arena *a)
     bool canary_ok = (sodium_memcmp(canary_pos, a->canary, NOX_CANARY_LEN) == 0);
 
     if (!canary_ok) {
-#ifdef PR_SET_DUMPABLE
-        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
         fprintf(stderr, "[FATAL] Arena canary bozulmuş!\n");
         fflush(stderr);
     }

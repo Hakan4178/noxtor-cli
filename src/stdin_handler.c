@@ -234,7 +234,15 @@ void process_line(struct app_state *state, const char *line) {
 
       state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
       if (state->session) {
-        handshake_split(state->hs, state->session);
+        if (handshake_split(state->hs, state->session) != NOX_OK) {
+          ui_print_error(state, "session split başarısız");
+          close(state->tofu_peer_fd);
+          state->peer_fd = -1;
+          state->hs = NULL;
+          arena_restore(&state->arena, state->tofu_arena_mark);
+          state->tofu_pending = false;
+          return;
+        }
         state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
         state->tx_seq = 0;
         state->rx_seq = 0;

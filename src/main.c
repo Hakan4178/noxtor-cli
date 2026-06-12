@@ -720,7 +720,13 @@ static void event_loop(struct app_state *state) {
                   state->session =
                       arena_alloc(&state->arena, sizeof(struct noise_session));
                   if (state->session) {
-                    handshake_split(state->hs, state->session);
+                    if (handshake_split(state->hs, state->session) != NOX_OK) {
+                      ui_print_error(state, "session split başarısız");
+                      close(fd);
+                      state->peer_fd = -1;
+                      arena_restore(&state->arena, state->session_arena_mark);
+                      continue;
+                    }
                     state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
                     state->tx_seq = 0;
                     state->rx_seq = 0;
@@ -1422,7 +1428,12 @@ static void prompt_transport_selection(struct app_state *state) {
 
     /* ── 14b. Seccomp blacklist yükle ────────────────
      * Tor ve Hidden Service hazır. Bundan sonra tehlikeli
-     * syscall'lar SIGSYS ile öldürmeli. */
+     * syscall'lar SIGSYS ile öldürmeli.
+     * prctl(PR_SET_DUMPABLE, 0) seccomp ÖNCESİ yapılır —
+     * çünkü seccomp prctl'ı blacklist'liyor. */
+#ifdef PR_SET_DUMPABLE
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
     if (seccomp_policy_load() != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "seccomp yüklenemedi — abort");
       cleanup(&state);
