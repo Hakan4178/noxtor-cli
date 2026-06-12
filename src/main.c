@@ -45,6 +45,7 @@
 #include <libgen.h> /* basename */
 #include <sodium.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <assert.h>
 #include <sys/socket.h>
 
@@ -1035,7 +1036,28 @@ static void prompt_transport_selection(struct app_state *state) {
       return 1;
     }
 
-    /* ── 7. Secure arena init ──────────────────────────── */
+    /* ── 7. RLIMIT_MEMLOCK kontrolü ──────────────────────
+     * Arena + sodium_malloc tahmini toplamı mevcut kilitten
+     * fazlaysa NOX_ERR_LOCKED ile başlattırmıyoruz. */
+#define NOX_SODIUM_LOCKED_BUDGET  (64U * 1024U) /* tahmini sodium heap */
+    {
+      struct rlimit rl;
+      if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
+        size_t needed = NOX_ARENA_DEFAULT_SIZE + NOX_SODIUM_LOCKED_BUDGET;
+        if (rl.rlim_cur < needed) {
+          NOX_FATAL(LOG_MOD_MAIN,
+                    "RLIMIT_MEMLOCK yetersiz: %lu < %zu byte "
+                    "(arena + sodium_heap)",
+                    (unsigned long)rl.rlim_cur, needed);
+          sodium_memzero(pin_buf, sizeof(pin_buf));
+          return NOX_ERR_LOCKED;
+        }
+        NOX_INFO(LOG_MOD_MAIN, "RLIMIT_MEMLOCK: %lu byte (gerekli: %zu)",
+                 (unsigned long)rl.rlim_cur, needed);
+      }
+    }
+
+    /* ── 8. Secure arena init ──────────────────────────── */
     err = arena_init(&state.arena, NOX_ARENA_DEFAULT_SIZE);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "arena başlatılamadı: %s", nox_strerror(err));
@@ -1043,7 +1065,7 @@ static void prompt_transport_selection(struct app_state *state) {
       return 1;
     }
 
-    /* ── 8. Salt yükle veya oluştur ───────────────────── */
+    /* ── 9. Salt yükle veya oluştur ───────────────────── */
     uint8_t salt[NOX_SALT_LEN];
     /* CodeQL #12 cpp/path-injection: config_dir realpath($HOME)'den türetilmiştir */
     assert(state.config_dir[0] != '\0');

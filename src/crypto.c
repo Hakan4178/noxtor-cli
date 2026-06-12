@@ -245,6 +245,7 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
                                    NOX_SUBKEY_IDENTITY_UNLOCK,
                                    NOX_KDF_CTX, master_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "identity_unlock_key türetme başarısız");
+        sodium_memzero(db_key, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 
@@ -252,6 +253,8 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
                                    NOX_SUBKEY_SESSION,
                                    NOX_KDF_CTX, master_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "session_key türetme başarısız");
+        sodium_memzero(db_key, NOX_KEY_LEN);
+        sodium_memzero(identity_unlock_key, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 
@@ -281,12 +284,19 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
         struct stat dir_st;
         if (fstat(dir_fd, &dir_st) == 0) {
             if ((dir_st.st_mode & 0777) != 0700) {
-                NOX_WARN(LOG_MOD_CRYPTO,
-                         "config_dir izinleri zayıf (%03o), düzeltiliyor",
-                         dir_st.st_mode & 0777);
-                if (fchmod(dir_fd, 0700) != 0)
-                    NOX_WARN(LOG_MOD_CRYPTO,
-                             "fchmod başarısız: %s", strerror(errno));
+                NOX_ERROR(LOG_MOD_CRYPTO,
+                          "config_dir izinleri güvensiz (%03o), "
+                          "fchmod deneniyor",
+                          dir_st.st_mode & 0777);
+                if (fchmod(dir_fd, 0700) != 0) {
+                    NOX_ERROR(LOG_MOD_CRYPTO,
+                              "config_dir izinleri düzeltilemiyor: %s — "
+                              "güvensiz dizinde kriptografik işlem yapılamaz",
+                              strerror(errno));
+                    close(dir_fd);
+                    return NOX_ERR_CONFIG;
+                }
+                NOX_INFO(LOG_MOD_CRYPTO, "config_dir izinleri 0700'e düzeltildi");
             }
         }
         close(dir_fd);
