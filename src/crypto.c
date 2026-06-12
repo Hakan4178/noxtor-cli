@@ -208,12 +208,13 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
                             crypto_pwhash_MEMLIMIT_INTERACTIVE,
                             crypto_pwhash_ALG_ARGON2ID13);
 
+    /* [P9] PIN'i hemen sil — başarılı olsa da olmasa da.
+     * Core dump veya bellek sniffing sızmasını engeller. */
+    sodium_memzero(pin, pin_len);
+
     if (ret != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "Argon2id başarısız (bellek yetersiz?)");
         explicit_bzero(master_key, NOX_KEY_LEN);
-        /* [P9] Hata durumunda PIN sil — core dump veya bellek sniffing
-         * sızmasını engeller. */
-        sodium_memzero(pin, pin_len);
         return NOX_ERR_CRYPTO;
     }
 
@@ -310,13 +311,17 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
     /* Mevcut salt dosyasını oku */
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
-        /* [P7] Dosya boyutu kontrolü */
+        /* [P7] Dosya boyutu kontrolü — fstat hata ayrımı UB önler */
         struct stat st;
-        if (fstat(fd, &st) != 0 ||
-            st.st_size != (off_t)NOX_SALT_LEN) {
+        if (fstat(fd, &st) != 0) {
+            NOX_WARN(LOG_MOD_CRYPTO,
+                     "salt dosyası fstat başarısız, yeniden üretiliyor");
+            close(fd);
+            fd = -1;
+        } else if (st.st_size != (off_t)NOX_SALT_LEN) {
             NOX_WARN(LOG_MOD_CRYPTO,
                      "salt dosyası boyutu hatalı (%lld byte), yeniden üretiliyor",
-                     (long long)(fd >= 0 ? st.st_size : -1));
+                     (long long)st.st_size);
             close(fd);
             fd = -1;
         } else {
@@ -458,16 +463,19 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity tmp dosyası açılamadı: %s", strerror(errno));
+        ret = NOX_ERR_IO;
         goto cleanup;
     }
 
     if (write_exact(fd, nonce, NOX_NONCE_LEN) != NOX_OK) {
         NOX_ERROR(LOG_MOD_CRYPTO, "nonce yazılamadı");
+        ret = NOX_ERR_IO;
         goto cleanup;
     }
 
     if (write_exact(fd, ciphertext, sizeof(ciphertext)) != NOX_OK) {
         NOX_ERROR(LOG_MOD_CRYPTO, "ciphertext yazılamadı");
+        ret = NOX_ERR_IO;
         goto cleanup;
     }
 
@@ -482,6 +490,7 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     if (rename(tmp_path, identity_path) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity rename başarısız: %s", strerror(errno));
+        ret = NOX_ERR_IO;
         goto cleanup;
     }
 
@@ -586,12 +595,15 @@ nox_err_t crypto_load_identity(const char *identity_path,
     }
 
     /*
-     * Ed25519 secret key formatı (libsodium):
-     *   [seed 32B][public_key 32B]
+     * Public key'i secret key'den türet — libsodium API kullan,
+     * iç bellek düzenine güvenme.
      */
-    memcpy(public_key_out,
-           secret_key_out + crypto_sign_SEEDBYTES,
-           crypto_sign_PUBLICKEYBYTES);
+    if (crypto_sign_ed25519_sk_to_pk(public_key_out, secret_key_out) != 0) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "public key türetilemedi");
+        sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(public_key_out, NOX_KEY_LEN);
+        return NOX_ERR_CRYPTO;
+    }
 
     memory_barrier();
     NOX_INFO(LOG_MOD_CRYPTO, "identity.key başarıyla çözüldü");
@@ -611,6 +623,14 @@ nox_err_t crypto_ed25519_to_curve25519(
     if (!ed25519_pk && !ed25519_sk) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "ed25519_to_curve25519: her iki kaynak NULL");
+        return NOX_ERR_CRYPTO;
+    }
+
+    /* [A-2] En az bir hedef verilmeli */
+    if (!curve25519_pk && !curve25519_sk) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "ed25519_to_curve25519: her iki hedef NULL — "
+                  "dönüşüm yapılacak çıktı yok");
         return NOX_ERR_CRYPTO;
     }
 

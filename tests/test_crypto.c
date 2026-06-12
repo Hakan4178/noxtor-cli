@@ -88,7 +88,8 @@ static int test_argon2id_derive(void)
 
     /* Aynı PIN + salt → aynı key (deterministic) */
     uint8_t master_key2[NOX_KEY_LEN] = {0};
-    err = crypto_derive_master_key(master_key2, pin, strlen(pin), salt);
+    char pin_dup[] = "testpassword1234";
+    err = crypto_derive_master_key(master_key2, pin_dup, strlen(pin_dup), salt);
     TEST_ASSERT(err == NOX_OK);
     TEST_ASSERT(sodium_memcmp(master_key, master_key2, NOX_KEY_LEN) == 0);
 
@@ -312,7 +313,8 @@ static int test_full_chain(void)
 
     /* 2. Aynı PIN → aynı master_key */
     uint8_t master2[NOX_KEY_LEN];
-    TEST_ASSERT(crypto_derive_master_key(master2, pin, strlen(pin), salt2) == NOX_OK);
+    char pin2_dup[] = "aktivist2024!";
+    TEST_ASSERT(crypto_derive_master_key(master2, pin2_dup, strlen(pin2_dup), salt2) == NOX_OK);
     TEST_ASSERT(sodium_memcmp(master, master2, NOX_KEY_LEN) == 0);
 
     /* 3. Aynı subkeys */
