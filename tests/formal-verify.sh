@@ -7,6 +7,7 @@
 #   ./tests/formal-verify.sh arena    # sadece arena.c
 #   ./tests/formal-verify.sh stdin    # sadece stdin_handler.c
 #   ./tests/formal-verify.sh noise    # sadece noise.c
+#   ./tests/formal-verify.sh crypto   # sadece crypto.c
 
 set -uo pipefail
 
@@ -136,6 +137,20 @@ verify_noise() {
         tests/cbmc_noise_easy.c
 }
 
+verify_crypto() {
+    log "\n${BOLD}${CYAN}═══ crypto.c — DUAL CHECK ═══${NC}"
+
+    run_and_check "CBMC crypto.c" 300 "$OUTDIR/cbmc_crypto.txt" \
+        cbmc --c23 --64 --bounds-check --pointer-check \
+        --no-unwinding-assertions --unwind 50 \
+        tests/cbmc_crypto.c
+
+    run_and_check "ESBMC crypto.c" 300 "$OUTDIR/esbmc_crypto.txt" \
+        esbmc -D__ESBMC__ --overflow-check --unsigned-overflow-check \
+        --memory-leak-check --unwind 50 \
+        tests/cbmc_crypto.c
+}
+
 # ════════════════════════════════════════════════════════════
 echo -e "${BOLD}${CYAN}noxtor-cli — Formal Verification (CBMC + ESBMC)${NC}"
 command -v cbmc  &>/dev/null || { echo -e "${RED}cbmc bulunamadı${NC}"; exit 1; }
@@ -151,8 +166,9 @@ case "$TARGET" in
     arena)  verify_arena ;;
     stdin)  verify_stdin ;;
     noise)  verify_noise ;;
-    all)    verify_log; verify_arena; verify_stdin; verify_noise ;;
-    *)      echo "Kullanım: $0 [log|arena|stdin|noise|all]"; exit 1 ;;
+    crypto) verify_crypto ;;
+    all)    verify_log; verify_arena; verify_stdin; verify_noise; verify_crypto ;;
+    *)      echo "Kullanım: $0 [log|arena|stdin|noise|crypto|all]"; exit 1 ;;
 esac
 
 log ""

@@ -407,6 +407,16 @@ void arena_check_canary(const struct secure_arena *a)
     if (!a || !a->base)
         return;
 
+    /* Struct bütünlüğü ÖNCE — bozuksa pointer arithmetic SIGSEGV tetikler */
+    bool struct_ok = (a->page_size > 0 && a->usable_size > 0 &&
+                      a->total_size > a->page_size &&
+                      a->total_size - a->page_size > a->page_size &&
+                      a->usable_size < a->total_size);
+    if (!struct_ok) {
+        secure_abort(a, "Arena struct bozuk — canary okunamaz.");
+        /* NOTREACHED */
+    }
+
     size_t         page_size  = a->page_size;
     const uint8_t *bptr       = (const uint8_t *)a->base;
     const uint8_t *canary_pos = bptr + page_size + a->usable_size;
@@ -442,7 +452,22 @@ void arena_destroy(struct secure_arena *a)
     if (!a || !a->base)
         return;
 
-    /* 1. Canary kontrolü — bozuksa logla ama devam et */
+    /* 1. Yapısal bütünlük ÖNCE — bozuksa pointer arithmetic SIGSEGV tetikler */
+    bool struct_ok = (a->page_size > 0 && a->usable_size > 0 &&
+                      a->total_size > a->page_size &&
+                      a->total_size - a->page_size > a->page_size &&
+                      a->usable_size < a->total_size);
+
+    if (!struct_ok) {
+#ifdef PR_SET_DUMPABLE
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+        fprintf(stderr, "[FATAL] Arena struct bozuk — güvenli kapanış!\n");
+        fflush(stderr);
+        abort(); /* munmap ve wipe atlanır, OS process ölünce temizler */
+    }
+
+    /* Artık struct'ın sağlam olduğunu biliyoruz, güvenle canary okuyabiliriz */
     uint8_t *bptr         = (uint8_t *)a->base;
     const uint8_t *canary_pos = bptr + a->page_size + a->usable_size;
     bool canary_ok = (sodium_memcmp(canary_pos, a->canary, NOX_CANARY_LEN) == 0);
@@ -472,12 +497,8 @@ void arena_destroy(struct secure_arena *a)
      *
      * Yapısal bütünlük kontrolü: struct bozuksa wipe → SIGSEGV
      * → munmap atlanır → veri sızar. Bozuksa wipe'ı atla.
+     * (struct_ok zemen başında hesaplandı — burada tekrar hesaplamaya gerek yok)
      */
-    bool struct_ok = (page_size > 0 && a->usable_size > 0 &&
-                      a->total_size > page_size &&
-                      a->total_size - page_size > page_size &&
-                      a->usable_size < a->total_size);
-
     if (struct_ok) {
         size_t wipe_size = a->usable_size + NOX_CANARY_LEN;
         /* Savunmacı üst sınır: 256 MB'dan fazlasını silme */

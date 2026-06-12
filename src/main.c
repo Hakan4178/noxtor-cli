@@ -721,6 +721,7 @@ static void event_loop(struct app_state *state) {
                       arena_alloc(&state->arena, sizeof(struct noise_session));
                   if (state->session) {
                     handshake_split(state->hs, state->session);
+                    state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
                     state->tx_seq = 0;
                     state->rx_seq = 0;
                     state->hs_attempt_count = 0; /* başarılı handshake — sayacı sıfırla */

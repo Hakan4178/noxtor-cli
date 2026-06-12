@@ -185,10 +185,13 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
     chunk[chunk_len] = '\0';
 
     nox_err_t err = db_queue_message(recipient_onion, chunk);
-    if (err != NOX_OK && first_err == NOX_OK) {
-      NOX_WARN(LOG_MOD_MAIN, "chunk %zu/%zu kuyruğa eklenemedi",
-               offset / 4096 + 1, (total_len + 4095) / 4096);
-      first_err = err;
+    if (err != NOX_OK) {
+      if (first_err == NOX_OK) {
+        NOX_WARN(LOG_MOD_MAIN, "chunk %zu/%zu kuyruğa eklenemedi — kalan parça atlanıyor",
+                 offset / 4096 + 1, (total_len + 4095) / 4096);
+        first_err = err;
+      }
+      break; /* kısmi kuyruklama veri bütünlüğünü bozar */
     }
 
     offset += chunk_len;
@@ -232,6 +235,7 @@ void process_line(struct app_state *state, const char *line) {
       state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
       if (state->session) {
         handshake_split(state->hs, state->session);
+        state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
         state->tx_seq = 0;
         state->rx_seq = 0;
         snprintf(state->active_peer_onion, sizeof(state->active_peer_onion), "%s", state->tofu_onion);
