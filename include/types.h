@@ -9,6 +9,7 @@
 #define PARANOID_TYPES_H
 
 #include "common.h"
+#include "state_machine.h"
 #include <sodium.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -137,6 +138,9 @@ enum tor_transport_type {
 /* CRIT-1: tx_buf için güvenli kapasite sabiti */
 #define TX_BUF_CAPACITY (13 + 4096 + NOX_MAC_LEN)
 
+/* Recv buffer kapasitesi — frame header (13) + max payload (4096 + MAC) */
+#define RECV_BUF_CAPACITY (13U + 4096U + NOX_MAC_LEN)
+
 struct file_rx_state {
     bool     active;
     int      fd;                  /* hedef dosya tanımlayıcısı */
@@ -210,6 +214,14 @@ struct app_state {
     uint32_t tx_seq;             /* gönderme sıra numarası           */
     uint32_t rx_seq;             /* alma sıra numarası               */
     size_t   session_arena_mark; /* session öncesi arena offset      */
+
+    /* Peer recv buffer — frame biriktirme (static local'den taşındı) */
+    uint8_t  recv_buf[RECV_BUF_CAPACITY];
+    size_t   recv_pos;           /* buffer'da mevcut byte sayısı      */
+
+    /* Peer State Machine */
+    peer_state_t peer_state;     /* mevcut peer bağlantı durumu       */
+    char     connect_target[NOX_ONION_LEN + 1]; /* /connect hedef adresi */
 
     /* Durum */
     bool     running;            /* false olunca event loop çıkar    */

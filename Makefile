@@ -103,7 +103,7 @@ WARN_BASE := \
     -Wduplicated-cond \
     -Wlogical-op \
     -Wjump-misses-init \
-    -Wstack-usage=16384 \
+    -Wstack-usage=20480 \
     -Wvla \
     -Wformat-overflow=2 \
     -Wstrict-overflow=5 \

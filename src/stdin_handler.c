@@ -11,6 +11,7 @@
 #include "noise.h"
 #include "ui.h"
 #include "tui.h"
+#include "state_machine.h"
 
 #include <errno.h>
 #include <time.h>
@@ -207,71 +208,15 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
 
 void process_line(struct app_state *state, const char *line) {
   /* ── TOFU Onay Modu ─────────────────── */
-  if (state->tofu_pending) {
+  if (state->peer_state == ST_TOFU_PENDING) {
     if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
-      /* hs geçerlilik kontrolü */
-      if (!state->hs) {
-        ui_print_error(state,
-            "Handshake durumu geçersiz (peer ayrılmış olabilir)");
-        close(state->tofu_peer_fd);
-        state->peer_fd = -1;
-        arena_restore(&state->arena, state->tofu_arena_mark);
-        state->tofu_pending = false;
-        return;
+      if (sm_dispatch(state, EV_TOFU_ACCEPTED) != NOX_OK) {
+        /* Session oluşturma başarısız — temizle */
+        sm_dispatch(state, EV_PEER_DISCONNECTED);
       }
-
-      /* db_add_contact dönüş kontrolü */
-      if (!state->ghost_mode) {
-        nox_err_t db_err = db_add_contact(
-            state->tofu_onion, state->tofu_name, state->tofu_new_key, NULL, NULL, 0);
-        if (db_err != NOX_OK) {
-          ui_print_error(state, "Rehbere kaydetme başarısız");
-          /* devam et — session yine kurulabilir */
-        }
-      } else {
-        NOX_INFO(LOG_MOD_MAIN, "ghost mod aktif — rehber kaydı atlandı");
-      }
-
-      state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
-      if (state->session) {
-        if (handshake_split(state->hs, state->session) != NOX_OK) {
-          ui_print_error(state, "session split başarısız");
-          close(state->tofu_peer_fd);
-          state->peer_fd = -1;
-          state->hs = NULL;
-          arena_restore(&state->arena, state->tofu_arena_mark);
-          state->tofu_pending = false;
-          return;
-        }
-        state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
-        state->tx_seq = 0;
-        state->rx_seq = 0;
-        snprintf(state->active_peer_onion, sizeof(state->active_peer_onion), "%s", state->tofu_onion);
-
-        NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
-        ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)",
-                        state->tofu_name);
-
-        /* Kuyruktaki bekleyen mesajları gönder */
-        if (!state->ghost_mode) {
-          db_process_queue(state->active_peer_onion, send_queued_callback, state);
-        }
-      } else {
-        ui_print_error(state, "Arena bellek hatası");
-        close(state->tofu_peer_fd);
-        state->peer_fd = -1;
-        state->hs = NULL;
-        arena_restore(&state->arena, state->tofu_arena_mark);
-      }
-      state->tofu_pending = false;
     } else if (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0) {
       ui_print_system(state, "[*] Bağlantı reddedildi.");
-      close(state->tofu_peer_fd);
-      state->peer_fd = -1;
-      state->hs = NULL;
-      state->session = NULL;
-      arena_restore(&state->arena, state->tofu_arena_mark);
-      state->tofu_pending = false;
+      sm_dispatch(state, EV_TOFU_REJECTED);
     } else {
       fprintf(
           stderr,
@@ -424,8 +369,8 @@ void process_line(struct app_state *state, const char *line) {
     while (*target == ' ')
       target++;
 
-    if (state->peer_fd >= 0) {
-      ui_print_error(state, "zaten bağlı");
+    if (state->peer_state != ST_IDLE) {
+      ui_print_error(state, "zaten bağlı veya handshake devam ediyor");
       return;
     }
 
@@ -448,7 +393,6 @@ void process_line(struct app_state *state, const char *line) {
 
     state->peer_fd = peer_fd;
     if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
-      /* S2: epoll_ctl başarısız — fd + state sızıntısını engelle. */
       NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı iptal");
       close(peer_fd);
       state->peer_fd = -1;
@@ -461,9 +405,6 @@ void process_line(struct app_state *state, const char *line) {
     state->session_arena_mark = arena_save(&state->arena);
     state->hs = arena_alloc(&state->arena, sizeof(struct noise_handshake));
     if (!state->hs) {
-      /* S2: arena_alloc başarısız — fd + peer_fd + epoll kaydını temizle.
-       * Linux close() fd'yi epoll'den otomatik çıkarır, ayrıca
-       * epoll_remove_fd gerekmez. */
       ui_print_error(state, "arena dolu");
       close(peer_fd);
       state->peer_fd = -1;
@@ -474,6 +415,11 @@ void process_line(struct app_state *state, const char *line) {
                state->my_static_priv,
                state->my_static_pub);
     clock_gettime(CLOCK_MONOTONIC, &state->handshake_start);
+
+    /* State geçişi: IDLE → HANDSHAKE_INIT
+     * Rate limit kontrolünden ÖNCE yapılmalı — aksi halde
+     * sm_dispatch(EV_RATE_LIMIT) ST_IDLE'da geçiş bulamaz. */
+    state->peer_state = ST_HANDSHAKE_INIT;
 
     /* Handshake rate limiting — outbound connect */
     {
@@ -486,9 +432,7 @@ void process_line(struct app_state *state, const char *line) {
         NOX_WARN(LOG_MOD_NOISE,
                  "Handshake rate limit aşıldı (5/60s) — outbound connect engellendi");
         ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin.");
-        close(peer_fd);
-        state->peer_fd = -1;
-        state->hs = NULL;
+        sm_dispatch(state, EV_RATE_LIMIT);
         return;
       }
     }
@@ -510,10 +454,7 @@ void process_line(struct app_state *state, const char *line) {
         write_full(peer_fd, hsbuf, hslen) != NOX_OK) {
       NOX_ERROR(LOG_MOD_NOISE, "handshake msg0 gönderilemedi");
       ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
-      close(peer_fd);
-      state->peer_fd = -1;
-      state->hs = NULL;
-      arena_restore(&state->arena, state->session_arena_mark);
+      sm_dispatch(state, EV_HANDSHAKE_ERROR);
       return;
     }
 
@@ -663,13 +604,13 @@ void process_stdin_events(struct app_state *state) {
       }
 
       /* TOFU veya normal girdi koruması */
-      if (!state->tofu_pending) {
+      if (state->peer_state != ST_TOFU_PENDING) {
         ui_save_input(state);
       }
 
       process_line(state, line);
 
-      if (!state->tofu_pending) {
+      if (state->peer_state != ST_TOFU_PENDING) {
         ui_restore_input(state);
       }
 
