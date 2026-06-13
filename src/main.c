@@ -556,7 +556,7 @@ static void event_loop(struct app_state *state) {
            * Bloke eden read_full() kaldırıldı — eksik veri gelirse
            * EPOLLIN tekrar tetiklenir ve kaldığı yerden devam eder.
            */
-          static uint8_t recv_buf[1 + FRAME_HEADER_WIRE_SIZE + 4096 + NOX_MAC_LEN];
+          static uint8_t recv_buf[FRAME_HEADER_WIRE_SIZE + 4096 + NOX_MAC_LEN];
           static size_t  recv_pos = 0;  /* buffer'da mevcut byte sayısı */
 
           /* Buffer'a mümkün olduğunca çok oku */
@@ -592,8 +592,8 @@ static void event_loop(struct app_state *state) {
           }
           recv_pos += (size_t)r;
 
-          /* Frame header tamamlandı mı? (1 magic + 12 header = 13 byte) */
-          if (recv_pos < 1 + FRAME_HEADER_WIRE_SIZE)
+          /* Frame header tamamlandı mı? (13 byte) */
+          if (recv_pos < FRAME_HEADER_WIRE_SIZE)
             break; /* eksik, bir sonraki EPOLLIN'de devam */
 
           struct frame_header fh;
@@ -609,7 +609,7 @@ static void event_loop(struct app_state *state) {
             continue;
           }
 
-          size_t frame_total = 1 + FRAME_HEADER_WIRE_SIZE + fh.len;
+          size_t frame_total = FRAME_HEADER_WIRE_SIZE + fh.len;
           if (recv_pos < frame_total)
             break; /* payload henüz tamamlanmadı, bir sonraki EPOLLIN'de devam */
 
@@ -619,7 +619,7 @@ static void event_loop(struct app_state *state) {
             recv_pos = 0;
             continue;
           }
-          memcpy(payload, recv_buf + 1 + FRAME_HEADER_WIRE_SIZE, fh.len);
+          memcpy(payload, recv_buf + FRAME_HEADER_WIRE_SIZE, fh.len);
           recv_pos = 0; /* buffer'ı sıfırla — bir sonraki frame'e hazır */
 
           if (fh.type == NOX_MSG_CTRL && state->hs) {
