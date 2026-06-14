@@ -21,6 +21,9 @@
  * Key materyali için mmap + MAP_LOCKED tabanlı arena.
  * 64 KB RLIMIT_MEMLOCK sınırına uygun.
  * 16-byte aligned bump allocator (libsodium SIMD uyumu).
+ *
+ * H-5: Tek thread tasarımı. Multi-thread kullanımı için mutex veya
+ * thread-local arena gereklidir. offset atomik değildir.
  * ================================================================ */
 struct secure_arena {
     void    *base;          /* mmap ile ayrılan bölge başlangıcı       */
@@ -141,6 +144,10 @@ enum tor_transport_type {
 /* Recv buffer kapasitesi — frame header (13) + max payload (4096 + MAC) */
 #define RECV_BUF_CAPACITY (13U + 4096U + NOX_MAC_LEN)
 
+/* noise.c output asla frame buffer'ı aşmamalı */
+NOX_STATIC_ASSERT(NOX_MAX_MSG_LEN + NOX_MAC_LEN <= 4096U + NOX_MAC_LEN,
+                  "NOISE_MAX_PAYLOAD_LEN frame kapasitesini asamaz");
+
 struct file_rx_state {
     bool     active;
     int      fd;                  /* hedef dosya tanımlayıcısı */
@@ -149,6 +156,7 @@ struct file_rx_state {
     uint64_t received_bytes;
     uint8_t  expected_hash[32];   /* 256-bit BLAKE2b */
     crypto_generichash_state hash_state;
+    time_t   last_chunk_time;     /* son chunk zamanı — timeout kontrolü */
 
     /* B-1 FIX: unlinkat için gerçek dosya adı */
     char     local_name[300];

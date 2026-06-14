@@ -403,9 +403,13 @@ static void cleanup_stale_tor_dirs(const char *config_dir) {
     if (n <= 0 || (size_t)n >= sizeof(path))
       continue;
 
-    /* CodeQL cpp/path-injection: path'in config_dir ile başladığını garanti et
-     * (is_safe_filename + snprintf zaten bunu sağlıyor, ama CodeQL data flow'u takip edemiyor) */
-    if (strncmp(path, config_dir, strlen(config_dir)) != 0)
+    /* CodeQL cpp/path-injection: path'in config_dir altında olduğunu garanti et
+     * (is_safe_filename + snprintf zaten bunu sağlıyor, ama CodeQL data flow'u takip edemiyor)
+     * M-25 FIX: prefix-only değil, sonrasındaki karakteri de kontrol et */
+    size_t cfg_len = strlen(config_dir);
+    if (strncmp(path, config_dir, cfg_len) != 0)
+      continue;
+    if (path[cfg_len] != '\0' && path[cfg_len] != '/')
       continue;
 
     if (!is_our_stale_entry(path, pid))
@@ -1025,7 +1029,9 @@ void tor_shutdown(struct app_state *state) {
   if (state->torrc_path[0] != '\0') {
     /* CodeQL #15 cpp/path-injection: torrc_path config_dir'den türetilmiştir */
     assert(strncmp(state->torrc_path, state->config_dir, strlen(state->config_dir)) == 0);
-    if (strncmp(state->torrc_path, state->config_dir, strlen(state->config_dir)) != 0) {
+    size_t cfg_len2 = strlen(state->config_dir);
+    if (strncmp(state->torrc_path, state->config_dir, cfg_len2) != 0 ||
+        (state->torrc_path[cfg_len2] != '\0' && state->torrc_path[cfg_len2] != '/')) {
       NOX_ERROR(LOG_MOD_MAIN, "torrc_path config_dir altında değil — silme engellendi");
     } else {
       unlink(state->torrc_path);

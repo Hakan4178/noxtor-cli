@@ -325,7 +325,8 @@ static nox_err_t read_msg0_stub(struct noise_handshake *hs, const uint8_t *msg,
 }
 
 nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
-                          size_t msg_len, uint8_t *payload_out, size_t *pl_len) {
+                          size_t msg_len, uint8_t *payload_out, size_t out_cap,
+                          size_t *pl_len) {
   if (!hs || !msg || !pl_len) return NOX_ERR_PROTO;
   if (!payload_out) return NOX_ERR_PROTO;
   nox_err_t err;
@@ -435,13 +436,13 @@ static void test_handshake_write_bad_state(void) {
 
 static void test_handshake_read_null(void) {
   uint8_t msg[256] = {0}, payload[256]; size_t pl;
-  assert(handshake_read(NULL, msg, 256, payload, &pl) == NOX_ERR_PROTO);
+  assert(handshake_read(NULL, msg, 256, payload, sizeof(payload), &pl) == NOX_ERR_PROTO);
 }
 static void test_handshake_read_bad_state(void) {
   struct noise_handshake hs = {0};
   hs.initiator = true; hs.msg_index = 0;
   uint8_t msg[256] = {0}, payload[256]; size_t pl;
-  assert(handshake_read(&hs, msg, 256, payload, &pl) == NOX_ERR_STATE);
+  assert(handshake_read(&hs, msg, 256, payload, sizeof(payload), &pl) == NOX_ERR_STATE);
 }
 
 static void test_noise_encrypt_null(void) {

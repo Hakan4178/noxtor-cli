@@ -440,7 +440,14 @@ void process_line(struct app_state *state, const char *line) {
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
     size_t hslen = sizeof(hsbuf);
-    handshake_write(state->hs, NULL, 0, hsbuf, &hslen);
+    nox_err_t hs_err = handshake_write(state->hs, NULL, 0, hsbuf, &hslen);
+    if (hs_err != NOX_OK) {
+      NOX_ERROR(LOG_MOD_NOISE, "handshake_write hatası: %s",
+                nox_strerror(hs_err));
+      ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
+      sm_dispatch(state, EV_HANDSHAKE_ERROR);
+      return;
+    }
 
     struct frame_header fh = {
         .magic = NOX_FRAME_MAGIC,

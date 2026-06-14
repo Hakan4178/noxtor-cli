@@ -75,11 +75,13 @@ void sanitize_filename(char *name, size_t max_len) {
   }
 }
 
-/* PATCH: HIGH‑3 — downloads_dir_fd güvenlik doğrulaması */
-static nox_err_t verify_downloads_dir(int dir_fd) {
+/* PATCH: H-13 — downloads_dir_fd güvenlik doğrulaması */
+static nox_err_t verify_downloads_dir(const char *dir_path) {
     struct stat st;
-    if (fstat(dir_fd, &st) != 0)
+    if (lstat(dir_path, &st) != 0)
         return NOX_ERR_IO;
+    if (S_ISLNK(st.st_mode))
+        return NOX_ERR_CONFIG;
     if (!S_ISDIR(st.st_mode))
         return NOX_ERR_CONFIG;
     if (st.st_uid != getuid())
@@ -171,9 +173,28 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   safe_name[bname_len] = '\0';
   explicit_bzero(path_copy, sizeof(path_copy));
 
-  /* Streaming BLAKE2b hash — dosyayı 4KB parçalarla hash'le */
+  /* Streaming BLAKE2b hash — dosyayı 4KB parçalarla hash'le
+   * C-6 FIX: Hash'e file_size'ı dahil et — boyut yalan söylenirse hash uyuşmaz */
   crypto_generichash_state hash_st;
-  crypto_generichash_init(&hash_st, NULL, 0, 32);
+  if (crypto_generichash_init(&hash_st, NULL, 0, 32) != 0) {
+    ui_print_error(state, "Hash state başlatılamadı");
+    close(file_fd);
+    return;
+  }
+
+  uint8_t size_buf[8];
+  uint64_t fsize = (uint64_t)st.st_size;
+  size_buf[0] = (uint8_t)(fsize >> 56); size_buf[1] = (uint8_t)(fsize >> 48);
+  size_buf[2] = (uint8_t)(fsize >> 40); size_buf[3] = (uint8_t)(fsize >> 32);
+  size_buf[4] = (uint8_t)(fsize >> 24); size_buf[5] = (uint8_t)(fsize >> 16);
+  size_buf[6] = (uint8_t)(fsize >> 8);  size_buf[7] = (uint8_t)(fsize);
+  if (crypto_generichash_update(&hash_st, size_buf, 8) != 0) {
+    ui_print_error(state, "Hash güncellenemedi");
+    explicit_bzero(size_buf, sizeof(size_buf));
+    close(file_fd);
+    return;
+  }
+  explicit_bzero(size_buf, sizeof(size_buf));
 
   uint8_t hash_buf[4096];
   for (;;) {
@@ -188,12 +209,21 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
     }
     if (r == 0)
       break;
-    crypto_generichash_update(&hash_st, hash_buf, (size_t)r);
+    if (crypto_generichash_update(&hash_st, hash_buf, (size_t)r) != 0) {
+      ui_print_error(state, "Hash güncellenemedi");
+      explicit_bzero(hash_buf, sizeof(hash_buf));
+      close(file_fd);
+      return;
+    }
   }
   explicit_bzero(hash_buf, sizeof(hash_buf));
 
   uint8_t file_hash[32];
-  crypto_generichash_final(&hash_st, file_hash, 32);
+  if (crypto_generichash_final(&hash_st, file_hash, 32) != 0) {
+    ui_print_error(state, "Hash tamamlanamadı");
+    close(file_fd);
+    return;
+  }
 
   /* Dosya başına geri sar */
   if (lseek(file_fd, 0, SEEK_SET) == (off_t)-1) {
@@ -403,9 +433,9 @@ static nox_err_t open_recv_file(struct app_state *state,
         return NOX_ERR_CONFIG;
     }
 
-    /* PATCH: HIGH‑3 — downloads_dir_fd güvenliğini doğrula */
+    /* PATCH: H-13 — downloads_dir_fd güvenliğini doğrula */
     if (state->downloads_dir_fd >= 0) {
-        if (verify_downloads_dir(state->downloads_dir_fd) != NOX_OK) {
+        if (verify_downloads_dir(state->downloads_dir) != NOX_OK) {
             NOX_ERROR(LOG_MOD_MAIN, "downloads_dir_fd güvenlik doğrulaması başarısız");
             return NOX_ERR_CONFIG;
         }
@@ -464,8 +494,9 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
   if (!state->rx_file.active && pt_len == 305 && memcmp(pt, "METADATA", 9) == 0) {
     /* Yeni dosya transferi (Metadata) */
     char safe_name[256];
-    memcpy(safe_name, pt + 9, 256);
-    safe_name[255] = '\0';
+    size_t name_len = strnlen((const char *)pt + 9, 255);
+    memcpy(safe_name, pt + 9, name_len);
+    safe_name[name_len] = '\0';
     sanitize_filename(safe_name, sizeof(safe_name));
 
     uint64_t net_size =
@@ -492,11 +523,32 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
         state->rx_file.fd = file_fd;
         state->rx_file.expected_size = net_size;
         state->rx_file.received_bytes = 0;
+        state->rx_file.last_chunk_time = time(NULL);
         memcpy(state->rx_file.expected_hash, file_hash, 32);
         strncpy(state->rx_file.filename, safe_name, 255);
         state->rx_file.filename[255] = '\0';
 
-        crypto_generichash_init(&state->rx_file.hash_state, NULL, 0, 32);
+        if (crypto_generichash_init(&state->rx_file.hash_state, NULL, 0, 32) != 0) {
+          ui_print_error(state, "Hash state başlatılamadı");
+          close(file_fd);
+          explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+          return;
+        }
+
+        /* C-6 FIX: Hash'e file_size dahil et — sender boyut yalan söylerse hash uyuşmaz */
+        uint8_t size_hdr[8];
+        size_hdr[0] = (uint8_t)(net_size >> 56); size_hdr[1] = (uint8_t)(net_size >> 48);
+        size_hdr[2] = (uint8_t)(net_size >> 40); size_hdr[3] = (uint8_t)(net_size >> 32);
+        size_hdr[4] = (uint8_t)(net_size >> 24); size_hdr[5] = (uint8_t)(net_size >> 16);
+        size_hdr[6] = (uint8_t)(net_size >> 8);  size_hdr[7] = (uint8_t)(net_size);
+        if (crypto_generichash_update(&state->rx_file.hash_state, size_hdr, 8) != 0) {
+          ui_print_error(state, "Hash güncellenemedi");
+          explicit_bzero(size_hdr, sizeof(size_hdr));
+          close(file_fd);
+          explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+          return;
+        }
+        explicit_bzero(size_hdr, sizeof(size_hdr));
 
         ui_print_system(state, "[⬇] Gelen dosya: %s (%lu byte)", safe_name,
                         (unsigned long)net_size);
@@ -523,12 +575,31 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
       goto rx_abort;
     }
 
-    crypto_generichash_update(&state->rx_file.hash_state, pt, write_len);
+    if (crypto_generichash_update(&state->rx_file.hash_state, pt, write_len) != 0) {
+      NOX_ERROR(LOG_MOD_MAIN, "Hash güncellenemedi — chunk reddedildi");
+      goto rx_abort;
+    }
     state->rx_file.received_bytes += write_len;
+    state->rx_file.last_chunk_time = time(NULL);
 
     if (state->rx_file.received_bytes >= state->rx_file.expected_size) {
+      /* C-6 FIX: Defense-in-depth — boyut tutarlılığı kontrolü */
+      if (state->rx_file.received_bytes != state->rx_file.expected_size) {
+        NOX_WARN(LOG_MOD_MAIN, "received_bytes(%lu) != expected_size(%lu)",
+                 (unsigned long)state->rx_file.received_bytes,
+                 (unsigned long)state->rx_file.expected_size);
+        goto rx_abort;
+      }
+
       uint8_t final_hash[32];
-      crypto_generichash_final(&state->rx_file.hash_state, final_hash, 32);
+      if (crypto_generichash_final(&state->rx_file.hash_state, final_hash, 32) != 0) {
+        NOX_ERROR(LOG_MOD_MAIN, "Hash tamamlanamadı");
+        unlinkat(state->downloads_dir_fd, state->rx_file.local_name, 0);
+        if (state->rx_file.fd >= 0) { close(state->rx_file.fd); state->rx_file.fd = -1; }
+        explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+        state->rx_file.fd = -1;
+        return;
+      }
 
       /* PATCH: HIGH‑1 — fd kapatıldıktan hemen sonra -1 yap */
       if (state->rx_file.fd >= 0) {

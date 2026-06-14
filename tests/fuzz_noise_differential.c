@@ -213,7 +213,7 @@ static void test_happy_path(const uint8_t i_priv[32], const uint8_t i_pub[32],
     DIFF_ASSERT(nc_rc == NOISE_ERROR_NONE, "nc: msg0 read");
 
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
     DIFF_ASSERT(our_rc == NOX_OK, "our: msg0 read");
 
     /* --- MSG 1: responder → initiator --- */
@@ -235,7 +235,7 @@ static void test_happy_path(const uint8_t i_priv[32], const uint8_t i_pub[32],
     DIFF_ASSERT(nc_rc == NOISE_ERROR_NONE, "nc: msg1 read");
 
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_i, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_i, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
     DIFF_ASSERT(our_rc == NOX_OK, "our: msg1 read");
 
     /* --- MSG 2: initiator → responder --- */
@@ -257,7 +257,7 @@ static void test_happy_path(const uint8_t i_priv[32], const uint8_t i_pub[32],
     DIFF_ASSERT(nc_rc == NOISE_ERROR_NONE, "nc: msg2 read");
 
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
     DIFF_ASSERT(our_rc == NOX_OK, "our: msg2 read");
 
     /* === Split === */
@@ -361,12 +361,12 @@ static void test_corrupted_msg(const uint8_t i_priv[32], const uint8_t i_pub[32]
 
     handshake_write(&g_our_i, NULL, 0, our_msg0, &our_m0_len);
     pl_len = sizeof(payload_buf);
-    handshake_read(&g_our_r, our_msg0, our_m0_len, payload_buf, &pl_len);
+    handshake_read(&g_our_r, our_msg0, our_m0_len, payload_buf, sizeof(payload_buf), &pl_len);
     handshake_write(&g_our_r, NULL, 0, our_msg1, &our_m1_len);
 
     if (our_m1_len > 0) our_msg1[0] ^= 0xFF;
     pl_len = sizeof(payload_buf);
-    nox_err_t our_rc = handshake_read(&g_our_i, our_msg1, our_m1_len, payload_buf, &pl_len);
+    nox_err_t our_rc = handshake_read(&g_our_i, our_msg1, our_m1_len, payload_buf, sizeof(payload_buf), &pl_len);
     DIFF_ASSERT(our_rc != NOX_OK, "our: reject corrupted msg1");
 }
 
@@ -437,7 +437,7 @@ static void test_cross_verify(const uint8_t i_priv[32], const uint8_t i_pub[32],
     our_setup(i_priv, i_pub, r_priv, r_pub, e_priv_i, e_priv_r);
     uint8_t cross_payload[512];
     size_t cross_pl_len = sizeof(cross_payload);
-    nox_err_t rc = handshake_read(&g_our_r, nc_msg0, nc_m0_len, cross_payload, &cross_pl_len);
+    nox_err_t rc = handshake_read(&g_our_r, nc_msg0, nc_m0_len, cross_payload, sizeof(cross_payload), &cross_pl_len);
     DIFF_ASSERT(rc == NOX_OK, "cross: our reads nc msg0");
 
     /* our msg0 → nc read */

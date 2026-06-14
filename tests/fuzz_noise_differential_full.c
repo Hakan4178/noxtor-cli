@@ -213,7 +213,7 @@ static void run_one_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
     /* Read msg0 */
     nc_rc = nc_read_msg(g_nc_r, nc_msg, nc_mlen);
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
 
     snprintf(errmsg, sizeof(errmsg), "%s: nc msg0 read", label);
     FA(nc_rc == NOISE_ERROR_NONE, errmsg);
@@ -242,7 +242,7 @@ static void run_one_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
     /* Read msg1 */
     nc_rc = nc_read_msg(g_nc_i, nc_msg, nc_mlen);
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_i, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_i, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
 
     snprintf(errmsg, sizeof(errmsg), "%s: nc msg1 read", label);
     FA(nc_rc == NOISE_ERROR_NONE, errmsg);
@@ -271,7 +271,7 @@ static void run_one_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
     /* Read msg2 */
     nc_rc = nc_read_msg(g_nc_r, nc_msg, nc_mlen);
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
 
     snprintf(errmsg, sizeof(errmsg), "%s: nc msg2 read", label);
     FA(nc_rc == NOISE_ERROR_NONE, errmsg);
@@ -436,7 +436,7 @@ static void run_error_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
     /* Read MSG 0 */
     nc_rc = nc_read_msg(g_nc_r, nc_msg, nc_mlen);
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_r, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
 
     /* MSG 1 */
     nc_rc = nc_write_msg(g_nc_r, nc_msg, &nc_mlen);
@@ -452,7 +452,7 @@ static void run_error_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
     /* Read MSG 1 */
     nc_rc = nc_read_msg(g_nc_i, nc_msg, nc_mlen);
     pl_len = sizeof(payload_buf);
-    our_rc = handshake_read(&g_our_i, our_msg, our_mlen, payload_buf, &pl_len);
+    our_rc = handshake_read(&g_our_i, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
 
     /* MSG 2 — şimdi boz */
     nc_rc = nc_write_msg(g_nc_i, nc_msg, &nc_mlen);
@@ -478,7 +478,7 @@ static void run_error_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
 
         /* MSG 0 + 1'i tekrar oyna */
         pl_len = sizeof(payload_buf);
-        handshake_read(&fresh_r, our_msg, our_mlen, payload_buf, &pl_len);
+        handshake_read(&fresh_r, our_msg, our_mlen, payload_buf, sizeof(payload_buf), &pl_len);
 
         uint8_t our_msg2[512];
         size_t our_msg2_len = sizeof(our_msg2);
@@ -490,7 +490,7 @@ static void run_error_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
 
         pl_len = sizeof(payload_buf);
         nox_err_t our_bad = handshake_read(&fresh_r, our_bad_msg, our_msg2_len,
-                                           payload_buf, &pl_len);
+                                           payload_buf, sizeof(payload_buf), &pl_len);
         snprintf(errmsg, sizeof(errmsg), "%s: our reject bad msg2", label);
         FA(our_bad != NOX_OK, errmsg);
     }
@@ -654,13 +654,13 @@ static void run_one_error_case(
     ol0 = sizeof(our_m0);
     handshake_write(&our_i, NULL, 0, our_m0, &ol0);
     oplen = sizeof(obuf);
-    handshake_read(&our_r, our_m0, ol0, obuf, &oplen);
+    handshake_read(&our_r, our_m0, ol0, obuf, sizeof(obuf), &oplen);
 
     /* MSG 1 */
     ol1 = sizeof(our_m1);
     handshake_write(&our_r, NULL, 0, our_m1, &ol1);
     oplen = sizeof(obuf);
-    handshake_read(&our_i, our_m1, ol1, obuf, &oplen);
+    handshake_read(&our_i, our_m1, ol1, obuf, sizeof(obuf), &oplen);
 
     /* MSG 2 */
     ol2 = sizeof(our_m2);
@@ -674,21 +674,21 @@ static void run_one_error_case(
         else if (error_type == 1) { memset(bad, 0, ol0); }
         else if (error_type == 2) { ol0 = 4; }
         oplen = sizeof(obuf);
-        our_bad = handshake_read(&our_r, bad, ol0, obuf, &oplen);
+        our_bad = handshake_read(&our_r, bad, ol0, obuf, sizeof(obuf), &oplen);
     } else if (error_msg == 1) {
         uint8_t bad[512]; memcpy(bad, our_m1, ol1);
         if (error_type == 0) { bad[0] ^= 0xFF; }
         else if (error_type == 1) { memset(bad, 0, ol1); }
         else if (error_type == 2) { ol1 = 4; }
         oplen = sizeof(obuf);
-        our_bad = handshake_read(&our_i, bad, ol1, obuf, &oplen);
+        our_bad = handshake_read(&our_i, bad, ol1, obuf, sizeof(obuf), &oplen);
     } else {
         uint8_t bad[512]; memcpy(bad, our_m2, ol2);
         if (error_type == 0) { bad[0] ^= 0xFF; }
         else if (error_type == 1) { memset(bad, 0, ol2); }
         else if (error_type == 2) { ol2 = 4; }
         oplen = sizeof(obuf);
-        our_bad = handshake_read(&our_r, bad, ol2, obuf, &oplen);
+        our_bad = handshake_read(&our_r, bad, ol2, obuf, sizeof(obuf), &oplen);
     }
 
     snprintf(errmsg, sizeof(errmsg), "%s: our reject", label);
@@ -773,18 +773,18 @@ static void run_wrong_static_key_test(
     ol = sizeof(our_m);
     handshake_write(&our_i, NULL, 0, our_m, &ol);
     oplen = sizeof(obuf);
-    handshake_read(&our_r, our_m, ol, obuf, &oplen);
+    handshake_read(&our_r, our_m, ol, obuf, sizeof(obuf), &oplen);
 
     ol = sizeof(our_m);
     handshake_write(&our_r, NULL, 0, our_m, &ol);
     oplen = sizeof(obuf);
-    handshake_read(&our_i, our_m, ol, obuf, &oplen);
+    handshake_read(&our_i, our_m, ol, obuf, sizeof(obuf), &oplen);
 
     ol = sizeof(our_m);
     handshake_write(&our_i, NULL, 0, our_m, &ol);
 
     oplen = sizeof(obuf);
-    nox_err_t our_rc = handshake_read(&our_r, our_m, ol, obuf, &oplen);
+    nox_err_t our_rc = handshake_read(&our_r, our_m, ol, obuf, sizeof(obuf), &oplen);
     bool our_ok = (our_rc == NOX_OK);
 
     /* Her iki taraf da aynı davranışı göstermeli */

@@ -37,6 +37,8 @@
 #include <stdio.h>       /* fprintf */
 #include <stdint.h>      /* SIZE_MAX */
 #include <errno.h>
+#include <assert.h>      /* assert */
+#include <sys/prctl.h>   /* PR_SET_DUMPABLE */
 
 /* libsodium — canary üretimi + sabit zamanlı karşılaştırma */
 #include <sodium.h>
@@ -88,12 +90,18 @@ static size_t page_align(size_t size, size_t page_size)
 /* ================================================================
  * YARDIMCI — Güvenli abort
  *
- * Core dump üretimi zaten main'de PR_SET_DUMPABLE=0 ile engellendi.
+ * PR_SET_DUMPABLE=0 her zaman ayarlanır — hangi aşamada olursa olsun.
+ * Seccomp prctl'ı engellerse SIGSYS ile ölüm (zaten güvenli).
+ * Seccomp henüz yüklenmediyse core dump engellenir.
  * Bu fonksiyon wipe + abort gerçekleştirir.
  * ================================================================ */
 static void secure_abort(const struct secure_arena *a, const char *msg) {
-    /* PR_SET_DUMPABLE=0 zaten main'de seccomp ÖNCESİ ayarlandı.
-     * Burada tekrar çağa gerek yok — seccomp prctl'ı engeller. */
+    /* Defense-in-depth: her zaman dumpable'ı kapat.
+     * Seccomp engellerse SIGSYS ile ölür (zaten güvenli).
+     * Seccomp henüz yüklenmediyse core dump engellenir. */
+#ifdef PR_SET_DUMPABLE
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
     fprintf(stderr,
             "\n[FATAL] %s\n"
             "[FATAL] Güvenlik ihlali — program sonlandırılıyor.\n",
@@ -341,6 +349,12 @@ void *arena_alloc(struct secure_arena *a, size_t size)
 
     /* Canary kontrolü — her alloc öncesi (overflow erken tespiti) */
     arena_check_canary(a);
+
+    /* H-5: arena_alloc tek thread'lidir (bump allocator).
+     * Multi-peer (Phase 6.3+) veya multi-thread kullanımı için
+     * arena mutex veya thread-local arena gereklidir.
+     * Şu an tüm arena erişimi main() ve main() çağrısı altındadır. */
+    assert(a->offset <= a->usable_size && "arena offset bozulmuş");
 
     /* ----------------------------------------------------------------
      * P2 — 16-byte alignment ile overflow koruması

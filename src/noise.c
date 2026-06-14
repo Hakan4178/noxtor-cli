@@ -346,20 +346,33 @@ ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
 
 ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *ciphertext, size_t ct_len,
-                                   uint8_t *out) {
-  /* 1. ÖNCE DecryptWithAd(h, ciphertext) */
-  ssize_t pt_len =
+                                   uint8_t *out, size_t out_cap) {
+  /* 1. Çıktı boyutu kontrolü */
+  if (ss->cs.has_key) {
+    /* Şifreli: plaintext = ct_len - MAC */
+    if (ct_len < NOX_MAC_LEN)
+      return -1;
+    if (ct_len - NOX_MAC_LEN > out_cap)
+      return -1;
+  } else {
+    /* Şifresiz pass-through: output = ct_len aynen */
+    if (ct_len > out_cap)
+      return -1;
+  }
+
+  /* 2. ÖNCE DecryptWithAd(h, ciphertext) */
+  ssize_t result =
       cipher_decrypt(&ss->cs, ss->h, NOISE_HASHLEN, ciphertext, ct_len, out);
 
   /* 2. MAC hatası → hata döndür, MixHash yapma, h sıfırlansın */
-  if (pt_len < 0) {
+  if (result < 0) {
     sodium_memzero(ss->h, NOISE_HASHLEN);
     return -1;
   }
 
   /* 3. Başarılı → SONRA MixHash(ciphertext) */
   symmetric_mix_hash(ss, ciphertext, ct_len);
-  return pt_len;
+  return result;
 }
 
 /*
@@ -637,7 +650,7 @@ nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
 /* --- read msg0: → e --- */
 static nox_err_t read_msg0(struct noise_handshake *hs, const uint8_t *msg,
                            size_t msg_len, uint8_t *payload_out,
-                           size_t *pl_len) {
+                           size_t out_cap, size_t *pl_len) {
   if (msg_len < NOX_KEY_LEN)
     return NOX_ERR_PROTO;
   size_t offset = 0;
@@ -649,7 +662,8 @@ static nox_err_t read_msg0(struct noise_handshake *hs, const uint8_t *msg,
 
   /* payload */
   ssize_t pt = symmetric_decrypt_and_hash(&hs->ss, msg + offset,
-                                          msg_len - offset, payload_out);
+                                          msg_len - offset, payload_out,
+                                          out_cap);
   if (pt < 0)
     return NOX_ERR_AUTH;
   *pl_len = (size_t)pt;
@@ -660,7 +674,7 @@ static nox_err_t read_msg0(struct noise_handshake *hs, const uint8_t *msg,
 /* --- read msg1: ← e, ee, s, es --- */
 static nox_err_t read_msg1(struct noise_handshake *hs, const uint8_t *msg,
                            size_t msg_len, uint8_t *payload_out,
-                           size_t *pl_len) {
+                           size_t out_cap, size_t *pl_len) {
   if (msg_len < NOX_KEY_LEN + NOX_KEY_LEN + NOX_MAC_LEN)
     return NOX_ERR_PROTO;
   size_t offset = 0;
@@ -684,7 +698,8 @@ static nox_err_t read_msg1(struct noise_handshake *hs, const uint8_t *msg,
 
   /* s: DecryptAndHash → rs */
   ssize_t pt = symmetric_decrypt_and_hash(&hs->ss, msg + offset,
-                                          NOX_KEY_LEN + NOX_MAC_LEN, hs->rs);
+                                          NOX_KEY_LEN + NOX_MAC_LEN, hs->rs,
+                                          NOX_KEY_LEN);
   if (pt < 0)
     return NOX_ERR_AUTH;
   offset += NOX_KEY_LEN + NOX_MAC_LEN;
@@ -701,7 +716,7 @@ static nox_err_t read_msg1(struct noise_handshake *hs, const uint8_t *msg,
 
   /* payload */
   pt = symmetric_decrypt_and_hash(&hs->ss, msg + offset, msg_len - offset,
-                                  payload_out);
+                                  payload_out, out_cap);
   if (pt < 0)
     return NOX_ERR_AUTH;
   *pl_len = (size_t)pt;
@@ -712,7 +727,7 @@ static nox_err_t read_msg1(struct noise_handshake *hs, const uint8_t *msg,
 /* --- read msg2: → s, se --- */
 static nox_err_t read_msg2(struct noise_handshake *hs, const uint8_t *msg,
                            size_t msg_len, uint8_t *payload_out,
-                           size_t *pl_len) {
+                           size_t out_cap, size_t *pl_len) {
   if (msg_len < NOX_KEY_LEN + NOX_MAC_LEN)
     return NOX_ERR_PROTO;
   size_t offset = 0;
@@ -721,7 +736,8 @@ static nox_err_t read_msg2(struct noise_handshake *hs, const uint8_t *msg,
 
   /* s: DecryptAndHash → rs */
   ssize_t pt = symmetric_decrypt_and_hash(&hs->ss, msg + offset,
-                                          NOX_KEY_LEN + NOX_MAC_LEN, hs->rs);
+                                          NOX_KEY_LEN + NOX_MAC_LEN, hs->rs,
+                                          NOX_KEY_LEN);
   if (pt < 0)
     return NOX_ERR_AUTH;
   offset += NOX_KEY_LEN + NOX_MAC_LEN;
@@ -738,7 +754,7 @@ static nox_err_t read_msg2(struct noise_handshake *hs, const uint8_t *msg,
 
   /* payload */
   pt = symmetric_decrypt_and_hash(&hs->ss, msg + offset, msg_len - offset,
-                                  payload_out);
+                                  payload_out, out_cap);
   if (pt < 0)
     return NOX_ERR_AUTH;
   *pl_len = (size_t)pt;
@@ -747,7 +763,8 @@ static nox_err_t read_msg2(struct noise_handshake *hs, const uint8_t *msg,
 }
 
 nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
-                         size_t msg_len, uint8_t *payload_out, size_t *pl_len) {
+                         size_t msg_len, uint8_t *payload_out, size_t out_cap,
+                         size_t *pl_len) {
   if (!hs || !msg || !pl_len)
     return NOX_ERR_PROTO;
   if (!payload_out)
@@ -758,7 +775,7 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
   if (hs->initiator) {
     switch (hs->msg_index) {
     case 1:
-      err = read_msg1(hs, msg, msg_len, payload_out, pl_len);
+      err = read_msg1(hs, msg, msg_len, payload_out, out_cap, pl_len);
       /* Initiator: read_msg1 sonrası hs->e artık kullanılmaz — sil */
       if (err == NOX_OK)
         sodium_memzero(hs->e, NOX_KEY_LEN);
@@ -769,10 +786,10 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
   } else {
     switch (hs->msg_index) {
     case 0:
-      err = read_msg0(hs, msg, msg_len, payload_out, pl_len);
+      err = read_msg0(hs, msg, msg_len, payload_out, out_cap, pl_len);
       break;
     case 2:
-      err = read_msg2(hs, msg, msg_len, payload_out, pl_len);
+      err = read_msg2(hs, msg, msg_len, payload_out, out_cap, pl_len);
       /* Responder: read_msg2 sonrası hs->e artık kullanılmaz — sil */
       if (err == NOX_OK)
         sodium_memzero(hs->e, NOX_KEY_LEN);

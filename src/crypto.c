@@ -205,7 +205,7 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
                             pin, (unsigned long long)pin_len,
                             salt,
                             crypto_pwhash_OPSLIMIT_MODERATE,
-                            crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                            crypto_pwhash_MEMLIMIT_MODERATE,
                             crypto_pwhash_ALG_ARGON2ID13);
 
     /* [P9] PIN'i hemen sil — başarılı olsa da olmasa da.

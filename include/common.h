@@ -40,8 +40,8 @@
 #define NOX_CANARY_LEN         16U       /* arena canary */
 
 /* Mesajlaşma sabitleri */
-#define NOX_MAX_MSG_LEN        65536U    /* 64 KB — tek mesaj üst sınır */
-#define NOX_CHUNK_SIZE         65536U    /* 64 KB — dosya transfer chunk */
+#define NOX_MAX_MSG_LEN        4096U     /* tek mesaj üst sınır (frame kapasitesi ile uyumlu) */
+#define NOX_CHUNK_SIZE         4096U     /* dosya transfer chunk */
 #define NOX_FRAME_MAGIC        0xDEADC0DEU
 
 /* PIN politikası */

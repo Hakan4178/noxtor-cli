@@ -85,7 +85,7 @@ static int test_loopback_handshake(void)
 
     pl_len = sizeof(payload_buf);
     TEST_ASSERT(handshake_read(&hs_bob, msg_buf, msg_len,
-                               payload_buf, &pl_len) == NOX_OK);
+                               payload_buf, sizeof(payload_buf), &pl_len) == NOX_OK);
     TEST_ASSERT(pl_len == 0); /* boş payload */
 
     /* msg1: Bob → Alice: ← e, ee, s, es */
@@ -96,7 +96,7 @@ static int test_loopback_handshake(void)
 
     pl_len = sizeof(payload_buf);
     TEST_ASSERT(handshake_read(&hs_alice, msg_buf, msg_len,
-                               payload_buf, &pl_len) == NOX_OK);
+                               payload_buf, sizeof(payload_buf), &pl_len) == NOX_OK);
 
     /* msg2: Alice → Bob: → s, se */
     msg_len = sizeof(msg_buf);
@@ -106,7 +106,7 @@ static int test_loopback_handshake(void)
 
     pl_len = sizeof(payload_buf);
     TEST_ASSERT(handshake_read(&hs_bob, msg_buf, msg_len,
-                               payload_buf, &pl_len) == NOX_OK);
+                               payload_buf, sizeof(payload_buf), &pl_len) == NOX_OK);
 
     /* Her iki taraf da tamamlanmış olmalı */
     TEST_ASSERT(handshake_is_complete(&hs_alice));
@@ -138,17 +138,17 @@ static int test_transport_roundtrip(void)
     len = sizeof(buf);
     handshake_write(&hs_a, NULL, 0, buf, &len);
     pl_len = sizeof(pl);
-    handshake_read(&hs_b, buf, len, pl, &pl_len);
+    handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
 
     len = sizeof(buf);
     handshake_write(&hs_b, NULL, 0, buf, &len);
     pl_len = sizeof(pl);
-    handshake_read(&hs_a, buf, len, pl, &pl_len);
+    handshake_read(&hs_a, buf, len, pl, sizeof(pl), &pl_len);
 
     len = sizeof(buf);
     handshake_write(&hs_a, NULL, 0, buf, &len);
     pl_len = sizeof(pl);
-    handshake_read(&hs_b, buf, len, pl, &pl_len);
+    handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
 
     /* Split */
     struct noise_session sa, sb;
@@ -202,11 +202,11 @@ static int test_mac_tamper(void)
 
     /* Handshake */
     len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
-    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, &pl_len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
     len = sizeof(buf); handshake_write(&hs_b, NULL, 0, buf, &len);
-    pl_len = sizeof(pl); handshake_read(&hs_a, buf, len, pl, &pl_len);
+    pl_len = sizeof(pl); handshake_read(&hs_a, buf, len, pl, sizeof(pl), &pl_len);
     len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
-    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, &pl_len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
 
     struct noise_session sa, sb;
     handshake_split(&hs_a, &sa);
@@ -249,11 +249,11 @@ static int test_remote_static_key(void)
 
     /* Full handshake */
     len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
-    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, &pl_len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
     len = sizeof(buf); handshake_write(&hs_b, NULL, 0, buf, &len);
-    pl_len = sizeof(pl); handshake_read(&hs_a, buf, len, pl, &pl_len);
+    pl_len = sizeof(pl); handshake_read(&hs_a, buf, len, pl, sizeof(pl), &pl_len);
     len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
-    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, &pl_len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
 
     struct noise_session sa, sb;
     handshake_split(&hs_a, &sa);
@@ -282,7 +282,7 @@ static int test_wrong_order(void)
     /* Initiator msg_index=0'da read yapamaz (write yapmalı) */
     uint8_t buf[64];
     size_t len = sizeof(buf);
-    TEST_ASSERT(handshake_read(&hs, buf, 32, buf, &len) == NOX_ERR_STATE);
+    TEST_ASSERT(handshake_read(&hs, buf, 32, buf, sizeof(buf), &len) == NOX_ERR_STATE);
 
     return 0;
 }
@@ -328,14 +328,14 @@ static int test_handshake_onion_payload(void)
     len = sizeof(buf);
     TEST_ASSERT(handshake_write(&hs_a, NULL, 0, buf, &len) == NOX_OK);
     pl_len = sizeof(pl);
-    TEST_ASSERT(handshake_read(&hs_b, buf, len, pl, &pl_len) == NOX_OK);
+    TEST_ASSERT(handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len) == NOX_OK);
     TEST_ASSERT(pl_len == 0);
 
     /* msg1: Bob -> Alice (carrying bob_onion) */
     len = sizeof(buf);
     TEST_ASSERT(handshake_write(&hs_b, (const uint8_t *)bob_onion, NOX_ONION_LEN + 1, buf, &len) == NOX_OK);
     pl_len = sizeof(pl);
-    TEST_ASSERT(handshake_read(&hs_a, buf, len, pl, &pl_len) == NOX_OK);
+    TEST_ASSERT(handshake_read(&hs_a, buf, len, pl, sizeof(pl), &pl_len) == NOX_OK);
     TEST_ASSERT(pl_len == NOX_ONION_LEN + 1);
     TEST_ASSERT(strcmp((const char *)pl, bob_onion) == 0);
 
@@ -343,7 +343,7 @@ static int test_handshake_onion_payload(void)
     len = sizeof(buf);
     TEST_ASSERT(handshake_write(&hs_a, (const uint8_t *)alice_onion, NOX_ONION_LEN + 1, buf, &len) == NOX_OK);
     pl_len = sizeof(pl);
-    TEST_ASSERT(handshake_read(&hs_b, buf, len, pl, &pl_len) == NOX_OK);
+    TEST_ASSERT(handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len) == NOX_OK);
     TEST_ASSERT(pl_len == NOX_ONION_LEN + 1);
     TEST_ASSERT(strcmp((const char *)pl, alice_onion) == 0);
 
@@ -494,7 +494,7 @@ static int test_spec_vectors(void)
 
     pl_len = sizeof(pl);
     TEST_ASSERT(handshake_read(&hs_r, out, out_len,
-                               pl, &pl_len) == NOX_OK);
+                               pl, sizeof(pl), &pl_len) == NOX_OK);
     TEST_ASSERT(pl_len == sizeof(msg0_payload));
     TEST_ASSERT(sodium_memcmp(pl, msg0_payload, pl_len) == 0);
 
@@ -515,7 +515,7 @@ static int test_spec_vectors(void)
 
     pl_len = sizeof(pl);
     TEST_ASSERT(handshake_read(&hs_i, out, out_len,
-                               pl, &pl_len) == NOX_OK);
+                               pl, sizeof(pl), &pl_len) == NOX_OK);
     TEST_ASSERT(pl_len == sizeof(msg1_payload));
     TEST_ASSERT(sodium_memcmp(pl, msg1_payload, pl_len) == 0);
 
@@ -528,7 +528,7 @@ static int test_spec_vectors(void)
 
     pl_len = sizeof(pl);
     TEST_ASSERT(handshake_read(&hs_r, out, out_len,
-                               pl, &pl_len) == NOX_OK);
+                               pl, sizeof(pl), &pl_len) == NOX_OK);
     TEST_ASSERT(pl_len == sizeof(msg2_payload));
     TEST_ASSERT(sodium_memcmp(pl, msg2_payload, pl_len) == 0);
 

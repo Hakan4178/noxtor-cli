@@ -276,7 +276,7 @@ nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t nois
   if (!onion || !name || !noise_key) { DB_UNLOCK(); return NOX_ERR_DB; }
 
   size_t onion_len = strnlen(onion, NOX_ONION_LEN + 1);
-  size_t name_len = strlen(name);
+  size_t name_len = strnlen(name, NOX_CONTACT_NAME_LEN + 1);
 
   if (onion_len != NOX_ONION_LEN || name_len > NOX_CONTACT_NAME_LEN) {
     DB_UNLOCK(); return NOX_ERR_DB;
@@ -348,6 +348,7 @@ nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t nois
   err = NOX_OK;
 
 cleanup:
+  sodium_memzero(hash, sizeof(hash));
   sodium_memzero(nonce, sizeof(nonce));
   sodium_memzero(cipher, sizeof(cipher));
   DB_UNLOCK();
@@ -363,25 +364,28 @@ nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uin
 
   uint8_t hash[32];
   nox_err_t err = hash_onion(onion, hash);
-  if (err != NOX_OK) { DB_UNLOCK(); return err; }
+  if (err != NOX_OK) { sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return err; }
 
   sqlite3_stmt *stmt = NULL;
   const char *sql = "SELECT nonce, encrypted_payload FROM contacts WHERE onion_hash = ?;";
   int rc = sqlite3_prepare_v2(g_state.db, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Statement hazırlanamadı: %s", sqlite3_errmsg(g_state.db));
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
   if (rc != SQLITE_OK) {
     sqlite3_finalize(stmt);
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   rc = sqlite3_step(stmt);
   if (rc != SQLITE_ROW) {
     sqlite3_finalize(stmt);
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB; /* Bulunamadı */
   }
 
@@ -392,6 +396,7 @@ nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uin
 
   if (nonce_bytes != NOX_NONCE_LEN || cipher_bytes <= 0) {
     sqlite3_finalize(stmt);
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
@@ -433,6 +438,7 @@ nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uin
   result = NOX_OK;
 
 cleanup_cp:
+  sodium_memzero(hash, sizeof(hash));
   sodium_memzero(&cp, sizeof(cp));
   DB_UNLOCK();
   return result;
@@ -476,6 +482,7 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
   err = hash_onion(recipient_onion, hash);
   if (err != NOX_OK) {
     sodium_free(cipher);
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return err;
   }
 
@@ -485,15 +492,16 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Statement hazırlanamadı: %s", sqlite3_errmsg(g_state.db));
     sodium_free(cipher);
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   rc = sqlite3_bind_blob(stmt, 2, nonce, sizeof(nonce), SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   rc = sqlite3_bind_blob(stmt, 3, cipher, (int)cipher_len, SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
 
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
@@ -501,10 +509,12 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
 
   if (rc != SQLITE_DONE) {
     NOX_ERROR(LOG_MOD_DB, "Mesaj kuyruklama hatası: %s", sqlite3_errmsg(g_state.db));
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   NOX_INFO(LOG_MOD_DB, "Mesaj kuyruğa eklendi (%zu byte)", text_len);
+  sodium_memzero(hash, sizeof(hash));
   DB_UNLOCK(); return NOX_OK;
 }
 
@@ -539,7 +549,7 @@ nox_err_t db_process_queue(const char *recipient_onion,
 
   uint8_t hash[32];
   nox_err_t err = hash_onion(recipient_onion, hash);
-  if (err != NOX_OK) { DB_UNLOCK(); return err; }
+  if (err != NOX_OK) { sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return err; }
 
   /* 1. Tüm kuyruk mesajlarını hafızaya çek (lock altında) */
   sqlite3_stmt *stmt = NULL;
@@ -547,11 +557,12 @@ nox_err_t db_process_queue(const char *recipient_onion,
   int rc = sqlite3_prepare_v2(g_state.db, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Statement hazırlanamadı: %s", sqlite3_errmsg(g_state.db));
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
 
   /* Mesajları basit diziye çek — 256 mesaj limiti (1MB kuyruk) */
   #define QUEUE_BATCH_LIMIT 256
@@ -583,15 +594,15 @@ nox_err_t db_process_queue(const char *recipient_onion,
     if (!batch[batch_count].cipher) {
         for (int j = 0; j < batch_count; j++) sodium_free(batch[j].cipher);
         sqlite3_finalize(stmt);
+        sodium_memzero(hash, sizeof(hash));
         DB_UNLOCK(); return NOX_ERR_ALLOC;
     }
     memcpy(batch[batch_count].cipher, sqlite3_column_blob(stmt, 2), (size_t)cipher_bytes_int);
     batch_count++;
   }
   sqlite3_finalize(stmt);
+  sodium_memzero(hash, sizeof(hash));
   DB_UNLOCK();
-
-  /* 2. Kilidi açık olarak mesajları çöz ve gönder */
   nox_err_t process_err = NOX_OK;
   int sent_count = 0;
 
@@ -752,6 +763,7 @@ nox_err_t db_save_message(const char *peer_onion, const char *text,
   err = hash_onion(peer_onion, hash);
   if (err != NOX_OK) {
     sodium_free(cipher);
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return err;
   }
 
@@ -761,19 +773,20 @@ nox_err_t db_save_message(const char *peer_onion, const char *text,
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Statement hazırlanamadı: %s", sqlite3_errmsg(g_state.db));
     sodium_free(cipher);
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   rc = sqlite3_bind_blob(stmt, 2, nonce, sizeof(nonce), SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   rc = sqlite3_bind_blob(stmt, 3, cipher, (int)cipher_len, SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   rc = sqlite3_bind_int64(stmt, 4, (sqlite3_int64)timestamp);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   rc = sqlite3_bind_int(stmt, 5, is_outgoing ? 1 : 0);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_free(cipher); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
 
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
@@ -781,9 +794,11 @@ nox_err_t db_save_message(const char *peer_onion, const char *text,
 
   if (rc != SQLITE_DONE) {
     NOX_ERROR(LOG_MOD_DB, "Mesaj kaydetme hatası: %s", sqlite3_errmsg(g_state.db));
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
+  sodium_memzero(hash, sizeof(hash));
   DB_UNLOCK();
   return NOX_OK;
 }
@@ -994,28 +1009,31 @@ nox_err_t db_delete_conversation(const char *peer_onion) {
 
   uint8_t hash[32];
   nox_err_t err = hash_onion(peer_onion, hash);
-  if (err != NOX_OK) { DB_UNLOCK(); return err; }
+  if (err != NOX_OK) { sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return err; }
 
   sqlite3_stmt *stmt = NULL;
   const char *sql = "DELETE FROM messages WHERE peer_hash = ?;";
   int rc = sqlite3_prepare_v2(g_state.db, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Statement hazırlanamadı: %s", sqlite3_errmsg(g_state.db));
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
 
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
 
   if (rc != SQLITE_DONE) {
     NOX_ERROR(LOG_MOD_DB, "Sohbet geçmişi silme hatası: %s", sqlite3_errmsg(g_state.db));
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   NOX_INFO(LOG_MOD_DB, "Sohbet geçmişi başarıyla silindi");
+  sodium_memzero(hash, sizeof(hash));
   DB_UNLOCK();
   return NOX_OK;
 }

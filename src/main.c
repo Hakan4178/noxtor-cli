@@ -219,7 +219,7 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
   
   /* CodeQL #14 cpp/path-injection: downloads_dir config_dir + "/downloads" */
   assert(strncmp(state->downloads_dir, state->config_dir, strlen(state->config_dir)) == 0);
-  state->downloads_dir_fd = open(state->downloads_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  state->downloads_dir_fd = open(state->downloads_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   if (state->downloads_dir_fd < 0) {
     NOX_ERROR(LOG_MOD_MAIN, "downloads dizini açılamadı: %s", strerror(errno));
     return NOX_ERR_CONFIG;
@@ -458,6 +458,24 @@ static void event_loop(struct app_state *state) {
       }
     }
 
+    /* C-5 FIX: Dosya transferi timeout — sender sessiz kalırsa 60sn sonra abort */
+    if (state->rx_file.active) {
+      time_t now = time(NULL);
+      if (now - state->rx_file.last_chunk_time > 60) {
+        NOX_WARN(LOG_MOD_MAIN, "Dosya transferi zaman aşımı: %s", state->rx_file.filename);
+        ui_print_error(state, "Dosya transferi zaman aşımı — sender sessiz.");
+        /* Kısmi dosyayı disk'ten sil */
+        if (state->downloads_dir_fd >= 0 && state->rx_file.local_name[0] != '\0') {
+          unlinkat(state->downloads_dir_fd, state->rx_file.local_name, 0);
+        }
+        if (state->rx_file.fd >= 0) {
+          close(state->rx_file.fd);
+        }
+        explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+        state->rx_file.fd = -1;
+      }
+    }
+
     int nfds = epoll_wait(state->epoll_fd, events, 4, 2000);
 
     if (nfds < 0) {
@@ -562,7 +580,7 @@ static void event_loop(struct app_state *state) {
           if (ioctl(fd, FIONREAD, &avail) < 0) avail = 0;
           size_t space = sizeof(state->recv_buf) - state->recv_pos;
           size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
-          if (to_read == 0) to_read = 1; /* en az 1 byte dene */
+          if (to_read == 0) break; /* buffer dolu — frame işleme devam etsin */
 
           ssize_t r = recv(fd, state->recv_buf + state->recv_pos, to_read, MSG_DONTWAIT);
           if (r <= 0) {
@@ -604,6 +622,7 @@ static void event_loop(struct app_state *state) {
             break; /* payload henüz tamamlanmadı, bir sonraki EPOLLIN'de devam */
 
           /* Frame tamamlandı — payload'ı ayıkla */
+          assert(fh.len > 0 && fh.len <= 4096 + NOX_MAC_LEN);
           uint8_t *payload = sodium_malloc(fh.len);
           if (!payload) {
             state->recv_pos = 0;
@@ -616,7 +635,7 @@ static void event_loop(struct app_state *state) {
             uint8_t pl[64];
             size_t pl_len = sizeof(pl);
             nox_err_t hs_err =
-                handshake_read(state->hs, payload, fh.len, pl, &pl_len);
+                handshake_read(state->hs, payload, fh.len, pl, sizeof(pl), &pl_len);
             if (hs_err != NOX_OK) {
               NOX_ERROR(LOG_MOD_NOISE, "Handshake okuma hatası: %s",
                         nox_strerror(hs_err));
@@ -630,8 +649,17 @@ static void event_loop(struct app_state *state) {
             if (state->hs->msg_index < 3) {
               uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
               size_t hslen = sizeof(hsbuf);
-              handshake_write(state->hs, (const uint8_t *)state->onion_addr,
-                              NOX_ONION_LEN + 1, hsbuf, &hslen);
+              nox_err_t hs_write_err = handshake_write(state->hs,
+                                  (const uint8_t *)state->onion_addr,
+                                  NOX_ONION_LEN + 1, hsbuf, &hslen);
+              if (hs_write_err != NOX_OK) {
+                NOX_ERROR(LOG_MOD_NOISE, "handshake_write hatası: %s",
+                          nox_strerror(hs_write_err));
+                ui_print_error(state, "Handshake yanıtı oluşturulamadı");
+                sm_dispatch(state, EV_HANDSHAKE_ERROR);
+                sodium_free(payload);
+                continue;
+              }
 
               struct frame_header rfh = {
                   .magic = NOX_FRAME_MAGIC,
@@ -1237,6 +1265,22 @@ static void prompt_transport_selection(struct app_state *state) {
     identity_unlock = NULL;
     NOX_DEBUG(LOG_MOD_MAIN, "identity_unlock bellekten silindi");
 
+    /* ── 10b. PR_SET_DUMPABLE=0 + Seccomp Stage 1 ──────────────────
+     * PR_SET_DUMPABLE=0 SEÇİMLStage 1 loadeda önce yapılır —
+     * çünkü seccomp prctl'ı blacklist'liyor. */
+#ifdef PR_SET_DUMPABLE
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+
+    /* 120s Tor bootstrap pencere koruması.
+     * process_vm_readv, ptrace, io_uring engellenir.
+     * fork/execve hâlâ serbest — tor_spawn() için gerekli. */
+    if (seccomp_policy_load(1) != NOX_OK) {
+      NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 1 yüklenemedi");
+      arena_destroy(&state.arena);
+      return 1;
+    }
+
     /* ── Pluggable Transport Seçimi (Faz 6.2) ── */
     prompt_transport_selection(&state);
     if (g_shutdown) {
@@ -1288,7 +1332,7 @@ static void prompt_transport_selection(struct app_state *state) {
       NOX_INFO(LOG_MOD_NOISE, "msg0 gönderildi (%zu byte)", msg_len);
 
       pl_len = sizeof(pl_buf);
-      handshake_read(&hs_b, msg_buf, msg_len, pl_buf, &pl_len);
+      handshake_read(&hs_b, msg_buf, msg_len, pl_buf, sizeof(pl_buf), &pl_len);
       NOX_INFO(LOG_MOD_NOISE, "msg0 alındı");
 
       /* msg1: Bob → Alice */
@@ -1297,7 +1341,7 @@ static void prompt_transport_selection(struct app_state *state) {
       NOX_INFO(LOG_MOD_NOISE, "msg1 gönderildi (%zu byte)", msg_len);
 
       pl_len = sizeof(pl_buf);
-      handshake_read(&hs_a, msg_buf, msg_len, pl_buf, &pl_len);
+      handshake_read(&hs_a, msg_buf, msg_len, pl_buf, sizeof(pl_buf), &pl_len);
       NOX_INFO(LOG_MOD_NOISE, "msg1 alındı");
 
       /* msg2: Alice → Bob */
@@ -1306,7 +1350,7 @@ static void prompt_transport_selection(struct app_state *state) {
       NOX_INFO(LOG_MOD_NOISE, "msg2 gönderildi (%zu byte)", msg_len);
 
       pl_len = sizeof(pl_buf);
-      handshake_read(&hs_b, msg_buf, msg_len, pl_buf, &pl_len);
+      handshake_read(&hs_b, msg_buf, msg_len, pl_buf, sizeof(pl_buf), &pl_len);
       NOX_INFO(LOG_MOD_NOISE, "msg2 alındı");
 
       /* Split → transport */
@@ -1402,16 +1446,12 @@ static void prompt_transport_selection(struct app_state *state) {
 
     NOX_INFO(LOG_MOD_MAIN, "adresiniz: %s", state.onion_addr);
 
-    /* ── 14b. Seccomp blacklist yükle ────────────────
-     * Tor ve Hidden Service hazır. Bundan sonra tehlikeli
-     * syscall'lar SIGSYS ile öldürmeli.
-     * prctl(PR_SET_DUMPABLE, 0) seccomp ÖNCESİ yapılır —
-     * çünkü seccomp prctl'ı blacklist'liyor. */
-#ifdef PR_SET_DUMPABLE
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
-    if (seccomp_policy_load() != NOX_OK) {
-      NOX_FATAL(LOG_MOD_MAIN, "seccomp yüklenemedi — abort");
+    /* ── 14b. Seccomp Stage 2 — Tam blacklist ────────────────
+     * Tor ve Hidden Service hazır. Fork/execve artık gerekmez.
+     * PR_SET_DUMPABLE=0 zaten stage 1 ÖNCESİ ayarlandı.
+     * prctl stage 1'de blacklist'li — burada çağrılamaz. */
+    if (seccomp_policy_load(2) != NOX_OK) {
+      NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
       cleanup(&state);
       return 1;
     }

@@ -287,7 +287,8 @@ static nox_err_t action_tofu_accept(struct app_state *state, peer_event_t ev)
     if (!state->hs) {
         ui_print_error(state,
             "Handshake durumu geçersiz (peer ayrılmış olabilir)");
-        return NOX_ERR_PROTO;  /* NOX_OK dönmez → state geçişi iptal, cleanup gerekir */
+        sm_dispatch(state, EV_PEER_DISCONNECTED);
+        return NOX_ERR_PROTO;
     }
 
     /* db_add_contact — rehbere kaydet */
@@ -306,12 +307,14 @@ static nox_err_t action_tofu_accept(struct app_state *state, peer_event_t ev)
     state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
     if (!state->session) {
         ui_print_error(state, "Arena bellek hatası");
+        sm_dispatch(state, EV_PEER_DISCONNECTED);
         return NOX_ERR_ALLOC;
     }
 
     if (handshake_split(state->hs, state->session) != NOX_OK) {
         ui_print_error(state, "session split başarısız");
         state->session = NULL;
+        sm_dispatch(state, EV_PEER_DISCONNECTED);
         return NOX_ERR_PROTO;
     }
 

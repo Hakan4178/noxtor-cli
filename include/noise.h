@@ -98,7 +98,7 @@ ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
 /* DecryptAndHash — Çöz + hash'e karıştır */
 ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *ciphertext, size_t ct_len,
-                                   uint8_t *out);
+                                   uint8_t *out, size_t out_cap);
 
 /* Split — Handshake bitince iki CipherState döndür */
 __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *ss,
@@ -144,13 +144,15 @@ nox_err_t handshake_write(struct noise_handshake *hs,
  * @msg:     Gelen mesaj
  * @msg_len: Mesaj uzunluğu
  * @payload_out: Çözülen payload çıktısı
- * @pl_len:  Payload buffer boyutu (in), çözülen byte sayısı (out)
+ * @out_cap: Payload output buffer kapasitesi (in)
+ * @pl_len:  Çözülen byte sayısı (out)
  *
  * Return: NOX_OK, NOX_ERR_AUTH (MAC hatası), NOX_ERR_PROTO
  */
 nox_err_t handshake_read(struct noise_handshake *hs,
                          const uint8_t *msg, size_t msg_len,
-                         uint8_t *payload_out, size_t *pl_len);
+                         uint8_t *payload_out, size_t out_cap,
+                         size_t *pl_len);
 
 /*
  * handshake_is_complete — Handshake tamamlandı mı?

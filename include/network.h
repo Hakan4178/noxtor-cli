@@ -92,7 +92,7 @@ nox_err_t epoll_modify_fd(int epoll_fd, int fd, uint32_t events);
 /* ================================================================
  * FRAME I/O — Wire format okuma/yazma
  *
- * frame_header (37 byte) + Noise-encrypted payload
+ * frame_header (13 byte) + Noise-encrypted payload
  * Tüm multi-byte alanlar network byte order (big-endian).
  * ================================================================ */
 

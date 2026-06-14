@@ -6,4 +6,4 @@ src/**/*.d
 *.d
 *.out
 memory-bank
-
+docs
