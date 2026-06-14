@@ -4,7 +4,7 @@
  * noxtor-cli'nin kullanmadığı tehlikeli syscall'ları engeller.
  *
  * Aşama 1 (key_derive sonrası): 120s Tor bootstrap penceresini korur.
- *   process_vm_readv, ptrace, io_uring, userfaultfd, perf_event_open, prctl
+ *   process_vm_readv, ptrace, io_uring, userfaultfd, perf_event_open
  *   Bu kurallar kalıcıdır — stage 2 ile kaldırılamaz (seccomp-bpf additive).
  *
  * Aşama 2 (Tor HS sonrası): Tam blacklist.
@@ -54,10 +54,12 @@ static const struct {
   /* Profiling / Timing attack koruması */
   { .num = SCMP_SYS(perf_event_open),   .name = "perf_event_open",   .stage = 1 },
 
-  /* Security bypass — PR_SET_DUMPABLE=0 sonra prctl artık gerekmez */
-  { .num = SCMP_SYS(prctl),             .name = "prctl",             .stage = 1 },
-
   /* ═══ Stage 2 — Tor spawn sonrası (fork/execve artık gerekmez) ═══ */
+
+  /* Security bypass — PR_SET_DUMPABLE=0 arena_init'de ayarlandı,
+   * Tor bootstrap sırasında prctl gerekebilir (PR_SET_NAME vb.).
+   * Stage 2'de engellenir. */
+  { .num = SCMP_SYS(prctl),             .name = "prctl",             .stage = 2 },
 
   /* Process manipulation */
   { .num = SCMP_SYS(execve),            .name = "execve",            .stage = 2 },

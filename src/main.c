@@ -632,7 +632,12 @@ static void event_loop(struct app_state *state) {
             continue;
           }
           memcpy(payload, state->recv_buf + FRAME_HEADER_WIRE_SIZE, fh.len);
-          state->recv_pos = 0; /* buffer'ı sıfırla — bir sonraki frame'e hazır */
+          /* M-3 FIX: Frame sonrasındaki kalan byte'ları koru */
+          size_t remaining = state->recv_pos - frame_total;
+          if (remaining > 0) {
+            memmove(state->recv_buf, state->recv_buf + frame_total, remaining);
+          }
+          state->recv_pos = remaining;
 
           if (fh.type == NOX_MSG_CTRL && state->hs) {
             uint8_t pl[64];
@@ -1127,6 +1132,14 @@ static void prompt_transport_selection(struct app_state *state) {
       return 1;
     }
 
+    /* ── 8b. PR_SET_DUMPABLE=0 —mümkün olduğunca erken ──────
+     * Arena mmap'landı, key'ler oluşmaya başlayacak.
+     * /proc/PID/mem ve ptrace ile okuma engellenir.
+     * Terminal I/O dumpable gerektirmez. */
+#ifdef PR_SET_DUMPABLE
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+
     /* ── 9. Salt yükle veya oluştur ───────────────────── */
     uint8_t salt[NOX_SALT_LEN];
     /* CodeQL #12 cpp/path-injection: config_dir realpath($HOME)'den türetilmiştir */
@@ -1268,12 +1281,9 @@ static void prompt_transport_selection(struct app_state *state) {
     identity_unlock = NULL;
     NOX_DEBUG(LOG_MOD_MAIN, "identity_unlock bellekten silindi");
 
-    /* ── 10b. PR_SET_DUMPABLE=0 + Seccomp Stage 1 ──────────────────
-     * PR_SET_DUMPABLE=0 SEÇİMLStage 1 loadeda önce yapılır —
-     * çünkü seccomp prctl'ı blacklist'liyor. */
-#ifdef PR_SET_DUMPABLE
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
+    /* ── 10b. Seccomp Stage 1 ──────────────────────────────────
+     * PR_SET_DUMPABLE=0 zaten arena_init sonrası ayarlandı (8b).
+     * Seccomp prctl'i blacklist'liyor — burada çağrılamaz. */
 
     /* 120s Tor bootstrap pencere koruması.
      * process_vm_readv, ptrace, io_uring engellenir.

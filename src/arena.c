@@ -38,7 +38,6 @@
 #include <stdint.h>      /* SIZE_MAX */
 #include <errno.h>
 #include <assert.h>      /* assert */
-#include <sys/prctl.h>   /* PR_SET_DUMPABLE */
 
 /* libsodium — canary üretimi + sabit zamanlı karşılaştırma */
 #include <sodium.h>
@@ -90,18 +89,13 @@ static size_t page_align(size_t size, size_t page_size)
 /* ================================================================
  * YARDIMCI — Güvenli abort
  *
- * PR_SET_DUMPABLE=0 her zaman ayarlanır — hangi aşamada olursa olsun.
- * Seccomp prctl'ı engellerse SIGSYS ile ölüm (zaten güvenli).
- * Seccomp henüz yüklenmediyse core dump engellenir.
+ * PR_SET_DUMPABLE=0 main'de seccomp ÖNCESİ ayarlandı (fork ile child'a
+ * miras kalır). Bu fonksiyonda tekrar prctl çağırmıyoruz — seccomp
+ * stage 1 prctl'i engeller, SIGSYS ile ölüm gereksiz.
+ *
  * Bu fonksiyon wipe + abort gerçekleştirir.
  * ================================================================ */
 static void secure_abort(const struct secure_arena *a, const char *msg) {
-    /* Defense-in-depth: her zaman dumpable'ı kapat.
-     * Seccomp engellerse SIGSYS ile ölür (zaten güvenli).
-     * Seccomp henüz yüklenmediyse core dump engellenir. */
-#ifdef PR_SET_DUMPABLE
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
     fprintf(stderr,
             "\n[FATAL] %s\n"
             "[FATAL] Güvenlik ihlali — program sonlandırılıyor.\n",
