@@ -238,7 +238,7 @@ static int test_db_history(void)
     uint8_t noise_key[NOX_KEY_LEN];
     memset(noise_key, 0x11, NOX_KEY_LEN);
 
-    const char *my_onion = "nopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz12.onion";
+    const char *my_onion = "nopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz1234567.onion";
     const char *my_onion_key = "ED25519-V3:b64encodedkeygoeshereforourpersistentidentityonionaddresskey";
     size_t my_onion_key_len = strlen(my_onion_key);
 

@@ -113,7 +113,9 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
       if (errno == EAGAIN) {
 #endif
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        poll(&pfd, 1, 3000);
+        int pret = poll(&pfd, 1, 3000);
+        if (pret < 0 && errno != EINTR)
+          return NOX_ERR_IO;
         continue;
       }
       return NOX_ERR_IO;
@@ -501,8 +503,9 @@ static nox_err_t generate_torrc(struct app_state *state) {
       /* C-1: Bridge line'daki \n karakterleri torrc'ye satır enjeksiyonu
        * yapabilir. Tor config dosyasında her satır tek bir direktördür.
        * Yeni satır karakteri varsa bridge line reddedilir. */
-      if (strchr(state->obfs4_bridge_line, '\n') != NULL) {
-        NOX_ERROR(LOG_MOD_NET, "obfs4 bridge line newline karakteri içeriyor");
+      if (strchr(state->obfs4_bridge_line, '\n') != NULL ||
+          strchr(state->obfs4_bridge_line, '\r') != NULL) {
+        NOX_ERROR(LOG_MOD_NET, "obfs4 bridge line newline/carriage return karakteri içeriyor");
         close(fd);
         return NOX_ERR_CONFIG;
       }
@@ -777,6 +780,7 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
   close(fd);
   if (err != NOX_OK) {
     NOX_ERROR(LOG_MOD_NET, "cookie okuma hatası");
+    explicit_bzero(cookie, sizeof(cookie));
     return NOX_ERR_TOR;
   }
 

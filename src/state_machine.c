@@ -213,7 +213,13 @@ static nox_err_t action_cleanup(struct app_state *state, peer_event_t ev)
         state->peer_fd = -1;
     }
 
-    /* 2. Kriptografik state */
+    /* 2. Kriptografik state — arena restore ÖNCESİ key material'ı sıfırla */
+    if (state->hs) {
+        sodium_memzero(state->hs, sizeof(struct noise_handshake));
+    }
+    if (state->session) {
+        sodium_memzero(state->session, sizeof(struct noise_session));
+    }
     state->hs      = NULL;
     state->session  = NULL;
     state->tx_seq   = 0;

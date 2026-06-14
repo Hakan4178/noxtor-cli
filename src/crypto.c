@@ -54,6 +54,8 @@ NOX_STATIC_ASSERT(crypto_secretbox_NONCEBYTES == NOX_NONCE_LEN,
                   "secretbox nonce boyutu NOX_NONCE_LEN ile uyumsuz");
 NOX_STATIC_ASSERT(crypto_pwhash_SALTBYTES == NOX_SALT_LEN,
                   "Argon2id salt boyutu NOX_SALT_LEN ile uyumsuz");
+NOX_STATIC_ASSERT(crypto_sign_SECRETKEYBYTES == NOX_KEY_LEN * 2,
+                  "Ed25519 secret key boyutu beklenen farklı");
 
 /* ================================================================
  * [P10] Subkey ID enum — magic number yok
@@ -81,7 +83,6 @@ NOX_STATIC_ASSERT(sizeof(NOX_KDF_CTX) - 1 == crypto_kdf_CONTEXTBYTES,
  * [P9] PIN uzunluk limitleri
  * ================================================================ */
 #define NOX_MIN_PIN_LEN  8U
-#define NOX_MAX_PIN_LEN  1024U
 
 /* ================================================================
  * Identity dosya boyutu
@@ -184,18 +185,22 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
                                     char *pin, size_t pin_len,
                                     const uint8_t salt[NOX_SALT_LEN])
 {
-    if (!master_key || !pin || !salt)
+    if (!master_key || !pin || !salt) {
+        if (pin && pin_len > 0) sodium_memzero(pin, pin_len);
         return NOX_ERR_PIN;
+    }
 
     /* [P9] PIN uzunluk kontrolü */
     if (pin_len < NOX_MIN_PIN_LEN) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "PIN çok kısa (min %u karakter)", NOX_MIN_PIN_LEN);
+        sodium_memzero(pin, pin_len);
         return NOX_ERR_PIN;
     }
-    if (pin_len > NOX_MAX_PIN_LEN) {
+    if (pin_len > NOX_PIN_MAX_LEN) {
         NOX_ERROR(LOG_MOD_CRYPTO,
-                  "PIN çok uzun (max %u karakter)", NOX_MAX_PIN_LEN);
+                  "PIN çok uzun (max %u karakter)", NOX_PIN_MAX_LEN);
+        sodium_memzero(pin, pin_len);
         return NOX_ERR_PIN;
     }
 
@@ -367,9 +372,13 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
 
     /* [P3] fsync — diske garanti yaz */
     if (werr == NOX_OK) {
-        if (fsync(tmp_fd) != 0)
-            NOX_WARN(LOG_MOD_CRYPTO,
+        if (fsync(tmp_fd) != 0) {
+            NOX_ERROR(LOG_MOD_CRYPTO,
                      "salt fsync başarısız: %s", strerror(errno));
+            close(tmp_fd);
+            unlink(tmp_path);
+            return NOX_ERR_IO;
+        }
     }
     close(tmp_fd);
 
@@ -538,8 +547,11 @@ nox_err_t crypto_load_identity(const char *identity_path,
                                 uint8_t public_key_out[NOX_KEY_LEN])
 {
     if (!identity_path || !unlock_key ||
-        !secret_key_out || !public_key_out)
+        !secret_key_out || !public_key_out) {
+        if (secret_key_out) sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        if (public_key_out) sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
+    }
 
     int fd = open(identity_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -610,7 +622,6 @@ nox_err_t crypto_load_identity(const char *identity_path,
         return NOX_ERR_CRYPTO;
     }
 
-    memory_barrier();
     NOX_INFO(LOG_MOD_CRYPTO, "identity.key başarıyla çözüldü");
     return NOX_OK;
 }

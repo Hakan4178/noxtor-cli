@@ -165,8 +165,11 @@ nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
                     "PRAGMA secure_delete=ON;",
                     NULL, NULL, &err_msg);
   if (rc != SQLITE_OK) {
-    NOX_WARN(LOG_MOD_DB, "PRAGMA ayarlanamadı: %s", err_msg);
+    NOX_ERROR(LOG_MOD_DB, "PRAGMA secure_delete ayarlanamadı: %s", err_msg);
     sqlite3_free(err_msg);
+    sqlite3_close(g_state.db);
+    g_state.db = NULL;
+    return NOX_ERR_DB;
   }
 
   /* Rehber tablosu */
@@ -288,6 +291,8 @@ nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t nois
   strncpy(cp.name, name, NOX_CONTACT_NAME_LEN);
   memcpy(cp.noise_key, noise_key, NOX_KEY_LEN);
   if (my_onion) {
+    size_t my_onion_len = strnlen(my_onion, NOX_ONION_LEN + 1);
+    if (my_onion_len != NOX_ONION_LEN) { DB_UNLOCK(); return NOX_ERR_DB; }
     strncpy(cp.my_onion, my_onion, NOX_ONION_LEN);
   }
   if (my_onion_key && my_onion_key_len > 0) {
@@ -427,7 +432,7 @@ nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uin
     my_onion_out[my_onion_len - 1] = '\0';
   }
   if (my_onion_key_out && my_onion_key_len_out) {
-    size_t key_len = strlen(cp.my_onion_key);
+    size_t key_len = strnlen(cp.my_onion_key, NOX_ONION_KEY_B64_LEN);
     if (*my_onion_key_len_out < key_len) {
       key_len = *my_onion_key_len_out;
     }
@@ -725,7 +730,7 @@ nox_err_t db_list_contacts(db_contact_visitor_fn visitor, void *ctx) {
         memset(cp.my_onion_key, 0, sizeof(cp.my_onion_key));
       }
       visitor(cp.onion, cp.name, cp.noise_key, cp.my_onion,
-              (const uint8_t *)cp.my_onion_key, strlen(cp.my_onion_key), ctx);
+              (const uint8_t *)cp.my_onion_key, strnlen(cp.my_onion_key, NOX_ONION_KEY_B64_LEN), ctx);
     }
     sodium_memzero(&cp, sizeof(cp));
   }
@@ -987,7 +992,7 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
     }
 
     visitor(cp.onion, cp.name, cp.noise_key, cp.my_onion,
-            (const uint8_t *)cp.my_onion_key, strlen(cp.my_onion_key),
+            (const uint8_t *)cp.my_onion_key, strnlen(cp.my_onion_key, NOX_ONION_KEY_B64_LEN),
             last_msg_text, last_msg_outgoing, last_msg_timestamp, ctx);
 
     if (last_msg_text) {

@@ -402,6 +402,9 @@ static void cleanup(struct app_state *state) {
   /* Secure arena — explicit_bzero + munmap */
   arena_destroy(&state->arena);
 
+  /* Dosya transferi temizliği — FD'leri kapat, yarım dosyaları sil */
+  file_transfer_cleanup(state);
+
   /* Async stdin buffer scrubbing and free */
   if (state->stdin_buf) {
     sodium_memzero(state->stdin_buf, state->stdin_cap);
@@ -580,7 +583,7 @@ static void event_loop(struct app_state *state) {
           if (ioctl(fd, FIONREAD, &avail) < 0) avail = 0;
           size_t space = sizeof(state->recv_buf) - state->recv_pos;
           size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
-          if (to_read == 0) break; /* buffer dolu — frame işleme devam etsin */
+          if (to_read == 0) continue; /* buffer dolu — bir sonraki epoll event'ine dön */
 
           ssize_t r = recv(fd, state->recv_buf + state->recv_pos, to_read, MSG_DONTWAIT);
           if (r <= 0) {
@@ -602,7 +605,7 @@ static void event_loop(struct app_state *state) {
 
           /* Frame header tamamlandı mı? (13 byte) */
           if (state->recv_pos < FRAME_HEADER_WIRE_SIZE)
-            break; /* eksik, bir sonraki EPOLLIN'de devam */
+            continue; /* eksik, bir sonraki epoll event'ine dön */
 
           struct frame_header fh;
           if (frame_header_decode(state->recv_buf, &fh) != NOX_OK) {
@@ -619,7 +622,7 @@ static void event_loop(struct app_state *state) {
 
           size_t frame_total = FRAME_HEADER_WIRE_SIZE + fh.len;
           if (state->recv_pos < frame_total)
-            break; /* payload henüz tamamlanmadı, bir sonraki EPOLLIN'de devam */
+            continue; /* payload henüz tamamlanmadı, bir sonraki epoll event'ine dön */
 
           /* Frame tamamlandı — payload'ı ayıkla */
           assert(fh.len > 0 && fh.len <= 4096 + NOX_MAC_LEN);

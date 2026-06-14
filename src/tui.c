@@ -295,7 +295,7 @@ void tui_draw_sidebar(struct app_state *state)
             snprintf(display_name, sizeof(display_name), "%s", tc->name);
         } else {
             size_t olen = strlen(tc->onion);
-            if (olen > 10) {
+            if (olen >= 12) {
                 snprintf(display_name, sizeof(display_name), "%.4s..%.4s", tc->onion, tc->onion + olen - 12);
             } else {
                 snprintf(display_name, sizeof(display_name), "%s", tc->onion);
@@ -382,6 +382,9 @@ void tui_chat_append(const char *line)
     }
 
     g_tui.chat_lines[g_tui.chat_line_count] = strdup(line);
+    if (!g_tui.chat_lines[g_tui.chat_line_count]) {
+        return;
+    }
     g_tui.chat_line_count++;
 }
 
