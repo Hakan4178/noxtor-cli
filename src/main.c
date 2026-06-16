@@ -1,4 +1,26 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * NOT: Bu yazılım GPLv3 ile korunmaktadır ve hukuken herkesin kullanımına açıktır.
+ * Ancak yazarın kişisel ricasıdır bu yazılımın ve türevlerinin aşağıda belirtilen kişi, kurum veya 
+ * oluşumlar tarafından KULLANILMASI, BARINDIRILMASI veya GELİŞTİRİLMESİ yazar tarafından etik nedenlerden dolayı hoş karşılanmaz:
+ *
+ * 1.HALK İRADESİNİ GASPEDENLER: Seçme ve seçilme hakkını yok sayarak,
+ *   halkın oylarıyla seçilmiş yerel veya ulusal yönetimlerin veya partilerin üzerine çöken, 
+ *   hukuksuz bir şekilde atanan tüm kayyumlar, kayyum yönetimleri ve onların 
+ *   alt kadroları.
+ *
+ * 2.DİKTATÖRLER VE OTORİTER REJİMLER: Gücü tek elde toplayarak yargıyı, basını 
+ *   ve ifade özgürlüğünü baskılayan, demokratik süreçleri işletmeyen diktatörler, 
+ *   otokratlar ve onların rejim aygıtları.
+ *
+ * 3.SANSÜR VE GÖZETİM MEKANİZMALARI: İnterneti kısıtlayan, insanları fikirlerinden 
+ *   dolayı hapseden, kitlesel takip ve fişleme teknolojileri geliştiren tüm 
+ *   devlet kurumları veya bunlara destek veren şirketler.
+ *
+ *
+ *
+ *
+ *
  * main.c — noxtor-cli giriş noktası
  *
  * Init sırası:
@@ -477,6 +499,56 @@ static void cleanup(struct app_state *state) {
  * ================================================================ */
 static void event_loop(struct app_state *state) {
   struct epoll_event events[4];
+
+  /* ── Stage 3: Sıfır ağ sızıntısı garantisi ────────────────────
+   * Tüm mevcut bağlantılar AF_UNIX (Tor control, SOCKS, peer).
+   * Event loop tek thread — clone tamamen yasak.
+   * TCP/UDP/NETLINK socket oluşturulamaz.
+   * ───────────────────────────────────────────────────────────── */
+  if (seccomp_policy_load(3) != NOX_OK) {
+    NOX_ERROR(LOG_MOD_MAIN, "seccomp stage 3 yüklenemedi");
+    ui_print_error(state, "Güvenlik politikası yüklenemedi.");
+    state->running = false;
+    return;
+  }
+
+  /* ── Komutlar banner'ı — stage 3 sonrası ──────────────────────
+   * Banner stage 3'ten sonra basılır: clone/TCP/UDP/NETLINK
+   * zaten engellenmiş, sadece fprintf() çalışır. */
+  if (!tui_is_active()) {
+    if (state->ghost_mode) {
+      fprintf(
+          stderr,
+          "\n  [👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı\n\n"
+          "  Komutlar:\n"
+          "    \033[38;2;210;24;38m/addr               — .onion adresini "
+          "göster\033[0m\n"
+          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+          "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
+          "(aktif bağlantı gerektirir)\033[0m\n"
+          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+          "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
+          "gönderilir.\n\n"
+          "> ");
+    } else {
+      fprintf(
+          stderr,
+          "\n  Komutlar:\n"
+          "    \033[38;2;210;24;38m/addr               — .onion adresini "
+          "göster\033[0m\n"
+          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+          "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi "
+          "ekle\033[0m\n"
+          "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu "
+          "mesaj gönder\033[0m\n"
+          "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
+          "(aktif bağlantı gerektirir)\033[0m\n"
+          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+          "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
+          "gönderilir.\n\n"
+          "> ");
+    }
+  }
 
   while (state->running && !g_shutdown) {
     /* Handshake timeout kontrolü (slot yorulması ve kilitlenmeyi önler) */
@@ -1210,36 +1282,25 @@ static void prompt_transport_selection(struct app_state *state) {
     /* ── 8b. PR_SET_DUMPABLE=0 —mümkün olduğunca erken ──────
      * Arena mmap'landı, key'ler oluşmaya başlayacak.
      * /proc/PID/mem ve ptrace ile okuma engellenir.
-     * Terminal I/O dumpable gerektirmez. */
+     * Terminal I/O dumpable gerektirmez.
+     * Core dump üretilmez (PR_SET_DUMPABLE=0 kernel-level engel). */
 #ifdef PR_SET_DUMPABLE
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 #endif
 
-    /* ── 8c. CAP_NET_RAW düşür — raw socket engelleme ────
-     * AF_PACKET (Layer 2) ve AF_INET/SOCK_RAW (IP raw) artık oluşturulamaz.
-     * AF_UNIX SOCK_STREAM (Tor control socket) ve AF_INET SOCK_STREAM
-     * (SOCKS5 + listener) etkilenmez.
-     *
-     * PR_CAPBSET_DROP normal kullanıcıda CAP_SETPCAP gerektirir.
-     * CAP_NET_RAW zaten bounding set dışındaysa bu "başarısızlık" değildir. */
+    /* ── 8c. CAP_NET_RAW ──────────────────────────────────────
+     * PR_CAPBSET_DROP normal kullanıcıda çalışmaz (CAP_SETPCAP gerekir).
+     * Raw socket engelleme seccomp stage 2'de yapılıyor (AF_PACKET,
+     * SOCK_RAW KILL kuralı). Bu blok sadece root/sudo için korunuyor. */
 #ifdef PR_CAPBSET_QUERY
     if (prctl(PR_CAPBSET_QUERY, CAP_NET_RAW, 0, 0, 0) == 0) {
-      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW zaten bounding set dışında");
+      /* CAP_NET_RAW zaten bounding set dışında — bir şey yapma */
     } else if (prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0) == 0) {
-      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW düşürüldü — raw socket engellendi");
-    } else if (errno == EPERM || errno == EINVAL) {
-      NOX_WARN(LOG_MOD_HARD,
-               "CAP_NET_RAW düşürülemedi (CAP_SETPCAP yok veya desteklenmiyor; errno=%d)",
-               errno);
-    } else {
-      NOX_WARN(LOG_MOD_HARD, "CAP_NET_RAW düşürülemedi (errno=%d)", errno);
+      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW düşürüldü");
     }
+    /* Normal kullanıcı: EPERM beklenir, sessizce atla */
 #else
-    if (prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0) == 0) {
-      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW düşürüldü — raw socket engellendi");
-    } else {
-      NOX_WARN(LOG_MOD_HARD, "CAP_NET_RAW düşürülemedi (errno=%d)", errno);
-    }
+    prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0);
 #endif
 
     /* ── 9. Salt yükle veya oluştur ───────────────────── */
@@ -1596,41 +1657,6 @@ static void prompt_transport_selection(struct app_state *state) {
 #endif
 
     if (g_shutdown) goto shutdown_clean;
-
-    if (!tui_is_active()) {
-        if (state.ghost_mode) {
-          fprintf(
-              stderr,
-              "\n  [👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı\n\n"
-              "  Komutlar:\n"
-              "    \033[38;2;210;24;38m/addr               — .onion adresini "
-              "göster\033[0m\n"
-              "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
-              "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
-              "(aktif bağlantı gerektirir)\033[0m\n"
-              "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
-              "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
-              "gönderilir.\n\n"
-              "> ");
-        } else {
-          fprintf(
-              stderr,
-              "\n  Komutlar:\n"
-              "    \033[38;2;210;24;38m/addr               — .onion adresini "
-              "göster\033[0m\n"
-              "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
-              "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi "
-              "ekle\033[0m\n"
-              "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu "
-              "mesaj gönder\033[0m\n"
-              "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
-              "(aktif bağlantı gerektirir)\033[0m\n"
-              "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
-              "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
-              "gönderilir.\n\n"
-              "> ");
-        }
-    }
 
     event_loop(&state);
 

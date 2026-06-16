@@ -1,5 +1,5 @@
 /* ================================================================
- * seccomp.c — Seccomp Blacklist Policy (İki Aşamalı)
+ * seccomp.c — Seccomp Blacklist Policy (Üç Aşamalı)
  *
  * noxtor-cli'nin kullanmadığı tehlikeli syscall'ları engeller.
  *
@@ -10,6 +10,11 @@
  * Aşama 2 (Tor HS sonrası): Tam blacklist + raw socket engelleme.
  *   fork, execve, mount, reboot vs. — Tor artık fork/execve kullanmaz.
  *   AF_PACKET/SOCK_RAW raw socket'lar engellenir.
+ *
+ * Aşama 3 (Event loop başı): Sıfır ağ sızıntısı garantisi.
+ *   clone tamamen yasak (tek thread), AF_INET/AF_INET6 tüm tipler,
+ *   AF_NETLINK, symlink, link, chmod, chown.
+ *   Tüm iletişim AF_UNIX üzerinden (Tor control, SOCKS, peer).
  *
  * Mod: SCMP_ACT_KILL — engellenen syscall çağrılırsa process SIGSYS ile öldürülür.
  *
@@ -24,6 +29,7 @@
 #include <seccomp.h>
 #include <stdint.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
 
 /* ── Blacklist tablosu ── */
 #define KILL(ctx, name) \
@@ -81,11 +87,6 @@ static const struct {
 
   /* ═══ Stage 2 — Tor spawn sonrası (fork/execve artık gerekmez) ═══ */
 
-  /* Security bypass — PR_SET_DUMPABLE=0 arena_init'de ayarlandı,
-   * Tor bootstrap sırasında prctl gerekebilir (PR_SET_NAME vb.).
-   * Stage 2'de engellenir. */
-  { .num = SCMP_SYS(prctl),             .name = "prctl",             .stage = 2 },
-
   /* Process manipulation */
   { .num = SCMP_SYS(execve),            .name = "execve",            .stage = 2 },
   { .num = SCMP_SYS(execveat),          .name = "execveat",          .stage = 2 },
@@ -128,6 +129,20 @@ static const struct {
   /* Other */
   { .num = SCMP_SYS(nfsservctl),        .name = "nfsservctl",        .stage = 2 },
   { .num = SCMP_SYS(quotactl),          .name = "quotactl",          .stage = 2 },
+
+  /* ═══ Stage 3 — Event loop başı: Sıfır ağ sızıntısı garantisi ═══ */
+
+  /* Filesystem manipulation — init'ten sonra değişiklik gerekmez */
+  { .num = SCMP_SYS(symlink),           .name = "symlink",           .stage = 3 },
+  { .num = SCMP_SYS(symlinkat),         .name = "symlinkat",         .stage = 3 },
+  { .num = SCMP_SYS(link),              .name = "link",              .stage = 3 },
+  { .num = SCMP_SYS(linkat),            .name = "linkat",            .stage = 3 },
+  { .num = SCMP_SYS(chmod),             .name = "chmod",             .stage = 3 },
+  { .num = SCMP_SYS(fchmod),            .name = "fchmod",            .stage = 3 },
+  { .num = SCMP_SYS(fchmodat),          .name = "fchmodat",          .stage = 3 },
+  { .num = SCMP_SYS(chown),             .name = "chown",             .stage = 3 },
+  { .num = SCMP_SYS(fchown),            .name = "fchown",            .stage = 3 },
+  { .num = SCMP_SYS(fchownat),          .name = "fchownat",          .stage = 3 },
 };
 
 /* ================================================================
@@ -201,6 +216,41 @@ nox_err_t seccomp_policy_load(int stage) {
     if (rc_clone3 == 0)
       n_custom_blocked++;
 
+    /* ── prctl: option'a göre filtreleme ─────────────────────────
+     * prctl() tamamen yasaklanmaz — seccomp_load() prctl(PR_SET_SECCOMP)
+     * kullanarak stage 3 yükler. Tehlikeli option'lar engellenir.
+     *
+     * prctl(option, arg2, arg3, arg4, arg5):
+     *   SCMP_A0 = option (ilk argüman)
+     *
+     * KILL: Tehlikeli option'lar (security bypass)
+     * ALLOW: PR_SET_SECCOMP (seccomp_load), PR_SET_NO_NEW_PRIVS,
+     *        PR_SET_NAME, PR_SET_TIMERSLACK (zararsız) */
+    {
+      static const struct { int op; const char *name; } blocked[] = {
+        { PR_SET_DUMPABLE,              "prctl(PR_SET_DUMPABLE)" },
+        { PR_SET_PTRACER,               "prctl(PR_SET_PTRACER)" },
+        { PR_SET_TIMING,                "prctl(PR_SET_TIMING)" },
+        { PR_SET_MM,                    "prctl(PR_SET_MM)" },
+        { PR_SET_TSC,                   "prctl(PR_SET_TSC)" },
+        { PR_SET_SECUREBITS,            "prctl(PR_SET_SECUREBITS)" },
+        { PR_SET_SYSCALL_USER_DISPATCH, "prctl(PR_SET_SYSCALL_USER_DISPATCH)" },
+        { PR_SET_VMA,                   "prctl(PR_SET_VMA)" },
+        { PR_SET_MDWE,                  "prctl(PR_SET_MDWE)" },
+      };
+      for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(prctl), 1,
+                                  SCMP_A0(SCMP_CMP_EQ, (uint64_t)blocked[i].op));
+        if (rc != 0 && rc != -EDOM) {
+          NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi", blocked[i].name);
+          seccomp_release(ctx);
+          return NOX_ERR_CRYPTO;
+        }
+        if (rc == 0)
+          n_custom_blocked++;
+      }
+    }
+
     /* Raw socket blocking — CAP_NET_RAW drop'a ek savunma katmanı.
      * AF_PACKET (Layer 2) ve AF_INET/AF_INET6 SOCK_RAW (IP raw)
      * stage 2'den sonra asla kullanılmaz. AF_UNIX ve AF_INET SOCK_STREAM
@@ -232,6 +282,59 @@ nox_err_t seccomp_policy_load(int stage) {
 #ifdef AF_INET6
     {
       int rc = add_socket_raw_rule(ctx, AF_INET6, "socket(AF_INET6, SOCK_RAW)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
+  }
+
+  /* ── Stage 3: Event loop başı — Sıfır ağ sızıntısı garantisi ──────
+   * Tüm mevcut bağlantılar AF_UNIX (Tor control, SOCKS, peer).
+   * Event loop tek thread — clone tamamen yasak.
+   * TCP/UDP/NETLINK socket oluşturulamaz.
+   * ─────────────────────────────────────────────────────────────── */
+  if (stage >= 3) {
+    /* clone tamamen yasak — event loop tek thread, thread gerekmez */
+    int rc_clone = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 0);
+    if (rc_clone != 0 && rc_clone != -EDOM) {
+      NOX_ERROR(LOG_MOD_MAIN, "seccomp: stage 3 clone kuralı eklenemedi");
+      seccomp_release(ctx);
+      return NOX_ERR_CRYPTO;
+    }
+    if (rc_clone == 0)
+      n_custom_blocked++;
+
+    /* socket(AF_INET/AF_INET6) tüm tipler — TCP ve UDP tamamen yasak */
+    {
+      static const struct { int domain; const char *name; } blocked[] = {
+#ifdef AF_INET
+        { AF_INET,  "socket(AF_INET)" },
+#endif
+#ifdef AF_INET6
+        { AF_INET6, "socket(AF_INET6)" },
+#endif
+      };
+      for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 1,
+                                  SCMP_A0(SCMP_CMP_EQ, (uint64_t)blocked[i].domain));
+        if (rc != 0 && rc != -EDOM) {
+          NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi", blocked[i].name);
+          seccomp_release(ctx);
+          return NOX_ERR_CRYPTO;
+        }
+        if (rc == 0)
+          n_custom_blocked++;
+      }
+    }
+
+    /* socket(AF_NETLINK) — kernel network config iletişim */
+#ifdef AF_NETLINK
+    {
+      int rc = add_socket_domain_rule(ctx, AF_NETLINK, "socket(AF_NETLINK)");
       if (rc < 0) {
         seccomp_release(ctx);
         return NOX_ERR_CRYPTO;

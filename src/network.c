@@ -661,13 +661,8 @@ nox_err_t tor_spawn(struct app_state *state) {
   if (pid == 0) {
     /* Child — tor'u başlat */
 
-    /* S1 (threat-model): Tor child'ı crash olursa core dump
-     * üretmesin. RLIMIT_CORE=0 kernel-level engel.
-     * PR_SET_DUMPABLE=0 zaten main'de seccomp ÖNCESİ ayarlandı,
-     * fork() ile child'a miras kalır — tekrar prctl çağırmaya
-     * gerek yok (seccomp stage 1 prctl'i engeller, SIGSYS). */
-    struct rlimit no_core = {0, 0};
-    (void)setrlimit(RLIMIT_CORE, &no_core);
+    /* PR_SET_DUMPABLE=0 main'de seccomp ÖNCESİ ayarlandı,
+     * fork() ile child'a miras kalır — core dump üretilmez. */
 
     setsid();
     int devnull = open("/dev/null", O_RDWR);

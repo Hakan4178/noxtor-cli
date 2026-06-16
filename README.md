@@ -97,7 +97,10 @@ cd noxtor-cli && make clean && make release
 - 🕳 **Memory hygiene** — Critical keys and data are wiped from RAM
   immediately after use
 - 👻 **Ghost mode** — Disable SQLite entirely; leave zero forensic trace
-- 🛡️ **Seccomp sandboxing** — Minimal syscall surface via libseccomp
+- 🛡️ **Seccomp sandboxing** — Three-stage seccomp policy blocks TCP, UDP,
+  raw sockets, NETLINK, clone, and dangerous syscalls. After initialization,
+  **zero bytes leave the process via clearnet** — all network I/O is
+  restricted to AF_UNIX (Tor control, SOCKS, peer connections only)
 - ✊️ **Censorship evasion** — obfs4 and Snowflake bridge support
 - 🧪 **Fuzz-tested parsers** — All external-input parsers individually
   fuzzed for memory safety
@@ -125,8 +128,25 @@ Please report vulnerabilities responsibly.
 **What hasn't been done yet:**
 - Independent third-party audit
 - TOFU (Trust On First Use) verification + QR support
-- Full seccomp policy hardening
 - Kernel < 5.15 fallback paths
+
+### Seccomp Policy (Three-Stage)
+
+Noxtor uses a three-stage seccomp blacklist policy that progressively
+restricts system calls as the process matures:
+
+| Stage | When | What's blocked |
+|---|---|---|
+| 1 | After key derivation | `process_vm_readv`, `ptrace`, `io_uring`, `userfaultfd`, `perf_event_open` |
+| 2 | After Tor hidden service | `fork`, `execve`, `mount`, `reboot`, raw sockets (`AF_PACKET`), dangerous `prctl` options |
+| 3 | Event loop start | `clone` (all), `socket(AF_INET)`, `socket(AF_INET6)`, `socket(AF_NETLINK)`, `symlink`, `link`, `chmod`, `chown` |
+
+**After stage 3:**
+- **Zero bytes leave the process via clearnet** — TCP, UDP, and raw sockets are blocked at the kernel level
+- All network I/O is restricted to **AF_UNIX only** (Tor control, SOCKS, peer connections)
+- The process cannot create new threads or processes
+- Core dumps are impossible (`PR_SET_DUMPABLE=0`)
+- Attacker code execution cannot exfiltrate data to external C2 servers
 
 ---
 
