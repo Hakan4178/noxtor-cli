@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 
 /* ================================================================
@@ -176,19 +177,36 @@ static int test_frame_all_types(void)
 }
 
 /* ================================================================
- * TEST: Listener create + port > 0 + close
+ * TEST: Listener create + AF_UNIX socket + cleanup
  * ================================================================ */
 static int test_listener_create(void)
 {
-    uint16_t port = 0;
+    char listen_path[512] = {0};
     int fd = -1;
 
-    nox_err_t err = listener_create(&port, &fd);
+    /* Geçici dizin oluştur */
+    char tmp_dir[] = "/tmp/noxtor_test_XXXXXX";
+    if (mkdtemp(tmp_dir) == NULL)
+        return 1;
+
+    nox_err_t err = listener_create(tmp_dir, listen_path, &fd);
     TEST_ASSERT(err == NOX_OK);
     TEST_ASSERT(fd >= 0);
-    TEST_ASSERT(port > 0);
+    TEST_ASSERT(listen_path[0] != '\0');
+
+    /* Socket dosyası var mı kontrol et */
+    struct stat st;
+    TEST_ASSERT(stat(listen_path, &st) == 0);
+    TEST_ASSERT(S_ISSOCK(st.st_mode));
+
+    /* İzinleri kontrol et (0600) */
+    TEST_ASSERT((st.st_mode & 0777) == 0600);
 
     close(fd);
+
+    /* Cleanup */
+    unlink(listen_path);
+    rmdir(tmp_dir);
     return 0;
 }
 

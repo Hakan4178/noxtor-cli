@@ -29,7 +29,9 @@
 #include "stdin_handler.h"
 #include "file_transfer.h"
 #include "tui.h"
+#ifndef NO_SECCOMP
 #include "seccomp_policy.h"
+#endif
 #include "state_machine.h"
 
 #include <fcntl.h>
@@ -50,6 +52,8 @@
 #include <sys/resource.h>
 #include <assert.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
+#include <linux/capability.h>
 
 /* ================================================================
  * GLOBAL SHUTDOWN FLAG — async-signal-safe
@@ -60,10 +64,16 @@
 
 static struct termios g_orig_termios;
 static bool g_termios_saved = false;
+static volatile sig_atomic_t g_tor_died = 0;
 
 static void signal_handler(int sig) {
   (void)sig;
   g_shutdown = 1; /* sadece flag, başka hiçbir şey */
+}
+
+static void sigchld_handler(int sig) {
+  (void)sig;
+  g_tor_died = 1;
 }
 
 static void setup_signal_handlers(void) {
@@ -84,6 +94,14 @@ static void setup_signal_handlers(void) {
   };
   sigemptyset(&sa_ign.sa_mask);
   sigaction(SIGPIPE, &sa_ign, NULL);
+
+  /* SIGCHLD → Tor crash tespiti (defense-in-depth) */
+  struct sigaction sa_chld = {
+      .sa_handler = sigchld_handler,
+      .sa_flags = SA_RESTART | SA_NOCLDSTOP,
+  };
+  sigemptyset(&sa_chld.sa_mask);
+  sigaction(SIGCHLD, &sa_chld, NULL);
 }
 
 /* Ctrl+P (0x10) → SIGQUIT eşlemesi */
@@ -378,15 +396,16 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
  * CLEANUP — Güvenli çıkış
  * ================================================================ */
 static void cleanup(struct app_state *state) {
+#ifndef DEBUG
+  /* Release: Terminal scrollback'i hemen sil — session/chat
+   * mesajları scrollback buffer'da kalmasın (OPSAFE). */
+  printf("\033[2J\033[3J\033[H");
+  fflush(stdout);
+#endif
+
   NOX_INFO(LOG_MOD_MAIN, "temizlik başlıyor...");
-  bool was_tui = tui_is_active();
   tui_shutdown();
   restore_terminal();
-
-  if (!was_tui) {
-    printf("\033[2J\033[3J\033[H");
-    fflush(stdout);
-  }
 
   if (!state->ghost_mode) {
     db_close();
@@ -417,10 +436,21 @@ static void cleanup(struct app_state *state) {
   /* Tor — temiz kapanma (SIGNAL SHUTDOWN + waitpid) */
   tor_shutdown(state);
 
-  /* File descriptor'ları kapat */
+  /* File descriptor'ları kapat — tor_shutdown SONRASINDA
+   * (Tor process'i zaten sonlandırıldı, socket artık kullanılmıyor) */
   if (state->listen_fd >= 0) {
     close(state->listen_fd);
     state->listen_fd = -1;
+  }
+  /* UNIX socket dosyalarını temizle (tor_data_dir zaten silindi,
+   * ama double-check: unlink başarısızlığı ENOENT ise zararsız) */
+  if (state->listen_path[0] != '\0') {
+    unlink(state->listen_path);
+    state->listen_path[0] = '\0';
+  }
+  if (state->socks_path[0] != '\0') {
+    unlink(state->socks_path);
+    state->socks_path[0] = '\0';
   }
   if (state->peer_fd >= 0) {
     close(state->peer_fd);
@@ -476,6 +506,51 @@ static void event_loop(struct app_state *state) {
         }
         explicit_bzero(&state->rx_file, sizeof(state->rx_file));
         state->rx_file.fd = -1;
+      }
+    }
+
+    /* ── TOR HEALTH CHECK — Defense-in-Depth ──────────────────────
+     * İki mekanizma:
+     *   1. SIGCHLD handler — Tor child öldüğünde anında flag set eder
+     *   2. Periyodik kill(pid, 0) — SIGCHLD kaybolursa yedek tespit
+     * Her ikisi de sm_dispatch(EV_TOR_DIED) ile state machine'i
+     * tetikler → her state ST_IDLE'a düşer, temizlik yapılır. */
+    {
+      static time_t last_tor_check = 0;
+      time_t now = time(NULL);
+      bool tor_dead = false;
+
+      /* SIGCHLD flag kontrolü — en hızlı yol */
+      if (g_tor_died) {
+        g_tor_died = 0;
+        tor_dead = true;
+      }
+      /* Periyodik kill(pid, 0) — SIGCHLD yedek */
+      else if (state->tor_pid > 0 && (now - last_tor_check >= 5)) {
+        last_tor_check = now;
+        if (kill(state->tor_pid, 0) != 0 && errno == ESRCH) {
+          tor_dead = true;
+        }
+      }
+
+      if (tor_dead && state->tor_pid > 0) {
+        NOX_ERROR(LOG_MOD_NET, "Tor process öldü (PID=%d)", state->tor_pid);
+        sm_dispatch(state, EV_TOR_DIED);
+        state->tor_pid = 0;
+        state->tor_ctrl_fd = -1;
+
+        /* Tüm arena'yı güvenli şekilde sil — Tor gitti, key'ler
+         * işe yaramaz. Yeniden başlatmada PIN ile yeniden türetilir. */
+        arena_destroy(&state->arena);
+        state->master_key = NULL;
+        state->db_key = NULL;
+        state->session_key = NULL;
+        state->my_static_priv = NULL;
+        state->my_static_pub = NULL;
+
+        ui_print_error(state,
+          "Tor bağlantısı koptu — tüm anahtarlar silindi. "
+          "Uygulamayı kapatıp yeniden başlatın.");
       }
     }
 
@@ -1140,6 +1215,33 @@ static void prompt_transport_selection(struct app_state *state) {
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 #endif
 
+    /* ── 8c. CAP_NET_RAW düşür — raw socket engelleme ────
+     * AF_PACKET (Layer 2) ve AF_INET/SOCK_RAW (IP raw) artık oluşturulamaz.
+     * AF_UNIX SOCK_STREAM (Tor control socket) ve AF_INET SOCK_STREAM
+     * (SOCKS5 + listener) etkilenmez.
+     *
+     * PR_CAPBSET_DROP normal kullanıcıda CAP_SETPCAP gerektirir.
+     * CAP_NET_RAW zaten bounding set dışındaysa bu "başarısızlık" değildir. */
+#ifdef PR_CAPBSET_QUERY
+    if (prctl(PR_CAPBSET_QUERY, CAP_NET_RAW, 0, 0, 0) == 0) {
+      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW zaten bounding set dışında");
+    } else if (prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0) == 0) {
+      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW düşürüldü — raw socket engellendi");
+    } else if (errno == EPERM || errno == EINVAL) {
+      NOX_WARN(LOG_MOD_HARD,
+               "CAP_NET_RAW düşürülemedi (CAP_SETPCAP yok veya desteklenmiyor; errno=%d)",
+               errno);
+    } else {
+      NOX_WARN(LOG_MOD_HARD, "CAP_NET_RAW düşürülemedi (errno=%d)", errno);
+    }
+#else
+    if (prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0) == 0) {
+      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW düşürüldü — raw socket engellendi");
+    } else {
+      NOX_WARN(LOG_MOD_HARD, "CAP_NET_RAW düşürülemedi (errno=%d)", errno);
+    }
+#endif
+
     /* ── 9. Salt yükle veya oluştur ───────────────────── */
     uint8_t salt[NOX_SALT_LEN];
     /* CodeQL #12 cpp/path-injection: config_dir realpath($HOME)'den türetilmiştir */
@@ -1285,6 +1387,16 @@ static void prompt_transport_selection(struct app_state *state) {
      * PR_SET_DUMPABLE=0 zaten arena_init sonrası ayarlandı (8b).
      * Seccomp prctl'i blacklist'liyor — burada çağrılamaz. */
 
+    /* NO_NEW_PRIVS — seccomp filter yüklemeden ÖNCE ayarla.
+     * execve() ile privilege escalation engellenir.
+     * Tor child'a da miras kalır — Tor zaten elevated privilege gerektirmez. */
+#ifdef PR_SET_NO_NEW_PRIVS
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+      NOX_WARN(LOG_MOD_MAIN, "PR_SET_NO_NEW_PRIVS ayarlanamadı (errno=%d)", errno);
+    }
+#endif
+
+#ifndef NO_SECCOMP
     /* 120s Tor bootstrap pencere koruması.
      * process_vm_readv, ptrace, io_uring engellenir.
      * fork/execve hâlâ serbest — tor_spawn() için gerekli. */
@@ -1293,6 +1405,9 @@ static void prompt_transport_selection(struct app_state *state) {
       arena_destroy(&state.arena);
       return 1;
     }
+#else
+    NOX_WARN(LOG_MOD_MAIN, "Seccomp devre dışı (NO_SECCOMP tanımlı)");
+#endif
 
     /* ── Pluggable Transport Seçimi (Faz 6.2) ── */
     prompt_transport_selection(&state);
@@ -1425,19 +1540,9 @@ static void prompt_transport_selection(struct app_state *state) {
 
     if (g_shutdown) goto shutdown_clean;
 
-    /* SOCKS port'unu öğren (auto port) */
-    err = tor_get_socks_port(state.tor_ctrl_fd, &state.socks_port);
-    if (err != NOX_OK) {
-      if (g_shutdown) goto shutdown_clean;
-      NOX_FATAL(LOG_MOD_MAIN, "SOCKS port öğrenilemedi: %s", nox_strerror(err));
-      cleanup(&state);
-      return 1;
-    }
-
-    if (g_shutdown) goto shutdown_clean;
-
-    /* ── 14. TCP listener + Hidden Service ─────────── */
-    err = listener_create(&state.listen_port, &state.listen_fd);
+    /* ── 14. UNIX listener + Hidden Service ─────────── */
+    err = listener_create(state.tor_data_dir, state.listen_path,
+                          &state.listen_fd);
     if (err != NOX_OK) {
       if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "listener başarısız: %s", nox_strerror(err));
@@ -1447,7 +1552,7 @@ static void prompt_transport_selection(struct app_state *state) {
 
     if (g_shutdown) goto shutdown_clean;
 
-    err = tor_create_hidden_service(state.tor_ctrl_fd, state.listen_port,
+    err = tor_create_hidden_service(state.tor_ctrl_fd, state.listen_path,
                                     state.onion_addr, sizeof(state.onion_addr));
     if (err != NOX_OK) {
       if (g_shutdown) goto shutdown_clean;
@@ -1458,18 +1563,6 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     NOX_INFO(LOG_MOD_MAIN, "adresiniz: %s", state.onion_addr);
-
-    /* ── 14b. Seccomp Stage 2 — Tam blacklist ────────────────
-     * Tor ve Hidden Service hazır. Fork/execve artık gerekmez.
-     * PR_SET_DUMPABLE=0 zaten stage 1 ÖNCESİ ayarlandı.
-     * prctl stage 1'de blacklist'li — burada çağrılamaz. */
-    if (seccomp_policy_load(2) != NOX_OK) {
-      NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
-      cleanup(&state);
-      return 1;
-    }
-
-    if (g_shutdown) goto shutdown_clean;
 
     /* ── 15. epoll event loop ─────────────────────────── */
     err = epoll_setup(&state, state.listen_fd);
@@ -1489,6 +1582,20 @@ static void prompt_transport_selection(struct app_state *state) {
     tui_init();
     tui_print_welcome(&state);
     tui_refresh_all(&state);
+
+#ifndef NO_SECCOMP
+    /* ── 15b. Seccomp Stage 2 — Tam blacklist ────────────────
+     * Tor/HS hazır, TUI init bitti. Fork/execve artık gerekmez.
+     * TUI init'i stage 1'de bırakıyoruz: ncurses/terminfo bazı sistemlerde
+     * fork/clone kullanabiliyor; event loop stage 2 ile korunuyor. */
+    if (seccomp_policy_load(2) != NOX_OK) {
+      NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
+      cleanup(&state);
+      return 1;
+    }
+#endif
+
+    if (g_shutdown) goto shutdown_clean;
 
     if (!tui_is_active()) {
         if (state.ghost_mode) {

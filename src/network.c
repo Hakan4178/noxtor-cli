@@ -459,11 +459,27 @@ static nox_err_t generate_torrc(struct app_state *state) {
     close(dd);
   }
 
-  /* torrc yaz */
+  /* torrc yaz — V6 FIX: O_NOFOLLOW symlink Engellemesi */
   int fd =
-      open(state->torrc_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+      open(state->torrc_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (fd < 0) {
-    NOX_ERROR(LOG_MOD_NET, "torrc oluşturulamadı: %s", strerror(errno));
+    if (errno == ELOOP) {
+      NOX_ERROR(LOG_MOD_NET, "torrc yolu symlink — saldırı tespit edildi, siliniyor");
+      unlink(state->torrc_path);
+      fd = open(state->torrc_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    }
+    if (fd < 0) {
+      NOX_ERROR(LOG_MOD_NET, "torrc oluşturulamadı: %s", strerror(errno));
+      return NOX_ERR_TOR;
+    }
+  }
+
+  /* fstat ile dosya tipini doğrula — regular file değilse kapat */
+  struct stat st;
+  if (fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) {
+    NOX_ERROR(LOG_MOD_NET, "torrc regular file değil — saldırı tespit edildi");
+    close(fd);
+    unlink(state->torrc_path);
     return NOX_ERR_TOR;
   }
 
@@ -478,7 +494,7 @@ static nox_err_t generate_torrc(struct app_state *state) {
     }
     clen = snprintf(
         content, sizeof(content),
-        "SocksPort auto\n"
+        "SocksPort unix:%s/socks.sock\n"
         "ControlSocket %s/control.sock\n"
         "CookieAuthentication 1\n"
         "DataDirectory %s\n"
@@ -492,7 +508,7 @@ static nox_err_t generate_torrc(struct app_state *state) {
         "url=https://snowflake-broker.torproject.net/ front=cdn.sstatic.net "
         "ice=stun:stun.l.google.com:19302 utls-imitation=hellorandomizedalpn\n",
         state->tor_data_dir, state->tor_data_dir, state->tor_data_dir,
-        snowflake_path);
+        state->tor_data_dir, snowflake_path);
   } else if (state->transport_type == TRANSPORT_OBFS4) {
     const char *obfs4_path = "/usr/bin/obfs4proxy";
     if (access("/usr/local/bin/obfs4proxy", X_OK) == 0) {
@@ -510,7 +526,7 @@ static nox_err_t generate_torrc(struct app_state *state) {
       }
       clen =
           snprintf(content, sizeof(content),
-                   "SocksPort auto\n"
+                   "SocksPort unix:%s/socks.sock\n"
                    "ControlSocket %s/control.sock\n"
                    "CookieAuthentication 1\n"
                    "DataDirectory %s\n"
@@ -519,10 +535,11 @@ static nox_err_t generate_torrc(struct app_state *state) {
                    "Bridge %s\n"
                    "ClientTransportPlugin obfs4 exec %s\n",
                    state->tor_data_dir, state->tor_data_dir,
-                   state->tor_data_dir, state->obfs4_bridge_line, obfs4_path);
+                   state->tor_data_dir, state->tor_data_dir,
+                   state->obfs4_bridge_line, obfs4_path);
     } else {
       clen = snprintf(content, sizeof(content),
-                      "SocksPort auto\n"
+                      "SocksPort unix:%s/socks.sock\n"
                       "ControlSocket %s/control.sock\n"
                       "CookieAuthentication 1\n"
                       "DataDirectory %s\n"
@@ -531,17 +548,18 @@ static nox_err_t generate_torrc(struct app_state *state) {
                       "UpdateBridgesFromAuthority 1\n"
                       "ClientTransportPlugin obfs4 exec %s\n",
                       state->tor_data_dir, state->tor_data_dir,
-                      state->tor_data_dir, obfs4_path);
+                      state->tor_data_dir, state->tor_data_dir, obfs4_path);
     }
   } else {
     clen =
         snprintf(content, sizeof(content),
-                 "SocksPort auto\n"
+                 "SocksPort unix:%s/socks.sock\n"
                  "ControlSocket %s/control.sock\n"
                  "CookieAuthentication 1\n"
                  "DataDirectory %s\n"
                  "Log notice file %s/tor.log\n",
-                 state->tor_data_dir, state->tor_data_dir, state->tor_data_dir);
+                 state->tor_data_dir, state->tor_data_dir,
+                 state->tor_data_dir, state->tor_data_dir);
   }
 
   if (clen <= 0 || (size_t)clen >= sizeof(content)) {
@@ -623,6 +641,14 @@ nox_err_t tor_spawn(struct app_state *state) {
     return NOX_ERR_CONFIG;
   }
 
+  /* SocksSocket yolunu ayarla */
+  int ssn = snprintf(state->socks_path, NOX_PATH_MAX, "%s/socks.sock",
+                     state->tor_data_dir);
+  if (ssn <= 0 || (size_t)ssn >= NOX_PATH_MAX) {
+    NOX_ERROR(LOG_MOD_NET, "socks.sock yolu çok uzun");
+    return NOX_ERR_CONFIG;
+  }
+
   /* Stale control.sock dosyasını sil */
   unlink(socket_path);
 
@@ -648,9 +674,19 @@ nox_err_t tor_spawn(struct app_state *state) {
     if (devnull >= 0) {
       dup2(devnull, STDIN_FILENO);
       dup2(devnull, STDOUT_FILENO);
-      dup2(devnull, STDERR_FILENO);
       close(devnull);
     }
+
+    /* ── stderr yönlendirmesi ─────────────────────────────────
+     * DEBUG build: Tor'un stderr'ı doğrudan ekrana gider.
+     * Tor çökünce hata mesajını anında görürsün.
+     * Release'de /dev/null'a gider (sessiz kapanış). */
+#ifndef DEBUG
+    {
+      int dn = open("/dev/null", O_RDWR);
+      if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+    }
+#endif
 
     /* B-1: Tor child'ı parent FD'lerini miras alır. Bu FD'ler
      * Tor sürecin açık kalmasına neden olur (epoll, peer, vb.)
@@ -780,6 +816,10 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
     return NOX_ERR_TOR;
   }
 
+  /* V1 FIX: Cookie'yi diskten sil — metadata theft engeli.
+   * Tor authenticate sonrası cookie'yi buffer'dan temizler. */
+  unlink(cookie_path);
+
   /* "AUTHENTICATE " (13) + 64 hex + "\r\n" (2) + NUL = 80 */
   char cmd[80];
   size_t pos = 0;
@@ -870,12 +910,12 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
 /* ================================================================
  * HIDDEN SERVICE — ADD_ONION
  * ================================================================ */
-nox_err_t tor_create_hidden_service(int ctrl_fd, uint16_t local_port,
-                                    char *onion_out, size_t onion_len) {
+nox_err_t tor_create_hidden_service(int ctrl_fd, const char *listen_path,
+                                     char *onion_out, size_t onion_len) {
   char cmd[128];
   int n = snprintf(cmd, sizeof(cmd),
-                   "ADD_ONION NEW:ED25519-V3 Port=%u,127.0.0.1:%u\r\n",
-                   NOX_VIRTUAL_PORT, local_port);
+                   "ADD_ONION NEW:ED25519-V3 Port=%u,unix:%s\r\n",
+                   NOX_VIRTUAL_PORT, listen_path);
   if (n <= 0 || (size_t)n >= sizeof(cmd))
     return NOX_ERR_OVERFLOW;
 
@@ -937,54 +977,6 @@ nox_err_t tor_create_hidden_service(int ctrl_fd, uint16_t local_port,
   sodium_memzero(candidate, sizeof(candidate));
 
   NOX_INFO(LOG_MOD_NET, "Hidden Service: %s", onion_out);
-  return NOX_OK;
-}
-
-/* ================================================================
- * TOR SOCKS PORT — GETINFO ile otomatik portu öğren
- * ================================================================ */
-nox_err_t tor_get_socks_port(int ctrl_fd, uint16_t *port_out) {
-  nox_err_t err = ctrl_send_command(ctrl_fd, "GETINFO net/listeners/socks\r\n");
-  if (err != NOX_OK)
-    return err;
-
-  char resp[512];
-  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_CTRL_TIMEOUT_MS);
-  if (err != NOX_OK)
-    return err;
-
-  /* Yanıt formatı: 250-net/listeners/socks="127.0.0.1:NNNNN"\r\n250 OK */
-  const char *quote = strchr(resp, '"');
-  if (!quote) {
-    NOX_ERROR(LOG_MOD_NET, "SOCKS listener parse hatası (quote yok)");
-    return NOX_ERR_TOR;
-  }
-
-  const char *colon = strchr(quote, ':');
-  if (!colon) {
-    NOX_ERROR(LOG_MOD_NET, "SOCKS port parse hatası (colon yok)");
-    return NOX_ERR_TOR;
-  }
-
-  /* D-1: strtol endptr ve errno doğrulaması.
-   * Tor yanıt formatı: "127.0.0.1:9050"\r\n
-   * endptr kapanış quote'a veya \r/\n'a işaret etmeli.
-   * errno ERANGE: port sayısı long aralığını aşıyor. */
-  errno = 0;
-  char *endptr = NULL;
-  long port = strtol(colon + 1, &endptr, 10);
-  if (errno == ERANGE || port <= 0 || port > 65535) {
-    NOX_ERROR(LOG_MOD_NET, "SOCKS port geçersiz: %ld", port);
-    return NOX_ERR_TOR;
-  }
-  if (!endptr || (*endptr != '"' && *endptr != '\r' && *endptr != '\n' &&
-                  *endptr != '\0')) {
-    NOX_ERROR(LOG_MOD_NET, "SOCKS port parse hatası (geçersiz karakter)");
-    return NOX_ERR_TOR;
-  }
-
-  *port_out = (uint16_t)port;
-  NOX_INFO(LOG_MOD_NET, "Tor SOCKS port: %u", *port_out);
   return NOX_OK;
 }
 
@@ -1052,23 +1044,41 @@ void tor_shutdown(struct app_state *state) {
 }
 
 /* ================================================================
- * TCP LISTENER — bind(0) ile rastgele port
+ * UNIX DOMAIN LISTENER — bind(listen.sock)
+ *
+ * Tor Hidden Service unix: prefix ile bağlanır.
+ * Socket izinleri 0600 ile kısıtlanır (sadece owner erişimi).
  * ================================================================ */
-nox_err_t listener_create(uint16_t *port_out, int *listen_fd_out) {
-  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+nox_err_t listener_create(const char *tor_data_dir, char *listen_path_out,
+                           int *listen_fd_out) {
+  int n = snprintf(listen_path_out, NOX_PATH_MAX, "%s/listen.sock",
+                   tor_data_dir);
+  if (n <= 0 || (size_t)n >= NOX_PATH_MAX) {
+    NOX_ERROR(LOG_MOD_NET, "listen.sock yolu çok uzun");
+    return NOX_ERR_CONFIG;
+  }
+
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     NOX_ERROR(LOG_MOD_NET, "listener socket: %s", strerror(errno));
     return NOX_ERR_NET;
   }
 
-  int opt = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  /* Eski socket dosyasını temizle (double instance koruması) */
+  unlink(listen_path_out);
 
-  struct sockaddr_in addr = {
-      .sin_family = AF_INET,
-      .sin_port = 0,
-      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-  };
+  struct sockaddr_un addr = {0};
+  addr.sun_family = AF_UNIX;
+  size_t copy_len = strlen(listen_path_out);
+  if (copy_len >= sizeof(addr.sun_path)) {
+    NOX_ERROR(LOG_MOD_NET, "listen socket yolu çok uzun (%zu byte, maks %zu)",
+              copy_len, sizeof(addr.sun_path) - 1);
+    close(fd);
+    unlink(listen_path_out);
+    return NOX_ERR_CONFIG;
+  }
+  memcpy(addr.sun_path, listen_path_out, copy_len);
+  addr.sun_path[copy_len] = '\0';
 
   if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
     NOX_ERROR(LOG_MOD_NET, "bind: %s", strerror(errno));
@@ -1076,51 +1086,50 @@ nox_err_t listener_create(uint16_t *port_out, int *listen_fd_out) {
     return NOX_ERR_NET;
   }
 
+  /* Socket izinlerini kısıtla — sadece owner read/write */
+  if (chmod(listen_path_out, 0600) != 0) {
+    NOX_WARN(LOG_MOD_NET, "chmod listen.sock: %s", strerror(errno));
+  }
+
   if (listen(fd, 1) != 0) {
     NOX_ERROR(LOG_MOD_NET, "listen: %s", strerror(errno));
     close(fd);
+    unlink(listen_path_out);
     return NOX_ERR_NET;
   }
 
-  /* F-2 FIX: getsockname() hata kontrolü + port doğrulaması */
-  socklen_t slen = sizeof(addr);
-  if (getsockname(fd, (struct sockaddr *)&addr, &slen) != 0) {
-    NOX_ERROR(LOG_MOD_NET, "getsockname başarısız: %s", strerror(errno));
-    close(fd);
-    return NOX_ERR_NET;
-  }
-
-  uint16_t bound_port = ntohs(addr.sin_port);
-  if (bound_port == 0) {
-    NOX_ERROR(LOG_MOD_NET, "bind(0) sıfır port döndürdü");
-    close(fd);
-    return NOX_ERR_NET;
-  }
-
-  *port_out = bound_port;
   *listen_fd_out = fd;
 
-  NOX_INFO(LOG_MOD_NET, "listener: 127.0.0.1:%u", *port_out);
+  NOX_INFO(LOG_MOD_NET, "listener: unix:%s", listen_path_out);
   return NOX_OK;
 }
 
 /* ================================================================
- * SOCKS5 CONNECT — Tor üzerinden .onion'a bağlan
+ * SOCKS5 CONNECT — Tor SocksSocket üzerinden .onion'a bağlan
+ *
+ * AF_UNIX SocksSocket ile bağlanır, SOCKS5 handshake aynı kalır.
+ * Onion adresi domain name olarak gönderilir (tip 0x03).
  * ================================================================ */
 nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
-                         uint16_t socks_port, int *fd_out) {
-  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                          const char *socks_path, int *fd_out) {
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
     return NOX_ERR_NET;
 
-  struct sockaddr_in proxy = {
-      .sin_family = AF_INET,
-      .sin_port = htons(socks_port),
-      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-  };
+  struct sockaddr_un proxy = {0};
+  proxy.sun_family = AF_UNIX;
+  size_t path_len = strlen(socks_path);
+  if (path_len >= sizeof(proxy.sun_path)) {
+    NOX_ERROR(LOG_MOD_NET, "SOCKS socket yolu çok uzun (%zu byte, maks %zu)",
+              path_len, sizeof(proxy.sun_path) - 1);
+    close(fd);
+    return NOX_ERR_CONFIG;
+  }
+  memcpy(proxy.sun_path, socks_path, path_len);
+  proxy.sun_path[path_len] = '\0';
 
   if (connect(fd, (struct sockaddr *)&proxy, sizeof(proxy)) != 0) {
-    NOX_ERROR(LOG_MOD_NET, "SOCKS5 proxy bağlantısı başarısız");
+    NOX_ERROR(LOG_MOD_NET, "SOCKS5 UNIX socket bağlantısı başarısız");
     close(fd);
     return NOX_ERR_NET;
   }

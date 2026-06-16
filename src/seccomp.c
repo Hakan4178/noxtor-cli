@@ -7,8 +7,9 @@
  *   process_vm_readv, ptrace, io_uring, userfaultfd, perf_event_open
  *   Bu kurallar kalıcıdır — stage 2 ile kaldırılamaz (seccomp-bpf additive).
  *
- * Aşama 2 (Tor HS sonrası): Tam blacklist.
+ * Aşama 2 (Tor HS sonrası): Tam blacklist + raw socket engelleme.
  *   fork, execve, mount, reboot vs. — Tor artık fork/execve kullanmaz.
+ *   AF_PACKET/SOCK_RAW raw socket'lar engellenir.
  *
  * Mod: SCMP_ACT_KILL — engellenen syscall çağrılırsa process SIGSYS ile öldürülür.
  *
@@ -21,10 +22,34 @@
 
 #include <errno.h>
 #include <seccomp.h>
+#include <stdint.h>
+#include <sys/socket.h>
 
 /* ── Blacklist tablosu ── */
 #define KILL(ctx, name) \
   seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(name), 0)
+
+static int add_socket_domain_rule(scmp_filter_ctx ctx, uint64_t domain, const char *name) {
+  int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 1,
+                            SCMP_A0(SCMP_CMP_EQ, domain));
+  if (rc == 0 || rc == -EDOM)
+    return rc == 0 ? 0 : 1;
+
+  NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi (rc=%d)", name, rc);
+  return -1;
+}
+
+static int add_socket_raw_rule(scmp_filter_ctx ctx, uint64_t domain, const char *name) {
+  int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 2,
+                            SCMP_A0(SCMP_CMP_EQ, domain),
+                            SCMP_A1(SCMP_CMP_MASKED_EQ,
+                                    (uint64_t)SOCK_RAW, (uint64_t)SOCK_RAW));
+  if (rc == 0 || rc == -EDOM)
+    return rc == 0 ? 0 : 1;
+
+  NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi (rc=%d)", name, rc);
+  return -1;
+}
 
 static const struct {
   int num;
@@ -123,6 +148,7 @@ nox_err_t seccomp_policy_load(int stage) {
     return NOX_ERR_CRYPTO;
 
   size_t n_blocked = 0;
+  size_t n_custom_blocked = 0;
   for (size_t i = 0; i < sizeof(blacklist) / sizeof(blacklist[0]); i++) {
     if (blacklist[i].stage > stage)
       continue;  /* bu stage henüz aktif değil */
@@ -150,9 +176,14 @@ nox_err_t seccomp_policy_load(int stage) {
   if (stage >= 2) {
     #define CLONE_THREAD 0x00100000
 
-    /* H-2 FIX: Tek kural — clone sadece CLONE_THREAD ile izin ver. */
+    /* H-2 FIX: Tek kural — clone sadece CLONE_THREAD ile izin ver.
+     * x86_64 clone(flags, newsp, ptid, ctid, tls):
+     *   SCMP_A0 = flags (CLONE_THREAD burada)
+     *   SCMP_A2 = ptid (eski hata: wrong argument index)
+     * CLONE_THREAD bit'i set ise → izin ver (pthread_create çalışsın).
+     * CLONE_THREAD bit'i set değilse → KILL (fork/vfork engellenir). */
     if (seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 1,
-          SCMP_A2(SCMP_CMP_MASKED_EQ, CLONE_THREAD, 0)) != 0) {
+          SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_THREAD, 0)) != 0) {
       NOX_ERROR(LOG_MOD_MAIN, "seccomp: clone kuralı eklenemedi");
       seccomp_release(ctx);
       return NOX_ERR_CRYPTO;
@@ -167,6 +198,48 @@ nox_err_t seccomp_policy_load(int stage) {
       seccomp_release(ctx);
       return NOX_ERR_CRYPTO;
     }
+    if (rc_clone3 == 0)
+      n_custom_blocked++;
+
+    /* Raw socket blocking — CAP_NET_RAW drop'a ek savunma katmanı.
+     * AF_PACKET (Layer 2) ve AF_INET/AF_INET6 SOCK_RAW (IP raw)
+     * stage 2'den sonra asla kullanılmaz. AF_UNIX ve AF_INET SOCK_STREAM
+     * (Tor control/SOCKS/listener) serbest kalır. */
+#ifdef AF_PACKET
+    {
+      int rc = add_socket_domain_rule(ctx, AF_PACKET, "socket(AF_PACKET)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
+
+#ifdef AF_INET
+    {
+      int rc = add_socket_raw_rule(ctx, AF_INET, "socket(AF_INET, SOCK_RAW)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
+
+#ifdef AF_INET6
+    {
+      int rc = add_socket_raw_rule(ctx, AF_INET6, "socket(AF_INET6, SOCK_RAW)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
   }
 
   int rc = seccomp_load(ctx);
@@ -178,6 +251,6 @@ nox_err_t seccomp_policy_load(int stage) {
   }
 
   NOX_INFO(LOG_MOD_MAIN, "seccomp: stage %d yüklendi (%zu syscall → SIGSYS)",
-           stage, n_blocked);
+           stage, n_blocked + n_custom_blocked);
   return NOX_OK;
 }

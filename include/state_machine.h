@@ -53,6 +53,7 @@ typedef enum {
     EV_RATE_LIMIT,          /* Rate limit aşıldı                        */
     EV_SEQ_MISMATCH,        /* Beklenmeyen sequence number              */
     EV_ARENA_FAIL,          /* Arena allocation başarısız                */
+    EV_TOR_DIED,            /* Tor process öldü (SIGCHLD veya kill)     */
     EV_COUNT                /* sentinel                                  */
 } peer_event_t;
 

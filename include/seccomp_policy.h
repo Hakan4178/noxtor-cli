@@ -6,7 +6,7 @@
  * Aşama 1 (key_derive sonrası): 120s Tor bootstrap penceresini korur.
  *   process_vm_readv, ptrace, io_uring, userfaultfd, perf_event_open, prctl
  *
- * Aşama 2 (Tor HS sonrası): Tam blacklist.
+ * Aşama 2 (Tor HS sonrası): Tam blacklist + raw socket engelleme.
  *   fork, execve, mount, reboot vs.
  * ================================================================ */
 #ifndef NOX_SECCOMP_POLICY_H

@@ -56,6 +56,7 @@ static const char *const event_names[] = {
     [EV_RATE_LIMIT]        = "RATE_LIMIT",
     [EV_SEQ_MISMATCH]      = "SEQ_MISMATCH",
     [EV_ARENA_FAIL]        = "ARENA_FAIL",
+    [EV_TOR_DIED]          = "TOR_DIED",
 };
 
 const char *sm_state_name(peer_state_t st)
@@ -155,6 +156,16 @@ static const state_transition_t transitions[] = {
 /* ── Arena Fail ────────────────────────────────────────────────── */
   { ST_HANDSHAKE_INIT, EV_ARENA_FAIL,          ST_IDLE,           action_cleanup      },
   { ST_HANDSHAKE_RESP, EV_ARENA_FAIL,          ST_IDLE,           action_cleanup      },
+
+/* ── Tor Died — Her durumdan idle'e ──────────────────────────────── */
+  { ST_IDLE,             EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
+  { ST_CONNECTING,       EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
+  { ST_HANDSHAKE_INIT,   EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
+  { ST_HANDSHAKE_RESP,   EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
+  { ST_TOFU_PENDING,     EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
+  { ST_ACTIVE,           EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
+  { ST_FILE_TX,          EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
+  { ST_FILE_RX,          EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
 
 /* ── Rate Limit ────────────────────────────────────────────────── */
   { ST_HANDSHAKE_INIT, EV_RATE_LIMIT,          ST_IDLE,           action_cleanup      },

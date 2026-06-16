@@ -385,7 +385,7 @@ void process_line(struct app_state *state, const char *line) {
     NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
     int peer_fd = -1;
     nox_err_t err =
-        socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_port, &peer_fd);
+        socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
     if (err != NOX_OK) {
       ui_print_error(state, "bağlantı başarısız");
       return;

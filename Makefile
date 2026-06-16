@@ -48,7 +48,13 @@ TEST_DIR := tests
 # ================================================================
 # KAYNAK VE NESNE DOSYALARI
 # ================================================================
-SRCS     := $(wildcard $(SRC_DIR)/*.c)
+SRCS_ALL := $(wildcard $(SRC_DIR)/*.c)
+# NO_SECCOMP=1 ise seccomp.c'yi hariç tut
+ifeq ($(NO_SECCOMP),1)
+    SRCS := $(filter-out $(SRC_DIR)/seccomp.c, $(SRCS_ALL))
+else
+    SRCS := $(SRCS_ALL)
+endif
 OBJS     := $(SRCS:%.c=%.o)
 DEPS     := $(OBJS:%.o=%.d)
 
@@ -64,7 +70,15 @@ TEST_DEPS := $(TEST_SRCS:%.c=%.d)
 # ================================================================
 # KÜTÜPHANELERd
 # ================================================================
-LIBS_BASE := -lsodium -lsqlite3 -lseccomp
+# Seccomp — make NO_SECCOMP=1 ile devre dışı bırakılabilir
+NO_SECCOMP ?= 0
+ifeq ($(NO_SECCOMP),1)
+    LIBS_BASE := -lsodium -lsqlite3
+    SECCOMP_DEF := -DNO_SECCOMP
+else
+    LIBS_BASE := -lsodium -lsqlite3 -lseccomp
+    SECCOMP_DEF :=
+endif
 
 # ncurses — make TUI=1 ile etkinleşir
 TUI ?= 0
@@ -123,7 +137,8 @@ HARDEN_COMMON := \
     -fstack-clash-protection \
     -fPIE \
     -pipe \
-    $(TUI_DEF)
+    $(TUI_DEF) \
+    $(SECCOMP_DEF)
 
 LINK_COMMON := \
     -pie \

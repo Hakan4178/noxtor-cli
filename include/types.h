@@ -217,8 +217,8 @@ struct app_state {
     int      epoll_fd;           /* epoll instance                   */
     int      listen_fd;          /* incoming peer listener veya -1   */
     int      peer_fd;            /* aktif peer bağlantısı veya -1    */
-    uint16_t listen_port;        /* listener portu (OS atar)         */
-    uint16_t socks_port;         /* Tor SOCKS proxy portu (auto)     */
+    char     listen_path[NOX_PATH_MAX]; /* listener socket yolu       */
+    char     socks_path[NOX_PATH_MAX];  /* Tor SOCKS socket yolu      */
     uint32_t tx_seq;             /* gönderme sıra numarası           */
     uint32_t rx_seq;             /* alma sıra numarası               */
     size_t   session_arena_mark; /* session öncesi arena offset      */
