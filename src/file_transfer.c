@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/uio.h>
 
 /* ================================================================
  * YARDIMCI METOTLAR
@@ -286,20 +288,25 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   struct frame_header mfh = {
       .magic = NOX_FRAME_MAGIC,
       .type = NOX_MSG_FILE,
-      .seq = state->tx_seq++,
+      .seq = state->tx_seq,
       .len = (uint32_t)meta_ct_len,
   };
   uint8_t mwire[FRAME_HEADER_WIRE_SIZE];
   frame_header_encode(&mfh, mwire);
 
-  if (write_full(state->peer_fd, mwire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
-      write_full(state->peer_fd, meta_ct, (size_t)meta_ct_len) != NOX_OK) {
+  struct iovec iov[2] = {
+      { .iov_base = (void *)mwire,   .iov_len = FRAME_HEADER_WIRE_SIZE },
+      { .iov_base = (void *)meta_ct, .iov_len = (size_t)meta_ct_len },
+  };
+  ssize_t written = writev(state->peer_fd, iov, 2);
+  if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)meta_ct_len)) {
     ui_print_error(state, "Metadata gönderim hatası.");
     close(file_fd);
     sodium_free(state->tx_file.plain_buf);
     explicit_bzero(&state->tx_file, sizeof(state->tx_file));
     return;
   }
+  state->tx_seq++;
 
   /* peer_fd'yi EPOLLIN | EPOLLOUT olarak değiştir */
   epoll_modify_fd(state->epoll_fd, state->peer_fd, EPOLLIN | EPOLLOUT);
@@ -326,6 +333,7 @@ void file_transfer_handle_tx(struct app_state *state) {
     if (w > 0) {
       state->tx_file.tx_offset += (size_t)w;
       if (state->tx_file.tx_offset == state->tx_file.tx_len) {
+        state->tx_seq++;
         state->tx_file.tx_len = 0;
         state->tx_file.tx_offset = 0;
         state->tx_file.sent_bytes += state->tx_file.current_chunk_size;
@@ -378,7 +386,7 @@ void file_transfer_handle_tx(struct app_state *state) {
         struct frame_header fh = {
             .magic = NOX_FRAME_MAGIC,
             .type = NOX_MSG_FILE,
-            .seq = state->tx_seq++,
+            .seq = state->tx_seq,
             .len = (uint32_t)ct_len,
         };
         frame_header_encode(&fh, state->tx_file.tx_buf);
@@ -511,49 +519,63 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
                      "Gelen dosya reddedildi: Geçersiz veya çok büyük dosya boyutu (%lu byte)",
                      (unsigned long)net_size);
     } else {
-      uint8_t file_hash[32];
-      memcpy(file_hash, pt + 273, 32);
-
-      int file_fd = -1;
-      /* Bzero öncesi: open_recv_file local_name'i temiz struct'a yazar */
-      explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-      nox_err_t err = open_recv_file(state, safe_name, &file_fd);
-      if (err == NOX_OK && file_fd >= 0) {
-        state->rx_file.active = true;
-        state->rx_file.fd = file_fd;
-        state->rx_file.expected_size = net_size;
-        state->rx_file.received_bytes = 0;
-        state->rx_file.last_chunk_time = time(NULL);
-        memcpy(state->rx_file.expected_hash, file_hash, 32);
-        strncpy(state->rx_file.filename, safe_name, 255);
-        state->rx_file.filename[255] = '\0';
-
-        if (crypto_generichash_init(&state->rx_file.hash_state, NULL, 0, 32) != 0) {
-          ui_print_error(state, "Hash state başlatılamadı");
-          close(file_fd);
-          explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-          return;
-        }
-
-        /* C-6 FIX: Hash'e file_size dahil et — sender boyut yalan söylerse hash uyuşmaz */
-        uint8_t size_hdr[8];
-        size_hdr[0] = (uint8_t)(net_size >> 56); size_hdr[1] = (uint8_t)(net_size >> 48);
-        size_hdr[2] = (uint8_t)(net_size >> 40); size_hdr[3] = (uint8_t)(net_size >> 32);
-        size_hdr[4] = (uint8_t)(net_size >> 24); size_hdr[5] = (uint8_t)(net_size >> 16);
-        size_hdr[6] = (uint8_t)(net_size >> 8);  size_hdr[7] = (uint8_t)(net_size);
-        if (crypto_generichash_update(&state->rx_file.hash_state, size_hdr, 8) != 0) {
-          ui_print_error(state, "Hash güncellenemedi");
-          explicit_bzero(size_hdr, sizeof(size_hdr));
-          close(file_fd);
-          explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-          return;
-        }
-        explicit_bzero(size_hdr, sizeof(size_hdr));
-
-        ui_print_system(state, "[⬇] Gelen dosya: %s (%lu byte)", safe_name,
-                        (unsigned long)net_size);
+      /* H-12 FIX: Disk alan kontrolü — %110 alan gerekli */
+      struct statvfs vfs;
+      if (fstatvfs(state->downloads_dir_fd, &vfs) != 0) {
+        ui_print_error(state, "Disk alanı kontrol edilemedi");
       } else {
-        ui_print_error(state, "Gelen dosya (%s) oluşturulamadı", safe_name);
+        uint64_t avail = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+        uint64_t required = net_size + (net_size / 10);  /* %110 */
+        if (avail < required) {
+          ui_print_error(state,
+                         "Yetersiz disk alanı: %lu byte gerekli, %lu byte mevcut",
+                         (unsigned long)required, (unsigned long)avail);
+        } else {
+          uint8_t file_hash[32];
+          memcpy(file_hash, pt + 273, 32);
+
+          int file_fd = -1;
+          /* Bzero öncesi: open_recv_file local_name'i temiz struct'a yazar */
+          explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+          nox_err_t err = open_recv_file(state, safe_name, &file_fd);
+          if (err == NOX_OK && file_fd >= 0) {
+            state->rx_file.active = true;
+            state->rx_file.fd = file_fd;
+            state->rx_file.expected_size = net_size;
+            state->rx_file.received_bytes = 0;
+            state->rx_file.last_chunk_time = time(NULL);
+            memcpy(state->rx_file.expected_hash, file_hash, 32);
+            strncpy(state->rx_file.filename, safe_name, 255);
+            state->rx_file.filename[255] = '\0';
+
+            if (crypto_generichash_init(&state->rx_file.hash_state, NULL, 0, 32) != 0) {
+              ui_print_error(state, "Hash state başlatılamadı");
+              close(file_fd);
+              explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+              return;
+            }
+
+            /* C-6 FIX: Hash'e file_size dahil et — sender boyut yalan söylerse hash uyuşmaz */
+            uint8_t size_hdr[8];
+            size_hdr[0] = (uint8_t)(net_size >> 56); size_hdr[1] = (uint8_t)(net_size >> 48);
+            size_hdr[2] = (uint8_t)(net_size >> 40); size_hdr[3] = (uint8_t)(net_size >> 32);
+            size_hdr[4] = (uint8_t)(net_size >> 24); size_hdr[5] = (uint8_t)(net_size >> 16);
+            size_hdr[6] = (uint8_t)(net_size >> 8);  size_hdr[7] = (uint8_t)(net_size);
+            if (crypto_generichash_update(&state->rx_file.hash_state, size_hdr, 8) != 0) {
+              ui_print_error(state, "Hash güncellenemedi");
+              explicit_bzero(size_hdr, sizeof(size_hdr));
+              close(file_fd);
+              explicit_bzero(&state->rx_file, sizeof(state->rx_file));
+              return;
+            }
+            explicit_bzero(size_hdr, sizeof(size_hdr));
+
+            ui_print_system(state, "[⬇] Gelen dosya: %s (%lu byte)", safe_name,
+                            (unsigned long)net_size);
+          } else {
+            ui_print_error(state, "Gelen dosya (%s) oluşturulamadı", safe_name);
+          }
+        }
       }
     }
   } else if (state->rx_file.active) {
@@ -594,6 +616,7 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
       uint8_t final_hash[32];
       if (crypto_generichash_final(&state->rx_file.hash_state, final_hash, 32) != 0) {
         NOX_ERROR(LOG_MOD_MAIN, "Hash tamamlanamadı");
+        sodium_free(pt);
         unlinkat(state->downloads_dir_fd, state->rx_file.local_name, 0);
         if (state->rx_file.fd >= 0) { close(state->rx_file.fd); state->rx_file.fd = -1; }
         explicit_bzero(&state->rx_file, sizeof(state->rx_file));

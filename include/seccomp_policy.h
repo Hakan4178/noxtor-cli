@@ -11,7 +11,13 @@
  *
  * Aşama 3 (Event loop başı): Sıfır ağ sızıntısı garantisi.
  *   clone tamamen yasak, AF_INET/AF_INET6 tüm tipler, AF_NETLINK,
- *   symlink, link, chmod, chown — tüm iletişim AF_UNIX.
+ *   symlink, link, chmod, chown, open, openat, creat — tüm iletişim AF_UNIX.
+ *
+ * Landlock Entegrasyonu:
+ *   open/openat/creat seccomp tarafından engellenir (fallback).
+ *   Landlock aktifse, path-based filtering ile sadece downloads dizinine
+ *   izin verilir (seccomp'dan önce yüklenir).
+ *   Kernel 5.13+ gerektirir, desteklemiyorsa seccomp fallback devreye girer.
  * ================================================================ */
 #ifndef NOX_SECCOMP_POLICY_H
 #define NOX_SECCOMP_POLICY_H

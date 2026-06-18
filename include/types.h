@@ -235,6 +235,8 @@ struct app_state {
     bool     running;            /* false olunca event loop çıkar    */
     bool     first_run;          /* ilk çalıştırma mı                */
     bool     ghost_mode;         /* --ghost veya -ghost: SQLite yok  */
+    bool     queue_flushed;      /* kuyruk ilk peer mesajında gönderildi */
+    size_t   prompt_display_len; /* prompt'un terminal karakter genişliği */
 
     /* Config yolları — NOX_PATH_MAX yeterli, PATH_MAX stack'i taşırır */
     char     config_dir[NOX_PATH_MAX];
@@ -254,7 +256,6 @@ struct app_state {
     char    *stdin_buf;
     size_t   stdin_len;
     size_t   stdin_cap;
-    bool     input_saved;        /* ui_save/restore iç içe çağrı koruması */
 
     /* Pluggable Transport (Faz 6.2) */
     enum tor_transport_type transport_type;
@@ -268,5 +269,6 @@ struct app_state {
 };
 
 extern volatile sig_atomic_t g_shutdown;
+extern volatile sig_atomic_t g_tor_died;
 
 #endif /* PARANOID_TYPES_H */

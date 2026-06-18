@@ -4,15 +4,20 @@
  * Tüm kullanıcıya görünen çıktılar bu dosyadan geçer.
  * Tema renkleri tek bir struct'ta tanımlı, ileride config'den okunabilir.
  *
- * Kritik tasarım: ui_save_input / ui_restore_input çifti sayesinde
- * gelen mesajlar kullanıcının yarım kalan girdisini ezmez.
+ * Tasarım: Atomic ANSI Terminal Output
+ *   - Her ui_print_* kendi kendine yeterli atomik çıkış üretir
+ *   - Save/restore statefulness yok — her fonksiyon state'ten hesaplar
+ *   - RAM'de plain text depolanmaz — fprintf + fflush + scrub
+ *   - Cursor hide/show ile flicker engellenir
+ *   - Prompt her zaman state'ten yeniden çizilir
  *
  * Audit fix'leri:
  *   [F1] g_theme global — thread-unsafe, şu an single-thread (nota eklendi)
  *   [F2] ui_print_progress — save/restore kaldırıldı, progress bar karışıyordu
- *   [F3] ui_print_outgoing — terminal wrap kırılganlığı yorumda belirtildi
+ *   [F3] ui_print_outgoing — wrap kırılganlığı düzeltildi (TIOCGWINSZ + multi-line clear)
  *   [F4] format_size — uint64_t → PRIu64, 32-bit taşma giderildi
- *   [F5] print_timestamp — ms eklendi, log sistemiyle tutarlı hale getirildi
+ *   [F6] Atomic ANSI — save/restore kaldırıldı, her mesaj atomik
+ *   [F7] Plain text scrub — local buffer'lar sodium_memzero ile temizleniyor
  */
 
 #include "ui.h"
@@ -23,9 +28,12 @@
 #include <assert.h>
 #include <inttypes.h>  /* PRIu64 — [F4] */
 #include <stdarg.h>
+#include <sodium.h>    /* [F7] sodium_memzero — plain text scrub */
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 /* ── Magic number sabitleri ───────────────────── */
 #define SHORT_ID_SIZE       12
@@ -71,74 +79,153 @@ void ui_init(const struct nox_theme *theme)
 }
 
 /* ================================================================
- * [F5] ZAMAN DAMGASI — [HH:MM:SS.mmm] formatında
- *
- * Önceki sürümde milisaniye yoktu, log sistemiyle tutarsızdı.
- * Şimdi log.c ile aynı format: HH:MM:SS.mmm
+ * YARDIMCI: Terminal genişliği ve wrap satır hesabı
  * ================================================================ */
-static void print_timestamp(void)
+static int get_terminal_cols(void)
 {
-    struct timespec ts;
-    memset(&ts, 0, sizeof(ts));
-
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
-        ts.tv_sec = 0;
-
-    struct tm tm_buf;
-    memset(&tm_buf, 0, sizeof(tm_buf));
-    localtime_r(&ts.tv_sec, &tm_buf);
-
-    /* [F5] Milisaniye eklendi — log sistemiyle tutarlı */
-    long ms = ts.tv_nsec / 1000000L;
-
-    fprintf(stderr, "%s[%02d:%02d:%02d.%03ld]%s ",
-            g_theme->clr_timestamp,
-            tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, ms,
-            g_theme->clr_reset);
+    struct winsize ws;
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80; /* fallback */
 }
 
-/* ================================================================
- * STDIN BUFFER SAVE / RESTORE
- *
- * Gelen mesaj yazılmadan önce kullanıcının yarım girdisi kaydedilir.
- * Mesaj basıldıktan sonra prompt + yarım girdi geri yazılır.
- *
- * İç içe çağrı koruması: input_saved flag'i ile kontrol edilir.
- * ================================================================ */
-void ui_save_input(struct app_state *state)
+/* Prompt display uzunluğunu hesapla (ANSI kodları hariç) */
+static size_t calc_prompt_display_len(struct app_state *state)
+{
+    if (state->peer_fd < 0 || state->active_peer_onion[0] == '\0')
+        return 5; /* "nox> " */
+
+    size_t olen = strlen(state->active_peer_onion);
+    size_t id_len;
+    if (olen > 10) {
+        size_t hash_len = olen;
+        if (olen > 6 &&
+            strcmp(state->active_peer_onion + olen - 6, ".onion") == 0)
+            hash_len = olen - 6;
+        id_len = (hash_len >= 8) ? 10 : hash_len;
+    } else {
+        id_len = olen;
+    }
+
+    /* [id] > = 1 + id_len + 1 + 3 */
+    size_t base = 1 + id_len + 1 + 3;
+
+    /* Dosya transferi progress: " ⬆XX%" veya " ⬇XX%" = 7 byte display */
+    if ((state->tx_file.active && state->tx_file.total_size > 0) ||
+        (state->rx_file.active && state->rx_file.expected_size > 0))
+        base += 7;
+
+    return base;
+}
+
+/* Prompt + stdin_len için wrap satır sayısını hesapla */
+static int calc_input_lines(struct app_state *state)
+{
+    int cols = get_terminal_cols();
+    size_t total = state->prompt_display_len + state->stdin_len;
+    if (total == 0) return 1;
+    return (int)((total + (size_t)cols - 1) / (size_t)cols);
+}
+
+/* Wrap edilmiş tüm satırları temizle (cursor yukarı + sil) */
+void clear_prompt_area(struct app_state *state)
 {
     if (tui_is_active())
         return;
-    if (state->input_saved)
-        return;  /* zaten kaydedilmiş */
-    state->input_saved = true;
+    if (state->tofu_pending)
+        return;  /* TOFU interaktif modunda temizleme yapma */
 
-    /* Mevcut satırı sil: imleci satır başına al, satırı temizle */
-    fprintf(stderr, "\r\033[K");
-    fflush(stderr);
+    int lines = calc_input_lines(state);
+    if (lines < 1) lines = 1;
+    /* N satır yukarı git, hepsini temizle */
+    fprintf(stderr, "\033[%dA\033[J", lines);
 }
 
-void ui_restore_input(struct app_state *state)
+/* Belirli satır sayısını temizle (saved prompt için) */
+void clear_prompt_area_lines(int lines)
 {
     if (tui_is_active())
         return;
-    if (!state->input_saved)
-        return;  /* kaydedilmemiş, restore gereksiz */
-    state->input_saved = false;
+    if (lines < 1) lines = 1;
+    /* Git yukarı → sütun 1'e git → cursor'dan ekran sonuna sil */
+    if (lines > 1)
+        fprintf(stderr, "\033[%dA", lines - 1);
+    fprintf(stderr, "\033[1G\033[J");
+}
 
-    /* Prompt'u yeniden bas */
+/* Mevcut input'un wrap satır sayısını dinamik hesapla */
+static int calc_current_input_lines(struct app_state *state)
+{
+    int cols = get_terminal_cols();
+    size_t total = state->prompt_display_len + state->stdin_len;
+    if (total == 0) return 1;
+    return (int)((total + (size_t)cols - 1) / (size_t)cols);
+}
+
+/* Cursor altındaki her şeyi temizle */
+static void clear_below_cursor(void)
+{
+    fprintf(stderr, "\033[J");
+}
+
+/* Prompt'u ve mevcut input'u state'ten yeniden çiz */
+static void redraw_input(struct app_state *state)
+{
+    if (tui_is_active())
+        return;
+    if (state->tofu_pending)
+        return;
+
+    /* Cursor altındaki her şeyi temizle — eski wrap satırlarını siler */
+    clear_below_cursor();
+
     ui_print_prompt(state);
 
-    /*
-     * Kullanıcının yarım kalan girdisini geri yaz.
-     * TOCTOU koruması: önce pointer + len kopyala, sonra kullan.
-     */
-    const char *buf = state->stdin_buf;
-    size_t      len = state->stdin_len;
-    if (len > 0 && buf != NULL)
+    /* Kullanıcının mevcut girdisini yeniden yaz — TOCTOU korumalı */
+    if (state->stdin_len > 0 && state->stdin_buf != NULL) {
+        char buf[1024];
+        size_t len = state->stdin_len;
+        if (len > sizeof(buf) - 1) len = sizeof(buf) - 1;
+        memcpy(buf, state->stdin_buf, len);
+        buf[len] = '\0';
         fwrite(buf, 1, len, stderr);
-
+        /* [F7] Local buffer scrub */
+        sodium_memzero(buf, sizeof(buf));
+    }
     fflush(stderr);
+}
+
+/* Mesaj label'ı yaz */
+enum ui_label {
+    UI_LABEL_NONE,
+    UI_LABEL_SELF,
+    UI_LABEL_PEER,
+    UI_LABEL_ERROR,
+};
+
+static enum ui_label g_last_label = UI_LABEL_NONE;
+
+static void print_label(enum ui_label label)
+{
+    switch (label) {
+    case UI_LABEL_SELF:
+        fprintf(stderr, "%sSen:%s", g_theme->clr_self, g_theme->clr_reset);
+        break;
+    case UI_LABEL_PEER:
+        fprintf(stderr, "%sPeer:%s", g_theme->clr_peer, g_theme->clr_reset);
+        break;
+    case UI_LABEL_ERROR:
+        fprintf(stderr, "%s!:%s", g_theme->clr_error, g_theme->clr_reset);
+        break;
+    case UI_LABEL_NONE:
+        break;
+    }
+}
+
+/* Sender durumunu sıfırla (yeni bağlantıda) */
+void ui_reset_sender(void)
+{
+    g_last_label = UI_LABEL_NONE;
 }
 
 /* ================================================================
@@ -152,6 +239,10 @@ void ui_print_prompt(struct app_state *state)
 {
     if (tui_is_active())
         return;
+
+    /* Display uzunluğunu hesapla ve kaydet (wrap hesabı için gerekli) */
+    state->prompt_display_len = calc_prompt_display_len(state);
+
     fprintf(stderr, "%s", g_theme->clr_prompt);
 
     if (state->peer_fd >= 0 && state->active_peer_onion[0] != '\0') {
@@ -208,29 +299,90 @@ void ui_print_prompt(struct app_state *state)
 }
 
 /* ================================================================
- * MESAJ ÇIKTILARI
+ * MESAJ ÇIKTILARI — İki Satır Formatı
+ *
+ *   [21:14:39] Sen:
+ *     pejfoooooooooooooooooooooooooooooooooooo
+ *     ooooooooooooooooooooooooooooooooooooooo
+ *
+ *   [21:14:39] Peer:
+ *     r3nhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+ *     hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+ *
+ * [F8] Dinamik satır hesabı — peer mesajı gelirken input bozulmaz
  * ================================================================ */
+
+static void print_timestamp_short(void)
+{
+    struct timespec ts;
+    memset(&ts, 0, sizeof(ts));
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        ts.tv_sec = 0;
+    struct tm tm_buf;
+    memset(&tm_buf, 0, sizeof(tm_buf));
+    localtime_r(&ts.tv_sec, &tm_buf);
+    fprintf(stderr, "%s[%02d:%02d:%02d]%s ",
+            g_theme->clr_timestamp,
+            tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+            g_theme->clr_reset);
+}
+
+/* Atomik mesaj çıkışı — tek satır format
+ *
+ *   [22:29:17] Sen: jeyyheyyo
+ *   [22:29:22] Peer: heyo
+ *   [22:29:33] Sen: uhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+ *               hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+ *
+ * Uzun mesajlar terminal genişliğine göre otomatik sarılır.
+ * Sender değişince boşluk eklenir.
+ */
+
+static void atomic_message(struct app_state *state, enum ui_label label,
+                           const char *msg)
+{
+    if (tui_is_active())
+        return;
+
+    int clear_lines = calc_current_input_lines(state);
+
+    fprintf(stderr, "\033[?25l");
+    clear_prompt_area_lines(clear_lines);
+
+    /* Sender değişince boşluk ekle */
+    if (g_last_label != UI_LABEL_NONE && g_last_label != label)
+        fprintf(stderr, "\n");
+
+    print_timestamp_short();
+    print_label(label);
+    fprintf(stderr, " %s\n", msg);
+    fflush(stderr);
+
+    g_last_label = label;
+
+    redraw_input(state);
+    fprintf(stderr, "\033[?25h");
+    fflush(stderr);
+}
 
 void ui_print_incoming(struct app_state *state, const char *msg)
 {
+    if (!msg || !*msg || strspn(msg, " \t") == strlen(msg))
+        return;
     if (tui_is_active()) {
         struct timespec ts;
         if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
         struct tm tm_buf;
         localtime_r(&ts.tv_sec, &tm_buf);
-        char buf[8192];
-        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] [Peer] %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
-                 ts.tv_nsec / 1000000L, msg);
-        tui_chat_append(buf);
+        char tbuf[8192];
+        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Peer: %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
+        tui_chat_append(tbuf);
         tui_refresh_all(state);
+        sodium_memzero(tbuf, sizeof(tbuf));
         return;
     }
-    ui_save_input(state);
-    print_timestamp();
-    fprintf(stderr, "%s[Peer]%s %s\n",
-            g_theme->clr_peer, g_theme->clr_reset, msg);
-    ui_restore_input(state);
+    atomic_message(state, UI_LABEL_PEER, msg);
 }
 
 void ui_print_outgoing(struct app_state *state, const char *msg)
@@ -240,34 +392,15 @@ void ui_print_outgoing(struct app_state *state, const char *msg)
         if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
         struct tm tm_buf;
         localtime_r(&ts.tv_sec, &tm_buf);
-        char buf[8192];
-        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] [Sen] %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
-                 ts.tv_nsec / 1000000L, msg);
-        tui_chat_append(buf);
+        char tbuf[8192];
+        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Sen: %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
+        tui_chat_append(tbuf);
         tui_refresh_all(state);
+        sodium_memzero(tbuf, sizeof(tbuf));
         return;
     }
-    /*
-     * [F3] Terminal wrap kırılganlığı:
-     *
-     * "\033[1A\r\033[K" yalnızca TEK satırı siler.
-     * Kullanıcı uzun mesaj yazdıysa terminal satır kaydırdıysa
-     * (wrap), yalnızca son satır silinir, önceki satır(lar) kalır.
-     *
-     * Gerçek çözüm ncurses (Phase 8) — o gelene kadar bu
-     * kırılganlık kabul edilmiş bir tradeoff'tur.
-     * İyileştirme: terminal genişliğini (TIOCGWINSZ) okuyup
-     * kaç satır kaydığını hesaplamak mümkün ama kompleks.
-     */
-    fprintf(stderr, "\033[1A\r\033[K");
-
-    print_timestamp();
-    fprintf(stderr, "%s[Sen]%s %s\n",
-            g_theme->clr_self, g_theme->clr_reset, msg);
-
-    ui_print_prompt(state);
-    fflush(stderr);
+    atomic_message(state, UI_LABEL_SELF, msg);
 }
 
 /* ================================================================
@@ -287,24 +420,33 @@ void ui_print_system(struct app_state *state, const char *fmt, ...)
         if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
         struct tm tm_buf;
         localtime_r(&ts.tv_sec, &tm_buf);
-        char buf[8192];
-        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
-                 ts.tv_nsec / 1000000L, msg);
-        tui_chat_append(buf);
+        char tbuf[8192];
+        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
+        tui_chat_append(tbuf);
         tui_refresh_all(state);
+        sodium_memzero(tbuf, sizeof(tbuf));
+        sodium_memzero(msg, sizeof(msg));
         return;
     }
-    ui_save_input(state);
 
-    fprintf(stderr, "  %s", g_theme->clr_system);
+    char msg[4096];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "%s\n", g_theme->clr_reset);
 
-    ui_restore_input(state);
+    int clear_lines = calc_current_input_lines(state);
+
+    fprintf(stderr, "\033[?25l");
+    clear_prompt_area_lines(clear_lines);
+    print_timestamp_short();
+    fprintf(stderr, "  %s%s%s\n", g_theme->clr_system, msg, g_theme->clr_reset);
+    fflush(stderr);
+    sodium_memzero(msg, sizeof(msg));
+    redraw_input(state);
+    fprintf(stderr, "\033[?25h");
+    fflush(stderr);
 }
 
 void ui_print_error(struct app_state *state, const char *fmt, ...)
@@ -320,24 +462,33 @@ void ui_print_error(struct app_state *state, const char *fmt, ...)
         if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
         struct tm tm_buf;
         localtime_r(&ts.tv_sec, &tm_buf);
-        char buf[8192];
-        snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03ld] [!] %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
-                 ts.tv_nsec / 1000000L, msg);
-        tui_chat_append(buf);
+        char tbuf[8192];
+        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] [!] %s",
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
+        tui_chat_append(tbuf);
         tui_refresh_all(state);
+        sodium_memzero(tbuf, sizeof(tbuf));
+        sodium_memzero(msg, sizeof(msg));
         return;
     }
-    ui_save_input(state);
 
-    fprintf(stderr, "  %s[!] ", g_theme->clr_error);
+    char msg[4096];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "%s\n", g_theme->clr_reset);
 
-    ui_restore_input(state);
+    int clear_lines = calc_current_input_lines(state);
+
+    fprintf(stderr, "\033[?25l");
+    clear_prompt_area_lines(clear_lines);
+    print_timestamp_short();
+    fprintf(stderr, "  %s[!] %s%s\n", g_theme->clr_error, msg, g_theme->clr_reset);
+    fflush(stderr);
+    sodium_memzero(msg, sizeof(msg));
+    redraw_input(state);
+    fprintf(stderr, "\033[?25h");
+    fflush(stderr);
 }
 
 /* ================================================================

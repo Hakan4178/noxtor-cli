@@ -143,6 +143,13 @@ static const struct {
   { .num = SCMP_SYS(chown),             .name = "chown",             .stage = 3 },
   { .num = SCMP_SYS(fchown),            .name = "fchown",            .stage = 3 },
   { .num = SCMP_SYS(fchownat),          .name = "fchownat",          .stage = 3 },
+
+  /* open/openat/creat — Landlock ile path-based filtering desteklenmiyorsa
+   * fallback olarak tamamen yasaklanır.
+   * Landlock aktifse bu kurallar ATLANIR (Landlock zaten kısıtlıyor). */
+  { .num = SCMP_SYS(open),              .name = "open",              .stage = 3 },
+  { .num = SCMP_SYS(openat),            .name = "openat",            .stage = 3 },
+  { .num = SCMP_SYS(creat),             .name = "creat",             .stage = 3 },
 };
 
 /* ================================================================

@@ -25,6 +25,7 @@
 #include "ui.h"
 
 #include <locale.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -296,7 +297,7 @@ void tui_draw_sidebar(struct app_state *state)
         } else {
             size_t olen = strlen(tc->onion);
             if (olen >= 12) {
-                snprintf(display_name, sizeof(display_name), "%.4s..%.4s", tc->onion, tc->onion + olen - 12);
+                snprintf(display_name, sizeof(display_name), "%.4s..%.4s", tc->onion, tc->onion + olen - 10);
             } else {
                 snprintf(display_name, sizeof(display_name), "%s", tc->onion);
             }
@@ -370,22 +371,120 @@ void tui_draw_sidebar(struct app_state *state)
  * ================================================================ */
 void tui_chat_append(const char *line)
 {
-    if (!g_tui.active || !line)
+    if (!g_tui.active || !line || !*line)
         return;
 
-    /* Circular buffer — en eski satırı sil */
-    if (g_tui.chat_line_count >= TUI_CHAT_SCROLLBACK) {
-        free(g_tui.chat_lines[0]);
-        memmove(&g_tui.chat_lines[0], &g_tui.chat_lines[1],
-                (size_t)(TUI_CHAT_SCROLLBACK - 1) * sizeof(char *));
-        g_tui.chat_line_count = TUI_CHAT_SCROLLBACK - 1;
+    int max_x;
+    int max_y_tmp;
+    getmaxyx(g_tui.chat_win, max_y_tmp, max_x);
+    (void)max_y_tmp;
+    if (max_x <= 0) max_x = 80;
+
+    /* Prefix uzunluğunu hesapla.
+     * Format: "[HH:MM:SS.mmm] [Sen] mesaj" veya "[HH:MM:SS.mmm] [Peer] mesaj"
+     * veya "[HH:MM:SS.mmm] mesaj" (sistem).
+     * "] " kalıbını ara — bu, ikinci parantez çifti (ya [Sen]/[Peer] ya da
+     * timestamp sonu). İkisini de bulmak için son "] " kalıbını kullan. */
+    size_t prefix_len = 0;
+    const char *msg_start = NULL;
+
+    /* Son "] " kalıbını bul — mesaj buradan başlar */
+    const char *last_bracket = NULL;
+    const char *search = line;
+    while ((search = strstr(search, "] ")) != NULL) {
+        last_bracket = search;
+        search += 2;
     }
 
-    g_tui.chat_lines[g_tui.chat_line_count] = strdup(line);
-    if (!g_tui.chat_lines[g_tui.chat_line_count]) {
+    if (last_bracket) {
+        msg_start = last_bracket + 2; /* "] " sonrası */
+        prefix_len = (size_t)(msg_start - line);
+    }
+
+    if (prefix_len == 0 || !msg_start) {
+        prefix_len = strlen(line);
+        msg_start = line; /* fallback: tüm satır mesaj */
+    }
+
+    size_t msg_len = strlen(msg_start);
+    /* Wrap genişliği: ncurses son sütuna yazınca auto-wrap yapabilir,
+     * bu yüzden max_x - 1 kullan (son sütun her zaman boş kalır). */
+    size_t wrap_width = (max_x > 1) ? (size_t)(max_x - 1) : (size_t)max_x;
+    if (prefix_len >= wrap_width) wrap_width = prefix_len + 1;
+
+    /* Mesaj tek satıra sığıyor mu? */
+    if (msg_len == 0 || prefix_len + msg_len <= wrap_width) {
+        /* Tek satır — olduğu gibi ekle */
+        if (g_tui.chat_line_count >= TUI_CHAT_SCROLLBACK) {
+            free(g_tui.chat_lines[0]);
+            memmove(&g_tui.chat_lines[0], &g_tui.chat_lines[1],
+                    (size_t)(TUI_CHAT_SCROLLBACK - 1) * sizeof(char *));
+            g_tui.chat_line_count = TUI_CHAT_SCROLLBACK - 1;
+        }
+        g_tui.chat_lines[g_tui.chat_line_count] = strdup(line);
+        if (!g_tui.chat_lines[g_tui.chat_line_count]) return;
+        g_tui.chat_line_count++;
         return;
     }
-    g_tui.chat_line_count++;
+
+    /* Uzun mesaj — prefix + continuation indent hazırla */
+    char indent[64];
+    size_t indent_len = prefix_len;
+    if (indent_len > sizeof(indent) - 1) indent_len = sizeof(indent) - 1;
+    memset(indent, ' ', indent_len);
+    indent[indent_len] = '\0';
+
+    size_t chunk = (wrap_width > prefix_len) ? (wrap_width - prefix_len) : 1;
+    const char *p = msg_start;
+    size_t remaining = msg_len;
+    int first = 1;
+
+    while (remaining > 0) {
+        size_t take = (remaining > chunk) ? chunk : remaining;
+
+        /* Kelime kaydırma: space'de böl (eğer tam ortadan kesmiyorsa) */
+        if (take < remaining) {
+            /* Geriye doğru space ara */
+            size_t ws = take;
+            while (ws > 0 && p[ws - 1] != ' ' && p[ws - 1] != '\n')
+                ws--;
+            if (ws > 0) take = ws; /* space'i dahil et */
+        }
+
+        if (take == 0) break; /*sonsuz döngü koruması */
+
+        /* Satırı oluştur */
+        char *row = NULL;
+        if (first) {
+            /* İlk satır: prefix + mesaj */
+            asprintf(&row, "%.*s%.*s", (int)prefix_len, line, (int)take, p);
+            first = 0;
+        } else {
+            /* Devam satırı: indent + mesaj */
+            asprintf(&row, "%s%.*s", indent, (int)take, p);
+        }
+
+        if (row) {
+            if (g_tui.chat_line_count >= TUI_CHAT_SCROLLBACK) {
+                free(g_tui.chat_lines[0]);
+                memmove(&g_tui.chat_lines[0], &g_tui.chat_lines[1],
+                        (size_t)(TUI_CHAT_SCROLLBACK - 1) * sizeof(char *));
+                g_tui.chat_line_count = TUI_CHAT_SCROLLBACK - 1;
+            }
+            g_tui.chat_lines[g_tui.chat_line_count] = row;
+            g_tui.chat_line_count++;
+        }
+
+        /* İlerle — space'yi atla */
+        if (take < remaining && p[take] == ' ')
+            take++;
+        p += take;
+        remaining -= take;
+        if (remaining == 0 || take == 0) break;
+    }
+
+    /* Yeni mesaj eklendi → otomatik olarak en alta kaydır */
+    g_tui.chat_scroll_offset = 0;
 }
 
 void tui_draw_chat(void)
@@ -421,21 +520,24 @@ void tui_draw_chat(void)
         if (!line) continue;
 
         /* Renk tespiti: [Sen] veya [Peer] veya sistem */
+        /* max_x - 1: ncurses son sütunda auto-wrap yapabilir,
+         * bu yüzden bir karakter kısa kes. */
+        int print_w = (max_x > 1) ? max_x - 1 : max_x;
         if (strstr(line, "[Sen]")) {
             wattron(g_tui.chat_win, COLOR_PAIR(CLR_SELF));
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", max_x, line);
+            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
             wattroff(g_tui.chat_win, COLOR_PAIR(CLR_SELF));
         } else if (strstr(line, "[Peer]")) {
             wattron(g_tui.chat_win, COLOR_PAIR(CLR_PEER));
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", max_x, line);
+            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
             wattroff(g_tui.chat_win, COLOR_PAIR(CLR_PEER));
         } else if (strstr(line, "[!]")) {
             wattron(g_tui.chat_win, COLOR_PAIR(CLR_ERROR) | A_BOLD);
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", max_x, line);
+            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
             wattroff(g_tui.chat_win, COLOR_PAIR(CLR_ERROR) | A_BOLD);
         } else {
             wattron(g_tui.chat_win, COLOR_PAIR(CLR_SYSTEM));
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", max_x, line);
+            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
             wattroff(g_tui.chat_win, COLOR_PAIR(CLR_SYSTEM));
         }
     }

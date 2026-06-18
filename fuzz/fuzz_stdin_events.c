@@ -89,7 +89,6 @@ int main(void) {
     state.stdin_buf = NULL;
     state.stdin_len = 0;
     state.stdin_cap = 0;
-    state.input_saved = false;
 
     /* Tor ctrl fd geçersiz */
     state.tor_ctrl_fd = -1;

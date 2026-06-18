@@ -44,23 +44,32 @@ void ui_init(const struct nox_theme *theme);
 
 /* ── Mesaj çıktıları ─────────────────────────────────────── */
 
-/* Gelen mesaj: save → print → restore */
+/* Gelen mesaj: atomik ANSI — cursor hide → clear → print → redraw → show */
 void ui_print_incoming(struct app_state *state, const char *msg);
 
-/* Giden mesaj: üst satırı sil → yeniden yaz */
+/* Giden mesaj: atomik ANSI — cursor hide → clear → print → redraw → show */
 void ui_print_outgoing(struct app_state *state, const char *msg);
 
 /* ── Bildirimler ─────────────────────────────────────────── */
 
-/* Sistem bilgi mesajı — save/restore ile güvenli */
+/* Sistem bilgi mesajı — atomik ANSI */
 void ui_print_system(struct app_state *state, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-/* Hata mesajı — save/restore ile güvenli */
+/* Hata mesajı — atomik ANSI */
 void ui_print_error(struct app_state *state, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 /* ── Prompt ──────────────────────────────────────────────── */
+
+/* Sender durumunu sıfırla (yeni bağlantıda) */
+void ui_reset_sender(void);
+
+/* Prompt alanını temizle (cursor yukarı + sil) — TOFU promptları için */
+void clear_prompt_area(struct app_state *state);
+
+/* Belirli satır sayısını temizle (saved prompt wrap için) */
+void clear_prompt_area_lines(int lines);
 
 /* Bağlam duyarlı prompt bas (bağlantı durumu + onion kısaltma) */
 void ui_print_prompt(struct app_state *state);
@@ -72,13 +81,5 @@ void ui_print_progress(struct app_state *state,
                        const char *filename,
                        uint64_t done, uint64_t total,
                        bool is_upload);
-
-/* ── stdin Buffer Save/Restore ───────────────────────────── */
-
-/* Kullanıcının yarım kalan girdisini kaydet ve satırı temizle */
-void ui_save_input(struct app_state *state);
-
-/* Prompt + yarım girdiyi geri yaz */
-void ui_restore_input(struct app_state *state);
 
 #endif /* PARANOID_UI_H */

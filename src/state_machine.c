@@ -338,17 +338,16 @@ static nox_err_t action_tofu_accept(struct app_state *state, peer_event_t ev)
     state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
     state->tx_seq = 0;
     state->rx_seq = 0;
+    state->queue_flushed = false;
+    NOX_DEBUG(LOG_MOD_NOISE,
+              "session setup (TOFU): tx_seq=0 rx_seq=0 queue_flushed=false");
     state->tofu_pending = false;
     snprintf(state->active_peer_onion, sizeof(state->active_peer_onion),
              "%s", state->tofu_onion);
 
     NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
     ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)", state->tofu_name);
-
-    /* Kuyruktaki bekleyen mesajları gönder */
-    if (!state->ghost_mode) {
-        db_process_queue(state->active_peer_onion, send_queued_callback, state);
-    }
+    ui_reset_sender();
 
     return NOX_OK;
 }

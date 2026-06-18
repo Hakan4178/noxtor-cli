@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/uio.h>
 #include <sodium.h>
 #include <stdbool.h>
 
@@ -66,6 +67,29 @@ static bool validate_onion_input(const char *onion, size_t len) {
   return memcmp(onion + 56, ".onion", 6) == 0;
 }
 
+/* Ham terminal modunda ANSI kaçış dizilerini temizle.
+ * ^[[A (Up), ^[[B (Down), ^[[C (Right), ^[[D (Left) gibi escape
+ * sequence'leri stdin buffer'a girer ve metin olarak gönderilir.
+ * Bu dizi: ESC '[' param final_char biçimindeki ANSI sequence'leri siler. */
+static void strip_ansi_escape(char *str) {
+  if (!str) return;
+  char *dst = str;
+  const char *src = str;
+  while (*src) {
+    if ((unsigned char)*src == 0x1b && src[1] == '[') {
+      /* ANSI CSI sequence: ESC [ <params> <final char> */
+      src += 2; /* ESC [ atla */
+      while (*src && ((*src >= '0' && *src <= '?') ||
+                      (*src >= ' ' && *src <= '/')))
+        src++; /* parametreleri atla (n; m; vs.) */
+      if (*src) src++; /* final char'ı atla (A-Z, a-z, `) */
+    } else {
+      *dst++ = *src++;
+    }
+  }
+  *dst = '\0';
+}
+
 /* ================================================================
  * MESAJ GÖNDERME VE KUYRUK YARDIMCILARI
  * ================================================================ */
@@ -99,16 +123,23 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
   struct frame_header fh = {
       .magic = NOX_FRAME_MAGIC,
       .type = NOX_MSG_TEXT,
-      .seq = state->tx_seq++,
+      .seq = state->tx_seq,
       .len = (uint32_t)ct_len,
   };
   uint8_t wire[FRAME_HEADER_WIRE_SIZE];
   frame_header_encode(&fh, wire);
 
+  struct iovec iov[2] = {
+      { .iov_base = (void *)wire,   .iov_len = FRAME_HEADER_WIRE_SIZE },
+      { .iov_base = (void *)payload, .iov_len = (size_t)ct_len },
+  };
+  ssize_t written = writev(state->peer_fd, iov, 2);
+
   nox_err_t err = NOX_OK;
-  if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
-      write_full(state->peer_fd, payload, (size_t)ct_len) != NOX_OK) {
+  if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
     err = NOX_ERR_IO;
+  } else {
+    state->tx_seq++;
   }
 
   sodium_free(payload);   /* her durumda, otomatik sıfırlar */
@@ -148,18 +179,23 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
     struct frame_header fh = {
         .magic = NOX_FRAME_MAGIC,
         .type = NOX_MSG_TEXT,
-        .seq = state->tx_seq++,
+        .seq = state->tx_seq,
         .len = (uint32_t)ct_len,
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     frame_header_encode(&fh, wire);
 
-    if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
-        write_full(state->peer_fd, ct, (size_t)ct_len) != NOX_OK) {
+    struct iovec iov[2] = {
+        { .iov_base = (void *)wire, .iov_len = FRAME_HEADER_WIRE_SIZE },
+        { .iov_base = (void *)ct,   .iov_len = (size_t)ct_len },
+    };
+    ssize_t written = writev(state->peer_fd, iov, 2);
+    if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
       sodium_free(chunk);
       sodium_free(ct);
       return NOX_ERR_IO;
     }
+    state->tx_seq++;
 
     offset += chunk_len;
   }
@@ -452,20 +488,25 @@ void process_line(struct app_state *state, const char *line) {
     struct frame_header fh = {
         .magic = NOX_FRAME_MAGIC,
         .type = NOX_MSG_CTRL,
-        .seq = state->tx_seq++,
+        .seq = state->tx_seq,
         .len = (uint32_t)hslen,
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     frame_header_encode(&fh, wire);
-    if (write_full(peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
-        write_full(peer_fd, hsbuf, hslen) != NOX_OK) {
+    struct iovec iov[2] = {
+        { .iov_base = (void *)wire,  .iov_len = FRAME_HEADER_WIRE_SIZE },
+        { .iov_base = (void *)hsbuf, .iov_len = hslen },
+    };
+    ssize_t written = writev(peer_fd, iov, 2);
+    if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + hslen)) {
       NOX_ERROR(LOG_MOD_NOISE, "handshake msg0 gönderilemedi");
       ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
       sm_dispatch(state, EV_HANDSHAKE_ERROR);
       return;
     }
+    state->tx_seq++;
 
-    NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi");
+    NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", state->tx_seq);
     ui_print_system(state, "[*] handshake başlatıldı");
     return;
   }
@@ -500,7 +541,6 @@ void process_stdin_events(struct app_state *state) {
       const char *line = tui_handle_input(state, ch);
       if (line) {
         process_line(state, line);
-        tui_refresh_all(state);
       }
     }
 #endif
@@ -580,6 +620,41 @@ void process_stdin_events(struct app_state *state) {
     state->stdin_len += (size_t)r;
     state->stdin_buf[state->stdin_len] = '\0';
 
+    /* Echo: terminal raw mode'da echo kapalı, program kendi yazacak
+     * Sadece son okunan byte'ları echo et (önceki döngüde zaten yazıldı)
+     * NOT: strip_ansi_escape'dan ÖNCE hesapla — escape temizlenince
+     * echo_start underflow olmasın */
+    size_t old_len = state->stdin_len - (size_t)r;
+    {
+      /* Escape sequence temizle — ok tuşları, vb. */
+      strip_ansi_escape(state->stdin_buf);
+      state->stdin_len = strlen(state->stdin_buf);
+
+      size_t echo_start = (state->stdin_len > old_len) ? old_len : state->stdin_len;
+      for (size_t i = echo_start; i < state->stdin_len; i++) {
+        unsigned char c = (unsigned char)state->stdin_buf[i];
+        if (c == '\n' || c == '\r') {
+          fprintf(stderr, "\n");
+        } else if (c == '\x7f' || c == '\b') {
+          /* Backspace: buffer'dan sil, ekrandan sil */
+          if (state->stdin_len > 0) {
+            state->stdin_len--;
+            state->stdin_buf[state->stdin_len] = '\0';
+            fprintf(stderr, "\b \b");
+          }
+        } else if (c >= 0x20 && c < 0x7f) {
+          /* Yazdırılabilir karakter — echo et */
+          fputc(c, stderr);
+        }
+        /* Diğer kontrol karakterleri (escape, vb.) — sessizce atla */
+      }
+      fflush(stderr);
+    }
+
+    /* Backspace işlendiyse newline kontrolünü atla */
+    if (state->stdin_len == 0 || state->stdin_buf[state->stdin_len - 1] == '\0')
+      continue;
+
     char *newline;
     while ((newline = memchr(state->stdin_buf, '\n', state->stdin_len)) != NULL) {
       size_t line_len = (size_t)(newline - state->stdin_buf);
@@ -610,16 +685,7 @@ void process_stdin_events(struct app_state *state) {
         line[line_len - 1] = '\0';
       }
 
-      /* TOFU veya normal girdi koruması */
-      if (state->peer_state != ST_TOFU_PENDING) {
-        ui_save_input(state);
-      }
-
       process_line(state, line);
-
-      if (state->peer_state != ST_TOFU_PENDING) {
-        ui_restore_input(state);
-      }
 
       sodium_free(line);
     }
