@@ -88,7 +88,6 @@
 
 static struct termios g_orig_termios;
 static bool g_termios_saved = false;
-volatile sig_atomic_t g_tor_died = 0;
 
 static void signal_handler(int sig) {
   (void)sig;
@@ -265,6 +264,10 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
   
   /* CodeQL #14 cpp/path-injection: downloads_dir config_dir + "/downloads" */
   assert(strncmp(state->downloads_dir, state->config_dir, strlen(state->config_dir)) == 0);
+  if (strncmp(state->downloads_dir, state->config_dir, strlen(state->config_dir)) != 0) {
+    NOX_ERROR(LOG_MOD_MAIN, "downloads_dir config_dir altında değil — yapılandırma hatası");
+    return NOX_ERR_CONFIG;
+  }
   state->downloads_dir_fd = open(state->downloads_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   if (state->downloads_dir_fd < 0) {
     NOX_ERROR(LOG_MOD_MAIN, "downloads dizini açılamadı: %s", strerror(errno));
@@ -652,6 +655,10 @@ static void prompt_transport_selection(struct app_state *state) {
       for (int i = 0; all_files[i] != NULL; i++) {
         /* CodeQL #11 cpp/path-injection: tüm dosya yolları config_dir'den türetilmiştir */
         assert(strncmp(all_files[i], state.config_dir, dir_len) == 0);
+        if (strncmp(all_files[i], state.config_dir, dir_len) != 0) {
+          NOX_WARN(LOG_MOD_MAIN, "dosya yolu config_dir altında değil — silme atlanıyor");
+          continue;
+        }
         struct stat st;
         if (stat(all_files[i], &st) != 0)
           continue; /* dosya yok — sorun değil */
@@ -888,6 +895,10 @@ static void prompt_transport_selection(struct app_state *state) {
     /* Diskten şifreli anahtarı yükle */
     /* CodeQL #13 cpp/path-injection: identity_path config_dir + "/identity.key" */
     assert(strncmp(state.identity_path, state.config_dir, strlen(state.config_dir)) == 0);
+    if (strncmp(state.identity_path, state.config_dir, strlen(state.config_dir)) != 0) {
+      NOX_ERROR(LOG_MOD_MAIN, "identity_path config_dir altında değil — yapılandırma hatası");
+      return NOX_ERR_CONFIG;
+    }
     err = crypto_load_identity(state.identity_path, identity_unlock, ed_sk,
                                ed_pub);
     if (err == NOX_ERR_AUTH) {

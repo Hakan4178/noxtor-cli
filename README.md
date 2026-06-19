@@ -39,6 +39,9 @@ It routes all traffic through **Tor**, uses the **Noise XX handshake**
 (with forward secrecy) for end-to-end encryption, and requires
 **no central server** not even for key exchange.
 
+DEVNOTE: I'm sorry, the codebase has grown so much, it's hard to add new features.
+I'm looking at the refactor or stability ux side instead.
+
 > **⚠️ Early Stage:** Core messaging works and has been tested against
 > non-official Noise XX (Cacophony) test vectors. Security hardening is
 > still in progress. **This project has NOT been independently audited.**

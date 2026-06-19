@@ -332,11 +332,8 @@ void event_loop(struct app_state *state) {
    * Sadece downloads dizini okunabilir/yazılabilir.
    * Kernel 5.13+ gerektirir, desteklemiyorsa sessizce atlar.
    * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez. */
-  bool landlock_active = false;
   if (state->downloads_dir_fd >= 0) {
-    if (landlock_sandbox_init(state->downloads_dir_fd) == NOX_OK) {
-      landlock_active = true;
-    }
+    landlock_sandbox_init(state->downloads_dir_fd);
   }
 
   /* ── Stage 3: Sıfır ağ sızıntısı garantisi ────────────────────

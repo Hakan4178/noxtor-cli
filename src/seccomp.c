@@ -169,6 +169,31 @@ nox_err_t seccomp_policy_load(int stage) {
   if (!ctx)
     return NOX_ERR_CRYPTO;
 
+  /* ── 32-bit compat modunu tamamen devre dışı bırak ────────────────
+   * x86_64 process'lerde i386 compat modu farklı syscall numaraları
+   * kullanır (execve: 59→11, clone: 56→120, socket: 41→102).
+   * Filtre sadece x86_64 numaralarını engeller → 32-bit bypass mümkün.
+   * Bu uygulama 64-bit → i386 support gereksiz.
+   *
+   * Yöntem: Filtreyi TÜM mimarilere senkronize et (TSYNC).
+   * Bu sayede i386/x32 compat modu da aynı filtreye tabi olur.
+   * Tek alternatif: seccomp_arch_remove + her mimari için tek tek KILL. */
+  {
+    int rc_tsync = seccomp_attr_set(ctx, SCMP_FLTATR_CTL_TSYNC, 1);
+    if (rc_tsync < 0) {
+      /* TSYNC desteklenmiyorsa (eski kernel) → fallback: i386'u tamamen kaldır */
+      NOX_WARN(LOG_MOD_MAIN, "seccomp: TSYNC desteklenmiyor (rc=%d), "
+               "32-bit fallback deneniyor", rc_tsync);
+      int rc_rem = seccomp_arch_remove(ctx, SCMP_ARCH_X86);
+      if (rc_rem < 0 && rc_rem != -EEXIST) {
+        NOX_ERROR(LOG_MOD_MAIN, "seccomp: 32-bit arch kaldırılamadı (rc=%d)",
+                  rc_rem);
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+    }
+  }
+
   size_t n_blocked = 0;
   size_t n_custom_blocked = 0;
   for (size_t i = 0; i < sizeof(blacklist) / sizeof(blacklist[0]); i++) {

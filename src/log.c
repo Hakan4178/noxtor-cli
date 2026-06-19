@@ -20,8 +20,9 @@
 #include <stdio.h>
 #include <time.h>
 
-/* Global shutdown flag — tanım burada, extern types.h'de */
+/* Global flags — tanım burada, extern types.h'de */
 volatile sig_atomic_t g_shutdown = 0;
+volatile sig_atomic_t g_tor_died = 0;
 
 /* ================================================================
  * ANSI RENK KODLARI

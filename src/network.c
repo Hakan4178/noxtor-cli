@@ -584,7 +584,11 @@ static nox_err_t generate_torrc(struct app_state *state) {
  * Kontrol portu ControlPortWriteToFile'dan okunur.
  * ================================================================ */
 
-/* control.sock dosyasının oluşmasını bekler, Tor sürecini takip eder */
+/* control.sock dosyasının oluşmasını bekler, Tor sürecini takip eder.
+ * access() TOCTOU yarışı yerine direkt connect() kullanılır:
+ *   - connect() başarısızsa → soket henüz hazır değil, retry
+ *   - connect() başarılıysa → soket hazır VE bağlantıyı kurduk
+ * Aynı zamanda soketin gerçekten bir AF_UNIX soketi olduğunu doğrular. */
 static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
                                          int timeout_sec) {
   const struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; /* 100 ms */
@@ -611,9 +615,27 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
       return NOX_ERR_TOR;
     }
 
-    if (access(socket_path, F_OK) == 0) {
+    /* access() TOCTOU yarışı yok: connect() ile hem varlık hem bağlantı */
+    int probe_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (probe_fd < 0) {
+      safe_nanosleep(&ts);
+      continue;
+    }
+
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    size_t copy_len = strlen(socket_path);
+    if (copy_len >= sizeof(addr.sun_path)) {
+      close(probe_fd);
+      return NOX_ERR_CONFIG;
+    }
+    memcpy(addr.sun_path, socket_path, copy_len);
+    addr.sun_path[copy_len] = '\0';
+
+    if (connect(probe_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+      close(probe_fd);
       return NOX_OK;
     }
+    close(probe_fd);
 
     safe_nanosleep(&ts);
   }
@@ -646,6 +668,11 @@ nox_err_t tor_spawn(struct app_state *state) {
                      state->tor_data_dir);
   if (ssn <= 0 || (size_t)ssn >= NOX_PATH_MAX) {
     NOX_ERROR(LOG_MOD_NET, "socks.sock yolu çok uzun");
+    return NOX_ERR_CONFIG;
+  }
+  if ((size_t)ssn >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+    NOX_ERROR(LOG_MOD_NET, "socks.sock yolu UDS sınırını aşıyor (maksimum %zu byte)",
+              sizeof(((struct sockaddr_un *)0)->sun_path) - 1);
     return NOX_ERR_CONFIG;
   }
 
@@ -734,11 +761,11 @@ nox_err_t tor_spawn(struct app_state *state) {
       .sun_family = AF_UNIX,
   };
   /* socket_path NOX_PATH_MAX (511) kadar olabilir, sun_path 108 byte.
-   * Kasıtlı truncation —Unix socket path uzunluğu sınırı. */
+   * tor_spawn() satır 638'de sun_path sınırını çoktan kontrol etti.
+   * Buradaki assert, o kontrol kaldırılırsa bile yakalar. */
   size_t copy_len = strlen(socket_path);
   assert(copy_len < NOX_PATH_MAX);
-  if (copy_len >= sizeof(addr.sun_path))
-      copy_len = sizeof(addr.sun_path) - 1;
+  assert(copy_len < sizeof(addr.sun_path));  /* ≥108 olamaz — tor_spawn() reject etti */
   memcpy(addr.sun_path, socket_path, copy_len);
   addr.sun_path[copy_len] = '\0';
 
@@ -813,7 +840,10 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
 
   /* V1 FIX: Cookie'yi diskten sil — metadata theft engeli.
    * Tor authenticate sonrası cookie'yi buffer'dan temizler. */
-  unlink(cookie_path);
+  if (unlink(cookie_path) != 0) {
+    NOX_WARN(LOG_MOD_NET, "cookie silinemedi (%s) — disk'te kalabilir",
+             strerror(errno));
+  }
 
   /* "AUTHENTICATE " (13) + 64 hex + "\r\n" (2) + NUL = 80 */
   char cmd[80];
