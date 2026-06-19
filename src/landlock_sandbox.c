@@ -98,8 +98,12 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
             LANDLOCK_ACCESS_FS_MAKE_BLOCK   |
             LANDLOCK_ACCESS_FS_MAKE_SYM     |
             LANDLOCK_ACCESS_FS_REFER        |
+#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
             LANDLOCK_ACCESS_FS_TRUNCATE     |
             LANDLOCK_ACCESS_FS_IOCTL_DEV,
+#else
+            LANDLOCK_ACCESS_FS_TRUNCATE,
+#endif
     };
 
     int ruleset_fd = sys_landlock_create_ruleset(&ruleset_attr,

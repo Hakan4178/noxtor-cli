@@ -85,6 +85,15 @@ static const struct {
   /* Profiling / Timing attack koruması */
   { .num = SCMP_SYS(perf_event_open),   .name = "perf_event_open",   .stage = 1 },
 
+  /* Kernel/code injection — uygulama hiçbirini kullanmaz */
+  { .num = SCMP_SYS(bpf),               .name = "bpf",               .stage = 1 },
+  { .num = SCMP_SYS(kexec_file_load),   .name = "kexec_file_load",   .stage = 1 },
+  { .num = SCMP_SYS(finit_module),      .name = "finit_module",      .stage = 1 },
+
+  /* ABI değiştirerek filtre bypass'ı engelle (defense-in-depth).
+   * TSYNC zaten koruyor ama gereksiz personality çağına izin vermeyelim. */
+  { .num = SCMP_SYS(personality),       .name = "personality",       .stage = 1 },
+
   /* ═══ Stage 2 — Tor spawn sonrası (fork/execve artık gerekmez) ═══ */
 
   /* Process manipulation */
@@ -99,6 +108,13 @@ static const struct {
   /* Filesystem */
   { .num = SCMP_SYS(mount),             .name = "mount",             .stage = 2 },
   { .num = SCMP_SYS(umount2),           .name = "umount2",           .stage = 2 },
+  { .num = SCMP_SYS(fsopen),            .name = "fsopen",            .stage = 2 },
+  { .num = SCMP_SYS(fsconfig),          .name = "fsconfig",          .stage = 2 },
+  { .num = SCMP_SYS(fsmount),           .name = "fsmount",           .stage = 2 },
+  { .num = SCMP_SYS(fspick),            .name = "fspick",            .stage = 2 },
+  { .num = SCMP_SYS(move_mount),        .name = "move_mount",        .stage = 2 },
+  { .num = SCMP_SYS(open_tree),         .name = "open_tree",         .stage = 2 },
+  { .num = SCMP_SYS(umount),            .name = "umount",            .stage = 2 },
   { .num = SCMP_SYS(pivot_root),        .name = "pivot_root",        .stage = 2 },
   { .num = SCMP_SYS(open_by_handle_at), .name = "open_by_handle_at", .stage = 2 },
   { .num = SCMP_SYS(openat2),           .name = "openat2",           .stage = 2 },
