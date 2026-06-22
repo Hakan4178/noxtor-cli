@@ -30,6 +30,7 @@
 #include <stdarg.h>
 #include <sodium.h>    /* [F7] sodium_memzero — plain text scrub */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -312,6 +313,25 @@ void ui_print_prompt(struct app_state *state)
  * [F8] Dinamik satır hesabı — peer mesajı gelirken input bozulmaz
  * ================================================================ */
 
+/* UI-1 FIX: Terminal ANSI injection koruması —peer mesajlarını temizle */
+static void strip_ansi_escape(char *str) {
+  if (!str) return;
+  char *dst = str;
+  const char *src = str;
+  while (*src) {
+    if ((unsigned char)*src == 0x1b && src[1] == '[') {
+      src += 2;
+      while (*src && ((*src >= '0' && *src <= '?') ||
+                      (*src >= ' ' && *src <= '/')))
+        src++;
+      if (*src) src++;
+    } else {
+      *dst++ = *src++;
+    }
+  }
+  *dst = '\0';
+}
+
 static void print_timestamp_short(void)
 {
     struct timespec ts;
@@ -344,6 +364,13 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     if (tui_is_active())
         return;
 
+    /* UI-1 FIX: ANSI injection koruması — mutable kopya oluştur */
+    size_t msg_len = strlen(msg);
+    char *safe_msg = malloc(msg_len + 1);
+    if (!safe_msg) return;
+    memcpy(safe_msg, msg, msg_len + 1);
+    strip_ansi_escape(safe_msg);
+
     int clear_lines = calc_current_input_lines(state);
 
     fprintf(stderr, "\033[?25l");
@@ -355,7 +382,8 @@ static void atomic_message(struct app_state *state, enum ui_label label,
 
     print_timestamp_short();
     print_label(label);
-    fprintf(stderr, " %s\n", msg);
+    fprintf(stderr, " %s\n", safe_msg);
+    free(safe_msg);
     fflush(stderr);
 
     g_last_label = label;

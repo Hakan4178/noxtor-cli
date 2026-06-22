@@ -6,6 +6,7 @@
 #include "asm_utils.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <sodium.h>
 #include <sqlite3.h>
 #include <stdio.h>
@@ -176,6 +177,8 @@ nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
     sqlite3_free(err_msg);
     sqlite3_close(g_state.db);
     g_state.db = NULL;
+    g_state.db_key = NULL;
+    DB_UNLOCK();
     return NOX_ERR_DB;
   }
 
@@ -304,16 +307,20 @@ nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t nois
   struct contact_payload cp;
   sodium_memzero(&cp, sizeof(cp));
   strncpy(cp.onion, onion, NOX_ONION_LEN);
+  cp.onion[NOX_ONION_LEN] = '\0';
   strncpy(cp.name, name, NOX_CONTACT_NAME_LEN);
+  cp.name[NOX_CONTACT_NAME_LEN] = '\0';
   memcpy(cp.noise_key, noise_key, NOX_KEY_LEN);
   if (my_onion) {
     size_t my_onion_len = strnlen(my_onion, NOX_ONION_LEN + 1);
     if (my_onion_len != NOX_ONION_LEN) { DB_UNLOCK(); return NOX_ERR_DB; }
     strncpy(cp.my_onion, my_onion, NOX_ONION_LEN);
+    cp.my_onion[NOX_ONION_LEN] = '\0';
   }
   if (my_onion_key && my_onion_key_len > 0) {
     size_t copy_len = my_onion_key_len > NOX_ONION_KEY_B64_LEN ? NOX_ONION_KEY_B64_LEN : my_onion_key_len;
     memcpy(cp.my_onion_key, my_onion_key, copy_len);
+    cp.my_onion_key[copy_len < NOX_ONION_KEY_B64_LEN ? copy_len : NOX_ONION_KEY_B64_LEN] = '\0';
   }
 
   uint8_t nonce[NOX_NONCE_LEN];
@@ -488,6 +495,7 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
     DB_UNLOCK(); return NOX_ERR_OVERFLOW;
   }
   size_t cipher_len = payload_len + crypto_secretbox_MACBYTES;
+  assert(cipher_len <= (size_t)INT_MAX && "DB-3: cipher_len truncation guard");
 
   uint8_t nonce[NOX_NONCE_LEN];
   uint8_t *cipher = sodium_malloc(cipher_len);
@@ -777,6 +785,7 @@ nox_err_t db_save_message(const char *peer_onion, const char *text,
   }
   size_t payload_len = text_len + 1;
   size_t cipher_len = payload_len + crypto_secretbox_MACBYTES;
+  assert(cipher_len <= (size_t)INT_MAX && "DB-3: cipher_len truncation guard");
 
   uint8_t nonce[NOX_NONCE_LEN];
   uint8_t *cipher = sodium_malloc(cipher_len);

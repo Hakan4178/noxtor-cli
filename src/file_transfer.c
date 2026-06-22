@@ -480,26 +480,26 @@ static nox_err_t open_recv_file(struct app_state *state,
     return NOX_OK;
 }
 
-void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, uint32_t len) {
+bool file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, uint32_t len) {
   if (len < NOX_MAC_LEN || len > 4096 + NOX_MAC_LEN) {
     ui_print_error(state, "Gecersiz payload uzunlugu: %u", len);
-    return;
+    return false;
   }
 
   uint8_t *pt = sodium_malloc(len);
   if (!pt) {
     ui_print_error(state, "Bellek tahsisi basarisiz.");
-    return;
+    return false;
   }
 
   ssize_t pt_len = noise_decrypt(state->session, payload, len, pt);
   if (pt_len <= 0) {
     sodium_free(pt);
-    return;
+    return false;
   }
 
   /* A-1 FIX: Gereksiz pt_len > 0 koşulu kaldırıldı */
-  if (!state->rx_file.active && pt_len == 305 && memcmp(pt, "METADATA", 9) == 0) {
+  if (!state->rx_file.active && pt_len == 305 && sodium_memcmp(pt, "METADATA", 9) == 0) {
     /* Yeni dosya transferi (Metadata) */
     char safe_name[256];
     size_t name_len = strnlen((const char *)pt + 9, 255);
@@ -552,7 +552,7 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
               ui_print_error(state, "Hash state başlatılamadı");
               close(file_fd);
               explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-              return;
+              return true;
             }
 
             /* C-6 FIX: Hash'e file_size dahil et — sender boyut yalan söylerse hash uyuşmaz */
@@ -566,7 +566,7 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
               explicit_bzero(size_hdr, sizeof(size_hdr));
               close(file_fd);
               explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-              return;
+              return true;
             }
             explicit_bzero(size_hdr, sizeof(size_hdr));
 
@@ -621,7 +621,7 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
         if (state->rx_file.fd >= 0) { close(state->rx_file.fd); state->rx_file.fd = -1; }
         explicit_bzero(&state->rx_file, sizeof(state->rx_file));
         state->rx_file.fd = -1;
-        return;
+        return true;
       }
 
       /* PATCH: HIGH‑1 — fd kapatıldıktan hemen sonra -1 yap */
@@ -651,7 +651,7 @@ void file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, ui
   }
 
   sodium_free(pt);
-  return;
+  return true;
 
 rx_abort:
   /* PATCH: HIGH‑1 — kapat ve geçersiz kıl */
@@ -667,6 +667,7 @@ rx_abort:
   explicit_bzero(&state->rx_file, sizeof(state->rx_file));
   state->rx_file.fd = -1;
   sodium_free(pt);
+  return true;
 }
 
 /* ================================================================

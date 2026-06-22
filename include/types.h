@@ -201,6 +201,7 @@ struct app_state {
     struct noise_session *session; /* arena'da veya NULL              */
     struct noise_handshake *hs;  /* aktif handshake veya NULL         */
     struct timespec handshake_start; /* handshake başlangıç zamanı     */
+    struct timespec tofu_start;    /* TOFU_PENDING başlangıç zamanı  */
 
     /* Handshake rate limiting — 60 saniyede max 5 deneme */
     int      hs_attempt_count;   /* penceredeki deneme sayısı         */

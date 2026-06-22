@@ -237,6 +237,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
             memcpy(state->tofu_new_key, remote_pub, NOX_KEY_LEN);
             state->tofu_arena_mark = state->session_arena_mark;
             /* State geçişi: HANDSHAKE → TOFU_PENDING */
+            clock_gettime(CLOCK_MONOTONIC, &state->tofu_start);
             state->peer_state = ST_TOFU_PENDING;
           }
          } else {
@@ -270,6 +271,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
           memcpy(state->tofu_new_key, remote_pub, NOX_KEY_LEN);
           state->tofu_arena_mark = state->session_arena_mark;
           /* State geçişi: HANDSHAKE → TOFU_PENDING */
+          clock_gettime(CLOCK_MONOTONIC, &state->tofu_start);
           state->peer_state = ST_TOFU_PENDING;
         }
       }
@@ -289,7 +291,6 @@ static void process_peer_frames(struct app_state *state, int fd) {
         sodium_free(payload);
         break;
       }
-      state->rx_seq++;
 
       if (fh.type == NOX_MSG_TEXT) {
         /* A-1 FIX: sodium_malloc ile swap koruması */
@@ -309,11 +310,15 @@ static void process_peer_frames(struct app_state *state, int fd) {
               db_process_queue(state->active_peer_onion,
                                send_queued_callback, state);
             }
+            /* EVT-1 FIX: rx_seq++ only after successful decryption */
+            state->rx_seq++;
           }
           sodium_free(pt); /* otomatik sıfırlar */
         }
       } else if (fh.type == NOX_MSG_FILE) {
-        file_transfer_handle_rx(state, payload, fh.len);
+        /* EVT-1 FIX: rx_seq++ only if file processing succeeded */
+        if (file_transfer_handle_rx(state, payload, fh.len))
+          state->rx_seq++;
       }
     }
 
@@ -399,6 +404,18 @@ void event_loop(struct app_state *state) {
         NOX_WARN(LOG_MOD_NOISE, "Handshake zaman aşımına uğradı");
         ui_print_error(state, "Akran ile handshake zaman aşımına uğradı.");
         sm_dispatch(state, EV_HANDSHAKE_TIMEOUT);
+      }
+    }
+
+    /* EVT-7 FIX: TOFU timeout — 2 dakika içinde onaylanmazsa temizle.
+     * fd ve key material sonsuza kadar tutulmasın. */
+    if (state->peer_state == ST_TOFU_PENDING) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (now.tv_sec - state->tofu_start.tv_sec > 120) {
+        NOX_WARN(LOG_MOD_NET, "TOFU timeout — 2 dakikada onaylanmadı");
+        ui_print_error(state, "TOFU onay zaman aşımı — bağlantı temizlendi.");
+        sm_dispatch(state, EV_PEER_DISCONNECTED);
       }
     }
 

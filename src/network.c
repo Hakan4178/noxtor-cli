@@ -92,15 +92,12 @@ bool validate_onion_address(const char *addr) {
  * - SOCKS5 greeting (sabit byte'lar)
  * Hassas veri 3. partiye gitmez — FP. */
 nox_err_t write_full(int fd, const void *buf, size_t len) {
-  /* CodeQL #6-#7 cpp/system-data-exposure: getenv("HOME") → config_dir → torrc zincirini
-   * takip ediyor. Bu fonksiyon sadece bizim process'larımız tarafından çağrılır
-   * (Tor control socket, torrc dosyası, SOCKS5). Hassas veri 3. partiye gitmez. */
   assert(buf != NULL || len == 0);
   const uint8_t *p = (const uint8_t *)buf;
   size_t written = 0;
+  int retries = 0;
+  const int MAX_RETRIES = 10;
   while (written < len) {
-    /* CodeQL #6-#7 cpp/system-data-exposure: write() çağrısı Tor control socket'e
-     * yapılıyor — bizim child process'ımız. Hassas veri 3. partiye gitmez. */
     assert(fd >= 0);
     ssize_t w = write(fd, p + written, len - written);
     if (w < 0) {
@@ -111,9 +108,13 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
 #else
       if (errno == EAGAIN) {
 #endif
+        if (++retries > MAX_RETRIES)
+          return NOX_ERR_IO;
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
         int pret = poll(&pfd, 1, 3000);
         if (pret < 0 && errno != EINTR)
+          return NOX_ERR_IO;
+        if (pret == 0)
           return NOX_ERR_IO;
         continue;
       }
@@ -122,6 +123,7 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
     if (w == 0)
       return NOX_ERR_IO;
     written += (size_t)w;
+    retries = 0;
   }
   return NOX_OK;
 }
@@ -805,7 +807,7 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
     return NOX_ERR_CONFIG;
   }
 
-  int fd = open(cookie_path, O_RDONLY | O_CLOEXEC);
+  int fd = open(cookie_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (fd < 0) {
     NOX_ERROR(LOG_MOD_NET, "cookie dosyası okunamadı: %s", strerror(errno));
     return NOX_ERR_TOR;
@@ -937,6 +939,12 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
  * ================================================================ */
 nox_err_t tor_create_hidden_service(int ctrl_fd, const char *listen_path,
                                      char *onion_out, size_t onion_len) {
+  /* NET-4 FIX: CRLF injection koruması */
+  if (strchr(listen_path, '\r') || strchr(listen_path, '\n')) {
+    NOX_ERROR(LOG_MOD_NET, "listen_path CRLF injection engellendi");
+    return NOX_ERR_CONFIG;
+  }
+
   char cmd[128];
   int n = snprintf(cmd, sizeof(cmd),
                    "ADD_ONION NEW:ED25519-V3 Port=%u,unix:%s\r\n",
@@ -1105,11 +1113,17 @@ nox_err_t listener_create(const char *tor_data_dir, char *listen_path_out,
   memcpy(addr.sun_path, listen_path_out, copy_len);
   addr.sun_path[copy_len] = '\0';
 
+  /* NET-2 FIX: umask ile TOCTOU race engelle — bind öncesi izinleri kısıtla */
+  mode_t old_umask = umask(0077);
   if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    int saved_errno = errno;
+    umask(old_umask);
+    errno = saved_errno;
     NOX_ERROR(LOG_MOD_NET, "bind: %s", strerror(errno));
     close(fd);
     return NOX_ERR_NET;
   }
+  umask(old_umask);
 
   /* Socket izinlerini kısıtla — sadece owner read/write */
   if (chmod(listen_path_out, 0600) != 0) {
