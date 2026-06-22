@@ -13,6 +13,7 @@
  * ================================================================ */
 #include "common.h"
 #include "landlock_sandbox.h"
+#include <assert.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -145,19 +146,24 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
     char config_dir[NOX_PATH_MAX];
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
-    snprintf(config_dir, sizeof(config_dir), "%s/.config/paranoidcli", home);
 
-    int config_fd = open(config_dir, O_PATH | O_DIRECTORY);
-    if (config_fd >= 0) {
-        struct landlock_path_beneath_attr config_rule = {
-            .allowed_access =
-                LANDLOCK_ACCESS_FS_READ_FILE |
-                LANDLOCK_ACCESS_FS_READ_DIR,
-            .parent_fd = config_fd,
-        };
-        sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
-                              &config_rule, 0);
-        close(config_fd);
+    /* CodeQL: cpp/path-injection — HOME mutlak path olmalı */
+    assert(home != NULL && "HOME must be set");
+    if (home[0] == '/') {
+        snprintf(config_dir, sizeof(config_dir), "%s/.config/paranoidcli", home);
+
+        int config_fd = open(config_dir, O_PATH | O_DIRECTORY);
+        if (config_fd >= 0) {
+            struct landlock_path_beneath_attr config_rule = {
+                .allowed_access =
+                    LANDLOCK_ACCESS_FS_READ_FILE |
+                    LANDLOCK_ACCESS_FS_READ_DIR,
+                .parent_fd = config_fd,
+            };
+            sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+                                  &config_rule, 0);
+            close(config_fd);
+        }
     }
 
     /* ── no_new_privs ayarla ──

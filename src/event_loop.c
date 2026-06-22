@@ -68,7 +68,9 @@ static void process_peer_frames(struct app_state *state, int fd) {
     }
 
     /* Frame tamamlandı — payload'ı ayıkla */
-    assert(fh.len > 0 && fh.len <= 4096 + NOX_MAC_LEN);
+    if (fh.len == 0 || fh.len > 4096 + NOX_MAC_LEN) {
+      break;
+    }
     uint8_t *payload = sodium_malloc(fh.len);
     if (!payload) {
       state->recv_pos = 0;
