@@ -452,7 +452,7 @@ fuzz-run-handshake: fuzz
 	         -- ./$(FUZZ_DIR)/fuzz_handshake
 
 # ----------------------------------------------------------------
-# DIFFERENTIAL FUZZING — noise-c referans ile karşılaştırma
+# DIFFERENTIAL FUZZING — noise-c referans ile karşılaştırma (hedefli + kapsamlı)
 # ----------------------------------------------------------------
 $(TEST_DIR)/fuzz_noise_differential: $(TEST_DIR)/fuzz_noise_differential.c src/noise.c
 	$(MSG) 'DIFF' '$<'
@@ -462,14 +462,7 @@ $(TEST_DIR)/fuzz_noise_differential: $(TEST_DIR)/fuzz_noise_differential.c src/n
 differential: $(TEST_DIR)/fuzz_noise_differential
 	$(Q)$(TEST_DIR)/fuzz_noise_differential
 
-# DIFFERENTIAL FUZZING FULL — 105 key × 12 prologue × 4 pattern × 10 payload (~1.26M test)
-$(TEST_DIR)/fuzz_noise_differential_full: $(TEST_DIR)/fuzz_noise_differential_full.c src/noise.c
-	$(MSG) 'DIFF-FULL' '$<'
-	$(Q)$(CC) $(STD) -DNOISE_TEST_DETERMINISTIC -I$(INC_DIR) \
-		$^ -L/usr/local/lib -lnoiseprotocol -lsodium -o $@
 
-differential-full: $(TEST_DIR)/fuzz_noise_differential_full
-	$(Q)$(TEST_DIR)/fuzz_noise_differential_full
 
 # ----------------------------------------------------------------
 # SECCOMP DENEME
@@ -491,7 +484,7 @@ clean:
 	rm -f $(TEST_BINS) $(TEST_DEPS)
 	rm -f $(FUZZ_DIR)/*.fuzz.o $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5 $(FUZZ_DIR)/fuzz_handshake
 	rm -f $(TEST_DIR)/fuzz_noise_differential
-	rm -f $(TEST_DIR)/fuzz_noise_differential_full
+
 	rm -f $(TEST_DIR)/test_seccomp
 	rm -rf $(FUZZ_DIR)/tmp_downloads
 	@echo "[*] Temizlendi."

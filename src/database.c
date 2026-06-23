@@ -939,6 +939,7 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
   if (!g_state.ready) { DB_UNLOCK(); return NOX_ERR_STATE; }
   if (!visitor) { DB_UNLOCK(); return NOX_ERR_DB; }
 
+  /* Ana sorgu: tüm contact'ları listele (nonce, şifreli payload, onion hash) */
   sqlite3_stmt *stmt = NULL;
   const char *sql = "SELECT nonce, encrypted_payload, onion_hash FROM contacts;";
   int rc = sqlite3_prepare_v2(g_state.db, sql, -1, &stmt, NULL);
@@ -947,6 +948,7 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
+  /* İkincil sorgu: her contact için son mesajı getir (N+1 query) */
   sqlite3_stmt *msg_stmt = NULL;
   const char *msg_sql = "SELECT nonce, encrypted_payload, timestamp, is_outgoing FROM messages "
                         "WHERE peer_hash = ? ORDER BY timestamp DESC, id DESC LIMIT 1;";
@@ -957,7 +959,9 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
+  /* Her contact'ı dolaş: decrypt → son mesajı bul → visitor'a aktar */
   while (sqlite3_step(stmt) == SQLITE_ROW) {
+    /* Contact verisini SQL sütunlarından oku */
     const void *nonce_ptr = sqlite3_column_blob(stmt, 0);
     int nonce_bytes = sqlite3_column_bytes(stmt, 0);
     const void *cipher_ptr = sqlite3_column_blob(stmt, 1);
@@ -969,6 +973,7 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
       continue;
     }
 
+    /* Contact payload'ı deşifre et (XChaCha20-Poly1305) */
     struct contact_payload cp;
     sodium_memzero(&cp, sizeof(cp));
     size_t plain_len_out = 0;
@@ -980,11 +985,13 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
       continue;
     }
 
+    /* Eski format uyumluluğu: my_onion/my_onion_key alanları yoksa sıfırla */
     if (plain_len_out == sizeof(struct contact_payload_old)) {
       memset(cp.my_onion, 0, sizeof(cp.my_onion));
       memset(cp.my_onion_key, 0, sizeof(cp.my_onion_key));
     }
 
+    /* Son mesajı getir ve deşifre et */
     char *last_msg_text = NULL;
     bool last_msg_outgoing = false;
     time_t last_msg_timestamp = 0;
@@ -1004,6 +1011,7 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
       last_msg_timestamp = (time_t)sqlite3_column_int64(msg_stmt, 2);
       last_msg_outgoing = sqlite3_column_int(msg_stmt, 3) != 0;
 
+      /* Mesaj nonce boyutu doğru ve MAC varsa deşifre et */
       if (msg_nonce_bytes == NOX_NONCE_LEN && msg_cipher_bytes_int > (int)crypto_secretbox_MACBYTES) {
         size_t msg_cipher_bytes = (size_t)msg_cipher_bytes_int;
         size_t msg_expected_plain = msg_cipher_bytes - crypto_secretbox_MACBYTES;
@@ -1024,10 +1032,12 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
       }
     }
 
+    /* Visitor callback: contact bilgisini ve son mesajı uygulamaya aktar */
     visitor(cp.onion, cp.name, cp.noise_key, cp.my_onion,
             (const uint8_t *)cp.my_onion_key, strnlen(cp.my_onion_key, NOX_ONION_KEY_B64_LEN),
             last_msg_text, last_msg_outgoing, last_msg_timestamp, ctx);
 
+    /* Temizlik: hassas verileri sıfırla */
     if (last_msg_text) {
       sodium_free(last_msg_text);
     }

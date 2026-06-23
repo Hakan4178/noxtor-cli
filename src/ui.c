@@ -100,8 +100,7 @@ static size_t calc_prompt_display_len(struct app_state *state)
     size_t id_len;
     if (olen > 10) {
         size_t hash_len = olen;
-        if (olen > 6 &&
-            strcmp(state->active_peer_onion + olen - 6, ".onion") == 0)
+        if (strcmp(state->active_peer_onion + olen - 6, ".onion") == 0)
             hash_len = olen - 6;
         id_len = (hash_len >= 8) ? 10 : hash_len;
     } else {
