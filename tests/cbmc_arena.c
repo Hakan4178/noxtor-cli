@@ -658,6 +658,96 @@ static void test_arena_destroy_overflow_protection(void) {
     arena_destroy(&a);
     free(mem);
 }
+
+/* ================================================================
+ * arena_alloc_canary — honeypot allocation (kolay)
+ *
+ * Fonksiyon: arena_alloc() + randombytes_buf() wrapper'ı.
+ * arena_alloc() zaten doğrulanmış. randombytes_buf() stub (noop).
+ * Yeni mantık yok — sadece iki mevcut fonksiyonun birleşimi.
+ * ================================================================ */
+static void test_arena_alloc_canary_null(void) {
+    assert(arena_alloc_canary(NULL, 32) == NULL);
+}
+
+static void test_arena_alloc_canary_zero_size(void) {
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+    a.base = (void *)0x1000;
+    a.page_size = 4096;
+    a.usable_size = 1024;
+    a.offset = 0;
+    memset(a.canary, 0xAA, 16);
+
+    __CPROVER_assume(g_canary_match == 1);
+    __CPROVER_assume(__CPROVER_POINTER_OBJECT(a.base) == __CPROVER_POINTER_OBJECT((void*)0x1000));
+
+    /* size=0 → arena_alloc NULL döner → canary de NULL döner */
+    assert(arena_alloc_canary(&a, 0) == NULL);
+}
+
+static void test_arena_alloc_canary_valid(void) {
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+
+    size_t page_size = 4096;
+    size_t usable = 256;
+    size_t total = page_size + usable + page_size;
+    uint8_t *mem = (uint8_t *)malloc(total);
+    if (!mem) return;
+
+    a.base = mem;
+    a.page_size = page_size;
+    a.usable_size = usable;
+    a.offset = 0;
+    memset(a.canary, 0xAA, 16);
+
+    __CPROVER_assume(a.page_size > 0);
+    __CPROVER_assume(a.usable_size <= usable);
+    __CPROVER_assume(a.page_size + a.usable_size <= page_size + usable);
+    __CPROVER_assume(g_canary_match == 1);
+    __CPROVER_assume(__CPROVER_POINTER_OBJECT(a.base) == __CPROVER_POINTER_OBJECT(mem));
+    __CPROVER_assume(__CPROVER_POINTER_OFFSET(a.base) == 0);
+
+    void *ptr = arena_alloc_canary(&a, 32);
+    if (ptr) {
+        /* 16-byte hizalı */
+        assert(((uintptr_t)ptr) % 16 == 0);
+        /* Offset artmış */
+        assert(a.offset == 32);
+    }
+
+    free(mem);
+}
+
+static void test_arena_alloc_canary_overflow(void) {
+    struct secure_arena a;
+    memset(&a, 0, sizeof(a));
+
+    size_t page_size = 4096;
+    size_t usable = 128;
+    size_t total = page_size + usable + page_size;
+    uint8_t *mem = (uint8_t *)malloc(total);
+    if (!mem) return;
+
+    a.base = mem;
+    a.page_size = page_size;
+    a.usable_size = usable;
+    a.offset = 120; /* sadece 8 byte kaldı */
+    memset(a.canary, 0xBB, 16);
+
+    __CPROVER_assume(a.page_size > 0);
+    __CPROVER_assume(a.usable_size <= usable);
+    __CPROVER_assume(g_canary_match == 1);
+    __CPROVER_assume(__CPROVER_POINTER_OBJECT(a.base) == __CPROVER_POINTER_OBJECT(mem));
+    __CPROVER_assume(__CPROVER_POINTER_OFFSET(a.base) == 0);
+
+    /* 32 byte iste ama sadece 8 byte kaldı → NULL */
+    assert(arena_alloc_canary(&a, 32) == NULL);
+
+    free(mem);
+}
+
 int main(void) {
     test_page_align();
     test_page_align_edge();
@@ -679,5 +769,9 @@ int main(void) {
     test_arena_destroy_valid();
     test_arena_destroy_corrupted_struct();
     test_arena_destroy_overflow_protection();
+    test_arena_alloc_canary_null();
+    test_arena_alloc_canary_zero_size();
+    test_arena_alloc_canary_valid();
+    test_arena_alloc_canary_overflow();
     return 0;
 }

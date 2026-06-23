@@ -267,6 +267,127 @@ static int test_arena_memory_zeroed(void)
 }
 
 /* ================================================================
+ * arena_alloc_canary — honeypot allocation testleri
+ * ================================================================ */
+static int test_arena_alloc_canary_null(void)
+{
+    /* NULL guard */
+    void *p = arena_alloc_canary(NULL, 32);
+    TEST_ASSERT(p == NULL);
+
+    return 0;
+}
+
+static int test_arena_alloc_canary_zero_size(void)
+{
+    struct secure_arena a;
+    nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
+    TEST_ASSERT(err == NOX_OK);
+
+    /* size=0 → NULL */
+    void *p = arena_alloc_canary(&a, 0);
+    TEST_ASSERT(p == NULL);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_alloc_canary_valid(void)
+{
+    struct secure_arena a;
+    nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
+    TEST_ASSERT(err == NOX_OK);
+
+    /* Canary allocation başarılı olmalı */
+    void *p = arena_alloc_canary(&a, NOX_KEY_LEN);
+    TEST_ASSERT(p != NULL);
+
+    /* 16-byte hizalı olmalı */
+    TEST_ASSERT(((uintptr_t)p) % 16 == 0);
+
+    /* Offset artmış olmalı */
+    TEST_ASSERT(a.offset == NOX_KEY_LEN);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_alloc_canary_random(void)
+{
+    struct secure_arena a;
+    nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
+    TEST_ASSERT(err == NOX_OK);
+
+    /* İki canary allocation'ı farklı içerik döndürmeli */
+    uint8_t *c1 = arena_alloc_canary(&a, NOX_KEY_LEN);
+    uint8_t *c2 = arena_alloc_canary(&a, NOX_KEY_LEN);
+    TEST_ASSERT(c1 != NULL);
+    TEST_ASSERT(c2 != NULL);
+
+    /* Rastgele oldukları için farklı olmaları çok muhtemel */
+    bool all_same = true;
+    for (size_t i = 0; i < NOX_KEY_LEN; i++) {
+        if (c1[i] != c2[i]) {
+            all_same = false;
+            break;
+        }
+    }
+    /* Teknik olarak aynı olma ihtimali var (2^-256), ama pratikte imkansız */
+    TEST_ASSERT(!all_same);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_alloc_canary_overflow(void)
+{
+    struct secure_arena a;
+    nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
+    TEST_ASSERT(err == NOX_OK);
+
+    /* Arena'yı doldur — canary allocation başarısız olmalı */
+    size_t huge = a.usable_size + 1;
+    void *p = arena_alloc_canary(&a, huge);
+    TEST_ASSERT(p == NULL);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_alloc_canary_between_keys(void)
+{
+    struct secure_arena a;
+    nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
+    TEST_ASSERT(err == NOX_OK);
+
+    /* Gerçek key → canary → gerçek key simülasyonu */
+    uint8_t *key1 = arena_alloc(&a, NOX_KEY_LEN);
+    TEST_ASSERT(key1 != NULL);
+    memset(key1, 0x11, NOX_KEY_LEN);
+
+    void *canary = arena_alloc_canary(&a, NOX_KEY_LEN);
+    TEST_ASSERT(canary != NULL);
+
+    uint8_t *key2 = arena_alloc(&a, NOX_KEY_LEN);
+    TEST_ASSERT(key2 != NULL);
+    memset(key2, 0x22, NOX_KEY_LEN);
+
+    /* Key'lerin içerikleri korunmalı */
+    TEST_ASSERT(key1[0] == 0x11);
+    TEST_ASSERT(key2[0] == 0x22);
+
+    /* Canary rastgele (0x11 veya 0x22 olmamalı) */
+    TEST_ASSERT(((uint8_t *)canary)[0] != 0x11);
+    TEST_ASSERT(((uint8_t *)canary)[0] != 0x22);
+
+    /* Offset: 3 × NOX_KEY_LEN (16-byte hizalı) */
+    TEST_ASSERT(a.offset == NOX_KEY_LEN * 3);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+/* ================================================================
  * MAIN — Tüm testleri çalıştır
  * ================================================================ */
 int main(void)
@@ -286,6 +407,12 @@ int main(void)
     RUN_TEST(test_arena_alloc_null);
     RUN_TEST(test_arena_default_size);
     RUN_TEST(test_arena_memory_zeroed);
+    RUN_TEST(test_arena_alloc_canary_null);
+    RUN_TEST(test_arena_alloc_canary_zero_size);
+    RUN_TEST(test_arena_alloc_canary_valid);
+    RUN_TEST(test_arena_alloc_canary_random);
+    RUN_TEST(test_arena_alloc_canary_overflow);
+    RUN_TEST(test_arena_alloc_canary_between_keys);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n\n",
             tests_passed, tests_run);

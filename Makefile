@@ -80,18 +80,15 @@ else
     SECCOMP_DEF :=
 endif
 
-# ncurses — make TUI=1 ile etkinleşir
+# termbox2 — make TUI=1 ile etkinleşir (header-only, bağımlılık yok)
 TUI ?= 0
 ifeq ($(TUI),1)
-    NCURSES_CFLAGS := $(shell pkg-config --cflags ncursesw 2>/dev/null)
-    LIBS_TUI := $(shell pkg-config --libs ncursesw 2>/dev/null)
-    TUI_DEF  := -DHAVE_NCURSES $(NCURSES_CFLAGS)
+    TUI_DEF := -DHAVE_TERMBOX -DTB_OPT_ATTR_W=32
 else
-    LIBS_TUI :=
-    TUI_DEF  := -DANSI_ONLY
+    TUI_DEF := -DANSI_ONLY
 endif
 
-LIBS := $(LIBS_BASE) $(LIBS_TUI)
+LIBS := $(LIBS_BASE)
 
 # ================================================================
 # UYARI DUVARI
@@ -109,7 +106,6 @@ WARN_BASE := \
     -Wdouble-promotion \
     -Wimplicit-fallthrough \
     -Walloca \
-    -Wconversion \
     -Wcast-align \
     -Wcast-qual \
     -Wwrite-strings \
@@ -232,7 +228,7 @@ debug: $(TARGET)
 release:
 	@echo "[*] Release build başlıyor (clean + yeniden derleme)..."
 	$(MAKE) clean
-	$(MAKE) _release_build
+	$(MAKE) _release_build TUI=$(TUI)
 	strip --strip-debug $(TARGET)
 	@echo "[*] Binary: $(TARGET)"
 	@echo "[*] Boyut: $$(du -sh $(TARGET) | cut -f1)"

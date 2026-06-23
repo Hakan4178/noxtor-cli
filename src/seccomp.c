@@ -159,13 +159,6 @@ static const struct {
   { .num = SCMP_SYS(chown),             .name = "chown",             .stage = 3 },
   { .num = SCMP_SYS(fchown),            .name = "fchown",            .stage = 3 },
   { .num = SCMP_SYS(fchownat),          .name = "fchownat",          .stage = 3 },
-
-  /* open/openat/creat — Landlock ile path-based filtering desteklenmiyorsa
-   * fallback olarak tamamen yasaklanır.
-   * Landlock aktifse bu kurallar ATLANIR (Landlock zaten kısıtlıyor). */
-  { .num = SCMP_SYS(open),              .name = "open",              .stage = 3 },
-  { .num = SCMP_SYS(openat),            .name = "openat",            .stage = 3 },
-  { .num = SCMP_SYS(creat),             .name = "creat",             .stage = 3 },
 };
 
 /* ================================================================
@@ -283,7 +276,6 @@ nox_err_t seccomp_policy_load(int stage) {
         { PR_SET_TSC,                   "prctl(PR_SET_TSC)" },
         { PR_SET_SECUREBITS,            "prctl(PR_SET_SECUREBITS)" },
         { PR_SET_SYSCALL_USER_DISPATCH, "prctl(PR_SET_SYSCALL_USER_DISPATCH)" },
-        { PR_SET_VMA,                   "prctl(PR_SET_VMA)" },
         { PR_SET_MDWE,                  "prctl(PR_SET_MDWE)" },
       };
       for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {

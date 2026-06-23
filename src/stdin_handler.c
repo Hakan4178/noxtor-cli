@@ -13,6 +13,10 @@
 #include "tui.h"
 #include "state_machine.h"
 
+#ifdef HAVE_TERMBOX
+#include "termbox2.h"
+#endif
+
 #include <errno.h>
 #include <time.h>
 #include <string.h>
@@ -527,20 +531,32 @@ void process_line(struct app_state *state, const char *line) {
 
 void process_stdin_events(struct app_state *state) {
   if (tui_is_active()) {
-#ifdef HAVE_NCURSES
+#ifdef HAVE_TERMBOX
     for (;;) {
-      int ch = wgetch(g_tui.input_win);
-      if (ch == ERR) {
+      struct tb_event ev;
+      int rc = tb_peek_event(&ev, 0);
+      if (rc == TB_ERR_NO_EVENT)
         break;
-      }
-      if (ch == KEY_RESIZE) {
+      if (rc != TB_OK)
+        break;
+      if (ev.type == TB_EVENT_RESIZE) {
         tui_resize();
         tui_refresh_all(state);
         continue;
       }
-      const char *line = tui_handle_input(state, ch);
-      if (line) {
-        process_line(state, line);
+      if (ev.type == TB_EVENT_KEY) {
+        /* termbox2 key → int ch mapping */
+        int ch;
+        if (ev.ch)
+          ch = (int)ev.ch;
+        else
+          ch = (int)ev.key;
+        const char *line = tui_handle_input(state, ch);
+        if (line) {
+          process_line(state, line);
+          /* Komut işlendi — input buffer'ı temizle */
+          sodium_memzero(g_tui.input_buf, sizeof(g_tui.input_buf));
+        }
       }
     }
 #endif

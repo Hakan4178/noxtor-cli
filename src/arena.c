@@ -402,6 +402,29 @@ void *arena_alloc(struct secure_arena *a, size_t size)
 }
 
 /* ================================================================
+ * arena_alloc_canary — Canary (honeypot) allocation
+ *
+ * Key'lerin arasına sahte key'ler yerleştirir.
+ * Rastgele byte'lar ile doldurulur — gerçek key'den ayırt edilemez.
+ *
+ * RCE sonrası memory scanning'i zorlaştırır:
+ *   - Saldırgan hangisinin gerçek hangisinin sahte olduğunu bilemez
+ *   - Honeypot'ları kullanmaya çalışırsa hata üretir
+ *
+ * @a:    Aktif arena
+ * @size: Canary boyutu (genellikle NOX_KEY_LEN = 32)
+ *
+ * Return: Rastgele byte'larla dolu pointer veya NULL (taşma/NULL guard)
+ * ================================================================ */
+void *arena_alloc_canary(struct secure_arena *a, size_t size)
+{
+    void *ptr = arena_alloc(a, size);
+    if (ptr)
+        randombytes_buf(ptr, size);
+    return ptr;
+}
+
+/* ================================================================
  * arena_check_canary — Buffer overflow tespiti
  *
  * Sabit zamanlı karşılaştırma ile timing side-channel koruması.

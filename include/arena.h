@@ -49,6 +49,17 @@ nox_err_t arena_init(struct secure_arena *a, size_t size);
 void *arena_alloc(struct secure_arena *a, size_t size);
 
 /*
+ * arena_alloc_canary — Canary (honeypot) allocation
+ *
+ * Key'lerin arasına sahte key'ler yerleştirir.
+ * Rastgele byte'lar ile doldurulur — gerçek key'den ayırt edilemez.
+ * RCE sonrası memory scanning'i zorlaştırır.
+ *
+ * Return: Rastgele byte'larla dolu pointer veya NULL
+ */
+void *arena_alloc_canary(struct secure_arena *a, size_t size);
+
+/*
  * arena_check_canary — Canary bütünlük kontrolü
  *
  * Taşma tespiti. Canary bozulmuşsa programı sonlandırır (abort).

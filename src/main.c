@@ -99,6 +99,27 @@ static void sigchld_handler(int sig) {
   g_tor_died = 1;
 }
 
+/* ================================================================
+ * SECCOMP STAGE 1 CONSTRUCTOR — main'den önce yüklenir
+ *
+ * glibc CRT → constructor → main sırasıyla çalışılır.
+ * Bu noktada log sistemi, arena, sodium henüz başlatılmamış —
+ * ama stage 1'in engellediği hiçbir syscall'a ihtiyaç yok.
+ * ================================================================ */
+#ifndef NO_SECCOMP
+__attribute__((constructor))
+static void seccomp_stage1_early(void) {
+#ifdef PR_SET_NO_NEW_PRIVS
+  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+#endif
+  if (seccomp_policy_load(1) != NOX_OK) {
+    const char msg[] = "FATAL: seccomp stage 1 yüklenemedi\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+  }
+}
+#endif
+
 static void setup_signal_handlers(void) {
   struct sigaction sa = {
       .sa_handler = signal_handler,
@@ -588,8 +609,8 @@ static void prompt_transport_selection(struct app_state *state) {
     (void)argc;
     (void)argv;
 
-    /* Struct'ı sıfırla — tüm fd'ler -1 olmalı */
-    struct app_state state = {
+    /* Struct'ı sıfırla — static: stack overflow riskini ortadan kaldırır */
+    static struct app_state state = {
         .tor_ctrl_fd = -1,
         .tor_pid = 0,
         .epoll_fd = -1,
@@ -812,6 +833,7 @@ static void prompt_transport_selection(struct app_state *state) {
 
     /* ── 9. Key derivation: PIN → master_key ──────────── */
     state.master_key = arena_alloc(&state.arena, NOX_KEY_LEN);
+    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: master_key sonrası */
     if (!state.master_key) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (master_key)");
       sodium_memzero(pin_buf, sizeof(pin_buf));
@@ -837,8 +859,11 @@ static void prompt_transport_selection(struct app_state *state) {
 
     /* ── 10. Subkey türetimi ─────────────────────────── */
     state.db_key = arena_alloc(&state.arena, NOX_KEY_LEN);
+    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: db_key sonrası */
     uint8_t *identity_unlock = arena_alloc(&state.arena, NOX_KEY_LEN);
+    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: identity_unlock sonrası */
     state.session_key = arena_alloc(&state.arena, NOX_KEY_LEN);
+    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: session_key sonrası */
 
     if (!state.db_key || !identity_unlock || !state.session_key) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (subkeys)");
@@ -857,6 +882,7 @@ static void prompt_transport_selection(struct app_state *state) {
 
     /* ── 11. Identity key yükle, oluştur ve Curve25519'a dönüştür ── */
     state.my_static_priv = arena_alloc(&state.arena, NOX_KEY_LEN);
+    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: my_static_priv sonrası */
     state.my_static_pub = arena_alloc(&state.arena, NOX_KEY_LEN);
     if (!state.my_static_priv || !state.my_static_pub) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (static keys)");
@@ -944,30 +970,8 @@ static void prompt_transport_selection(struct app_state *state) {
     NOX_DEBUG(LOG_MOD_MAIN, "identity_unlock bellekten silindi");
 
     /* ── 10b. Seccomp Stage 1 ──────────────────────────────────
-     * PR_SET_DUMPABLE=0 zaten arena_init sonrası ayarlandı (8b).
-     * Seccomp prctl'i blacklist'liyor — burada çağrılamaz. */
-
-    /* NO_NEW_PRIVS — seccomp filter yüklemeden ÖNCE ayarla.
-     * execve() ile privilege escalation engellenir.
-     * Tor child'a da miras kalır — Tor zaten elevated privilege gerektirmez. */
-#ifdef PR_SET_NO_NEW_PRIVS
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-      NOX_WARN(LOG_MOD_MAIN, "PR_SET_NO_NEW_PRIVS ayarlanamadı (errno=%d)", errno);
-    }
-#endif
-
-#ifndef NO_SECCOMP
-    /* 120s Tor bootstrap pencere koruması.
-     * process_vm_readv, ptrace, io_uring engellenir.
-     * fork/execve hâlâ serbest — tor_spawn() için gerekli. */
-    if (seccomp_policy_load(1) != NOX_OK) {
-      NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 1 yüklenemedi");
-      arena_destroy(&state.arena);
-      return 1;
-    }
-#else
-    NOX_WARN(LOG_MOD_MAIN, "Seccomp devre dışı (NO_SECCOMP tanımlı)");
-#endif
+     * Artık __attribute__((constructor)) ile main'den önce yükleniyor.
+     * Bak: seccomp_stage1_early() fonksiyonu. */
 
     /* ── Pluggable Transport Seçimi (Faz 6.2) ── */
     prompt_transport_selection(&state);
@@ -1140,7 +1144,6 @@ static void prompt_transport_selection(struct app_state *state) {
                  1024);
 
     tui_init();
-    tui_print_welcome(&state);
     tui_refresh_all(&state);
 
 #ifndef NO_SECCOMP

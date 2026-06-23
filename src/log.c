@@ -15,6 +15,7 @@
 
 #include "common.h"
 #include "types.h"
+#include "tui.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -115,6 +116,24 @@ void nox_log_impl(log_level_t level, log_module_t mod,
 
     if ((unsigned)level > LOG_LEVEL_FATAL)
         level = LOG_LEVEL_INFO;
+
+    /* ── TUI aktif mi? ── */
+    if (tui_is_active()) {
+        /* Düz metin formatı — ANSI kodu yok */
+        char msg[2048];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(msg, sizeof(msg), fmt, ap);
+        va_end(ap);
+
+        char line_buf[2200];
+        snprintf(line_buf, sizeof(line_buf), "[LOG] [%s] [%s] %s",
+                 levels[level].tag, modules[mod].name, msg);
+        tui_chat_append(line_buf);
+        return;
+    }
+
+    /* ── Terminal modu — mevcut ANSI renkli çıktı ── */
 
     /* Zaman damgası */
     fprintf(stderr, "[");

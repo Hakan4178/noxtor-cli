@@ -68,9 +68,6 @@ static void process_peer_frames(struct app_state *state, int fd) {
     }
 
     /* Frame tamamlandı — payload'ı ayıkla */
-    if (fh.len == 0 || fh.len > 4096 + NOX_MAC_LEN) {
-      break;
-    }
     uint8_t *payload = sodium_malloc(fh.len);
     if (!payload) {
       state->recv_pos = 0;
@@ -215,6 +212,13 @@ static void process_peer_frames(struct app_state *state, int fd) {
             }
           } else {
             /* Atomic ANSI: cursor hide → clear → print warning → prompt */
+            if (tui_is_active()) {
+              ui_print_error(state, "[!] UYARI: AKRANIN ANAHTARI DEĞİŞMİŞ! (MITM RİSKİ)");
+              ui_print_error(state, "      Adres: %s", peer_onion);
+              ui_print_error(state, "      Kayıtlı İsim: %s", name);
+              ui_print_error(state, "      Yeni Fingerprint: %s", fp_str);
+              ui_print_error(state, "  [?] Yeni anahtarı onaylıyor musunuz? (y/n): ");
+            } else {
             fprintf(stderr, "\033[?25l");
             clear_prompt_area(state);
             fprintf(stderr, "\n\033[31m  [!] UYARI: AKRANIN ANAHTARI "
@@ -227,6 +231,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
             fflush(stderr);
             fprintf(stderr, "\033[?25h");
             fflush(stderr);
+            }
 
             state->tofu_pending = true;
             state->tofu_peer_fd = fd;
@@ -241,6 +246,13 @@ static void process_peer_frames(struct app_state *state, int fd) {
             state->peer_state = ST_TOFU_PENDING;
           }
          } else {
+          if (tui_is_active()) {
+            ui_print_system(state, "[!] TOFU: Yeni peer bağlantısı");
+            ui_print_system(state, "      Adres: %s", peer_onion);
+            ui_print_system(state, "      Fingerprint: %s", fp_str);
+            ui_print_system(state, "  [?] Bu bağlantıyı onaylıyor ve rehbere "
+                            "kaydediyor musunuz? (y/n): ");
+          } else {
           fprintf(stderr, "\033[?25l");
           clear_prompt_area(state);
           fprintf(stderr,
@@ -252,6 +264,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
           fflush(stderr);
           fprintf(stderr, "\033[?25h");
           fflush(stderr);
+          }
 
           char default_name[NOX_CONTACT_NAME_LEN + 1];
           if (db_err == NOX_OK && zero_key && name[0] != '\0') {
@@ -347,8 +360,8 @@ void event_loop(struct app_state *state) {
    * Tüm mevcut bağlantılar AF_UNIX (Tor control, SOCKS, peer).
    * Event loop tek thread — clone tamamen yasak.
    * TCP/UDP/NETLINK socket oluşturulamaz.
-   * open/openat/creat Landlock tarafından kısıtlandıysa, seccomp
-   * tarafından da engellenir (defense in depth). */
+   * open/openat/creat seccomp tarafından engellenmez —
+   * Landlock path-based filtering sağlar (yoksa openat serbest). */
   if (seccomp_policy_load(3) != NOX_OK) {
     NOX_ERROR(LOG_MOD_MAIN, "seccomp stage 3 yüklenemedi");
     ui_print_error(state, "Güvenlik politikası yüklenemedi.");
@@ -356,10 +369,54 @@ void event_loop(struct app_state *state) {
     return;
   }
 
-  /* ── Komutlar banner'ı — stage 3 sonrası ──────────────────────
-   * Banner stage 3'ten sonra basılır: clone/TCP/UDP/NETLINK
-   * zaten engellenmiş, sadece fprintf() çalışır. */
-  if (!tui_is_active()) {
+  /* ── Hoşgeldiniz + Komutlar — stage 3 sonrası ────────────────
+   * Hem TUI hem terminal modunda hoşgeldiniz ve komut listesi basılır.
+   * Stage 3'ten sonra basılır: clone/TCP/UDP/NETLINK zaten engellenmiş. */
+  if (tui_is_active()) {
+    tui_print_welcome(state);
+    if (state->ghost_mode) {
+      ui_print_system(state, "[👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı");
+    }
+
+    /* Renkli komut listesi — ASCII banner ile aynı renkler */
+    char tbuf[256];
+    struct timespec ts;
+    struct tm tm_buf;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
+    localtime_r(&ts.tv_sec, &tm_buf);
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Komutlar:",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append(tbuf);
+
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /addr               — .onion adresini göster",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append_colored(tbuf, 0xD21826);
+
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /connect <onion>    — peer'a bağlan",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append_colored(tbuf, 0xE07E14);
+
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /add <onion> <isim> — rehbere kişi ekle",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append_colored(tbuf, 0xCA970F);
+
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /msg <onion> <msj>  — çevrimdışı/kuyruklu mesaj gönder",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append_colored(tbuf, 0x26A269);
+
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /file <dosya_yolu>  — peer'a dosya gönder",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append_colored(tbuf, 0x1F4175);
+
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   Ctrl+P              — çıkış",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append_colored(tbuf, 0x853C99);
+
+    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Bağlantı kurulduktan sonra yazdığınız her şey mesaj olarak gönderilir.",
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    tui_chat_append(tbuf);
+    tui_refresh_all(state);
+  } else {
     if (state->ghost_mode) {
       fprintf(
           stderr,

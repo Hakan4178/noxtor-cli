@@ -1,136 +1,155 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * tui.c — noxtor-cli ncurses TUI implementasyonu
+ * tui.c — noxtor-cli termbox2 TUI implementasyonu
  *
- * Yalnızca HAVE_NCURSES tanımlıysa derlenir (Makefile: TUI=1).
+ * Yalnızca HAVE_TERMBOX tanımlıysa derlenir (Makefile: TUI=1).
  *
  * 3-Panel Düzen:
  *   Sidebar (22 karakter) | Chat + Input
  *
- * Renk paleti nox_theme ile uyumlu:
- *   PAIR 1: [Sen]     → yeşil    (38, 162, 105)
- *   PAIR 2: [Peer]    → mor      (133, 60, 153)
- *   PAIR 3: Sistem    → amber    (202, 151, 15)
- *   PAIR 4: Hata      → kırmızı  (210, 24, 38)
- *   PAIR 5: Sidebar   → teal     (34, 105, 121)
- *   PAIR 6: Zaman     → koyu mavi(31, 65, 117)
- *   PAIR 7: Aktif peer→ beyaz/bg
+ * Renk paleti (truecolor 0xRRGGBB):
+ *   [Sen]     → yeşil    0x26A269
+ *   [Peer]    → mor      0x853C99
+ *   Sistem    → amber    0xC9970F
+ *   [!] Hata  → kırmızı  0xD21826
+ *   Sidebar   → teal     0x226979
+ *   Zaman     → koyu mavi 0x1F4175
  */
 
-#ifdef HAVE_NCURSES
+#ifdef HAVE_TERMBOX
 
+#define TB_IMPL
 #include "tui.h"
 #include "common.h"
 #include "types.h"
 #include "database.h"
 #include "ui.h"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include "termbox2.h"
+#pragma GCC diagnostic pop
 
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 /* ── Global TUI State ─────────────────────── */
 struct tui_state g_tui;
 
-/* ── ncurses Renk Çiftleri ────────────────── */
-enum {
-    CLR_SELF = 1,
-    CLR_PEER,
-    CLR_SYSTEM,
-    CLR_ERROR,
-    CLR_SIDEBAR,
-    CLR_TIMESTAMP,
-    CLR_ACTIVE_PEER,
-    CLR_BORDER,
-};
+/* ── Truecolor Renkler (0xRRGGBB) ─────────── */
+#define TC_SELF       0x26A269
+#define TC_PEER       0x853C99
+#define TC_SYSTEM     0xC9970F
+#define TC_ERROR      0xD21826
+#define TC_SIDEBAR    0x226979
+#define TC_TIMESTAMP  0x1F4175
+#define TC_ACTIVE_BG  0x226979
 
 /* ── Yardımcılar ──────────────────────────── */
-static int g_rows, g_cols;
 static void tui_load_contacts(struct app_state *state);
 
-static void get_dimensions(void)
-{
-    getmaxyx(stdscr, g_rows, g_cols);
-}
-
-/* Renkleri başlat — true color destekleniyorsa extended, yoksa basic */
-static void init_colors(void)
-{
-    start_color();
-    use_default_colors();
-
-    if (can_change_color() && COLORS >= 256) {
-        /* Tema renklerini custom tanımla (RGB 0-1000 scale) */
-        init_color(10, 149, 635, 412);   /* yeşil  (38,162,105) */
-        init_color(11, 522, 235, 600);   /* mor    (133,60,153) */
-        init_color(12, 792, 592, 59);    /* amber  (202,151,15) */
-        init_color(13, 824, 94, 149);    /* kırmızı(210,24,38)  */
-        init_color(14, 133, 412, 475);   /* teal   (34,105,121) */
-        init_color(15, 122, 255, 459);   /* koyu mavi(31,65,117)*/
-
-        init_pair(CLR_SELF,        10, -1);
-        init_pair(CLR_PEER,        11, -1);
-        init_pair(CLR_SYSTEM,      12, -1);
-        init_pair(CLR_ERROR,       13, -1);
-        init_pair(CLR_SIDEBAR,     14, -1);
-        init_pair(CLR_TIMESTAMP,   15, -1);
-        init_pair(CLR_ACTIVE_PEER, COLOR_BLACK, 14);
-        init_pair(CLR_BORDER,      14, -1);
+/* Unicode codepoint'i UTF-8 byte dizisine çevir.
+ * buf: en az 5 byte (4 data + null). Return: byte sayısı (1-4). */
+static int utf8_encode(uint32_t cp, char *buf) {
+    if (cp < 0x80) {
+        buf[0] = (char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
     } else {
-        /* Fallback: temel 8 renk */
-        init_pair(CLR_SELF,        COLOR_GREEN,   -1);
-        init_pair(CLR_PEER,        COLOR_MAGENTA, -1);
-        init_pair(CLR_SYSTEM,      COLOR_YELLOW,  -1);
-        init_pair(CLR_ERROR,       COLOR_RED,     -1);
-        init_pair(CLR_SIDEBAR,     COLOR_CYAN,    -1);
-        init_pair(CLR_TIMESTAMP,   COLOR_BLUE,    -1);
-        init_pair(CLR_ACTIVE_PEER, COLOR_BLACK,   COLOR_CYAN);
-        init_pair(CLR_BORDER,      COLOR_CYAN,    -1);
+        buf[0] = (char)(0xF0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
     }
 }
 
-/* Alt pencere boyutlarını hesapla ve oluştur */
-static void create_windows(void)
-{
-    get_dimensions();
+/* input_buf'da byte offset'indeki character'in byte sayısını bul (1-4) */
+static int utf8_char_bytes(const char *buf, int byte_pos, int buf_len) {
+    if (byte_pos >= buf_len) return 0;
+    unsigned char b = (unsigned char)buf[byte_pos];
+    int len;
+    if (b < 0x80)          len = 1;
+    else if (b < 0xE0)     len = 2;
+    else if (b < 0xF0)     len = 3;
+    else                    len = 4;
+    if (byte_pos + len > buf_len) return 1;
+    return len;
+}
 
-    int sidebar_w = TUI_SIDEBAR_WIDTH;
-    int chat_w    = g_cols - sidebar_w;
-    int chat_h    = g_rows - TUI_INPUT_HEIGHT;
-    int input_h   = TUI_INPUT_HEIGHT;
+/* Byte offset'inden önceki karakterin byte sayısını bul (backspace için) */
+static int utf8_prev_char_bytes(const char *buf, int byte_pos) {
+    if (byte_pos <= 0) return 0;
+    int i = byte_pos - 1;
+    while (i > 0 && ((unsigned char)buf[i] & 0xC0) == 0x80)
+        i--;
+    return byte_pos - i;
+}
 
-    /* Minimum boyut koruması */
-    if (chat_w < 20) chat_w = 20;
-    if (chat_h < 5)  chat_h = 5;
+/* Byte offset'inden itibaren ekran genişliğini hesapla (cursor için) */
+#include <wchar.h>
+static int input_display_width_up_to(int byte_pos) {
+    mbstate_t ps;
+    memset(&ps, 0, sizeof(ps));
+    int width = 0;
+    const char *p = g_tui.input_buf;
+    int remaining = byte_pos;
+    while (remaining > 0) {
+        wchar_t wc;
+        size_t consumed = mbrtowc(&wc, p, (size_t)remaining, &ps);
+        if (consumed == 0 || consumed == (size_t)-1 || consumed == (size_t)-2)
+            break;
+        int w = wcwidth(wc);
+        width += (w > 0) ? w : 1;
+        p += consumed;
+        remaining -= (int)consumed;
+    }
+    return width;
+}
 
-    /* Border pencereler (çerçeve çizimi için) */
-    g_tui.sidebar_border = newwin(g_rows, sidebar_w, 0, 0);
-    g_tui.chat_border    = newwin(chat_h, chat_w, 0, sidebar_w);
-    g_tui.input_border   = newwin(input_h, chat_w, chat_h, sidebar_w);
+/* Düz çizgi */
+static void hline(int x, int y, int len, uintattr_t fg) {
+    for (int i = 0; i < len; i++)
+        tb_set_cell(x + i, y, 0x2500, fg, 0);  /* ─ */
+}
 
-    /* İç pencereler (içerik yazımı için — border'ın 1 px içinde) */
-    g_tui.sidebar_win = derwin(g_tui.sidebar_border, g_rows - 2, sidebar_w - 2, 1, 1);
-    g_tui.chat_win    = derwin(g_tui.chat_border, chat_h - 2, chat_w - 2, 1, 1);
-    g_tui.input_win   = derwin(g_tui.input_border, input_h - 2, chat_w - 2, 1, 1);
+/* Kutu çerçeve çiz */
+static void draw_box(int x, int y, int w, int h, uintattr_t fg) {
+    if (w < 2 || h < 2) return;
 
-    /* Scroll aktif */
-    scrollok(g_tui.chat_win, TRUE);
+    /* Köşeler */
+    tb_set_cell(x, y, 0x250C, fg, 0);              /* ┌ */
+    tb_set_cell(x + w - 1, y, 0x2510, fg, 0);      /* ┐ */
+    tb_set_cell(x, y + h - 1, 0x2514, fg, 0);      /* └ */
+    tb_set_cell(x + w - 1, y + h - 1, 0x2518, fg, 0); /* ┘ */
 
-    /* Renk ve border ayarları */
-    wattron(g_tui.sidebar_border, COLOR_PAIR(CLR_BORDER));
-    box(g_tui.sidebar_border, 0, 0);
-    mvwprintw(g_tui.sidebar_border, 0, 2, " Rehber ");
-    wattroff(g_tui.sidebar_border, COLOR_PAIR(CLR_BORDER));
+    /* Yatay kenarlar */
+    for (int i = 1; i < w - 1; i++) {
+        tb_set_cell(x + i, y, 0x2500, fg, 0);          /* ─ */
+        tb_set_cell(x + i, y + h - 1, 0x2500, fg, 0);  /* ─ */
+    }
 
-    wattron(g_tui.chat_border, COLOR_PAIR(CLR_BORDER));
-    box(g_tui.chat_border, 0, 0);
-    mvwprintw(g_tui.chat_border, 0, 2, " Sohbet ");
-    wattroff(g_tui.chat_border, COLOR_PAIR(CLR_BORDER));
+    /* Dikey kenarlar */
+    for (int i = 1; i < h - 1; i++) {
+        tb_set_cell(x, y + i, 0x2502, fg, 0);              /* │ */
+        tb_set_cell(x + w - 1, y + i, 0x2502, fg, 0);      /* │ */
+    }
+}
 
-    wattron(g_tui.input_border, COLOR_PAIR(CLR_BORDER));
-    box(g_tui.input_border, 0, 0);
-    wattroff(g_tui.input_border, COLOR_PAIR(CLR_BORDER));
+/* Başlık yazısı (kutu içinde) */
+static void draw_title(int x, int y, const char *title, uintattr_t fg) {
+    tb_print(x + 2, y, fg, 0, title);
 }
 
 /* ================================================================
@@ -145,22 +164,24 @@ void tui_init(void)
     for (int i = 0; i < TUI_CHAT_SCROLLBACK; i++)
         g_tui.chat_lines[i] = NULL;
 
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);   /* Non-blocking getch — epoll uyumu */
-    curs_set(1);
+    int rc = tb_init();
+    if (rc != TB_OK) {
+        fprintf(stderr, "tui: termbox init başarısız: %s\n", tb_strerror(rc));
+        return;
+    }
 
-    init_colors();
-    create_windows();
+    tb_set_output_mode(TB_OUTPUT_TRUECOLOR);
+    tb_set_cursor(-1, -1);  /* İmleci gizle */
 
+    g_tui.cols = tb_width();
+    g_tui.rows = tb_height();
     g_tui.active = true;
     g_tui.focus = TUI_FOCUS_INPUT;
     g_tui.selected_idx = 0;
 
     tui_draw_chat();
     tui_draw_input();
+    tb_present();
 }
 
 void tui_print_welcome(struct app_state *state)
@@ -187,21 +208,12 @@ void tui_shutdown(void)
 
     g_tui.active = false;
 
-    /* Scrollback buffer temizliği */
     for (int i = 0; i < TUI_CHAT_SCROLLBACK; i++) {
         free(g_tui.chat_lines[i]);
         g_tui.chat_lines[i] = NULL;
     }
 
-    /* Alt pencereleri sil (derwin -> delwin önce) */
-    if (g_tui.sidebar_win)  delwin(g_tui.sidebar_win);
-    if (g_tui.chat_win)     delwin(g_tui.chat_win);
-    if (g_tui.input_win)    delwin(g_tui.input_win);
-    if (g_tui.sidebar_border) delwin(g_tui.sidebar_border);
-    if (g_tui.chat_border)    delwin(g_tui.chat_border);
-    if (g_tui.input_border)   delwin(g_tui.input_border);
-
-    endwin();
+    tb_shutdown();
 }
 
 void tui_resize(void)
@@ -209,17 +221,9 @@ void tui_resize(void)
     if (!g_tui.active)
         return;
 
-    /* Eski pencereleri temizle */
-    if (g_tui.sidebar_win)  delwin(g_tui.sidebar_win);
-    if (g_tui.chat_win)     delwin(g_tui.chat_win);
-    if (g_tui.input_win)    delwin(g_tui.input_win);
-    if (g_tui.sidebar_border) delwin(g_tui.sidebar_border);
-    if (g_tui.chat_border)    delwin(g_tui.chat_border);
-    if (g_tui.input_border)   delwin(g_tui.input_border);
-
-    endwin();
-    refresh();
-    create_windows();
+    g_tui.cols = tb_width();
+    g_tui.rows = tb_height();
+    tb_clear();
 }
 
 /* ================================================================
@@ -250,7 +254,6 @@ static void tui_load_contacts(struct app_state *state)
         db_list_contacts(contact_visitor, state);
     }
 
-    /* Eğer aktif peer listede yoksa geçici olarak ekleyelim */
     if (state->peer_fd >= 0 && state->active_peer_onion[0] != '\0') {
         bool found = false;
         for (int i = 0; i < g_tui.contact_count; i++) {
@@ -270,9 +273,6 @@ static void tui_load_contacts(struct app_state *state)
     }
 }
 
-/* ================================================================
- * SIDEBAR ÇİZİMİ
- * ================================================================ */
 void tui_draw_sidebar(struct app_state *state)
 {
     if (!g_tui.active)
@@ -280,24 +280,31 @@ void tui_draw_sidebar(struct app_state *state)
 
     tui_load_contacts(state);
 
-    werase(g_tui.sidebar_win);
+    int sidebar_w = TUI_SIDEBAR_WIDTH;
+    int chat_w = g_tui.cols - sidebar_w;
+    if (chat_w < 20) chat_w = 20;
 
-    int max_y, max_x;
-    getmaxyx(g_tui.sidebar_win, max_y, max_x);
-    (void)max_x;
+    /* Border */
+    draw_box(0, 0, sidebar_w, g_tui.rows, TC_SIDEBAR);
+    draw_title(0, 0, " Rehber ", TC_SIDEBAR);
 
+    /* İçerik bölgesi: x=1..sidebar_w-2, y=1..rows-2 */
+    int content_w = sidebar_w - 2;
+    int content_h = g_tui.rows - 2;
+    int name_w = content_w - 2;  /* ● için yer bırak */
     int row = 0;
 
-    for (int i = 0; i < g_tui.contact_count; i++) {
+    for (int i = 0; i < g_tui.contact_count && row < content_h; i++) {
         struct tui_contact *tc = &g_tui.contacts[i];
-        
+
         char display_name[128];
         if (tc->name[0] != '\0') {
             snprintf(display_name, sizeof(display_name), "%s", tc->name);
         } else {
             size_t olen = strlen(tc->onion);
             if (olen >= 12) {
-                snprintf(display_name, sizeof(display_name), "%.4s..%.4s", tc->onion, tc->onion + olen - 10);
+                snprintf(display_name, sizeof(display_name), "%.4s..%.4s",
+                         tc->onion, tc->onion + olen - 10);
             } else {
                 snprintf(display_name, sizeof(display_name), "%s", tc->onion);
             }
@@ -306,64 +313,45 @@ void tui_draw_sidebar(struct app_state *state)
         bool is_selected = (g_tui.focus == TUI_FOCUS_SIDEBAR && g_tui.selected_idx == i);
         bool is_active_chat = (state->peer_fd >= 0 && strcmp(state->active_peer_onion, tc->onion) == 0);
 
+        uintattr_t fg = TC_SIDEBAR;
+        uintattr_t bg = 0;
         if (is_selected) {
-            wattron(g_tui.sidebar_win, COLOR_PAIR(CLR_ACTIVE_PEER) | A_BOLD);
+            fg = 0xFFFFFF;
+            bg = TC_ACTIVE_BG;
         } else if (is_active_chat) {
-            wattron(g_tui.sidebar_win, COLOR_PAIR(CLR_SIDEBAR) | A_BOLD);
+            fg = TC_SIDEBAR | TB_BOLD;
         }
 
-        mvwprintw(g_tui.sidebar_win, row, 0, " %-*.*s", TUI_SIDEBAR_WIDTH - 5, TUI_SIDEBAR_WIDTH - 5, display_name);
+        /* İsim yaz — tb_print UTF-8 destekler */
+        tb_printf(1, 1 + row, fg, bg, "%-*.*s", name_w, name_w, display_name);
 
-        if (is_selected) {
-            wattroff(g_tui.sidebar_win, COLOR_PAIR(CLR_ACTIVE_PEER) | A_BOLD);
-        } else if (is_active_chat) {
-            wattroff(g_tui.sidebar_win, COLOR_PAIR(CLR_SIDEBAR) | A_BOLD);
-        }
-
+        /* Online göstergesi */
         if (tc->online) {
-            wattron(g_tui.sidebar_win, COLOR_PAIR(CLR_SELF));
-            wprintw(g_tui.sidebar_win, " ●");
-            wattroff(g_tui.sidebar_win, COLOR_PAIR(CLR_SELF));
-        } else {
-            wprintw(g_tui.sidebar_win, "  ");
+            tb_set_cell(1 + name_w, 1 + row, 0x25CF, TC_SELF, 0);  /* ● */
         }
 
         row++;
-        if (row >= max_y - 2) break;
     }
 
     /* Ayırıcı çizgi */
-    if (row > 0 && row < max_y - 2) {
-        mvwhline(g_tui.sidebar_win, row, 0, ACS_HLINE, TUI_SIDEBAR_WIDTH - 2);
+    if (row > 0 && row < content_h) {
+        hline(1, 1 + row, content_w, TC_SIDEBAR);
         row++;
     }
 
     /* "+ /connect" seçeneği */
-    if (row < max_y) {
-        bool is_plus_selected = (g_tui.focus == TUI_FOCUS_SIDEBAR && g_tui.selected_idx == g_tui.contact_count);
+    if (row < content_h) {
+        uintattr_t fg = TC_SIDEBAR;
+        uintattr_t bg = 0;
+        bool is_plus_selected = (g_tui.focus == TUI_FOCUS_SIDEBAR &&
+                                 g_tui.selected_idx == g_tui.contact_count);
         if (is_plus_selected) {
-            wattron(g_tui.sidebar_win, COLOR_PAIR(CLR_ACTIVE_PEER) | A_BOLD);
-        } else {
-            wattron(g_tui.sidebar_win, COLOR_PAIR(CLR_SIDEBAR));
+            fg = 0xFFFFFF;
+            bg = TC_ACTIVE_BG;
         }
-
-        mvwprintw(g_tui.sidebar_win, row, 0, " %-*s", TUI_SIDEBAR_WIDTH - 2, "+ /connect");
-
-        if (is_plus_selected) {
-            wattroff(g_tui.sidebar_win, COLOR_PAIR(CLR_ACTIVE_PEER) | A_BOLD);
-        } else {
-            wattroff(g_tui.sidebar_win, COLOR_PAIR(CLR_SIDEBAR));
-        }
+        const char *label = "+ /connect";
+        tb_printf(1, 1 + row, fg, bg, "%-*s", content_w, label);
     }
-
-    /* Border'ı güncelle */
-    wattron(g_tui.sidebar_border, COLOR_PAIR(CLR_BORDER));
-    box(g_tui.sidebar_border, 0, 0);
-    mvwprintw(g_tui.sidebar_border, 0, 2, " Rehber ");
-    wattroff(g_tui.sidebar_border, COLOR_PAIR(CLR_BORDER));
-
-    wnoutrefresh(g_tui.sidebar_border);
-    wnoutrefresh(g_tui.sidebar_win);
 }
 
 /* ================================================================
@@ -371,24 +359,22 @@ void tui_draw_sidebar(struct app_state *state)
  * ================================================================ */
 void tui_chat_append(const char *line)
 {
+    tui_chat_append_colored(line, 0);
+}
+
+void tui_chat_append_colored(const char *line, uintattr_t fg)
+{
     if (!g_tui.active || !line || !*line)
         return;
 
-    int max_x;
-    int max_y_tmp;
-    getmaxyx(g_tui.chat_win, max_y_tmp, max_x);
-    (void)max_y_tmp;
-    if (max_x <= 0) max_x = 80;
+    int sidebar_w = TUI_SIDEBAR_WIDTH;
+    int content_w = g_tui.cols - sidebar_w - 2;
+    if (content_w < 10) content_w = 10;
 
-    /* Prefix uzunluğunu hesapla.
-     * Format: "[HH:MM:SS.mmm] [Sen] mesaj" veya "[HH:MM:SS.mmm] [Peer] mesaj"
-     * veya "[HH:MM:SS.mmm] mesaj" (sistem).
-     * "] " kalıbını ara — bu, ikinci parantez çifti (ya [Sen]/[Peer] ya da
-     * timestamp sonu). İkisini de bulmak için son "] " kalıbını kullan. */
+    /* Prefix uzunluğunu hesapla */
     size_t prefix_len = 0;
     const char *msg_start = NULL;
 
-    /* Son "] " kalıbını bul — mesaj buradan başlar */
     const char *last_bracket = NULL;
     const char *search = line;
     while ((search = strstr(search, "] ")) != NULL) {
@@ -397,37 +383,37 @@ void tui_chat_append(const char *line)
     }
 
     if (last_bracket) {
-        msg_start = last_bracket + 2; /* "] " sonrası */
+        msg_start = last_bracket + 2;
         prefix_len = (size_t)(msg_start - line);
     }
 
     if (prefix_len == 0 || !msg_start) {
         prefix_len = strlen(line);
-        msg_start = line; /* fallback: tüm satır mesaj */
+        msg_start = line;
     }
 
     size_t msg_len = strlen(msg_start);
-    /* Wrap genişliği: ncurses son sütuna yazınca auto-wrap yapabilir,
-     * bu yüzden max_x - 1 kullan (son sütun her zaman boş kalır). */
-    size_t wrap_width = (max_x > 1) ? (size_t)(max_x - 1) : (size_t)max_x;
+    size_t wrap_width = (content_w > 1) ? (size_t)(content_w - 1) : (size_t)content_w;
     if (prefix_len >= wrap_width) wrap_width = prefix_len + 1;
 
-    /* Mesaj tek satıra sığıyor mu? */
+    /* Tek satır */
     if (msg_len == 0 || prefix_len + msg_len <= wrap_width) {
-        /* Tek satır — olduğu gibi ekle */
         if (g_tui.chat_line_count >= TUI_CHAT_SCROLLBACK) {
             free(g_tui.chat_lines[0]);
             memmove(&g_tui.chat_lines[0], &g_tui.chat_lines[1],
                     (size_t)(TUI_CHAT_SCROLLBACK - 1) * sizeof(char *));
+            memmove(&g_tui.chat_line_colors[0], &g_tui.chat_line_colors[1],
+                    (size_t)(TUI_CHAT_SCROLLBACK - 1) * sizeof(g_tui.chat_line_colors[0]));
             g_tui.chat_line_count = TUI_CHAT_SCROLLBACK - 1;
         }
         g_tui.chat_lines[g_tui.chat_line_count] = strdup(line);
         if (!g_tui.chat_lines[g_tui.chat_line_count]) return;
+        g_tui.chat_line_colors[g_tui.chat_line_count] = fg;
         g_tui.chat_line_count++;
         return;
     }
 
-    /* Uzun mesaj — prefix + continuation indent hazırla */
+    /* Uzun mesaj — word wrap */
     char indent[64];
     size_t indent_len = prefix_len;
     if (indent_len > sizeof(indent) - 1) indent_len = sizeof(indent) - 1;
@@ -442,40 +428,38 @@ void tui_chat_append(const char *line)
     while (remaining > 0) {
         size_t take = (remaining > chunk) ? chunk : remaining;
 
-        /* Kelime kaydırma: space'de böl (eğer tam ortadan kesmiyorsa) */
         if (take < remaining) {
-            /* Geriye doğru space ara */
             size_t ws = take;
             while (ws > 0 && p[ws - 1] != ' ' && p[ws - 1] != '\n')
                 ws--;
-            if (ws > 0) take = ws; /* space'i dahil et */
+            if (ws > 0) take = ws;
         }
 
-        if (take == 0) break; /*sonsuz döngü koruması */
+        if (take == 0) break;
 
-        /* Satırı oluştur */
-        char *row = NULL;
+        char row[1024];
         if (first) {
-            /* İlk satır: prefix + mesaj */
-            asprintf(&row, "%.*s%.*s", (int)prefix_len, line, (int)take, p);
+            snprintf(row, sizeof(row), "%.*s%.*s",
+                     (int)prefix_len, line, (int)take, p);
             first = 0;
         } else {
-            /* Devam satırı: indent + mesaj */
-            asprintf(&row, "%s%.*s", indent, (int)take, p);
+            snprintf(row, sizeof(row), "%s%.*s", indent, (int)take, p);
         }
 
-        if (row) {
+        if (row[0]) {
             if (g_tui.chat_line_count >= TUI_CHAT_SCROLLBACK) {
                 free(g_tui.chat_lines[0]);
                 memmove(&g_tui.chat_lines[0], &g_tui.chat_lines[1],
                         (size_t)(TUI_CHAT_SCROLLBACK - 1) * sizeof(char *));
+                memmove(&g_tui.chat_line_colors[0], &g_tui.chat_line_colors[1],
+                        (size_t)(TUI_CHAT_SCROLLBACK - 1) * sizeof(g_tui.chat_line_colors[0]));
                 g_tui.chat_line_count = TUI_CHAT_SCROLLBACK - 1;
             }
-            g_tui.chat_lines[g_tui.chat_line_count] = row;
+            g_tui.chat_lines[g_tui.chat_line_count] = strdup(row);
+            g_tui.chat_line_colors[g_tui.chat_line_count] = fg;
             g_tui.chat_line_count++;
         }
 
-        /* İlerle — space'yi atla */
         if (take < remaining && p[take] == ' ')
             take++;
         p += take;
@@ -483,7 +467,6 @@ void tui_chat_append(const char *line)
         if (remaining == 0 || take == 0) break;
     }
 
-    /* Yeni mesaj eklendi → otomatik olarak en alta kaydır */
     g_tui.chat_scroll_offset = 0;
 }
 
@@ -492,64 +475,48 @@ void tui_draw_chat(void)
     if (!g_tui.active)
         return;
 
-    werase(g_tui.chat_win);
+    int sidebar_w = TUI_SIDEBAR_WIDTH;
+    int chat_w = g_tui.cols - sidebar_w;
+    int chat_h = g_tui.rows - TUI_INPUT_HEIGHT;
+    if (chat_w < 20) chat_w = 20;
+    if (chat_h < 5) chat_h = 5;
 
-    int max_y, max_x;
-    getmaxyx(g_tui.chat_win, max_y, max_x);
+    /* Border */
+    draw_box(sidebar_w, 0, chat_w, chat_h, TC_SIDEBAR);
+    draw_title(sidebar_w, 0, " Sohbet ", TC_SIDEBAR);
 
-    /* chat_scroll_offset'i sınırla (clamp) */
-    int max_scroll = g_tui.chat_line_count - max_y;
+    /* İçerik */
+    int content_w = chat_w - 2;
+    int content_h = chat_h - 2;
+
+    int max_scroll = g_tui.chat_line_count - content_h;
     if (max_scroll < 0) max_scroll = 0;
-    if (g_tui.chat_scroll_offset > max_scroll) {
+    if (g_tui.chat_scroll_offset > max_scroll)
         g_tui.chat_scroll_offset = max_scroll;
-    }
-    if (g_tui.chat_scroll_offset < 0) {
+    if (g_tui.chat_scroll_offset < 0)
         g_tui.chat_scroll_offset = 0;
-    }
 
-    int start = g_tui.chat_line_count - max_y - g_tui.chat_scroll_offset;
+    int start = g_tui.chat_line_count - content_h - g_tui.chat_scroll_offset;
     if (start < 0) start = 0;
-    int end = start + max_y;
+    int end = start + content_h;
     if (end > g_tui.chat_line_count) end = g_tui.chat_line_count;
 
     for (int i = start; i < end; i++) {
         int row = i - start;
-        if (row >= max_y) break;
-
         const char *line = g_tui.chat_lines[i];
         if (!line) continue;
 
-        /* Renk tespiti: [Sen] veya [Peer] veya sistem */
-        /* max_x - 1: ncurses son sütunda auto-wrap yapabilir,
-         * bu yüzden bir karakter kısa kes. */
-        int print_w = (max_x > 1) ? max_x - 1 : max_x;
-        if (strstr(line, "[Sen]")) {
-            wattron(g_tui.chat_win, COLOR_PAIR(CLR_SELF));
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
-            wattroff(g_tui.chat_win, COLOR_PAIR(CLR_SELF));
-        } else if (strstr(line, "[Peer]")) {
-            wattron(g_tui.chat_win, COLOR_PAIR(CLR_PEER));
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
-            wattroff(g_tui.chat_win, COLOR_PAIR(CLR_PEER));
-        } else if (strstr(line, "[!]")) {
-            wattron(g_tui.chat_win, COLOR_PAIR(CLR_ERROR) | A_BOLD);
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
-            wattroff(g_tui.chat_win, COLOR_PAIR(CLR_ERROR) | A_BOLD);
-        } else {
-            wattron(g_tui.chat_win, COLOR_PAIR(CLR_SYSTEM));
-            mvwprintw(g_tui.chat_win, row, 0, "%.*s", print_w, line);
-            wattroff(g_tui.chat_win, COLOR_PAIR(CLR_SYSTEM));
+        uintattr_t fg = (uintattr_t)g_tui.chat_line_colors[i];
+        if (fg == 0) {
+            fg = TC_SYSTEM;
+            if (strstr(line, "[Sen]"))         fg = TC_SELF;
+            else if (strstr(line, "[Peer]"))   fg = TC_PEER;
+            else if (strstr(line, "[!]"))      fg = TC_ERROR | TB_BOLD;
         }
+
+        /* tb_print UTF-8 dizilerini otomatik çözer */
+        tb_printf(sidebar_w + 1, 1 + row, fg, 0, "%.*s", content_w, line);
     }
-
-    /* Border güncelle */
-    wattron(g_tui.chat_border, COLOR_PAIR(CLR_BORDER));
-    box(g_tui.chat_border, 0, 0);
-    mvwprintw(g_tui.chat_border, 0, 2, " Sohbet ");
-    wattroff(g_tui.chat_border, COLOR_PAIR(CLR_BORDER));
-
-    wnoutrefresh(g_tui.chat_border);
-    wnoutrefresh(g_tui.chat_win);
 }
 
 /* ================================================================
@@ -560,28 +527,34 @@ void tui_draw_input(void)
     if (!g_tui.active)
         return;
 
-    werase(g_tui.input_win);
+    int sidebar_w = TUI_SIDEBAR_WIDTH;
+    int chat_w = g_tui.cols - sidebar_w;
+    int chat_h = g_tui.rows - TUI_INPUT_HEIGHT;
+    if (chat_w < 20) chat_w = 20;
+
+    /* Border */
+    draw_box(sidebar_w, chat_h, chat_w, TUI_INPUT_HEIGHT, TC_SIDEBAR);
 
     /* Prompt */
-    wattron(g_tui.input_win, COLOR_PAIR(CLR_SIDEBAR));
-    mvwprintw(g_tui.input_win, 0, 0, "> ");
-    wattroff(g_tui.input_win, COLOR_PAIR(CLR_SIDEBAR));
+    int px = sidebar_w + 1;
+    int py = chat_h + 1;
+    tb_set_cell(px, py, '>', TC_SIDEBAR, 0);
+    tb_set_cell(px + 1, py, ' ', TC_SIDEBAR, 0);
 
-    /* Kullanıcı girdisi */
+    /* Kullanıcı girdisi — tb_printf UTF-8 destekler */
+    int input_x = px + 2;
+    int max_input_w = chat_w - 4;
     if (g_tui.input_len > 0) {
-        wprintw(g_tui.input_win, "%.*s", g_tui.input_len, g_tui.input_buf);
+        tb_printf(input_x, py, 0xFFFFFF, 0, "%.*s", max_input_w, g_tui.input_buf);
     }
 
-    /* Input border */
-    wattron(g_tui.input_border, COLOR_PAIR(CLR_BORDER));
-    box(g_tui.input_border, 0, 0);
-    wattroff(g_tui.input_border, COLOR_PAIR(CLR_BORDER));
-
-    /* İmleci göster */
-    wmove(g_tui.input_win, 0, 2 + g_tui.input_cursor);
-
-    wnoutrefresh(g_tui.input_border);
-    wnoutrefresh(g_tui.input_win);
+    /* İmleci göster — Unicode display width ile */
+    if (g_tui.focus == TUI_FOCUS_INPUT) {
+        int cursor_col = input_display_width_up_to(g_tui.input_cursor);
+        tb_set_cursor(input_x + cursor_col, py);
+    } else {
+        tb_hide_cursor();
+    }
 }
 
 /* ================================================================
@@ -592,16 +565,18 @@ void tui_refresh_all(struct app_state *state)
     if (!g_tui.active)
         return;
 
+    g_tui.cols = tb_width();
+    g_tui.rows = tb_height();
+    tb_clear();
+
     tui_draw_sidebar(state);
     tui_draw_chat();
     tui_draw_input();
-    doupdate();
+    tb_present();
 }
 
 /* ================================================================
  * GİRDİ İŞLEME
- *
- * Return: Enter'a basıldığında tamamlanmış satır, yoksa NULL.
  * ================================================================ */
 const char *tui_handle_input(struct app_state *state, int ch)
 {
@@ -609,36 +584,38 @@ const char *tui_handle_input(struct app_state *state, int ch)
         return NULL;
 
     switch (ch) {
+    case TB_KEY_CTRL_C:
+    case TB_KEY_CTRL_P:
+        g_shutdown = 1;
+        break;
+
     case '\t':
-    case KEY_BTAB:
-        /* Odak değiştir */
+    case TB_KEY_BACK_TAB:
         g_tui.focus = (g_tui.focus == TUI_FOCUS_INPUT) ? TUI_FOCUS_SIDEBAR : TUI_FOCUS_INPUT;
         if (g_tui.focus == TUI_FOCUS_INPUT) {
-            curs_set(1);
+            tb_set_cursor(g_tui.cols - 4, g_tui.rows - 2);
         } else {
-            curs_set(0);
+            tb_hide_cursor();
         }
         break;
 
-    case KEY_PPAGE: /* Page Up */
+    case TB_KEY_PGUP:
         g_tui.chat_scroll_offset += 10;
         tui_draw_chat();
         break;
 
-    case KEY_NPAGE: /* Page Down */
+    case TB_KEY_PGDN:
         g_tui.chat_scroll_offset -= 10;
         if (g_tui.chat_scroll_offset < 0) g_tui.chat_scroll_offset = 0;
         tui_draw_chat();
         break;
 
-    case KEY_UP:
+    case TB_KEY_ARROW_UP:
         if (g_tui.focus == TUI_FOCUS_SIDEBAR) {
-            if (g_tui.contact_count >= 0) {
-                if (g_tui.selected_idx > 0) {
-                    g_tui.selected_idx--;
-                } else {
-                    g_tui.selected_idx = g_tui.contact_count;
-                }
+            if (g_tui.selected_idx > 0) {
+                g_tui.selected_idx--;
+            } else {
+                g_tui.selected_idx = g_tui.contact_count;
             }
         } else {
             g_tui.chat_scroll_offset += 1;
@@ -646,14 +623,12 @@ const char *tui_handle_input(struct app_state *state, int ch)
         }
         break;
 
-    case KEY_DOWN:
+    case TB_KEY_ARROW_DOWN:
         if (g_tui.focus == TUI_FOCUS_SIDEBAR) {
-            if (g_tui.contact_count >= 0) {
-                if (g_tui.selected_idx < g_tui.contact_count) {
-                    g_tui.selected_idx++;
-                } else {
-                    g_tui.selected_idx = 0;
-                }
+            if (g_tui.selected_idx < g_tui.contact_count) {
+                g_tui.selected_idx++;
+            } else {
+                g_tui.selected_idx = 0;
             }
         } else {
             g_tui.chat_scroll_offset -= 1;
@@ -662,47 +637,52 @@ const char *tui_handle_input(struct app_state *state, int ch)
         }
         break;
 
-    case KEY_LEFT:
+    case TB_KEY_ARROW_LEFT:
         if (g_tui.focus == TUI_FOCUS_INPUT) {
             if (g_tui.input_cursor > 0) {
                 g_tui.input_cursor--;
             } else {
                 g_tui.focus = TUI_FOCUS_SIDEBAR;
-                curs_set(0);
+                tb_hide_cursor();
             }
         }
         break;
 
-    case KEY_RIGHT:
+    case TB_KEY_ARROW_RIGHT:
         if (g_tui.focus == TUI_FOCUS_INPUT) {
             if (g_tui.input_cursor < g_tui.input_len)
                 g_tui.input_cursor++;
         } else {
             g_tui.focus = TUI_FOCUS_INPUT;
-            curs_set(1);
+            tb_set_cursor(g_tui.cols - 4, g_tui.rows - 2);
         }
         break;
 
     case '\n':
-    case KEY_ENTER:
+    case TB_KEY_ENTER:
         if (g_tui.focus == TUI_FOCUS_SIDEBAR) {
             if (g_tui.selected_idx < g_tui.contact_count) {
-                /* Seçili kişiye bağlan */
+                /* Eski chat satırlarını temizle */
+                for (int i = 0; i < g_tui.chat_line_count; i++) {
+                    free(g_tui.chat_lines[i]);
+                    g_tui.chat_lines[i] = NULL;
+                }
+                g_tui.chat_line_count = 0;
+                g_tui.chat_scroll_offset = 0;
+
                 struct tui_contact *tc = &g_tui.contacts[g_tui.selected_idx];
                 snprintf(g_tui.input_buf, sizeof(g_tui.input_buf), "/connect %s", tc->onion);
                 g_tui.input_len = 0;
                 g_tui.input_cursor = 0;
                 g_tui.focus = TUI_FOCUS_INPUT;
-                curs_set(1);
-                g_tui.chat_scroll_offset = 0;
+                tb_set_cursor(g_tui.cols - 4, g_tui.rows - 2);
                 return g_tui.input_buf;
             } else {
-                /* "+ /connect" seçeneği: komutu yaz ve odağı input'a al */
                 snprintf(g_tui.input_buf, sizeof(g_tui.input_buf), "/connect ");
                 g_tui.input_len = (int)strlen(g_tui.input_buf);
                 g_tui.input_cursor = g_tui.input_len;
                 g_tui.focus = TUI_FOCUS_INPUT;
-                curs_set(1);
+                tb_set_cursor(g_tui.cols - 4, g_tui.rows - 2);
                 tui_draw_input();
             }
         } else {
@@ -716,42 +696,65 @@ const char *tui_handle_input(struct app_state *state, int ch)
         }
         break;
 
-    case KEY_BACKSPACE:
+    case TB_KEY_BACKSPACE:
     case 127:
-    case '\b':
         if (g_tui.focus == TUI_FOCUS_INPUT) {
             if (g_tui.input_cursor > 0 && g_tui.input_len > 0) {
-                memmove(&g_tui.input_buf[g_tui.input_cursor - 1],
+                int del = utf8_prev_char_bytes(g_tui.input_buf, g_tui.input_cursor);
+                memmove(&g_tui.input_buf[g_tui.input_cursor - del],
                         &g_tui.input_buf[g_tui.input_cursor],
                         (size_t)(g_tui.input_len - g_tui.input_cursor));
-                g_tui.input_len--;
-                g_tui.input_cursor--;
+                g_tui.input_len -= del;
+                g_tui.input_cursor -= del;
             }
         }
         break;
 
-    case KEY_HOME:
+    case TB_KEY_DELETE:
         if (g_tui.focus == TUI_FOCUS_INPUT) {
-            g_tui.input_cursor = 0;
+            if (g_tui.input_cursor < g_tui.input_len) {
+                int del = utf8_char_bytes(g_tui.input_buf,
+                                          g_tui.input_cursor,
+                                          g_tui.input_len);
+                memmove(&g_tui.input_buf[g_tui.input_cursor],
+                        &g_tui.input_buf[g_tui.input_cursor + del],
+                        (size_t)(g_tui.input_len - g_tui.input_cursor - del));
+                g_tui.input_len -= del;
+            }
         }
         break;
 
-    case KEY_END:
-        if (g_tui.focus == TUI_FOCUS_INPUT) {
+    case TB_KEY_HOME:
+        if (g_tui.focus == TUI_FOCUS_INPUT)
+            g_tui.input_cursor = 0;
+        break;
+
+    case TB_KEY_END:
+        if (g_tui.focus == TUI_FOCUS_INPUT)
             g_tui.input_cursor = g_tui.input_len;
-        }
         break;
 
     default:
-        /* Yazdırılabilir karakter ekle */
         if (g_tui.focus == TUI_FOCUS_INPUT) {
-            if (ch >= 32 && ch < 127 && g_tui.input_len < (int)sizeof(g_tui.input_buf) - 2) {
-                memmove(&g_tui.input_buf[g_tui.input_cursor + 1],
+            uint32_t c = 0;
+            if (ch >= 32 && ch < 127)
+                c = (uint32_t)ch;
+            else if (ch > 127 && ch < 0x110000)
+                c = (uint32_t)ch;
+            else if (ch == 0)
+                return NULL;
+
+            if (c == 0) return NULL;
+
+            char utf8[5];
+            int nbytes = utf8_encode(c, utf8);
+            if (g_tui.input_len + nbytes <= (int)sizeof(g_tui.input_buf) - 1) {
+                memmove(&g_tui.input_buf[g_tui.input_cursor + nbytes],
                         &g_tui.input_buf[g_tui.input_cursor],
                         (size_t)(g_tui.input_len - g_tui.input_cursor));
-                g_tui.input_buf[g_tui.input_cursor] = (char)ch;
-                g_tui.input_len++;
-                g_tui.input_cursor++;
+                memcpy(&g_tui.input_buf[g_tui.input_cursor], utf8, (size_t)nbytes);
+                g_tui.input_len += nbytes;
+                g_tui.input_cursor += nbytes;
             }
         }
         break;
@@ -759,11 +762,11 @@ const char *tui_handle_input(struct app_state *state, int ch)
 
     tui_draw_input();
     tui_draw_sidebar(state);
-    doupdate();
+    tb_present();
     return NULL;
 }
 
-#endif /* HAVE_NCURSES */
+#endif /* HAVE_TERMBOX */
 
 /* ISO C forbids an empty translation unit — pedantic guard */
 typedef int tui_empty_tu_guard;

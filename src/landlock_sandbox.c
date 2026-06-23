@@ -62,6 +62,8 @@ static int landlock_abi_version(void) {
  *
  * Returns: NOX_OK veya NOX_ERR_CONFIG
  * ================================================================ */
+static bool s_landlock_active = false;
+
 nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
     if (downloads_dir_fd < 0) {
         NOX_ERROR(LOG_MOD_MAIN, "landlock: geçersiz downloads dir fd");
@@ -184,6 +186,8 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
         return NOX_ERR_CONFIG;
     }
 
+    s_landlock_active = true;
+
     close(ruleset_fd);
 
     NOX_INFO(LOG_MOD_MAIN,
@@ -197,7 +201,12 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
  * Landlock mevcut mu kontrol et.
  * Returns: true/false
  * ================================================================ */
+
 bool landlock_is_available(void) {
     int abi = landlock_abi_version();
     return abi >= 1;
+}
+
+bool landlock_is_active(void) {
+    return s_landlock_active;
 }
