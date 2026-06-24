@@ -456,7 +456,7 @@ fuzz-run-handshake: fuzz
 # ----------------------------------------------------------------
 $(TEST_DIR)/fuzz_noise_differential: $(TEST_DIR)/fuzz_noise_differential.c src/noise.c
 	$(MSG) 'DIFF' '$<'
-	$(Q)$(CC) $(STD) -DNOISE_TEST_DETERMINISTIC -I$(INC_DIR) \
+	$(Q)$(CC) $(STD) $(HARDEN_COMMON) -fsanitize=address,undefined -DNOISE_TEST_DETERMINISTIC -I$(INC_DIR) \
 		$^ -L/usr/local/lib -lnoiseprotocol -lsodium -o $@
 
 differential: $(TEST_DIR)/fuzz_noise_differential
@@ -469,10 +469,10 @@ differential: $(TEST_DIR)/fuzz_noise_differential
 # ----------------------------------------------------------------
 $(TEST_DIR)/test_seccomp: $(TEST_DIR)/test_seccomp.c
 	$(MSG) 'SECCOMP' '$<'
-	$(Q)$(CC) $(STD) $< -lseccomp -o $@
+	$(Q)$(CC) $(STD) $(HARDEN_COMMON) -fsanitize=address,undefined $< -lseccomp -o $@
 
 seccomp-test: $(TEST_DIR)/test_seccomp
-	$(Q)$(TEST_DIR)/test_seccomp
+	$(Q)LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0 $(TEST_DIR)/test_seccomp
 
 # ----------------------------------------------------------------
 # TEMİZLİK

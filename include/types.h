@@ -78,7 +78,7 @@ enum msg_state {
  * Sonraki bağlantılarda değişmişse MITM uyarısı.
  * ================================================================ */
 struct contact {
-    char     name[NOX_CONTACT_NAME_LEN];  /* kullanıcı verdiği isim  */
+    char     name[NOX_CONTACT_NAME_LEN + 1]; /* kullanıcı verdiği isim (null-terminated) */
     char     onion[NOX_ONION_LEN];        /* .onion adresi           */
     uint8_t  noise_key[NOX_KEY_LEN];      /* static public key       */
     bool     verified;                     /* fingerprint onaylandı mı*/

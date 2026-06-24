@@ -697,7 +697,7 @@ static void prompt_transport_selection(struct app_state *state) {
         int fd = open(all_files[i], O_WRONLY | O_CLOEXEC);
         if (fd >= 0) {
           uint8_t zeros[256];
-          memset(zeros, 0, sizeof(zeros));
+          explicit_bzero(zeros, sizeof(zeros));
           off_t remaining = st.st_size;
           while (remaining > 0) {
             size_t chunk = (size_t)remaining < sizeof(zeros) ? (size_t)remaining
