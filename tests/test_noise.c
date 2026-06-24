@@ -541,6 +541,146 @@ static int test_spec_vectors(void)
 #endif /* NOISE_TEST_DETERMINISTIC */
 
 /* ================================================================
+ * PAYLOAD VARYASYON TESTLERİ
+ *
+ * Aynı Cacophony anahtarları/prologue ile farklı payload boyutları
+ * test edilir. Byte-for-byte ciphertext doğrulanmaz (beklenen
+ * değerler mevcut değil), sadece roundtrip ve tamamlanma doğrulanır.
+ * ================================================================ */
+#ifdef NOISE_TEST_DETERMINISTIC
+static int test_spec_vectors_payloads(void)
+{
+    /* --- Cacophony anahtarları/prologue (Noise_XX_25519_ChaChaPoly_BLAKE2b) --- */
+    static const uint8_t prologue[9] = {
+        0x4a, 0x6f, 0x68, 0x6e, 0x20, 0x47, 0x61, 0x6c, 0x74
+    };
+    static const uint8_t init_s_priv[32] = {
+        0xe6, 0x1e, 0xf9, 0x91, 0x9c, 0xde, 0x45, 0xdd,
+        0x5f, 0x82, 0x16, 0x64, 0x04, 0xbd, 0x08, 0xe3,
+        0x8b, 0xce, 0xb5, 0xdf, 0xdf, 0xde, 0xd0, 0xa3,
+        0x4c, 0x8d, 0xf7, 0xed, 0x54, 0x22, 0x14, 0xd1
+    };
+    static const uint8_t init_e_priv[32] = {
+        0x89, 0x3e, 0x28, 0xb9, 0xdc, 0x6c, 0xa8, 0xd6,
+        0x11, 0xab, 0x66, 0x47, 0x54, 0xb8, 0xce, 0xb7,
+        0xba, 0xc5, 0x11, 0x73, 0x49, 0xa4, 0x43, 0x9a,
+        0x6b, 0x05, 0x69, 0xda, 0x97, 0x7c, 0x46, 0x4a
+    };
+    static const uint8_t resp_s_priv[32] = {
+        0x4a, 0x3a, 0xcb, 0xfd, 0xb1, 0x63, 0xde, 0xc6,
+        0x51, 0xdf, 0xa3, 0x19, 0x4d, 0xec, 0xe6, 0x76,
+        0xd4, 0x37, 0x02, 0x9c, 0x62, 0xa4, 0x08, 0xb4,
+        0xc5, 0xea, 0x91, 0x14, 0x24, 0x6e, 0x48, 0x93
+    };
+    static const uint8_t resp_e_priv[32] = {
+        0xbb, 0xdb, 0x4c, 0xdb, 0xd3, 0x09, 0xf1, 0xa1,
+        0xf2, 0xe1, 0x45, 0x69, 0x67, 0xfe, 0x28, 0x8c,
+        0xad, 0xd6, 0xf7, 0x12, 0xd6, 0x5d, 0xc7, 0xb7,
+        0x79, 0x3d, 0x5e, 0x63, 0xda, 0x6b, 0x37, 0x5b
+    };
+
+    uint8_t init_s_pub[32], resp_s_pub[32];
+    crypto_scalarmult_base(init_s_pub, init_s_priv);
+    crypto_scalarmult_base(resp_s_pub, resp_s_priv);
+
+    /* --- Payload senaryoları --- */
+    static const uint8_t all_zero[256]  = {0};
+    static uint8_t all_ff[256];
+    memset(all_ff, 0xff, sizeof(all_ff));
+    uint8_t single_byte[1] = {0xAB};
+    uint8_t large_payload[256];
+    memset(large_payload, 0x42, sizeof(large_payload));
+
+    struct {
+        const char     *name;
+        const uint8_t  *p0;  size_t p0_len;
+        const uint8_t  *p1;  size_t p1_len;
+        const uint8_t  *p2;  size_t p2_len;
+    } scenarios[] = {
+        { "empty (0 bytes)",
+          NULL, 0,  NULL, 0,  NULL, 0 },
+        { "single byte",
+          single_byte, 1,  single_byte, 1,  single_byte, 1 },
+        { "256 byte (0x42)",
+          large_payload, 256,  large_payload, 256,  large_payload, 256 },
+        { "all zeros",
+          all_zero, 64,  all_zero, 64,  all_zero, 64 },
+        { "all 0xFF",
+          all_ff, 64,  all_ff, 64,  all_ff, 64 },
+    };
+    size_t n_scenarios = sizeof(scenarios) / sizeof(scenarios[0]);
+
+    uint8_t out[1024], pl[1024];
+    size_t  out_len, pl_len;
+
+    for (size_t i = 0; i < n_scenarios; i++) {
+        fprintf(stderr, "\n    payload scenario %zu: %s", i, scenarios[i].name);
+
+        struct noise_handshake hs_i, hs_r;
+        TEST_ASSERT(handshake_init_with_prologue(&hs_i, true,
+                        init_s_priv, init_s_pub,
+                        prologue, sizeof(prologue)) == NOX_OK);
+        TEST_ASSERT(handshake_init_with_prologue(&hs_r, false,
+                        resp_s_priv, resp_s_pub,
+                        prologue, sizeof(prologue)) == NOX_OK);
+        TEST_ASSERT(handshake_inject_ephemeral(&hs_i, init_e_priv) == NOX_OK);
+        TEST_ASSERT(handshake_inject_ephemeral(&hs_r, resp_e_priv) == NOX_OK);
+
+        /* msg0: Alice → Bob */
+        out_len = sizeof(out);
+        TEST_ASSERT(handshake_write(&hs_i,
+                        scenarios[i].p0, scenarios[i].p0_len,
+                        out, &out_len) == NOX_OK);
+        TEST_ASSERT(out_len > 0);
+
+        pl_len = sizeof(pl);
+        TEST_ASSERT(handshake_read(&hs_r, out, out_len,
+                                   pl, sizeof(pl), &pl_len) == NOX_OK);
+        TEST_ASSERT(pl_len == scenarios[i].p0_len);
+        if (scenarios[i].p0_len > 0) {
+            TEST_ASSERT(sodium_memcmp(pl, scenarios[i].p0, pl_len) == 0);
+        }
+
+        /* msg1: Bob → Alice */
+        out_len = sizeof(out);
+        TEST_ASSERT(handshake_write(&hs_r,
+                        scenarios[i].p1, scenarios[i].p1_len,
+                        out, &out_len) == NOX_OK);
+        TEST_ASSERT(out_len > 0);
+
+        pl_len = sizeof(pl);
+        TEST_ASSERT(handshake_read(&hs_i, out, out_len,
+                                   pl, sizeof(pl), &pl_len) == NOX_OK);
+        TEST_ASSERT(pl_len == scenarios[i].p1_len);
+        if (scenarios[i].p1_len > 0) {
+            TEST_ASSERT(sodium_memcmp(pl, scenarios[i].p1, pl_len) == 0);
+        }
+
+        /* msg2: Alice → Bob */
+        out_len = sizeof(out);
+        TEST_ASSERT(handshake_write(&hs_i,
+                        scenarios[i].p2, scenarios[i].p2_len,
+                        out, &out_len) == NOX_OK);
+        TEST_ASSERT(out_len > 0);
+
+        pl_len = sizeof(pl);
+        TEST_ASSERT(handshake_read(&hs_r, out, out_len,
+                                   pl, sizeof(pl), &pl_len) == NOX_OK);
+        TEST_ASSERT(pl_len == scenarios[i].p2_len);
+        if (scenarios[i].p2_len > 0) {
+            TEST_ASSERT(sodium_memcmp(pl, scenarios[i].p2, pl_len) == 0);
+        }
+
+        /* Handshake tamamlanmış olmalı */
+        TEST_ASSERT(handshake_is_complete(&hs_i));
+        TEST_ASSERT(handshake_is_complete(&hs_r));
+    }
+
+    return 0;
+}
+#endif /* NOISE_TEST_DETERMINISTIC */
+
+/* ================================================================
  * MAIN
  * ================================================================ */
 int main(void)
@@ -561,6 +701,7 @@ int main(void)
     RUN_TEST(test_handshake_onion_payload);
 #ifdef NOISE_TEST_DETERMINISTIC
     RUN_TEST(test_spec_vectors);
+    RUN_TEST(test_spec_vectors_payloads);
 #endif
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n\n",

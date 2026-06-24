@@ -16,6 +16,7 @@
 
 #include <sodium.h>
 #include <stdatomic.h>
+#include <assert.h>
 #include <string.h>
 
 /* ================================================================
@@ -212,7 +213,13 @@ hmac_blake2b(const uint8_t *key, size_t key_len, const uint8_t *data,
   /* 1. key normalize */
   memset(k, 0, BLAKE2B_BLOCK_SIZE);
   if (key_len > BLAKE2B_BLOCK_SIZE) {
-    crypto_generichash_blake2b(k, NOISE_HASHLEN, key, key_len, NULL, 0);
+    assert(0 && "hmac_blake2b: key > BLAKE2B_BLOCK_SIZE");
+    NOX_ERROR(LOG_MOD_NOISE,
+              "hmac_blake2b: beklenmeyen büyük key (%zu byte)", key_len);
+    sodium_memzero(k, BLAKE2B_BLOCK_SIZE);
+    sodium_free(k); sodium_free(ipad); sodium_free(opad); sodium_free(inner);
+    sodium_memzero(out, NOISE_HASHLEN);
+    return NOX_ERR_CRYPTO;
   } else {
     memcpy(k, key, key_len);
   }
