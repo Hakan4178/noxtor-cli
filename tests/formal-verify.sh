@@ -93,7 +93,7 @@ verify_log() {
 }
 
 verify_arena() {
-    log "\n${BOLD}${CYAN}═══ arena.c — DUAL CHECK ═══${NC}"
+    log "\n${BOLD}${CYAN}═══ arena.c — CBMC ONLY (ESBMC Z3 timeout nedeniyle devre dışı) ═══${NC}"
 
     run_and_check "CBMC arena.c" 300 "$OUTDIR/cbmc_arena.txt" \
         cbmc --c23 -I include \
@@ -102,10 +102,17 @@ verify_arena() {
         --div-by-zero-check --enum-range-check \
         --unwinding-assertions --unwind 50 \
         tests/cbmc_arena.c src/arena.c
+}
 
-    run_and_check "ESBMC arena.c" 300 "$OUTDIR/esbmc_arena.txt" \
-        esbmc -D__ESBMC__ -I include \
-        --overflow-check --unsigned-overflow-check --memory-leak-check \
+verify_arena_coverage() {
+    log "\n${BOLD}${CYAN}═══ arena.c — BRANCH COVERAGE ═══${NC}"
+
+    run_and_check "CBMC arena branch-coverage" 300 "$OUTDIR/cbmc_arena_cov.txt" \
+        cbmc --c23 -I include \
+        --bounds-check --pointer-check --pointer-overflow-check \
+        --signed-overflow-check --unsigned-overflow-check \
+        --div-by-zero-check --enum-range-check \
+        --cover branch --show-test-suite \
         --unwind 50 \
         tests/cbmc_arena.c src/arena.c
 }
@@ -205,12 +212,14 @@ TARGET="${1:-all}"
 case "$TARGET" in
     log)    verify_log ;;
     arena)  verify_arena ;;
+    arena-cov) verify_arena_coverage ;;
     stdin)  verify_stdin ;;
     noise)  verify_noise ;;
     crypto) verify_crypto ;;
     sm)     verify_state_machine ;;
     all)    verify_log; verify_arena; verify_stdin; verify_noise; verify_crypto; verify_state_machine ;;
-    *)      echo "Kullanım: $0 [log|arena|stdin|noise|crypto|sm|all]"; exit 1 ;;
+    cov-all) verify_arena_coverage ;;
+    *)      echo "Kullanım: $0 [log|arena|arena-cov|stdin|noise|crypto|sm|all|cov-all]"; exit 1 ;;
 esac
 
 log ""

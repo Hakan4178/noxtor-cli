@@ -96,6 +96,8 @@ static void process_peer_frames(struct app_state *state, int fd) {
         break;
       }
 
+      uint8_t remote_pub[NOX_KEY_LEN];
+
       if (state->hs->msg_index < 3) {
         uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
         size_t hslen = sizeof(hsbuf);
@@ -159,11 +161,11 @@ static void process_peer_frames(struct app_state *state, int fd) {
         if (!state->ghost_mode) {
           db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key, NULL, 0, NULL, NULL);
         }
-        uint8_t remote_pub[NOX_KEY_LEN];
         memcpy(remote_pub, state->hs->rs, NOX_KEY_LEN);
 
         char fp_str[NOX_KEY_LEN * 2 + 1];
         for (size_t k = 0; k < NOX_KEY_LEN; k++) {
+          if (k * 2 + 3 > sizeof(fp_str)) break;
           snprintf(&fp_str[k * 2], sizeof(fp_str) - (k * 2), "%02x", remote_pub[k]);
         }
 
@@ -288,6 +290,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
           state->peer_state = ST_TOFU_PENDING;
         }
       }
+      sodium_memzero(remote_pub, NOX_KEY_LEN);
     } else if ((fh.type == NOX_MSG_TEXT || fh.type == NOX_MSG_FILE) &&
                state->session) {
       /* Sequence Number Doğrulaması (Y1) */

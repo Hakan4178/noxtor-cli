@@ -451,8 +451,8 @@ static void cleanup(struct app_state *state) {
 #ifndef DEBUG
   /* Release: Terminal scrollback'i hemen sil — session/chat
    * mesajları scrollback buffer'da kalmasın (OPSAFE). */
-  printf("\033[2J\033[3J\033[H");
-  fflush(stdout);
+  fprintf(stderr, "\033[2J\033[3J\033[H");
+  fflush(stderr);
 #endif
 
   NOX_INFO(LOG_MOD_MAIN, "temizlik başlıyor...");
@@ -605,6 +605,15 @@ static void prompt_transport_selection(struct app_state *state) {
   /* ================================================================
    * ANA GİRİŞ NOKTASI
    * ================================================================ */
+
+  /* Honeypot scattered allocation: 0-3 rastgele sahte key yerleştirir.
+   * Arena layout'u her çalıştırmada farklı olur → saldırgan tahmin edemez. */
+  static void scatter_honeypots(struct secure_arena *a, size_t min, size_t max) {
+    size_t count = min + randombytes_uniform((unsigned int)(max - min + 1));
+    for (size_t i = 0; i < count; i++)
+      arena_alloc_canary(a, NOX_KEY_LEN);
+  }
+
   int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
@@ -832,8 +841,9 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     /* ── 9. Key derivation: PIN → master_key ──────────── */
+    scatter_honeypots(&state.arena, 0, 3);
     state.master_key = arena_alloc(&state.arena, NOX_KEY_LEN);
-    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: master_key sonrası */
+    scatter_honeypots(&state.arena, 0, 3);
     if (!state.master_key) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (master_key)");
       sodium_memzero(pin_buf, sizeof(pin_buf));
@@ -858,12 +868,13 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     /* ── 10. Subkey türetimi ─────────────────────────── */
+    scatter_honeypots(&state.arena, 0, 3);
     state.db_key = arena_alloc(&state.arena, NOX_KEY_LEN);
-    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: db_key sonrası */
+    scatter_honeypots(&state.arena, 0, 3);
     uint8_t *identity_unlock = arena_alloc(&state.arena, NOX_KEY_LEN);
-    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: identity_unlock sonrası */
+    scatter_honeypots(&state.arena, 0, 3);
     state.session_key = arena_alloc(&state.arena, NOX_KEY_LEN);
-    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: session_key sonrası */
+    scatter_honeypots(&state.arena, 0, 3);
 
     if (!state.db_key || !identity_unlock || !state.session_key) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (subkeys)");
@@ -881,8 +892,9 @@ static void prompt_transport_selection(struct app_state *state) {
     }
 
     /* ── 11. Identity key yükle, oluştur ve Curve25519'a dönüştür ── */
+    scatter_honeypots(&state.arena, 0, 3);
     state.my_static_priv = arena_alloc(&state.arena, NOX_KEY_LEN);
-    arena_alloc_canary(&state.arena, NOX_KEY_LEN); /* honeypot: my_static_priv sonrası */
+    scatter_honeypots(&state.arena, 0, 3);
     state.my_static_pub = arena_alloc(&state.arena, NOX_KEY_LEN);
     if (!state.my_static_priv || !state.my_static_pub) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (static keys)");

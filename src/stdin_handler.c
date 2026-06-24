@@ -58,11 +58,10 @@ static size_t get_next_chunk_size(const char *msg, size_t offset, size_t total_l
 static bool validate_onion_input(const char *onion, size_t len) {
   if (len != NOX_ONION_LEN) return false;   /* 56 + ".onion" = 62 */
 
-  /* 56 base32 karakter */
+  /* 56 base32 karakter — sadece lowercase (validate_onion_address ile uyumlu) */
   for (size_t i = 0; i < 56; i++) {
     char c = onion[i];
     bool ok = (c >= 'a' && c <= 'z') ||
-              (c >= 'A' && c <= 'Z') ||
               (c >= '2' && c <= '7');
     if (!ok) return false;
   }

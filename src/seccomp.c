@@ -194,7 +194,7 @@ nox_err_t seccomp_policy_load(int stage) {
       NOX_WARN(LOG_MOD_MAIN, "seccomp: TSYNC desteklenmiyor (rc=%d), "
                "32-bit fallback deneniyor", rc_tsync);
       int rc_rem = seccomp_arch_remove(ctx, SCMP_ARCH_X86);
-      if (rc_rem < 0 && rc_rem != -EEXIST) {
+      if (rc_rem < 0 && rc_rem != -EEXIST && rc_rem != -EINVAL) {
         NOX_ERROR(LOG_MOD_MAIN, "seccomp: 32-bit arch kaldırılamadı (rc=%d)",
                   rc_rem);
         seccomp_release(ctx);

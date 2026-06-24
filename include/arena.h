@@ -32,7 +32,7 @@
  *   - Uyarı verir, MAP_LOCKED olmadan tekrar dener
  *   - mlock() ile kısmi koruma dener
  *
- * Return: NOX_OK veya NOX_ERR_ALLOC / NOX_ERR_LOCKED
+ * Return: NOX_OK veya NOX_ERR_ALLOC
  */
 nox_err_t arena_init(struct secure_arena *a, size_t size);
 
@@ -49,11 +49,12 @@ nox_err_t arena_init(struct secure_arena *a, size_t size);
 void *arena_alloc(struct secure_arena *a, size_t size);
 
 /*
- * arena_alloc_canary — Canary (honeypot) allocation
+ * arena_alloc_canary — Honeypot allocation
  *
  * Key'lerin arasına sahte key'ler yerleştirir.
  * Rastgele byte'lar ile doldurulur — gerçek key'den ayırt edilemez.
- * RCE sonrası memory scanning'i zorlaştırır.
+ * RCE sonrası memory scanning'i zorlaştırır: saldırgan hangisinin
+ * gerçek olduğunu bilemez. Honeypot'lar normal arena bloklarıdır.
  *
  * Return: Rastgele byte'larla dolu pointer veya NULL
  */
@@ -72,10 +73,10 @@ void arena_check_canary(const struct secure_arena *a);
  *
  * Yaptıkları:
  *   1. Canary kontrolü
- *   2. explicit_bzero(usable alan)
+ *   2. sodium_memzero(usable alan)
  *   3. Memory barrier
  *   4. munmap(tüm alan)
- *   5. struct'ı sıfırla
+ *   5. Struct'ı sıfırla
  */
 void arena_destroy(struct secure_arena *a);
 
@@ -90,7 +91,7 @@ size_t arena_bytes_free(const struct secure_arena *a);
  * arena_save — Mevcut offset'i kaydet (session scope başlangıcı)
  * arena_restore — Kaydedilen offset'e geri dön
  *
- * Geri alınan bellek explicit_bzero ile sıfırlanır.
+ * Geri alınan alan sodium_memzero() ile sıfırlanır.
  * Session bittiğinde hs/session belleğini geri kazanır.
  */
 size_t arena_save(const struct secure_arena *a);

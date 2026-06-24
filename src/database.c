@@ -150,10 +150,10 @@ nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
     return NOX_ERR_CONFIG;
   }
 
-  /* SQLite bağlantısını aç */
+  /* SQLite bağlantısını aç — uygulama kendi lock'unu yönetiyor (g_state.lock) */
   int rc = sqlite3_open_v2(
       db_path, &g_state.db,
-      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Veritabanı açılamadı: %s", DB_ERRMSG());
     if (g_state.db) {

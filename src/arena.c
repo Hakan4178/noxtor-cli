@@ -7,7 +7,6 @@
  *   [Lower Guard Page (PROT_NONE)] PAGE_SIZE
  *   [Usable Area]                  usable_size  (16-byte aligned bump)
  *   [Canary Zone]                  NOX_CANARY_LEN
- *   [Padding to page boundary]     variable
  *   [Upper Guard Page (PROT_NONE)] PAGE_SIZE
  *
  * Guard page'lere erişim → SIGSEGV (donanımsal MMU tetikleme).
@@ -131,6 +130,7 @@ static void secure_abort(const struct secure_arena *a, const char *msg) {
  * arena_init — Güvenli arena oluştur
  *
  * Hata durumlarında NOX_ERR_ALLOC döner; kısmi tahsisler temizlenir.
+ * NOX_ARENA_STRICT_LOCK tanımlıysa mlock başarısızliğinde de NOX_ERR_ALLOC döner.
  * ================================================================ */
 nox_err_t arena_init(struct secure_arena *a, size_t size)
 {
@@ -218,7 +218,7 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
             return NOX_ERR_ALLOC;
         }
 
-        /* Usable alanı kilitlemyi dene (guard page'ler hariç) */
+        /* Usable alanı kilitlemeyi dene (guard page'ler hariç) */
         uint8_t *usable_start = (uint8_t *)base + page_size;
         if (mlock(usable_start, usable) != 0) {
             NOX_WARN(LOG_MOD_ARENA,
@@ -409,7 +409,10 @@ void *arena_alloc(struct secure_arena *a, size_t size)
  *
  * RCE sonrası memory scanning'i zorlaştırır:
  *   - Saldırgan hangisinin gerçek hangisinin sahte olduğunu bilemez
- *   - Honeypot'ları kullanmaya çalışırsa hata üretir
+ *   - Honeypot'lar gerçek anahtarlarla aynı bellek düzeninde yer alır
+ *
+ * Not: Honeypot'lar normal arena bloklarıdır — üzerlerine yazılabilir.
+ * Korum mekanizması "kullanılamazlık" değil, "ayırt edilemezlik"tir.
  *
  * @a:    Aktif arena
  * @size: Canary boyutu (genellikle NOX_KEY_LEN = 32)
@@ -428,7 +431,7 @@ void *arena_alloc_canary(struct secure_arena *a, size_t size)
  * arena_check_canary — Buffer overflow tespiti
  *
  * Sabit zamanlı karşılaştırma ile timing side-channel koruması.
- * Canary bozulmuşsa: core dump kapatılır → abort().
+ * Canary bozulmuşsa: secure_abort() ile temizlik + abort().
  * ================================================================ */
 void arena_check_canary(const struct secure_arena *a)
 {
@@ -454,7 +457,7 @@ void arena_check_canary(const struct secure_arena *a)
      * memcmp() kullanmak timing saldırısına zemin hazırlar.
      */
     if (sodium_memcmp(canary_pos, a->canary, NOX_CANARY_LEN) != 0) {
-        /* P6 — secure_abort(): önce dumpable=0, sonra abort() */
+        /* secure_abort(): wipe + abort() — PR_SET_DUMPABLE=0 main'de ayarlandı */
         secure_abort(a, "Arena canary bozulmuş! Buffer overflow tespit edildi.");
         /* NOTREACHED */
     }
@@ -519,7 +522,7 @@ void arena_destroy(struct secure_arena *a)
      *
      * Yapısal bütünlük kontrolü: struct bozuksa wipe → SIGSEGV
      * → munmap atlanır → veri sızar. Bozuksa wipe'ı atla.
-     * (struct_ok zemen başında hesaplandı — burada tekrar hesaplamaya gerek yok)
+     * (struct_ok başında hesaplandı — burada tekrar hesaplamaya gerek yok)
      */
     if (struct_ok) {
         size_t wipe_size = a->usable_size + NOX_CANARY_LEN;
@@ -607,9 +610,6 @@ size_t arena_save(const struct secure_arena *a)
 /**
  * arena_restore — Offset'i geri al, aradaki alanı güvenle sıfırla.
  *
- * P3: sysconf() artık kullanılmıyor; get_page_size() kullanılıyor.
- * P4: Canary kontrolü eklendi.
- *
  * @param a             Arena pointer'ı
  * @param saved_offset  arena_save() ile alınan offset
  */
@@ -644,7 +644,7 @@ void arena_restore(struct secure_arena *a, size_t saved_offset)
     }
 
     /*
-     * P3: a->page_size kullanılıyor.
+     * a->page_size kullanılıyor (arena_init tarafından ayarlandı).
      */
     size_t   page_size = a->page_size;
     uint8_t *usable    = (uint8_t *)a->base + page_size;
