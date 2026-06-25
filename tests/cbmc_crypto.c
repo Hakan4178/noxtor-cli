@@ -34,7 +34,7 @@
 #define NOX_MAC_LEN     16U
 #define NOX_SALT_LEN    16U
 
-#define NOX_MIN_PIN_LEN  8U
+#define NOX_PIN_MIN_LEN  8U
 #define NOX_MAX_PIN_LEN  1024U
 
 #define crypto_sign_PUBLICKEYBYTES NOX_KEY_LEN
@@ -204,7 +204,7 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
     if (!master_key || !pin || !salt)
         return NOX_ERR_PIN;
 
-    if (pin_len < NOX_MIN_PIN_LEN)
+    if (pin_len < NOX_PIN_MIN_LEN)
         return NOX_ERR_PIN;
     if (pin_len > NOX_MAX_PIN_LEN)
         return NOX_ERR_PIN;

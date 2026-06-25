@@ -80,11 +80,6 @@ NOX_STATIC_ASSERT(sizeof(NOX_KDF_CTX) - 1 == crypto_kdf_CONTEXTBYTES,
                   "KDF context tam 8 byte olmali");
 
 /* ================================================================
- * [P9] PIN uzunluk limitleri
- * ================================================================ */
-#define NOX_MIN_PIN_LEN  8U
-
-/* ================================================================
  * Identity dosya boyutu
  * ================================================================ */
 #define IDENTITY_FILE_SIZE \
@@ -191,9 +186,9 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
     }
 
     /* [P9] PIN uzunluk kontrolü */
-    if (pin_len < NOX_MIN_PIN_LEN) {
+    if (pin_len < NOX_PIN_MIN_LEN) {
         NOX_ERROR(LOG_MOD_CRYPTO,
-                  "PIN çok kısa (min %u karakter)", NOX_MIN_PIN_LEN);
+                  "PIN çok kısa (min %u karakter)", NOX_PIN_MIN_LEN);
         sodium_memzero(pin, pin_len);
         return NOX_ERR_PIN;
     }

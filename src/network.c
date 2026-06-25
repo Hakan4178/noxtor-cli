@@ -28,8 +28,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <poll.h>
-
 /* ── Timeout sabitleri ────────────────────────── */
 #define NOX_READ_TIMEOUT_MS       10000
 #define NOX_CTRL_TIMEOUT_MS       5000

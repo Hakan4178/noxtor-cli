@@ -70,22 +70,39 @@ static bool validate_onion_input(const char *onion, size_t len) {
   return memcmp(onion + 56, ".onion", 6) == 0;
 }
 
-/* Ham terminal modunda ANSI kaçış dizilerini temizle.
- * ^[[A (Up), ^[[B (Down), ^[[C (Right), ^[[D (Left) gibi escape
- * sequence'leri stdin buffer'a girer ve metin olarak gönderilir.
- * Bu dizi: ESC '[' param final_char biçimindeki ANSI sequence'leri siler. */
+/* Ham terminal modunda ANSI kaçış dizilerini temizle — tüm türler:
+ * CSI (ESC [), OSC (ESC ]), DCS (ESC P), tek ESC */
 static void strip_ansi_escape(char *str) {
   if (!str) return;
   char *dst = str;
   const char *src = str;
   while (*src) {
-    if ((unsigned char)*src == 0x1b && src[1] == '[') {
-      /* ANSI CSI sequence: ESC [ <params> <final char> */
-      src += 2; /* ESC [ atla */
-      while (*src && ((*src >= '0' && *src <= '?') ||
-                      (*src >= ' ' && *src <= '/')))
-        src++; /* parametreleri atla (n; m; vs.) */
-      if (*src) src++; /* final char'ı atla (A-Z, a-z, `) */
+    if ((unsigned char)*src == 0x1b) {
+      if (src[1] == '[') {
+        /* CSI: ESC [ <params> <final> */
+        src += 2;
+        while (*src && ((*src >= '0' && *src <= '?') ||
+                        (*src >= ' ' && *src <= '/')))
+          src++;
+        if (*src) src++;
+      } else if (src[1] == ']') {
+        /* OSC: ESC ] <cmd> ; <data> BEL or ESC \ */
+        src += 2;
+        while (*src && (unsigned char)*src != 0x07 &&
+               !(src[0] == 0x1b && src[1] == '\\'))
+          src++;
+        if ((unsigned char)*src == 0x07) src++;
+        else if (src[0] == 0x1b && src[1] == '\\') src += 2;
+      } else if (src[1] == 'P') {
+        /* DCS: ESC P <data> ESC \ */
+        src += 2;
+        while (*src && !(src[0] == 0x1b && src[1] == '\\'))
+          src++;
+        if (src[0] == 0x1b && src[1] == '\\') src += 2;
+      } else {
+        /* Diğer tüm ESC sequence'leri (ST, tek ESC, vs.) — atla */
+        src += 2;
+      }
     } else {
       *dst++ = *src++;
     }

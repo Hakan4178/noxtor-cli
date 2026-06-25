@@ -102,6 +102,14 @@ static void print_timestamp(void)
             CLR_RESET);
 }
 
+/* M-25 FIX: Log injection koruması — \n ve \r karakterlerini temizle */
+static void sanitize_log_newlines(char *str) {
+  for (char *p = str; *p; p++) {
+    if (*p == '\n' || *p == '\r')
+      *p = ' ';
+  }
+}
+
 /* ================================================================
  * ANA LOG FONKSİYONU
  *
@@ -125,6 +133,7 @@ void nox_log_impl(log_level_t level, log_module_t mod,
         va_start(ap, fmt);
         vsnprintf(msg, sizeof(msg), fmt, ap);
         va_end(ap);
+        sanitize_log_newlines(msg);
 
         char line_buf[2200];
         snprintf(line_buf, sizeof(line_buf), "[LOG] [%s] [%s] %s",
@@ -152,11 +161,14 @@ void nox_log_impl(log_level_t level, log_module_t mod,
             modules[mod].name,
             CLR_RESET);
 
-    /* Mesaj */
+    /* Mesaj — M-25 FIX: newline sanitization */
+    char msg[2048];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    sanitize_log_newlines(msg);
+    fputs(msg, stderr);
 
     /* Kaynak dosya — yalnızca debug build */
 #ifdef DEBUG

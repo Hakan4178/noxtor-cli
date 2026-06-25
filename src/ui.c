@@ -312,18 +312,39 @@ void ui_print_prompt(struct app_state *state)
  * [F8] Dinamik satır hesabı — peer mesajı gelirken input bozulmaz
  * ================================================================ */
 
-/* UI-1 FIX: Terminal ANSI injection koruması —peer mesajlarını temizle */
+/* UI-1 FIX: Terminal ANSI injection koruması — tüm escape sequence türlerini temizle
+ * CSI (ESC [), OSC (ESC ]), DCS (ESC P), ESC followed by non-[, tek ESC */
 static void strip_ansi_escape(char *str) {
   if (!str) return;
   char *dst = str;
   const char *src = str;
   while (*src) {
-    if ((unsigned char)*src == 0x1b && src[1] == '[') {
-      src += 2;
-      while (*src && ((*src >= '0' && *src <= '?') ||
-                      (*src >= ' ' && *src <= '/')))
-        src++;
-      if (*src) src++;
+    if ((unsigned char)*src == 0x1b) {
+      if (src[1] == '[') {
+        /* CSI: ESC [ <params> <final> */
+        src += 2;
+        while (*src && ((*src >= '0' && *src <= '?') ||
+                        (*src >= ' ' && *src <= '/')))
+          src++;
+        if (*src) src++;
+      } else if (src[1] == ']') {
+        /* OSC: ESC ] <cmd> ; <data> BEL or ESC \ */
+        src += 2;
+        while (*src && (unsigned char)*src != 0x07 &&
+               !(src[0] == 0x1b && src[1] == '\\'))
+          src++;
+        if ((unsigned char)*src == 0x07) src++;
+        else if (src[0] == 0x1b && src[1] == '\\') src += 2;
+      } else if (src[1] == 'P') {
+        /* DCS: ESC P <data> ESC \ */
+        src += 2;
+        while (*src && !(src[0] == 0x1b && src[1] == '\\'))
+          src++;
+        if (src[0] == 0x1b && src[1] == '\\') src += 2;
+      } else {
+        /* Diğer tüm ESC sequence'leri (ST, tek ESC, vs.) — atla */
+        src += 2;
+      }
     } else {
       *dst++ = *src++;
     }
@@ -567,6 +588,13 @@ void ui_print_progress(struct app_state *state, const char *filename,
      */
     (void)state;  /* şu an kullanılmıyor — ileride tema için gerekebilir */
 
+    /* M-24 FIX: ANSI injection koruması — filename strip */
+    size_t fn_len = strlen(filename);
+    char *safe_fn = malloc(fn_len + 1);
+    if (!safe_fn) return;
+    memcpy(safe_fn, filename, fn_len + 1);
+    strip_ansi_escape(safe_fn);
+
     unsigned pct = (unsigned)((done * 100ULL) / total);
     if (pct > 100) pct = 100;
 
@@ -586,8 +614,9 @@ void ui_print_progress(struct app_state *state, const char *filename,
 
     fprintf(stderr, "\r\033[K  %s%s %s [%s] %u%% %s/%s%s",
             g_theme->clr_progress,
-            arrow, filename, bar, pct,
+            arrow, safe_fn, bar, pct,
             done_str, total_str,
             g_theme->clr_reset);
     fflush(stderr);
+    free(safe_fn);
 }
