@@ -28,7 +28,8 @@
  *
  * tor_authenticate: Cookie dosyasını okur, hex olarak gönderir + siler.
  * tor_wait_bootstrap: timeout ile %100 bootstrap bekler.
- * tor_create_hs: ADD_ONION ile Hidden Service oluşturur (unix: prefix).
+ * tor_create_new_hs: ADD_ONION NEW:ED25519-V3 — yeni HS + PrivateKey kaydet.
+ * tor_create_persistent_hs: ADD_ONION ED25519-V3:<key> — kayıtlı key ile HS.
  * tor_shutdown: SIGNAL SHUTDOWN + waitpid + dizin temizliği.
  * ================================================================ */
 
@@ -41,14 +42,24 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir);
 /* Bootstrap %100 olana kadar bekle */
 nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec);
 
-/* Hidden Service oluştur — onion adresini onion_out'a yaz.
- * listen_path: AF_UNIX socket yolu (ADD_ONION unix: prefix ile) */
-nox_err_t tor_create_hidden_service(int ctrl_fd, const char *listen_path,
-                                     char *onion_out, size_t onion_len);
+/* Yeni Hidden Service üret — ServiceID + PrivateKey döndür.
+ * listen_path: AF_UNIX socket yolu (ADD_ONION unix: prefix ile)
+ * onion_out: 63 byte (56 base32 + ".onion\0")
+ * key_out: 89 byte (88 base64 + "\0") */
+__attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
+                             char *onion_out, size_t onion_len,
+                             char *key_out, size_t key_len);
+
+/* Kayıtlı ED25519-V3 private key ile Hidden Service oluştur.
+ * onion_key_b64: 88 byte base64 key (ED25519-V3: prefix'siz)
+ * onion_out: 63 byte (56 base32 + ".onion\0") */
+__attribute__((strub)) nox_err_t tor_create_persistent_hs(int ctrl_fd, const char *listen_path,
+                                    const char *onion_key_b64,
+                                    char *onion_out, size_t onion_len);
 
 /* Onion v3 adres doğrulaması — base32 + ".onion" suffix.
  * 62 karakter tam v3 .onion adresi için true döner.
- * socks5_connect (peer) ve tor_create_hidden_service (S3 — kendi HS)
+ * socks5_connect (peer) ve tor_create_new_hs (S3 — kendi HS)
  * tarafından çağrılır. */
 bool validate_onion_address(const char *addr);
 

@@ -673,13 +673,23 @@ static void prompt_transport_selection(struct app_state *state) {
       memcpy(salt_path, state.config_dir, dir_len);
       memcpy(salt_path + dir_len, "/salt", 6); /* 5 + NUL */
 
+      /* Onion key dosyası yolu */
+      char onion_key_path[NOX_PATH_MAX];
+      size_t okp_len = strlen(state.config_dir);
+      if (okp_len + 10 < NOX_PATH_MAX) {
+        memcpy(onion_key_path, state.config_dir, okp_len);
+        memcpy(onion_key_path + okp_len, "/onion.key", 10);
+      } else {
+        onion_key_path[0] = '\0';
+      }
+
       /* contacts.db */
       char db_path[NOX_PATH_MAX];
       memcpy(db_path, state.config_dir, dir_len);
       memcpy(db_path + dir_len, "/contacts.db", 13); /* 12 + NUL */
 
       const char *all_files[] = {state.identity_path, salt_path, db_path,
-                                 state.contacts_path, NULL};
+                                 state.contacts_path, onion_key_path, NULL};
 
       int wiped = 0;
       for (int i = 0; all_files[i] != NULL; i++) {
@@ -1128,17 +1138,84 @@ static void prompt_transport_selection(struct app_state *state) {
 
     if (g_shutdown) goto shutdown_clean;
 
-    err = tor_create_hidden_service(state.tor_ctrl_fd, state.listen_path,
-                                    state.onion_addr, sizeof(state.onion_addr));
-    if (err != NOX_OK) {
-      if (g_shutdown) goto shutdown_clean;
-      NOX_FATAL(LOG_MOD_MAIN, "Hidden Service başarısız: %s",
-                nox_strerror(err));
-      cleanup(&state);
-      return 1;
-    }
+    /* ── 14b. Kalıcı onion key — dosyadan oku veya yeni HS üret ── */
+    {
+      char onion_key_path[NOX_PATH_MAX];
+      {
+        size_t okp_len = strlen(state.config_dir);
+        if (okp_len + 10 < NOX_PATH_MAX) {
+          memcpy(onion_key_path, state.config_dir, okp_len);
+          memcpy(onion_key_path + okp_len, "/onion.key", 10);
+        } else {
+          onion_key_path[0] = '\0';
+        }
+      }
 
-    NOX_INFO(LOG_MOD_MAIN, "adresiniz: %s", state.onion_addr);
+      char saved_key[NOX_ONION_KEY_B64_LEN + 1];
+      saved_key[0] = '\0';
+
+      /* Dosyadan mevcut key'i okumaya çalış */
+      int key_fd = open(onion_key_path, O_RDONLY);
+      if (key_fd >= 0) {
+        ssize_t n = read(key_fd, saved_key, NOX_ONION_KEY_B64_LEN);
+        close(key_fd);
+        if (n == (ssize_t)NOX_ONION_KEY_B64_LEN) {
+          saved_key[NOX_ONION_KEY_B64_LEN] = '\0';
+        } else {
+          saved_key[0] = '\0';
+        }
+      }
+
+      if (saved_key[0] != '\0') {
+        /* Kayıtlı key ile kalıcı HS oluştur */
+        err = tor_create_persistent_hs(state.tor_ctrl_fd, state.listen_path,
+                                        saved_key,
+                                        state.onion_addr,
+                                        sizeof(state.onion_addr));
+        explicit_bzero(saved_key, sizeof(saved_key));
+        if (err != NOX_OK) {
+          if (g_shutdown) goto shutdown_clean;
+          NOX_FATAL(LOG_MOD_MAIN, "Persistent HS başarısız: %s",
+                    nox_strerror(err));
+          cleanup(&state);
+          return 1;
+        }
+        NOX_INFO(LOG_MOD_MAIN, "adresiniz (kalıcı): %s", state.onion_addr);
+      } else {
+        /* Yeni HS üret + key'i dosyaya kaydet */
+        err = tor_create_new_hs(state.tor_ctrl_fd, state.listen_path,
+                                 state.onion_addr, sizeof(state.onion_addr),
+                                 saved_key, sizeof(saved_key));
+        if (err != NOX_OK) {
+          explicit_bzero(saved_key, sizeof(saved_key));
+          if (g_shutdown) goto shutdown_clean;
+          NOX_FATAL(LOG_MOD_MAIN, "Yeni HS başarısız: %s",
+                    nox_strerror(err));
+          cleanup(&state);
+          return 1;
+        }
+
+        /* Key'i dosyaya yaz — izin 0600 (sadece owner) */
+        key_fd = open(onion_key_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (key_fd >= 0) {
+          nox_err_t werr = write_full(key_fd, saved_key, NOX_ONION_KEY_B64_LEN);
+          close(key_fd);
+          if (werr != NOX_OK) {
+            NOX_WARN(LOG_MOD_MAIN, "onion key yazılamadı: %s",
+                     nox_strerror(werr));
+          } else {
+            NOX_INFO(LOG_MOD_MAIN, "onion key kaydedildi: %s",
+                     onion_key_path);
+          }
+        } else {
+          NOX_WARN(LOG_MOD_MAIN, "onion key dosyaya yazılamadı: %s",
+                   strerror(errno));
+        }
+
+        explicit_bzero(saved_key, sizeof(saved_key));
+        NOX_INFO(LOG_MOD_MAIN, "adresiniz: %s", state.onion_addr);
+      }
+    }
 
     /* ── 15. epoll event loop ─────────────────────────── */
     err = epoll_setup(&state, state.listen_fd);

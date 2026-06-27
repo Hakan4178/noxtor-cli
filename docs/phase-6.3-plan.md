@@ -467,3 +467,313 @@ Sıralı mı yoksa arka plan mı olacağı, gerçek Tor davranışı test edildi
 - ncurses olmadan derleme → tek-peer ANSI modunun sorunsuz çalışması
 - Uygulama yeniden başlatıldıktan sonra `.onion` adreslerinin korunması
 - Ghost modda hiçbir şeyin diske yazılmaması
+
+---
+
+## EK: Detaylı Uygulama Planı (2026-06-24)
+
+### Teknik Kararlar (Güncel)
+
+| Karar | Seçim |
+|---|---|
+| TUI Teknolojisi | **termbox2** (mevcut 772 satır korunur, ncurses'e geçiş yok) |
+| noise_key lookup | Sonra (ayrı iyileştirme) |
+| Ortak fingerprint | Sonra (ayrı tasarım kararı) |
+| Key rotation | Sonra (gelecek optimizasyonu) |
+| State machine refactoring | Sonra (şu an 7 boş stub var, doldurulacak) |
+| Test stratejisi | Manuel test (iki terminal, iki instance) |
+| Commit zamanlaması | Manuel, her alt fazdan sonra |
+
+### Veri Modeli
+
+#### Mevcut (database.c — değişiklik gerekmez)
+
+```c
+struct contact_payload {
+    char     onion[63];
+    char     name[65];
+    uint8_t  noise_key[32];
+    char     my_onion[63];      // ← Pairwise için zaten var
+    char     my_onion_key[89];  // ← Kalıcı HS için zaten var
+};
+```
+
+#### Yeni (types.h)
+
+```c
+#define NOX_MAX_PEERS  16U
+
+struct peer_session {
+    char     peer_onion[NOX_ONION_LEN + 1];
+    char     my_onion[NOX_ONION_LEN + 1];
+    uint8_t  my_onion_key[NOX_ONION_KEY_B64_LEN + 1];
+    char     name[NOX_CONTACT_NAME_LEN + 1];
+    int      fd;
+    int      listen_fd;
+    char     listen_path[NOX_PATH_MAX];
+    struct noise_session *session;
+    struct noise_handshake *hs;
+    time_t   handshake_start;
+    size_t   session_arena_mark;
+    uint32_t tx_seq;
+    uint32_t rx_seq;
+    bool     queue_flushed;
+    struct file_rx_state rx_file;
+    struct file_tx_state tx_file;
+    bool     tofu_pending;
+    uint8_t  tofu_new_key[NOX_KEY_LEN];
+    char     tofu_onion[NOX_ONION_LEN + 1];
+    char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
+    struct   timespec tofu_start;
+    uint8_t  recv_buf[RECV_BUF_CAPACITY];
+    size_t   recv_pos;
+    peer_state_t state;
+    uint32_t unread_count;
+    int      hs_attempt_count;
+    time_t   hs_window_start;
+};
+
+struct app_state {
+    struct noise_identity id;
+    struct noise_identity peer_id;
+    struct noise_session  session;
+    struct noise_handshake *hs;
+    time_t handshake_start;
+    struct config  cfg;
+    struct tor     tor;
+    struct pollfd  fds[4];
+    struct tor_state tor_st;
+    struct tor_state tor_hs;
+    struct tor_state tor_ev;
+    struct arena   session_arena;
+    struct arena   msg_arena;
+    size_t session_arena_mark;
+    bool   session_arena_active;
+    struct file_rx_state rx_file;
+    struct file_tx_state tx_file;
+    size_t   recv_pos;
+    uint8_t  recv_buf[4096];
+    uint32_t tx_seq;
+    uint32_t rx_seq;
+    bool     queue_flushed;
+    bool     id_loaded;
+    bool     has_identity_key;
+    uint8_t  peer_onion_hash[BLAKE2b_HASH_LEN];
+    char     peer_onion[NOX_ONION_LEN + 1];
+    char     peer_name[NOX_CONTACT_NAME_LEN + 1];
+    bool     verified;
+    uint8_t  peer_noise_pub[32];
+    bool     peer_noise_pub_set;
+    char     onion_priv_b64[NOX_ONION_KEY_B64_LEN + 1];
+    uint8_t  onion_priv[NOX_ONION_PRIV_LEN];
+    bool     onion_generated;
+    struct sockaddr_un remote_addr;
+    socklen_t remote_addr_len;
+    peer_state_t state;
+    struct timespec handshake_deadline;
+    uint8_t  tofu_new_key[NOX_KEY_LEN];
+    char     tofu_onion[NOX_ONION_LEN + 1];
+    char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
+    struct   timespec tofu_start;
+    struct epoll_event events[4];
+
+    /* ===== YENİ: Çoklu peer ===== */
+    struct peer_session peers[NOX_MAX_PEERS];
+    int      active_peer_idx;
+    int      peer_count;
+
+    /* ===== ESKİ: Tek peer alanları (kalır, geriye uyumluluk için) ===== */
+    int      peer_fd;
+    int      listen_fd;
+    char     listen_path[NOX_PATH_MAX];
+};
+```
+
+---
+
+### Alt Faz 6.3.1 — Kalıcı Onion Anahtarı
+
+**Hedef:** Her restart'ta aynı .onion adresleri geri gelsin.
+**Tahmini Satır:** ~200
+**Dosyalar:** network.c, network.h, main.c
+
+#### network.c Yeni Fonksiyonlar
+
+```c
+nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
+                             char *onion_out, size_t onion_len,
+                             char *key_out, size_t key_len);
+// ADD_ONION NEW:ED25519-V3 → ServiceID + PrivateKey parse
+
+nox_err_t tor_create_persistent_hs(int ctrl_fd, const char *listen_path,
+                                    const char *onion_key_b64,
+                                    char *onion_out, size_t onion_len);
+// ADD_ONION ED25519-V3:<key> → sadece ServiceID parse
+```
+
+#### main.c Startup Flow
+
+```
+Mevcut:
+  tor_create_hidden_service(ctrl_fd, listen_path, onion_addr, sizeof(onion_addr))
+
+Yeni:
+  1. DB'den mevcut onion key'i ara (self-key veya ilk contact'tan)
+  2. Key varsa → tor_create_persistent_hs(key)
+  3. Key yoksa → tor_create_new_hs() → key'i DB'ye kaydet
+  4. onion_addr'i peers[0].my_onion'a yaz
+```
+
+#### PrivateKey Parse
+
+Tor control port yanıtından `PrivateKey=` alanını parse:
+```
+250-ServiceID=abc123.onion\r\n
+250-PrivateKey=ED25519-V3:base64key\r\n
+250 OK\r\n
+```
+
+#### Test
+- Uygulama yeniden başlatıldığında aynı .onion adresinin gelmesi
+
+---
+
+### Alt Faz 6.3.2 — Pairwise Onion Adresleri
+
+**Hedef:** Her peer'a ayrı .onion adresi.
+**Tahmini Satır:** ~250
+**Dosyalar:** types.h, main.c, event_loop.c
+
+#### Veri Akışı
+
+```
+Ali (/connect veli) →
+  1. db_get_contact("veli") → peer_onion, name, my_onion, my_onion_key
+  2. my_onion_key varsa → tor_create_persistent_hs(my_onion_key) → peers[i].my_onion
+  3. my_onion_key yoksa → tor_create_new_hs() → key'i DB'ye kaydet
+  4. SOCKS5 proxy üzerinden veli.onion'a bağlan
+```
+
+#### Database API (Zaten var, değişiklik gerekmez)
+
+```c
+nox_err_t db_get_contact(sqlite3 *db,
+                          const uint8_t *onion_hash,
+                          struct contact **out);
+
+nox_err_t db_add_contact(sqlite3 *db,
+                          const char *onion_addr,
+                          const char *name,
+                          const uint8_t *noise_key,
+                          const char *my_onion,
+                          const char *my_onion_key);
+
+nox_err_t db_list_contacts(sqlite3 *db,
+                            struct contact_list **out);
+```
+
+#### Test
+- İki farklı peer'a farklı .onion adresleri verildiğinin doğrulanması
+
+---
+
+### Alt Faz 6.3.3 — Çoklu Oturum Event Loop
+
+**Hedef:** Birden fazla peer ile aynı anda iletişim.
+**Tahmini Satır:** ~350
+**Dosyalar:** event_loop.c, state_machine.c, stdin_handler.c
+
+#### event_loop.c Değişiklikleri
+
+| Değişiklik | Açıklama |
+|---|---|
+| `fd_to_peer_index()` | fd → peers[i] eşleştirmesi |
+| `events[]` boyutu | `4` → `4 + NOX_MAX_PEERS * 2` |
+| Accept routing | Tek `listen_fd` → `peers[i].listen_fd` döngüsü |
+| Data routing | `fd == peer_fd` → `fd_to_peer_index(state, fd)` |
+| `process_peer_frames()` | `state->session` → `peers[idx].session` |
+| Timeout checks | Tek peer → tüm peer'ları tara |
+| recv_buf drain | Tek buffer → `peers[idx].recv_buf` |
+
+#### state_machine.c Değişiklikleri
+
+| Değişiklik | Açıklama |
+|---|---|
+| `sm_dispatch` imzası | `sm_dispatch(state, ev)` → `sm_dispatch(ps, ev)` |
+| `action_cleanup` | `state->peer_fd` → `ps->fd`, `state->session` → `ps->session` |
+| `action_tofu_accept` | `state->tofu_*` → `ps->tofu_*` |
+| Tüm action fonksiyonları | `app_state*` → `peer_session*` parametresi |
+
+#### stdin_handler.c Değişiklikleri
+
+| Komut | Davranış |
+|---|---|
+| `/connect <isim\|onion>` | Rehberden bul → `peers[idx]` oluştur → SOCKS5 → handshake |
+| `/switch <isim\|indeks>` | `active_peer_idx` güncelle → TUI refresh |
+| `/disconnect` | `peers[idx]`'i temizle → state → IDLE |
+| `/list` | `db_list_contacts` → sidebar'a yaz |
+| `/addr` | `peers[active_peer_idx].my_onion` göster |
+| `<metin>` | `peers[active_peer_idx]`'e mesaj gönder |
+
+#### Test
+- İki peer'la aynı anda bağlantı kurma ve mesajlaşma
+
+---
+
+### Alt Faz 6.3.4 — Mesaj Geçmişi
+
+**Hedef:** `/history` komutu + TUI'da geçmiş gösterimi.
+**Tahmini Satır:** ~50
+**Dosyalar:** stdin_handler.c, tui.c
+
+database.c zaten hazır:
+- `db_save_message()` ✅
+- `db_get_history()` ✅
+
+Sadece:
+- `/history` komutunu stdin_handler.c'ye ekle
+- TUI'da geçmiş yükleme (chat scrollback'a DB'den mesajları bas)
+
+---
+
+### Alt Faz 6.3.5 — TUI Multi-peer Genişletme
+
+**Hedef:** Per-peer chat buffer, unread badge, Tab ile geçiş.
+**Tahmini Satır:** ~150
+**Dosyalar:** tui.c
+
+| Değişiklik | Açıklama |
+|---|---|
+| Per-peer chat buffer | `chat_lines[]` → `peers[i].chat_lines[]` veya ring buffer |
+| Unread badge | Sidebar'da `peers[i].unread_count` göster |
+| Tab/BackTab | `active_peer_idx` döngüsel geçiş |
+| Chat temizleme | Sidebar'da Enter → sadece o peer'ın chat'ini temizle |
+
+---
+
+### Özet Tablosu
+
+| Alt Faz | Satır | Dosya | Bağımlılık |
+|---|---|---|---|
+| 6.3.1 Kalıcı Onion | ~200 | network.c, network.h, main.c | — |
+| 6.3.2 Pairwise Onion | ~250 | types.h, main.c, event_loop.c | 6.3.1 |
+| 6.3.3 Çoklu Oturum | ~350 | event_loop.c, state_machine.c, stdin_handler.c | 6.3.2 |
+| 6.3.4 Mesaj Geçmişi | ~50 | stdin_handler.c, tui.c | 6.3.3 |
+| 6.3.5 TUI Genişletme | ~150 | tui.c | 6.3.3 |
+| **Toplam** | **~1000** | **~8 dosya** | — |
+
+### Sıralı Uygulama
+
+```
+6.3.1 → 6.3.2 → 6.3.3 → 6.3.4 → 6.3.5
+```
+
+Her alt faz bağımsız derlenebilir ve test edilebilir.
+
+### Eksik Konular (Bu Plan'a Dahil Değil)
+
+| Konu | Neden |
+|---|---|
+| noise_key ile contact lookup | Onion rotation koruması — ayrı bir iyileştirme |
+| Ortak fingerprint | Out-of-band doğrulama — ayrı bir tasarım kararı |
+| Key rotation | Gelecek optimizasyon — şimdilik gerek yok |

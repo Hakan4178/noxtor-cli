@@ -49,8 +49,8 @@ static void safe_nanosleep(const struct timespec *req) {
  *
  * A-2 FIX: Onion v3 adres format doğrulaması
  * Format: 56 karakter base32 + ".onion" = 62 karakter
- * Public: tor_create_hidden_service (S3 — kendi HS adresimiz) ve
- *         socks5_connect (peer adresi) tarafından çağrılır.
+ * Public: tor_create_new_hs / tor_create_persistent_hs (S3 — kendi HS)
+ *         ve socks5_connect (peer adresi) tarafından çağrılır.
  *
  * S3 notu: v3 checksum (SHA3-256 truncated) doğrulaması YAPILMAZ.
  *   libsodium SHA3-256 sunmaz, ek kütüphane ekleme maliyeti
@@ -935,8 +935,57 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
 /* ================================================================
  * HIDDEN SERVICE — ADD_ONION
  * ================================================================ */
-nox_err_t tor_create_hidden_service(int ctrl_fd, const char *listen_path,
-                                     char *onion_out, size_t onion_len) {
+/* ServiceID parse helper — ADD_ONION yanıtından 56 char base32 okur.
+ * onion_out en az 63 byte olmalı (56 + ".onion\0"). */
+static nox_err_t parse_service_id(const char *resp,
+                                   char *onion_out, size_t onion_len) {
+  const char *sid = strstr(resp, "ServiceID=");
+  if (!sid) {
+    NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtında ServiceID yok");
+    return NOX_ERR_TOR;
+  }
+  sid += 10;
+
+  size_t remaining = strlen(sid);
+  if (remaining < 56) {
+    NOX_ERROR(LOG_MOD_NET, "ServiceID truncated (%zu byte)", remaining);
+    return NOX_ERR_TOR;
+  }
+
+  size_t i = 0;
+  while (i < 56 && sid[i] && sid[i] != '\r' && sid[i] != '\n')
+    i++;
+  if (i != 56) {
+    NOX_ERROR(LOG_MOD_NET, "onion adresi uzunluğu hatalı: %zu", i);
+    return NOX_ERR_TOR;
+  }
+
+  if (onion_len < 63)
+    return NOX_ERR_OVERFLOW;
+
+  /* S3 (threat-model): Tor'dan gelen ServiceID'yi validate et.
+   * Yanlış formatlı yanıt (compromised tor binary, control socket
+   * manipülasyonu, vb.) peer handshake payload'umuza kirli veri
+   * sızdırmadan reddedilmeli. */
+  char candidate[63];
+  memcpy(candidate, sid, 56);
+  memcpy(candidate + 56, ".onion", 7);
+  candidate[62] = '\0';
+
+  if (!validate_onion_address(candidate)) {
+    NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtı geçersiz format");
+    sodium_memzero(candidate, sizeof(candidate));
+    return NOX_ERR_TOR;
+  }
+
+  memcpy(onion_out, candidate, 63);
+  sodium_memzero(candidate, sizeof(candidate));
+  return NOX_OK;
+}
+
+__attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
+                             char *onion_out, size_t onion_len,
+                             char *key_out, size_t key_len) {
   /* NET-4 FIX: CRLF injection koruması */
   if (strchr(listen_path, '\r') || strchr(listen_path, '\n')) {
     NOX_ERROR(LOG_MOD_NET, "listen_path CRLF injection engellendi");
@@ -959,55 +1008,87 @@ nox_err_t tor_create_hidden_service(int ctrl_fd, const char *listen_path,
   if (err != NOX_OK)
     return err;
 
-  char *sid = strstr(resp, "ServiceID=");
-  if (!sid) {
-    NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtında ServiceID yok");
+  /* ServiceID parse */
+  err = parse_service_id(resp, onion_out, onion_len);
+  if (err != NOX_OK)
+    return err;
+
+  /* PrivateKey parse — ADD_ONION NEW:ED25519-V3 yanıtı:
+   *   250-ServiceID=abc123.onion
+   *   250-PrivateKey=ED25519-V3:<88_byte_base64>
+   *   250 OK
+   * Format sabittir: ED25519-V3: prefix + 88 byte base64 (64 byte raw). */
+  if (key_len < 89) {
+    NOX_ERROR(LOG_MOD_NET, "key_out buffer çok küçük (%zu byte)", key_len);
+    return NOX_ERR_OVERFLOW;
+  }
+
+  char *priv = strstr(resp, "PrivateKey=ED25519-V3:");
+  if (!priv) {
+    NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtında PrivateKey yok");
+    return NOX_ERR_TOR;
+  }
+  priv += 22; /* strlen("PrivateKey=ED25519-V3:") */
+
+  /* Buffer taşma koruması — 88 byte base64 + sonraki satır kontrolü */
+  size_t priv_remaining = strlen(priv);
+  if (priv_remaining < 88) {
+    NOX_ERROR(LOG_MOD_NET, "PrivateKey base64 truncated (%zu byte)", priv_remaining);
     return NOX_ERR_TOR;
   }
 
-  sid += 10;
-
-  /* resp sınırları içinde kaldığından emin ol */
-  size_t remaining = strlen(sid);
-  if (remaining < 56) {
-    NOX_ERROR(LOG_MOD_NET, "ServiceID truncated (%zu byte)", remaining);
+  size_t pi = 0;
+  while (pi < 88 && priv[pi] && priv[pi] != '\r' && priv[pi] != '\n')
+    pi++;
+  if (pi != 88) {
+    NOX_ERROR(LOG_MOD_NET, "PrivateKey base64 uzunluğu hatalı: %zu", pi);
     return NOX_ERR_TOR;
   }
 
-  /* 56 byte base32 onion address doğrula */
-  size_t i = 0;
-  while (i < 56 && sid[i] && sid[i] != '\r' && sid[i] != '\n')
-    i++;
+  memcpy(key_out, priv, 88);
+  key_out[88] = '\0';
 
-  if (i != 56) {
-    NOX_ERROR(LOG_MOD_NET, "onion adresi uzunluğu hatalı: %zu", i);
-    return NOX_ERR_TOR;
+  NOX_INFO(LOG_MOD_NET, "Hidden Service (yeni): %s", onion_out);
+  explicit_bzero(resp, sizeof(resp)); /* Tor yanıt buffer'ındaki hassas veriyi temizle */
+  return NOX_OK;
+}
+
+__attribute__((strub)) nox_err_t tor_create_persistent_hs(int ctrl_fd, const char *listen_path,
+                                    const char *onion_key_b64,
+                                    char *onion_out, size_t onion_len) {
+  /* NET-4 FIX: CRLF injection koruması */
+  if (strchr(listen_path, '\r') || strchr(listen_path, '\n')) {
+    NOX_ERROR(LOG_MOD_NET, "listen_path CRLF injection engellendi");
+    return NOX_ERR_CONFIG;
+  }
+  if (!onion_key_b64 || strnlen(onion_key_b64, 89) != 88) {
+    NOX_ERROR(LOG_MOD_NET, "geçersiz onion key (88 byte base64 bekleniyor)");
+    return NOX_ERR_CONFIG;
   }
 
-  if (onion_len < 63)
+  char cmd[256];
+  int n = snprintf(cmd, sizeof(cmd),
+                   "ADD_ONION ED25519-V3:%s Port=%u,unix:%s\r\n",
+                   onion_key_b64, NOX_VIRTUAL_PORT, listen_path);
+  if (n <= 0 || (size_t)n >= sizeof(cmd))
     return NOX_ERR_OVERFLOW;
 
-  /* S3 (threat-model): Tor'dan gelen ServiceID'yi validate et.
-   * Yanlış formatlı yanıt (compromised tor binary, control socket
-   * manipülasyonu, vb.) peer handshake payload'umuza kirli veri
-   * sızdırmadan reddedilmeli. Peer tarafında da aynı kontrolden
-   * geçen adres artık bizim HS adresimiz de aynı sıkılıkta
-   * doğrulanıyor. */
-  char candidate[63];
-  memcpy(candidate, sid, 56);
-  memcpy(candidate + 56, ".onion", 7);
-  candidate[62] = '\0';
+  nox_err_t err = ctrl_send_command(ctrl_fd, cmd);
+  explicit_bzero(cmd, sizeof(cmd)); /* Hassas key'i stack'ten temizle */
+  if (err != NOX_OK)
+    return err;
 
-  if (!validate_onion_address(candidate)) {
-    NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtı geçersiz format");
-    sodium_memzero(candidate, sizeof(candidate));
-    return NOX_ERR_TOR;
-  }
+  char resp[512];
+  err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_READ_TIMEOUT_MS);
+  if (err != NOX_OK)
+    return err;
 
-  memcpy(onion_out, candidate, 63);
-  sodium_memzero(candidate, sizeof(candidate));
+  /* Persistent HS'ta PrivateKey yanıtı olmaz — sadece ServiceID */
+  err = parse_service_id(resp, onion_out, onion_len);
+  if (err != NOX_OK)
+    return err;
 
-  NOX_INFO(LOG_MOD_NET, "Hidden Service: %s", onion_out);
+  NOX_INFO(LOG_MOD_NET, "Hidden Service (kalıcı): %s", onion_out);
   return NOX_OK;
 }
 

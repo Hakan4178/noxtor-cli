@@ -438,6 +438,13 @@ void process_line(struct app_state *state, const char *line) {
       return;
     }
 
+    /* Self-connection koruması */
+    if (target_len == NOX_ONION_LEN &&
+        memcmp(target, state->onion_addr, NOX_ONION_LEN) == 0) {
+      ui_print_error(state, "kendi adresinize bağlanamazsınız");
+      return;
+    }
+
     NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
     int peer_fd = -1;
     nox_err_t err =
