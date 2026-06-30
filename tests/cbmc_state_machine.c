@@ -84,12 +84,8 @@ void file_transfer_cleanup(struct app_state *state) {
 }
 
 nox_err_t db_add_contact(const char *onion, const char *name,
-                         const uint8_t noise_key[NOX_KEY_LEN],
-                         const char *my_onion,
-                         const uint8_t *my_onion_key,
-                         size_t onion_key_len) {
+                         const uint8_t noise_key[NOX_KEY_LEN]) {
     (void)onion; (void)name; (void)noise_key;
-    (void)my_onion; (void)my_onion_key; (void)onion_key_len;
     return __VERIFIER_nondet_bool() ? NOX_OK : NOX_ERR_DB;
 }
 

@@ -30,85 +30,102 @@
 #include <sodium.h>
 
 /* ================================================================
+ * PEER ARAMA YARDIMCILARI
+ *
+ * fd → peer_session eşlemesi: epoll'taki data.fd integer'ını
+ * peer_session struct'ındaki fd veya listen_fd alanlarıyla eşleştirir.
+ * ================================================================ */
+static struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
+{
+    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+        struct peer_session *ps = &state->peers[i];
+        if (ps->fd == fd)
+            return ps;
+    }
+    return NULL;
+}
+
+/* ================================================================
  * FRAME PROCESSING — recv_buf'daki frame'leri işle
  *
  * Hem EPOLLIN handler'dan hem de epoll_wait öncesi drain'den
  * çağrılır. Bu sayede TOFU_PENDING sonrası bekleyen frame'ler
  * session kurulduktan sonra işlenebilir.
  * ================================================================ */
-static void process_peer_frames(struct app_state *state, int fd) {
-  while (state->recv_pos >= FRAME_HEADER_WIRE_SIZE) {
+static void process_peer_frames(struct peer_session *ps, struct app_state *state,
+                                int fd) {
+  while (ps->recv_pos >= FRAME_HEADER_WIRE_SIZE) {
 
     struct frame_header fh;
-    if (frame_header_decode(state->recv_buf, &fh) != NOX_OK) {
-      state->recv_pos = 0; /* bozuk header — buffer'ı sıfırla */
+    if (frame_header_decode(ps->recv_buf, &fh) != NOX_OK) {
+      ps->recv_pos = 0; /* bozuk header — buffer'ı sıfırla */
       break;
     }
 
     /* A-1 FIX: Boyut sınırı kontrolü */
     if (fh.len == 0 || fh.len > 4096 + NOX_MAC_LEN) {
       NOX_WARN(LOG_MOD_NET, "geçersiz frame boyutu: %u", fh.len);
-      state->recv_pos = 0;
+      ps->recv_pos = 0;
       break;
     }
 
     size_t frame_total = FRAME_HEADER_WIRE_SIZE + fh.len;
-    if (state->recv_pos < frame_total)
+    if (ps->recv_pos < frame_total)
       break; /* payload henüz tamamlanmadı, bir sonraki EPOLLIN'de devam */
 
     /* FIX: Session henüz kurulmadıysa TEXT/FILE frame'leri tüketme —
      * recv_buf'da beklesin, session sonrası drain ile işlenecek.
      * TOFU_PENDING sırasında peer mesaj gönderirse bunlar drop edilirdi,
      * bu da seq mismatch'e yol açardı. */
-    if ((fh.type == NOX_MSG_TEXT || fh.type == NOX_MSG_FILE) && !state->session) {
+    if ((fh.type == NOX_MSG_TEXT || fh.type == NOX_MSG_FILE) && !ps->session) {
       NOX_DEBUG(LOG_MOD_NET,
                "session henüz yok — frame bekletiliyor (type=%u seq=%u recv_pos=%zu)",
-               fh.type, fh.seq, state->recv_pos);
+               fh.type, fh.seq, ps->recv_pos);
       break;
     }
 
     /* Frame tamamlandı — payload'ı ayıkla */
     uint8_t *payload = sodium_malloc(fh.len);
     if (!payload) {
-      state->recv_pos = 0;
+      ps->recv_pos = 0;
       break;
     }
-    memcpy(payload, state->recv_buf + FRAME_HEADER_WIRE_SIZE, fh.len);
+    memcpy(payload, ps->recv_buf + FRAME_HEADER_WIRE_SIZE, fh.len);
     /* M-3 FIX: Frame sonrasındaki kalan byte'ları koru */
-    size_t remaining = state->recv_pos - frame_total;
+    size_t remaining = ps->recv_pos - frame_total;
     if (remaining > 0) {
-      memmove(state->recv_buf, state->recv_buf + frame_total, remaining);
+      memmove(ps->recv_buf, ps->recv_buf + frame_total, remaining);
     }
-    state->recv_pos = remaining;
+    ps->recv_pos = remaining;
 
-    if (fh.type == NOX_MSG_CTRL && state->hs) {
+    if (fh.type == NOX_MSG_CTRL && ps->hs) {
       uint8_t pl[64];
       size_t pl_len = sizeof(pl);
       nox_err_t hs_err =
-          handshake_read(state->hs, payload, fh.len, pl, sizeof(pl), &pl_len);
+          handshake_read(ps->hs, payload, fh.len, pl, sizeof(pl), &pl_len);
       if (hs_err != NOX_OK) {
         NOX_ERROR(LOG_MOD_NOISE, "Handshake okuma hatası: %s",
                   nox_strerror(hs_err));
         ui_print_error(
             state, "Akran ile handshake el sıkışması başarısız oldu.");
-        sm_dispatch(state, EV_HANDSHAKE_ERROR);
+        sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
         sodium_free(payload);
         break;
       }
 
       uint8_t remote_pub[NOX_KEY_LEN];
 
-      if (state->hs->msg_index < 3) {
+      if (ps->hs->msg_index < 3) {
         uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
         size_t hslen = sizeof(hsbuf);
-        nox_err_t hs_write_err = handshake_write(state->hs,
+        nox_err_t hs_write_err = handshake_write(ps->hs,
                             (const uint8_t *)state->onion_addr,
                             NOX_ONION_LEN + 1, hsbuf, &hslen);
         if (hs_write_err != NOX_OK) {
           NOX_ERROR(LOG_MOD_NOISE, "handshake_write hatası: %s",
                     nox_strerror(hs_write_err));
           ui_print_error(state, "Handshake yanıtı oluşturulamadı");
-          sm_dispatch(state, EV_HANDSHAKE_ERROR);
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
           sodium_free(payload);
           break;
         }
@@ -116,7 +133,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
         struct frame_header rfh = {
             .magic = NOX_FRAME_MAGIC,
             .type = NOX_MSG_CTRL,
-            .seq = state->tx_seq,
+            .seq = ps->tx_seq,
             .len = (uint32_t)hslen,
         };
         uint8_t rwire[FRAME_HEADER_WIRE_SIZE];
@@ -129,15 +146,15 @@ static void process_peer_frames(struct app_state *state, int fd) {
         if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + hslen)) {
           NOX_ERROR(LOG_MOD_NOISE, "handshake yanıtı gönderilemedi");
           ui_print_error(state, "Handshake yanıtı gönderilemedi");
-          sm_dispatch(state, EV_HANDSHAKE_ERROR);
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
           sodium_free(payload);
           break;
         }
-        state->tx_seq++;
-        NOX_INFO(LOG_MOD_NOISE, "handshake yanıt (tx_seq→%u)", state->tx_seq);
+        ps->tx_seq++;
+        NOX_INFO(LOG_MOD_NOISE, "handshake yanıt (tx_seq→%u)", ps->tx_seq);
       }
 
-      if (state->hs->msg_index >= 3) {
+      if (ps->hs->msg_index >= 3) {
         char peer_onion[NOX_ONION_LEN + 1];
         sodium_memzero(peer_onion, sizeof(peer_onion));
 
@@ -147,7 +164,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
           NOX_ERROR(LOG_MOD_NOISE,
                     "Handshake payload geçersiz veya eksik");
           ui_print_error(state, "Akran geçerli bir adres iletmedi");
-          sm_dispatch(state, EV_HANDSHAKE_ERROR);
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
           sodium_free(payload);
           continue;
         }
@@ -159,9 +176,9 @@ static void process_peer_frames(struct app_state *state, int fd) {
 
         nox_err_t db_err = NOX_ERR_DB;
         if (!state->ghost_mode) {
-          db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key, NULL, 0, NULL, NULL);
+          db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key);
         }
-        memcpy(remote_pub, state->hs->rs, NOX_KEY_LEN);
+        memcpy(remote_pub, ps->hs->rs, NOX_KEY_LEN);
 
         char fp_str[NOX_KEY_LEN * 2 + 1];
         for (size_t k = 0; k < NOX_KEY_LEN; k++) {
@@ -180,28 +197,25 @@ static void process_peer_frames(struct app_state *state, int fd) {
         if (db_err == NOX_OK && !zero_key) {
           /* E-1 FIX: sodium_memcmp — sabit zamanlı karşılaştırma, timing saldırısı koruması */
           if (sodium_memcmp(stored_key, remote_pub, NOX_KEY_LEN) == 0) {
-            state->session =
-                arena_alloc(&state->arena, sizeof(struct noise_session));
-            if (state->session) {
-              if (handshake_split(state->hs, state->session) != NOX_OK) {
+            ps->session = sodium_malloc(sizeof(struct noise_session));
+            if (ps->session) {
+              if (handshake_split(ps->hs, ps->session) != NOX_OK) {
                 ui_print_error(state, "session split başarısız");
-                sm_dispatch(state, EV_HANDSHAKE_ERROR);
+                sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
                 sodium_free(payload);
                 continue;
               }
-              state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
-              state->tx_seq = 0;
-              state->rx_seq = 0;
-              state->queue_flushed = false;
+              sodium_free(ps->hs);
+              ps->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
+              ps->tx_seq = 0;
+              ps->rx_seq = 0;
+              ps->queue_flushed = false;
               NOX_DEBUG(LOG_MOD_NOISE,
                         "session setup: tx_seq=0 rx_seq=0 queue_flushed=false");
-              state->hs_attempt_count = 0; /* başarılı handshake — sayacı sıfırla */
-              strncpy(state->active_peer_onion, peer_onion,
-                      NOX_ONION_LEN);
-              state->active_peer_onion[NOX_ONION_LEN] = '\0';
+              sm_dispatch(ps, state, EV_SESSION_READY);
 
-              /* State geçişi: HANDSHAKE → ACTIVE */
-              state->peer_state = ST_ACTIVE;
+              strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
+              state->active_peer_onion[NOX_ONION_LEN] = '\0';
 
               NOX_INFO(LOG_MOD_NOISE,
                        "session kuruldu — mesajlaşma hazır");
@@ -210,7 +224,7 @@ static void process_peer_frames(struct app_state *state, int fd) {
               ui_reset_sender();
             } else {
               ui_print_error(state, "Arena bellek hatası");
-              sm_dispatch(state, EV_ARENA_FAIL);
+              sm_dispatch(ps, state, EV_ARENA_FAIL);
             }
           } else {
             /* Atomic ANSI: cursor hide → clear → print warning → prompt */
@@ -235,17 +249,16 @@ static void process_peer_frames(struct app_state *state, int fd) {
             fflush(stderr);
             }
 
-            state->tofu_pending = true;
-            state->tofu_peer_fd = fd;
-            strncpy(state->tofu_onion, peer_onion, NOX_ONION_LEN);
-            state->tofu_onion[NOX_ONION_LEN] = '\0';
-            strncpy(state->tofu_name, name, NOX_CONTACT_NAME_LEN);
-            state->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
-            memcpy(state->tofu_new_key, remote_pub, NOX_KEY_LEN);
-            state->tofu_arena_mark = state->session_arena_mark;
+            ps->tofu_pending = true;
+            ps->tofu_peer_fd = fd;
+            strncpy(ps->tofu_onion, peer_onion, NOX_ONION_LEN);
+            ps->tofu_onion[NOX_ONION_LEN] = '\0';
+            strncpy(ps->tofu_name, name, NOX_CONTACT_NAME_LEN);
+            ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+            memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
             /* State geçişi: HANDSHAKE → TOFU_PENDING */
-            clock_gettime(CLOCK_MONOTONIC, &state->tofu_start);
-            state->peer_state = ST_TOFU_PENDING;
+            clock_gettime(CLOCK_MONOTONIC, &ps->tofu_start);
+            sm_dispatch(ps, state, EV_HANDSHAKE_DONE);
           }
          } else {
           if (tui_is_active()) {
@@ -277,33 +290,32 @@ static void process_peer_frames(struct app_state *state, int fd) {
           }
           default_name[NOX_CONTACT_NAME_LEN] = '\0';
 
-          state->tofu_pending = true;
-          state->tofu_peer_fd = fd;
-          strncpy(state->tofu_onion, peer_onion, NOX_ONION_LEN);
-          state->tofu_onion[NOX_ONION_LEN] = '\0';
-          strncpy(state->tofu_name, default_name, NOX_CONTACT_NAME_LEN);
-          state->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
-          memcpy(state->tofu_new_key, remote_pub, NOX_KEY_LEN);
-          state->tofu_arena_mark = state->session_arena_mark;
+          ps->tofu_pending = true;
+          ps->tofu_peer_fd = fd;
+          strncpy(ps->tofu_onion, peer_onion, NOX_ONION_LEN);
+          ps->tofu_onion[NOX_ONION_LEN] = '\0';
+          strncpy(ps->tofu_name, default_name, NOX_CONTACT_NAME_LEN);
+          ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+          memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
           /* State geçişi: HANDSHAKE → TOFU_PENDING */
-          clock_gettime(CLOCK_MONOTONIC, &state->tofu_start);
-          state->peer_state = ST_TOFU_PENDING;
+          clock_gettime(CLOCK_MONOTONIC, &ps->tofu_start);
+          sm_dispatch(ps, state, EV_HANDSHAKE_DONE);
         }
       }
       sodium_memzero(remote_pub, NOX_KEY_LEN);
     } else if ((fh.type == NOX_MSG_TEXT || fh.type == NOX_MSG_FILE) &&
-               state->session) {
+               ps->session) {
       /* Sequence Number Doğrulaması (Y1) */
-      if (fh.seq != state->rx_seq) {
+      if (fh.seq != ps->rx_seq) {
         NOX_WARN(LOG_MOD_NET,
                  "SEQ_MISMATCH: frame type=%u seq=%u beklenen=%u "
                  "tx_seq=%u recv_pos=%zu",
-                 fh.type, fh.seq, state->rx_seq,
-                 state->tx_seq, state->recv_pos);
+                 fh.type, fh.seq, ps->rx_seq,
+                 ps->tx_seq, ps->recv_pos);
         ui_print_error(state,
                        "Hata: Akran bağlantısında geçersiz sıra numarası "
                        "algılandı (Replay Attack veya paket kaybı)!");
-        sm_dispatch(state, EV_SEQ_MISMATCH);
+        sm_dispatch(ps, state, EV_SEQ_MISMATCH);
         sodium_free(payload);
         break;
       }
@@ -314,27 +326,28 @@ static void process_peer_frames(struct app_state *state, int fd) {
         uint8_t *pt = sodium_malloc(max_pt + 1);
         if (pt) {
           ssize_t pt_len =
-              noise_decrypt(state->session, payload, fh.len, pt);
+              noise_decrypt(ps->session, payload, fh.len, pt);
           /* A-1 FIX: pt_len overflow kontrolü */
           if (pt_len > 0 && (size_t)pt_len <= max_pt) {
             pt[pt_len] = '\0';
             ui_print_incoming(state, (const char *)pt);
 
             /* BUG-1 FIX: İlk mesaj alındı → kuyruğu gönder */
-            if (!state->queue_flushed && !state->ghost_mode) {
-              state->queue_flushed = true;
-              db_process_queue(state->active_peer_onion,
-                               send_queued_callback, state);
+            if (!ps->queue_flushed && !state->ghost_mode) {
+              ps->queue_flushed = true;
+              struct queue_flush_ctx qctx = { .state = state, .ps = ps };
+              db_process_queue(ps->peer_onion,
+                               send_queued_callback, &qctx);
             }
             /* EVT-1 FIX: rx_seq++ only after successful decryption */
-            state->rx_seq++;
+            ps->rx_seq++;
           }
           sodium_free(pt); /* otomatik sıfırlar */
         }
       } else if (fh.type == NOX_MSG_FILE) {
         /* EVT-1 FIX: rx_seq++ only if file processing succeeded */
-        if (file_transfer_handle_rx(state, payload, fh.len))
-          state->rx_seq++;
+        if (file_transfer_handle_rx(state, ps, payload, fh.len))
+          ps->rx_seq++;
       }
     }
 
@@ -348,7 +361,8 @@ static void process_peer_frames(struct app_state *state, int fd) {
  * EVENT LOOP — epoll tabanlı async I/O
  * ================================================================ */
 void event_loop(struct app_state *state) {
-  struct epoll_event events[4];
+  /* 1 (stdin) + 2*NOX_MAX_PEERS (listener + data per peer) */
+  struct epoll_event events[1 + 2 * NOX_MAX_PEERS];
 
   /* ── Landlock sandbox — open/openat/creat'i kısıtla ──────────────
    * Landlock ÖNCE yüklenmeli (seccomp'tan önce).
@@ -381,43 +395,6 @@ void event_loop(struct app_state *state) {
       ui_print_system(state, "[👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı");
     }
 
-    /* Renkli komut listesi — ASCII banner ile aynı renkler */
-    char tbuf[256];
-    struct timespec ts;
-    struct tm tm_buf;
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
-    localtime_r(&ts.tv_sec, &tm_buf);
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Komutlar:",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append(tbuf);
-
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /addr               — .onion adresini göster",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append_colored(tbuf, 0xD21826);
-
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /connect <onion>    — peer'a bağlan",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append_colored(tbuf, 0xE07E14);
-
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /add <onion> <isim> — rehbere kişi ekle",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append_colored(tbuf, 0xCA970F);
-
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /msg <onion> <msj>  — çevrimdışı/kuyruklu mesaj gönder",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append_colored(tbuf, 0x26A269);
-
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   /file <dosya_yolu>  — peer'a dosya gönder",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append_colored(tbuf, 0x1F4175);
-
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d]   Ctrl+P              — çıkış",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append_colored(tbuf, 0x853C99);
-
-    snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Bağlantı kurulduktan sonra yazdığınız her şey mesaj olarak gönderilir.",
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-    tui_chat_append(tbuf);
     tui_refresh_all(state);
   } else {
     if (state->ghost_mode) {
@@ -425,12 +402,22 @@ void event_loop(struct app_state *state) {
           stderr,
           "\n  [👻] GHOST MOD — hiçbir veri kaydedilmez, rehber ve kuyruk devre dışı\n\n"
           "  Komutlar:\n"
+          "    \033[38;2;210;24;38m/help               — bu yardımı "
+          "göster\033[0m\n"
+          "    \033[38;2;210;24;38m/quit               — "
+          "uygulamadan çık\033[0m\n"
           "    \033[38;2;210;24;38m/addr               — .onion adresini "
           "göster\033[0m\n"
-          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
+          "    \033[38;2;224;126;20m/connect <onion>    — peer'a "
+          "bağlan\033[0m\n"
+          "    \033[38;2;210;24;38m/disconnect          — aktif peer "
+          "bağlantısını kes\033[0m\n"
           "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
           "(aktif bağlantı gerektirir)\033[0m\n"
-          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+          "    \033[38;2;31;65;117m/status              — "
+          "bağlantı durumunu göster\033[0m\n"
+          "    \033[38;2;133;60;153mCtrl+P              — "
+          "çıkış\033[0m\n"
           "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
           "gönderilir.\n\n"
           "> ");
@@ -438,16 +425,32 @@ void event_loop(struct app_state *state) {
       fprintf(
           stderr,
           "\n  Komutlar:\n"
+          "    \033[38;2;210;24;38m/help               — bu yardımı "
+          "göster\033[0m\n"
+          "    \033[38;2;210;24;38m/quit               — "
+          "uygulamadan çık\033[0m\n"
           "    \033[38;2;210;24;38m/addr               — .onion adresini "
           "göster\033[0m\n"
-          "    \033[38;2;224;126;20m/connect <onion>    — peer'a bağlan\033[0m\n"
-          "    \033[38;2;202;151;15m/add <onion> <isim> — rehbere kişi "
+          "    \033[38;2;210;115;15m/connect <onion>    — peer'a "
+          "bağlan\033[0m\n"
+          "    \033[38;2;210;115;15m/disconnect          — aktif peer "
+          "bağlantısını kes\033[0m\n"
+          "    \033[38;2;240;170;20m/add <onion> <isim> — rehbere kişi "
           "ekle\033[0m\n"
+          "    \033[38;2;240;170;20m/list               — rehberi ve "
+          "çevrimiçi durumu listele\033[0m\n"
+          "    \033[38;2;240;170;20m/switch <isim|onion>— aktif peer'ı "
+          "değiştir\033[0m\n"
           "    \033[38;2;38;162;105m/msg <onion> <msj>  — çevrimdışı/kuyruklu "
           "mesaj gönder\033[0m\n"
           "    \033[38;2;31;65;117m/file <dosya_yolu>  — peer'a dosya gönder "
           "(aktif bağlantı gerektirir)\033[0m\n"
-          "    \033[38;2;133;60;153mCtrl+P              — çıkış\033[0m\n"
+          "    \033[38;2;31;65;117m/status              — "
+          "bağlantı durumunu göster\033[0m\n"
+          "    \033[38;2;31;65;117m/history             — "
+          "mesaj geçmişini göster\033[0m\n"
+          "    \033[38;2;133;60;153mCtrl+P              — "
+          "çıkış\033[0m\n"
           "  Bağlantı kurulduktan sonra yazdığınız her şey doğrudan mesaj olarak "
           "gönderilir.\n\n"
           "> ");
@@ -455,45 +458,50 @@ void event_loop(struct app_state *state) {
   }
 
   while (state->running && !g_shutdown) {
-    /* Handshake timeout kontrolü (slot yorulması ve kilitlenmeyi önler) */
-    if (state->peer_state == ST_HANDSHAKE_INIT ||
-        state->peer_state == ST_HANDSHAKE_RESP) {
-      struct timespec now;
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      if (now.tv_sec - state->handshake_start.tv_sec > 30) {
-        NOX_WARN(LOG_MOD_NOISE, "Handshake zaman aşımına uğradı");
-        ui_print_error(state, "Akran ile handshake zaman aşımına uğradı.");
-        sm_dispatch(state, EV_HANDSHAKE_TIMEOUT);
-      }
-    }
+    /* ── Per-peer timeout kontrolları ── */
+    for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
+      struct peer_session *ps = &state->peers[pi];
+      if (ps->fd == -1 && ps->state == ST_IDLE)
+        continue;
 
-    /* EVT-7 FIX: TOFU timeout — 2 dakika içinde onaylanmazsa temizle.
-     * fd ve key material sonsuza kadar tutulmasın. */
-    if (state->peer_state == ST_TOFU_PENDING) {
-      struct timespec now;
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      if (now.tv_sec - state->tofu_start.tv_sec > 120) {
-        NOX_WARN(LOG_MOD_NET, "TOFU timeout — 2 dakikada onaylanmadı");
-        ui_print_error(state, "TOFU onay zaman aşımı — bağlantı temizlendi.");
-        sm_dispatch(state, EV_PEER_DISCONNECTED);
+      /* Handshake timeout — 30 saniye */
+      if (ps->state == ST_HANDSHAKE_INIT ||
+          ps->state == ST_HANDSHAKE_RESP) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - ps->handshake_start.tv_sec > 30) {
+          NOX_WARN(LOG_MOD_NOISE, "Handshake zaman aşımına uğradı");
+          ui_print_error(state, "Akran ile handshake zaman aşımına uğradı.");
+          sm_dispatch(ps, state, EV_HANDSHAKE_TIMEOUT);
+        }
       }
-    }
 
-    /* C-5 FIX: Dosya transferi timeout — sender sessiz kalırsa 60sn sonra abort */
-    if (state->rx_file.active) {
-      time_t now = time(NULL);
-      if (now - state->rx_file.last_chunk_time > 60) {
-        NOX_WARN(LOG_MOD_MAIN, "Dosya transferi zaman aşımı: %s", state->rx_file.filename);
-        ui_print_error(state, "Dosya transferi zaman aşımı — sender sessiz.");
-        /* Kısmi dosyayı disk'ten sil */
-        if (state->downloads_dir_fd >= 0 && state->rx_file.local_name[0] != '\0') {
-          unlinkat(state->downloads_dir_fd, state->rx_file.local_name, 0);
+      /* TOFU timeout — 2 dakika */
+      if (ps->state == ST_TOFU_PENDING) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - ps->tofu_start.tv_sec > 120) {
+          NOX_WARN(LOG_MOD_NET, "TOFU timeout — 2 dakikada onaylanmadı");
+          ui_print_error(state, "TOFU onay zaman aşımı — bağlantı temizlendi.");
+          sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         }
-        if (state->rx_file.fd >= 0) {
-          close(state->rx_file.fd);
+      }
+
+      /* Dosya transferi timeout — 60 saniye */
+      if (ps->rx_file.active) {
+        time_t now = time(NULL);
+        if (now - ps->rx_file.last_chunk_time > 60) {
+          NOX_WARN(LOG_MOD_MAIN, "Dosya transferi zaman aşımı: %s", ps->rx_file.filename);
+          ui_print_error(state, "Dosya transferi zaman aşımı — sender sessiz.");
+          if (state->downloads_dir_fd >= 0 && ps->rx_file.local_name[0] != '\0') {
+            unlinkat(state->downloads_dir_fd, ps->rx_file.local_name, 0);
+          }
+          if (ps->rx_file.fd >= 0) {
+            close(ps->rx_file.fd);
+          }
+          explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+          ps->rx_file.fd = -1;
         }
-        explicit_bzero(&state->rx_file, sizeof(state->rx_file));
-        state->rx_file.fd = -1;
       }
     }
 
@@ -523,7 +531,14 @@ void event_loop(struct app_state *state) {
 
       if (tor_dead && state->tor_pid > 0) {
         NOX_ERROR(LOG_MOD_NET, "Tor process öldü (PID=%d)", state->tor_pid);
-        sm_dispatch(state, EV_TOR_DIED);
+
+        /* Aktif tüm peer'lar için EV_TOR_DIED gönder */
+        for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
+          struct peer_session *ps = &state->peers[pi];
+          if (ps->fd >= 0 || ps->state != ST_IDLE)
+            sm_dispatch(ps, state, EV_TOR_DIED);
+        }
+
         state->tor_pid = 0;
         state->tor_ctrl_fd = -1;
 
@@ -542,16 +557,17 @@ void event_loop(struct app_state *state) {
       }
     }
 
-    /* ── Recv_buf drain — TOFU sonrası bekleyen frame'leri işle ──
-     * TOFU_PENDING sırasında TEXT frame'ler recv_buf'da bekletilmişti.
-     * Session oluşturulduktan sonra bunları burada işliyoruz.
-     * process_peer_frames while loop'u zaten session kontrolü yapıyor. */
-    if (state->session && state->peer_fd >= 0 &&
-        state->recv_pos >= FRAME_HEADER_WIRE_SIZE) {
-      process_peer_frames(state, state->peer_fd);
+    /* ── Recv_buf drain — TOFU sonrası bekleyen frame'leri işle ── */
+    for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
+      struct peer_session *ps = &state->peers[pi];
+      if (ps->session && ps->fd >= 0 &&
+          ps->recv_pos >= FRAME_HEADER_WIRE_SIZE) {
+        process_peer_frames(ps, state, ps->fd);
+      }
     }
 
-    int nfds = epoll_wait(state->epoll_fd, events, 4, 2000);
+    int nfds = epoll_wait(state->epoll_fd, events,
+                          1 + 2 * NOX_MAX_PEERS, 2000);
 
     if (nfds < 0) {
       if (errno == EINTR)
@@ -565,22 +581,32 @@ void event_loop(struct app_state *state) {
 
       if (fd == STDIN_FILENO) {
         process_stdin_events(state);
-      } else if (fd == state->listen_fd) {
-        /* ── Gelen peer bağlantısı ───────── */
+        continue;
+      }
+
+      /* ── Gelen peer bağlantısı — tek global listener ── */
+      if (fd == state->listen_fd) {
         int peer_fd =
-            accept4(state->listen_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            accept4(fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (peer_fd < 0)
           continue;
 
-        if (state->peer_state != ST_IDLE) {
-          NOX_WARN(LOG_MOD_MAIN, "zaten peer var — reddedildi");
+        /* Boş peer slotu bul */
+        struct peer_session *listener_ps = NULL;
+        for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
+          if (state->peers[pi].fd == -1 && state->peers[pi].state == ST_IDLE) {
+            listener_ps = &state->peers[pi];
+            break;
+          }
+        }
+
+        if (!listener_ps) {
+          NOX_WARN(LOG_MOD_MAIN, "maksimum peer sayısına ulaşıldı — bağlantı reddedildi");
           close(peer_fd);
           continue;
         }
 
-        /* Handshake rate limiting — 60 saniyede max 5 deneme.
-         * Sadece yeni bağlantı kabulunda kontrol et, aktif oturumu
-         * kesmesin. */
+        /* Handshake rate limiting — 60 saniyede max 5 deneme. */
         {
           time_t now = time(NULL);
           if (now - state->hs_window_start >= 60) {
@@ -596,88 +622,88 @@ void event_loop(struct app_state *state) {
           }
         }
 
-        state->peer_fd = peer_fd;
-        if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
-          /* S2: epoll_ctl başarısız (örn. EMFILE) — fd sızıntısını
-           * engelle, "bağlandı" yanılsamasını kır. */
-          NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı reddedildi");
-          close(peer_fd);
-          state->peer_fd = -1;
-          continue;
-        }
-
-        state->session_arena_mark = arena_save(&state->arena);
-        state->hs = arena_alloc(&state->arena, sizeof(struct noise_handshake));
-        if (!state->hs) {
-          close(peer_fd);
-          state->peer_fd = -1;
-          continue;
-        }
-
-        handshake_init(state->hs, false,
-               state->my_static_priv,
-               state->my_static_pub);    
-        clock_gettime(CLOCK_MONOTONIC, &state->handshake_start);
-        state->hs_attempt_count++;
-
-        /* State geçişi: IDLE → HANDSHAKE_RESP */
-        state->peer_state = ST_HANDSHAKE_RESP;
-
-        NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi");
-        ui_print_system(state, "[*] gelen bağlantı — handshake bekleniyor");
-
-      } else if (fd == state->peer_fd) {
-        /* ── Peer'a Veri Gönderimi (EPOLLOUT) ────── */
-        if (events[i].events & EPOLLOUT) {
-          if (state->tx_file.active) {
-            file_transfer_handle_tx(state);
-          } else {
-            epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-          }
-        }
-
-        /* ── Peer'dan Veri Alımı (EPOLLIN) ───────── */
-        if (events[i].events & EPOLLIN) {
-          /*
-           * TODO (gelecek refactor): Gerçek bir ring buffer + state machine.
-           *   State: RECV_MAGIC → RECV_HEADER → RECV_PAYLOAD
-           *   Her EPOLLIN'de recv() ile hazır olan kadar oku,
-           *   state makinesinde ilerle, eksikse bir sonraki event'e dön.
-           *
-           * Pragmatik fix: state->recv_buf ile biriktirme.
-           * Bloke eden read_full() kaldırıldı — eksik veri gelirse
-           * EPOLLIN tekrar tetiklenir ve kaldığı yerden devam eder.
-           * recv_buf state struct'ında yaşar — cleanup'ta sıfırlanır.
-           */
-
-          /* Buffer'a mümkün olduğunca çok oku */
-          int avail = 0;
-          if (ioctl(fd, FIONREAD, &avail) < 0) avail = 0;
-          size_t space = sizeof(state->recv_buf) - state->recv_pos;
-          size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
-          if (to_read == 0) continue; /* buffer dolu — bir sonraki epoll event'ine dön */
-
-          ssize_t r = recv(fd, state->recv_buf + state->recv_pos, to_read, MSG_DONTWAIT);
-          if (r <= 0) {
-#if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
-            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-#else
-            if (r < 0 && (errno == EAGAIN))
-#endif
-              break; /* veri henüz hazır değil, bir sonraki epoll event'ine dön */
-            if (r < 0 && errno == EINTR)
-              continue;
-
-            NOX_INFO(LOG_MOD_MAIN, "peer bağlantısı kapandı");
-            ui_print_system(state, "[*] peer ayrıldı");
-            sm_dispatch(state, EV_PEER_DISCONNECTED);
+        listener_ps->fd = peer_fd;
+          if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
+            NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı reddedildi");
+            close(peer_fd);
+            listener_ps->fd = -1;
             continue;
           }
-          state->recv_pos += (size_t)r;
 
-          process_peer_frames(state, fd);
+          listener_ps->hs = sodium_malloc(sizeof(struct noise_handshake));
+          if (!listener_ps->hs) {
+            close(peer_fd);
+            listener_ps->fd = -1;
+            continue;
+          }
 
+          handshake_init(listener_ps->hs, false,
+                 state->my_static_priv,
+                 state->my_static_pub);
+          clock_gettime(CLOCK_MONOTONIC, &listener_ps->handshake_start);
+          state->hs_attempt_count++;
+
+          /* State geçişi: IDLE → HANDSHAKE_RESP */
+          sm_dispatch(listener_ps, state, EV_PEER_ACCEPTED);
+
+          /* Aktif peer olarak ata — eğer başka aktif peer yoksa */
+          if (state->active_peer_idx < 0) {
+            for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
+              if (&state->peers[pi] == listener_ps) {
+                state->active_peer_idx = (int)pi;
+                break;
+              }
+            }
+          }
+
+          NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi (slot %lu, toplam %d)",
+                   (unsigned long)(listener_ps - state->peers),
+                   active_peer_count(state));
+          ui_print_system(state, "[*] gelen bağlantı — handshake bekleniyor");
+          continue;
         }
+
+      /* ── Peer'dan veri — EPOLLOUT veya EPOLLIN ── */
+      struct peer_session *ps = find_peer_by_fd(state, fd);
+      if (!ps)
+        continue;
+
+      /* Peer'a Veri Gönderimi (EPOLLOUT) */
+      if (events[i].events & EPOLLOUT) {
+        if (ps->tx_file.active) {
+          file_transfer_handle_tx(state, ps);
+        } else {
+          epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
+        }
+      }
+
+      /* Peer'dan Veri Alımı (EPOLLIN) */
+      if (events[i].events & EPOLLIN) {
+        int avail = 0;
+        if (ioctl(fd, FIONREAD, &avail) < 0) avail = 0;
+        size_t space = sizeof(ps->recv_buf) - ps->recv_pos;
+        size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
+        if (to_read == 0) continue;
+
+        ssize_t r = recv(fd, ps->recv_buf + ps->recv_pos, to_read, MSG_DONTWAIT);
+        if (r <= 0) {
+#if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
+          if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+#else
+          if (r < 0 && (errno == EAGAIN))
+#endif
+            break;
+          if (r < 0 && errno == EINTR)
+            continue;
+
+          NOX_INFO(LOG_MOD_MAIN, "peer bağlantısı kapandı");
+          ui_print_system(state, "[*] peer ayrıldı");
+          sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
+          continue;
+        }
+        ps->recv_pos += (size_t)r;
+
+        process_peer_frames(ps, state, fd);
       }
     }
   }

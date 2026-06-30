@@ -181,6 +181,56 @@ struct file_tx_state {
 };
 
 /* ================================================================
+ * PEER OTURUMU — Tek bir peer bağlantısının tüm durumu
+ *
+ * Faz 6.3: Tek onion modeli ile çoklu peer desteği.
+ * Her peer Noise handshake ile tanımlanır, ayrı onion gerekmez.
+ * ================================================================ */
+#define NOX_MAX_PEERS 16U
+
+struct peer_session {
+    /* ── Kimlik ── */
+    char     peer_onion[NOX_ONION_LEN + 1];       /* karşı tarafın adresi       */
+    char     name[NOX_CONTACT_NAME_LEN + 1];      /* rehber ismi               */
+
+    /* ── Bağlantı ── */
+    int      fd;                                   /* TCP soket veya -1         */
+
+    /* ── Kriptografi ── */
+    struct noise_session *session;                 /* sodium_malloc veya NULL */
+    struct noise_handshake *hs;                    /* aktif handshake veya NULL */
+    struct timespec handshake_start;
+
+    /* ── Sıra numaraları ── */
+    uint32_t tx_seq;
+    uint32_t rx_seq;
+    bool     queue_flushed;
+
+    /* ── Durum ── */
+    peer_state_t state;
+    char     connect_target[NOX_ONION_LEN + 1];
+
+    /* ── TOFU ── */
+    bool     tofu_pending;
+    int      tofu_peer_fd;
+    uint8_t  tofu_new_key[NOX_KEY_LEN];
+    char     tofu_onion[NOX_ONION_LEN + 1];
+    char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
+    struct   timespec tofu_start;
+
+    /* ── Recv buffer ── */
+    uint8_t  recv_buf[RECV_BUF_CAPACITY];
+    size_t   recv_pos;
+
+    /* ── Dosya transfer ── */
+    struct file_rx_state rx_file;
+    struct file_tx_state tx_file;
+
+    /* ── Okunmamış mesaj sayacı ── */
+    uint32_t unread_count;
+};
+
+/* ================================================================
  * UYGULAMA ANA DURUMU — app_state
  *
  * Tek global struct. Tüm modüller buna pointer alır.
@@ -190,6 +240,10 @@ struct app_state {
     /* Bellek güvenliği */
     struct secure_arena arena;
 
+    /* ── Peer oturumları (Faz 6.3) ── */
+    struct peer_session peers[NOX_MAX_PEERS];
+    int      active_peer_idx;      /* aktif peer indeksi, başta -1 */
+
     /* Kriptografi — pointer'lar arena'ya işaret eder */
     uint8_t *master_key;         /* arena'da, 32 byte                */
     uint8_t *db_key;             /* arena'da, 32 byte                */
@@ -197,7 +251,7 @@ struct app_state {
     uint8_t *my_static_priv;     /* arena'da, 32 byte (Curve25519)  */
     uint8_t *my_static_pub;      /* arena'da, 32 byte (Curve25519)  */
 
-    /* Noise session (aktif bağlantı varsa) */
+    /* Eski tek-peer alanları — ghost mode fallback (Faz 6.3'te kaldırılacak) */
     struct noise_session *session; /* arena'da veya NULL              */
     struct noise_handshake *hs;  /* aktif handshake veya NULL         */
     struct timespec handshake_start; /* handshake başlangıç zamanı     */
@@ -222,7 +276,6 @@ struct app_state {
     char     socks_path[NOX_PATH_MAX];  /* Tor SOCKS socket yolu      */
     uint32_t tx_seq;             /* gönderme sıra numarası           */
     uint32_t rx_seq;             /* alma sıra numarası               */
-    size_t   session_arena_mark; /* session öncesi arena offset      */
 
     /* Peer recv buffer — frame biriktirme (static local'den taşındı) */
     uint8_t  recv_buf[RECV_BUF_CAPACITY];
@@ -250,7 +303,6 @@ struct app_state {
     char     tofu_onion[NOX_ONION_LEN + 1];
     char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
     uint8_t  tofu_new_key[NOX_KEY_LEN];
-    size_t   tofu_arena_mark;
     char     active_peer_onion[NOX_ONION_LEN + 1];
 
     /* Async stdin buffering */
@@ -265,9 +317,11 @@ struct app_state {
     /* Asenkron Dosya İşlemleri */
     int      downloads_dir_fd;
     char     downloads_dir[NOX_PATH_MAX];
-    struct file_rx_state rx_file;
-    struct file_tx_state tx_file;
 };
+
+/* Aktif peer'a便捷 erişim — NULL-safe */
+#define ACTIVE_PEER(state) \
+    ((state)->active_peer_idx >= 0 ? &(state)->peers[(state)->active_peer_idx] : NULL)
 
 extern volatile sig_atomic_t g_shutdown;
 extern volatile sig_atomic_t g_tor_died;

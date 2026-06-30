@@ -93,7 +93,8 @@ static int get_terminal_cols(void)
 /* Prompt display uzunluğunu hesapla (ANSI kodları hariç) */
 static size_t calc_prompt_display_len(struct app_state *state)
 {
-    if (state->peer_fd < 0 || state->active_peer_onion[0] == '\0')
+    struct peer_session *ps = ACTIVE_PEER(state);
+    if (!ps || state->active_peer_onion[0] == '\0')
         return 5; /* "nox> " */
 
     size_t olen = strlen(state->active_peer_onion);
@@ -111,8 +112,8 @@ static size_t calc_prompt_display_len(struct app_state *state)
     size_t base = 1 + id_len + 1 + 3;
 
     /* Dosya transferi progress: " ⬆XX%" veya " ⬇XX%" = 7 byte display */
-    if ((state->tx_file.active && state->tx_file.total_size > 0) ||
-        (state->rx_file.active && state->rx_file.expected_size > 0))
+    if (ps && ((ps->tx_file.active && ps->tx_file.total_size > 0) ||
+        (ps->rx_file.active && ps->rx_file.expected_size > 0)))
         base += 7;
 
     return base;
@@ -132,7 +133,8 @@ void clear_prompt_area(struct app_state *state)
 {
     if (tui_is_active())
         return;
-    if (state->tofu_pending)
+    struct peer_session *ps = ACTIVE_PEER(state);
+    if (ps && ps->tofu_pending)
         return;  /* TOFU interaktif modunda temizleme yapma */
 
     int lines = calc_input_lines(state);
@@ -173,7 +175,8 @@ static void redraw_input(struct app_state *state)
 {
     if (tui_is_active())
         return;
-    if (state->tofu_pending)
+    struct peer_session *ps = ACTIVE_PEER(state);
+    if (ps && ps->tofu_pending)
         return;
 
     /* Cursor altındaki her şeyi temizle — eski wrap satırlarını siler */
@@ -245,7 +248,9 @@ void ui_print_prompt(struct app_state *state)
 
     fprintf(stderr, "%s", g_theme->clr_prompt);
 
-    if (state->peer_fd >= 0 && state->active_peer_onion[0] != '\0') {
+    struct peer_session *ps = ACTIVE_PEER(state);
+
+    if (ps && state->active_peer_onion[0] != '\0') {
 
         /* Onion kısaltma: ilk 4 + ".." + son 4 (toplam 10 karakter) */
         size_t olen = strlen(state->active_peer_onion);
@@ -275,14 +280,14 @@ void ui_print_prompt(struct app_state *state)
         }
 
         /* Dosya transferi progress göstergesi */
-        if (state->tx_file.active && state->tx_file.total_size > 0) {
-            unsigned pct = (unsigned)((state->tx_file.sent_bytes * 100ULL) /
-                                       state->tx_file.total_size);
+        if (ps && ps->tx_file.active && ps->tx_file.total_size > 0) {
+            unsigned pct = (unsigned)((ps->tx_file.sent_bytes * 100ULL) /
+                                       ps->tx_file.total_size);
             if (pct > 100) pct = 100;
             fprintf(stderr, "[%s \xe2\xac\x86%u%%]", short_id, pct);
-        } else if (state->rx_file.active && state->rx_file.expected_size > 0) {
-            unsigned pct = (unsigned)((state->rx_file.received_bytes * 100ULL) /
-                                       state->rx_file.expected_size);
+        } else if (ps && ps->rx_file.active && ps->rx_file.expected_size > 0) {
+            unsigned pct = (unsigned)((ps->rx_file.received_bytes * 100ULL) /
+                                       ps->rx_file.expected_size);
             if (pct > 100) pct = 100;
             fprintf(stderr, "[%s \xe2\xac\x87%u%%]", short_id, pct);
         } else {

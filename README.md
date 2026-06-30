@@ -40,7 +40,7 @@ It routes all traffic through **Tor**, uses the **Noise XX handshake**
 **no central server** not even for key exchange.
 
 DEVNOTE: I'm sorry, the codebase has grown so much, it's hard to add new features.
-I'm looking at the refactor or stability ux side instead.
+I'm looking at the refactor or stability ux side instead. I finally started adding features, but I will add it piece by piece, at least a week, except for critical security patches, there will be no commits.
 
 > **⚠️ Early Stage:** Core messaging works and has been tested against
 > non-official Noise XX (Cacophony) test vectors. Security hardening is

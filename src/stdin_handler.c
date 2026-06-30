@@ -70,6 +70,72 @@ static bool validate_onion_input(const char *onion, size_t len) {
   return memcmp(onion + 56, ".onion", 6) == 0;
 }
 
+/* ================================================================
+ * PER-PEER YARDIMCI FONKSİYONLAR
+ * ================================================================ */
+
+/* /list callback — her contact'ı listele */
+static void list_visitor_cb(const char *onion, const char *name,
+                            const uint8_t noise_key[NOX_KEY_LEN],
+                            void *ctx) {
+  (void)noise_key;
+  struct app_state *state = (struct app_state *)ctx;
+
+  /* Çevrimiçi durumunu kontrol et */
+  bool online = false;
+  for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+    if (state->peers[i].fd >= 0 &&
+        strcmp(state->peers[i].peer_onion, onion) == 0) {
+      online = true;
+      break;
+    }
+  }
+
+  char short_onion[12];
+  snprintf(short_onion, sizeof(short_onion), "%.11s", onion);
+  ui_print_system(state, "  %s %s %s",
+                  online ? "●" : "○",
+                  name[0] ? name : short_onion,
+                  online ? "(çevrimiçi)" : "");
+}
+
+/* Aktif peer sayısını say */
+int active_peer_count(struct app_state *state) {
+  int count = 0;
+  for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+    if (state->peers[i].fd >= 0)
+      count++;
+  }
+  return count;
+}
+
+/* İsim veya onion ile peer bul */
+static struct peer_session *find_peer_by_name_or_onion(struct app_state *state,
+                                                        const char *arg) {
+  for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+    struct peer_session *ps = &state->peers[i];
+    if (ps->fd < 0 && ps->state == ST_IDLE)
+      continue;
+    if ((ps->name[0] && strcmp(ps->name, arg) == 0) ||
+        strcmp(ps->peer_onion, arg) == 0) {
+      return ps;
+    }
+  }
+  /* Rehberde de ara — connect edilmemiş olabilir */
+  if (!state->ghost_mode) {
+    static char db_name_buf[NOX_CONTACT_NAME_LEN + 1];
+    static uint8_t db_key_buf[NOX_KEY_LEN];
+    if (db_get_contact(arg, db_name_buf, sizeof(db_name_buf), db_key_buf) == NOX_OK) {
+      for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+        struct peer_session *ps = &state->peers[i];
+        if (ps->fd >= 0 && strcmp(ps->peer_onion, arg) == 0)
+          return ps;
+      }
+    }
+  }
+  return NULL;
+}
+
 /* Ham terminal modunda ANSI kaçış dizilerini temizle — tüm türler:
  * CSI (ESC [), OSC (ESC ]), DCS (ESC P), tek ESC */
 static void strip_ansi_escape(char *str) {
@@ -100,8 +166,11 @@ static void strip_ansi_escape(char *str) {
           src++;
         if (src[0] == 0x1b && src[1] == '\\') src += 2;
       } else {
-        /* Diğer tüm ESC sequence'leri (ST, tek ESC, vs.) — atla */
-        src += 2;
+        /* Diğer tüm ESC sequence'leri — atla */
+        if (src[1] != '\0')
+          src += 2;
+        else
+          src++;  /* bare ESC — NUL'a kadar atla */
       }
     } else {
       *dst++ = *src++;
@@ -114,9 +183,17 @@ static void strip_ansi_escape(char *str) {
  * MESAJ GÖNDERME VE KUYRUK YARDIMCILARI
  * ================================================================ */
 
+/* Kuyruk flush context — doğru peer'a gönderim için */
+struct queue_flush_ctx {
+  struct app_state *state;
+  struct peer_session *ps;
+};
+
 nox_err_t send_queued_callback(const char *text, void *ctx) {
-  struct app_state *state = (struct app_state *)ctx;
-  if (!state || state->peer_fd < 0 || !state->session)
+  struct queue_flush_ctx *qctx = (struct queue_flush_ctx *)ctx;
+  struct app_state *state = qctx->state;
+  struct peer_session *ps = qctx->ps;
+  if (!state || !ps || ps->fd < 0 || !ps->session)
     return NOX_ERR_NET;
 
   size_t pt_len = strlen(text) + 1;
@@ -132,7 +209,7 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
   uint8_t *payload = sodium_malloc(4096 + NOX_MAC_LEN);
   if (!payload) return NOX_ERR_ALLOC;
 
-  ssize_t ct_len = noise_encrypt(state->session,
+  ssize_t ct_len = noise_encrypt(ps->session,
                                  (const uint8_t *)text,
                                  pt_len, payload);
   if (ct_len < 0) {
@@ -143,7 +220,7 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
   struct frame_header fh = {
       .magic = NOX_FRAME_MAGIC,
       .type = NOX_MSG_TEXT,
-      .seq = state->tx_seq,
+      .seq = ps->tx_seq,
       .len = (uint32_t)ct_len,
   };
   uint8_t wire[FRAME_HEADER_WIRE_SIZE];
@@ -153,13 +230,13 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
       { .iov_base = (void *)wire,   .iov_len = FRAME_HEADER_WIRE_SIZE },
       { .iov_base = (void *)payload, .iov_len = (size_t)ct_len },
   };
-  ssize_t written = writev(state->peer_fd, iov, 2);
+  ssize_t written = writev(ps->fd, iov, 2);
 
   nox_err_t err = NOX_OK;
   if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
     err = NOX_ERR_IO;
   } else {
-    state->tx_seq++;
+    ps->tx_seq++;
   }
 
   sodium_free(payload);   /* her durumda, otomatik sıfırlar */
@@ -168,7 +245,15 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
 
 /* Uzun bir mesajı güvenli chunk'lara ayırıp sırayla şifreleyerek sokete yazar */
 nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
-  if (!state->session || state->peer_fd < 0)
+  struct peer_session *ps = ACTIVE_PEER(state);
+  return send_segmented_message_to(state, ps, msg);
+}
+
+nox_err_t send_segmented_message_to(struct app_state *state,
+                                    struct peer_session *ps,
+                                    const char *msg) {
+  (void)state;
+  if (!ps || !ps->session || ps->fd < 0)
     return NOX_ERR_NET;
 
   size_t total_len = strlen(msg);
@@ -189,7 +274,7 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
 
     size_t pt_len = chunk_len + 1;
     ssize_t ct_len =
-        noise_encrypt(state->session, (const uint8_t *)chunk, pt_len, ct);
+        noise_encrypt(ps->session, (const uint8_t *)chunk, pt_len, ct);
     if (ct_len < 0) {
       sodium_free(chunk);
       sodium_free(ct);
@@ -199,7 +284,7 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
     struct frame_header fh = {
         .magic = NOX_FRAME_MAGIC,
         .type = NOX_MSG_TEXT,
-        .seq = state->tx_seq,
+        .seq = ps->tx_seq,
         .len = (uint32_t)ct_len,
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
@@ -209,13 +294,13 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
         { .iov_base = (void *)wire, .iov_len = FRAME_HEADER_WIRE_SIZE },
         { .iov_base = (void *)ct,   .iov_len = (size_t)ct_len },
     };
-    ssize_t written = writev(state->peer_fd, iov, 2);
+    ssize_t written = writev(ps->fd, iov, 2);
     if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
       sodium_free(chunk);
       sodium_free(ct);
       return NOX_ERR_IO;
     }
-    state->tx_seq++;
+    ps->tx_seq++;
 
     offset += chunk_len;
   }
@@ -263,16 +348,18 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
  * ================================================================ */
 
 void process_line(struct app_state *state, const char *line) {
+  struct peer_session *ps = ACTIVE_PEER(state);
+
   /* ── TOFU Onay Modu ─────────────────── */
-  if (state->peer_state == ST_TOFU_PENDING) {
+  if (ps && ps->state == ST_TOFU_PENDING) {
     if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
-      if (sm_dispatch(state, EV_TOFU_ACCEPTED) != NOX_OK) {
+      if (sm_dispatch(ps, state, EV_TOFU_ACCEPTED) != NOX_OK) {
         /* Session oluşturma başarısız — temizle */
-        sm_dispatch(state, EV_PEER_DISCONNECTED);
+        sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
       }
     } else if (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0) {
       ui_print_system(state, "[*] Bağlantı reddedildi.");
-      sm_dispatch(state, EV_TOFU_REJECTED);
+      sm_dispatch(ps, state, EV_TOFU_REJECTED);
     } else {
       fprintf(
           stderr,
@@ -281,8 +368,41 @@ void process_line(struct app_state *state, const char *line) {
     return;
   }
 
+  /* ── Komut modu — her zaman kontrol et (session aktif olsa bile) ─── */
+  if (line[0] == '/') {
+    if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) {
+      state->running = false;
+      return;
+    }
+
+    if (strcmp(line, "/help") == 0) {
+      ui_print_system(state,
+          "Komutlar:\n"
+          "  /help               — bu yardımı göster\n"
+          "  /quit               — uygulamadan çık\n"
+          "  /addr               — .onion adresini göster\n"
+          "  /connect <onion>    — peer'a bağlan\n"
+          "  /disconnect         — aktif peer bağlantısını kes\n"
+          "  /add <onion> <isim> — rehbere kişi ekle\n"
+          "  /list               — rehberi ve çevrimiçi durumu listele\n"
+          "  /switch <isim|onion>— aktif peer'ı değiştir\n"
+          "  /msg <onion> <msj>  — mesaj gönder (çevrimdışıysa kuyruğa ekler)\n"
+          "  /file <dosya_yolu>  — peer'a dosya gönder\n"
+          "  /status             — bağlantı durumunu göster\n"
+          "  /history            — mesaj geçmişini göster\n"
+          "  Ctrl+P              — çıkış\n\n"
+          "Bağlantı kurulduktan sonra yazdığınız her şey mesaj olarak gönderilir.");
+      return;
+    }
+
+    if (strcmp(line, "/addr") == 0) {
+      ui_print_system(state, "%s", state->onion_addr);
+      return;
+    }
+  }
+
   /* ── Session aktifken: her satır mesaj ─── */
-  if (state->session && state->peer_fd >= 0) {
+  if (ps && ps->session && ps->fd >= 0) {
     if (line[0] == '\0')
       return; /* boş satır gönderme */
     nox_err_t err = send_segmented_message(state, line);
@@ -295,18 +415,13 @@ void process_line(struct app_state *state, const char *line) {
   }
 
   /* ── Session yokken: komut modu ─────── */
-  if (state->peer_fd < 0 && line[0] != '/') {
+  if ((!ps || ps->fd < 0) && line[0] != '/') {
     if (state->ghost_mode) {
       ui_print_error(state, "bağlantı yok — önce /connect kullan");
     } else {
       ui_print_error(state, "bağlantı yok — önce /connect kullan veya çevrimdışı "
                             "mesaj için /msg kullan");
     }
-    return;
-  }
-
-  if (strcmp(line, "/addr") == 0) {
-    ui_print_system(state, "%s", state->onion_addr);
     return;
   }
 
@@ -354,7 +469,7 @@ void process_line(struct app_state *state, const char *line) {
     uint8_t zero_key[NOX_KEY_LEN];
     sodium_memzero(zero_key, sizeof(zero_key));
 
-    nox_err_t err = db_add_contact(onion, name, zero_key, NULL, NULL, 0);
+    nox_err_t err = db_add_contact(onion, name, zero_key);
     if (err == NOX_OK) {
       ui_print_system(state, "[✓] Rehbere kaydedildi: %s (%s)", name, onion);
     } else {
@@ -397,9 +512,10 @@ void process_line(struct app_state *state, const char *line) {
       return;
     }
 
-    if (state->session && state->peer_fd >= 0 &&
-        strcmp(state->active_peer_onion, onion) == 0) {
-      nox_err_t err = send_segmented_message(state, msg_start);
+    /* Tüm bağlı peer'larda aktif oturum ara */
+    struct peer_session *target_ps = find_peer_by_name_or_onion(state, onion);
+    if (target_ps && target_ps->session && target_ps->fd >= 0) {
+      nox_err_t err = send_segmented_message_to(state, target_ps, msg_start);
       if (err == NOX_OK) {
         ui_print_outgoing(state, msg_start);
       } else {
@@ -425,7 +541,7 @@ void process_line(struct app_state *state, const char *line) {
     while (*target == ' ')
       target++;
 
-    if (state->peer_state != ST_IDLE) {
+    if (ps && ps->state != ST_IDLE) {
       ui_print_error(state, "zaten bağlı veya handshake devam ediyor");
       return;
     }
@@ -445,46 +561,31 @@ void process_line(struct app_state *state, const char *line) {
       return;
     }
 
-    NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
-    int peer_fd = -1;
-    nox_err_t err =
-        socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
-    if (err != NOX_OK) {
-      ui_print_error(state, "bağlantı başarısız");
+    /* Boş peer slotu bul */
+    struct peer_session *target_ps = NULL;
+    unsigned target_idx = 0;
+    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+      if (state->peers[i].fd == -1 && state->peers[i].state == ST_IDLE) {
+        target_ps = &state->peers[i];
+        target_idx = i;
+        break;
+      }
+    }
+    if (!target_ps) {
+      ui_print_error(state, "maksimum peer sayısına ulaşıldı");
       return;
     }
 
-    state->peer_fd = peer_fd;
-    if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
-      NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı iptal");
-      close(peer_fd);
-      state->peer_fd = -1;
-      ui_print_error(state, "bağlantı kayıt hatası");
-      return;
-    }
-    NOX_INFO(LOG_MOD_MAIN, "peer bağlandı");
-
-    /* Noise handshake — initiator */
-    state->session_arena_mark = arena_save(&state->arena);
-    state->hs = arena_alloc(&state->arena, sizeof(struct noise_handshake));
-    if (!state->hs) {
-      ui_print_error(state, "arena dolu");
-      close(peer_fd);
-      state->peer_fd = -1;
-      return;
+    /* Duplicate bağlantı kontrolü */
+    for (unsigned j = 0; j < NOX_MAX_PEERS; j++) {
+      if (j != target_idx && state->peers[j].fd >= 0 &&
+          strcmp(state->peers[j].peer_onion, target) == 0) {
+        ui_print_error(state, "Bu peer'a zaten bağlı");
+        return;
+      }
     }
 
-    handshake_init(state->hs, true,
-               state->my_static_priv,
-               state->my_static_pub);
-    clock_gettime(CLOCK_MONOTONIC, &state->handshake_start);
-
-    /* State geçişi: IDLE → HANDSHAKE_INIT
-     * Rate limit kontrolünden ÖNCE yapılmalı — aksi halde
-     * sm_dispatch(EV_RATE_LIMIT) ST_IDLE'da geçiş bulamaz. */
-    state->peer_state = ST_HANDSHAKE_INIT;
-
-    /* Handshake rate limiting — outbound connect */
+    /* BUG-6 FIX: Rate limit kontrolü SOCKS5 öncesi */
     {
       time_t now = time(NULL);
       if (now - state->hs_window_start >= 60) {
@@ -495,27 +596,68 @@ void process_line(struct app_state *state, const char *line) {
         NOX_WARN(LOG_MOD_NOISE,
                  "Handshake rate limit aşıldı (5/60s) — outbound connect engellendi");
         ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin.");
-        sm_dispatch(state, EV_RATE_LIMIT);
         return;
       }
     }
+
+    NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
+    int peer_fd = -1;
+    nox_err_t err =
+        socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
+    if (err != NOX_OK) {
+      ui_print_error(state, "bağlantı başarısız");
+      return;
+    }
+
+    target_ps->fd = peer_fd;
+    snprintf(target_ps->peer_onion, sizeof(target_ps->peer_onion),
+             "%s", target);
+
+    if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
+      NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı iptal");
+      close(peer_fd);
+      target_ps->fd = -1;
+      sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
+      ui_print_error(state, "bağlantı kayıt hatası");
+      return;
+    }
+    NOX_INFO(LOG_MOD_MAIN, "peer bağlandı");
+
+    /* Noise handshake — initiator */
+    target_ps->hs = sodium_malloc(sizeof(struct noise_handshake));
+    if (!target_ps->hs) {
+      ui_print_error(state, "arena dolu");
+      close(peer_fd);
+      target_ps->fd = -1;
+      sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
+      return;
+    }
+
+    handshake_init(target_ps->hs, true,
+               state->my_static_priv,
+               state->my_static_pub);
+    clock_gettime(CLOCK_MONOTONIC, &target_ps->handshake_start);
+
+    /* State geçişi: IDLE → HANDSHAKE_INIT */
+    sm_dispatch(target_ps, state, EV_CONNECT_CMD);
+
     state->hs_attempt_count++;
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
     size_t hslen = sizeof(hsbuf);
-    nox_err_t hs_err = handshake_write(state->hs, NULL, 0, hsbuf, &hslen);
+    nox_err_t hs_err = handshake_write(target_ps->hs, NULL, 0, hsbuf, &hslen);
     if (hs_err != NOX_OK) {
       NOX_ERROR(LOG_MOD_NOISE, "handshake_write hatası: %s",
                 nox_strerror(hs_err));
       ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
-      sm_dispatch(state, EV_HANDSHAKE_ERROR);
+      sm_dispatch(target_ps, state, EV_HANDSHAKE_ERROR);
       return;
     }
 
     struct frame_header fh = {
         .magic = NOX_FRAME_MAGIC,
         .type = NOX_MSG_CTRL,
-        .seq = state->tx_seq,
+        .seq = target_ps->tx_seq,
         .len = (uint32_t)hslen,
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
@@ -528,13 +670,14 @@ void process_line(struct app_state *state, const char *line) {
     if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + hslen)) {
       NOX_ERROR(LOG_MOD_NOISE, "handshake msg0 gönderilemedi");
       ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
-      sm_dispatch(state, EV_HANDSHAKE_ERROR);
+      sm_dispatch(target_ps, state, EV_HANDSHAKE_ERROR);
       return;
     }
-    state->tx_seq++;
+    target_ps->tx_seq++;
 
-    NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", state->tx_seq);
+    NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", target_ps->tx_seq);
     ui_print_system(state, "[*] handshake başlatıldı");
+    state->active_peer_idx = (int)target_idx;
     return;
   }
 
@@ -548,8 +691,75 @@ void process_line(struct app_state *state, const char *line) {
     return;
   }
 
-  ui_print_system(state, "komutlar: /addr  /connect <onion>  /add <onion> "
-                         "<isim>  /msg <onion> <mesaj>  /file <dosya>  Ctrl+P");
+  /* ── /list — Rehberdeki kişileri listele ── */
+  if (strcmp(line, "/list") == 0) {
+    if (state->ghost_mode) {
+      ui_print_error(state, "ghost mod — rehber kullanılamaz");
+      return;
+    }
+    ui_print_system(state, "── Rehber ──");
+    db_list_contacts(list_visitor_cb, state);
+    ui_print_system(state, "── (%d bağlı) ──",
+                    active_peer_count(state));
+    return;
+  }
+
+  /* ── /switch <isim|onion> — Aktif peer'ı değiştir ── */
+  if (strncmp(line, "/switch ", 8) == 0) {
+    const char *arg = line + 8;
+    while (*arg == ' ')
+      arg++;
+    if (*arg == '\0') {
+      ui_print_error(state, "Kullanım: /switch <isim|onion>");
+      return;
+    }
+
+    struct peer_session *found = find_peer_by_name_or_onion(state, arg);
+    if (!found) {
+      ui_print_error(state, "Peer bulunamadı: %s", arg);
+      return;
+    }
+
+    /* active_peer_idx'yi güncelle */
+    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+      if (&state->peers[i] == found) {
+        state->active_peer_idx = (int)i;
+        strncpy(state->active_peer_onion, found->peer_onion, NOX_ONION_LEN);
+        state->active_peer_onion[NOX_ONION_LEN] = '\0';
+        ui_print_system(state, "Aktif peer: %s (%s)",
+                        found->name[0] ? found->name : found->peer_onion,
+                        sm_state_name(found->state));
+        return;
+      }
+    }
+    return;
+  }
+
+  /* ── /disconnect — Aktif peer'ın bağlantısını kes ── */
+  if (strcmp(line, "/disconnect") == 0) {
+    struct peer_session *ps_disconnect = ACTIVE_PEER(state);
+    if (!ps_disconnect) {
+      ui_print_error(state, "Aktif peer yok");
+      return;
+    }
+    char name_buf[NOX_CONTACT_NAME_LEN + 1];
+    strncpy(name_buf, ps_disconnect->name[0] ? ps_disconnect->name : "bilinmeyen",
+            sizeof(name_buf) - 1);
+    name_buf[sizeof(name_buf) - 1] = '\0';
+    sm_dispatch(ps_disconnect, state, EV_PEER_DISCONNECTED);
+    ui_print_system(state, "Bağlantı kesildi: %s", name_buf);
+    return;
+  }
+
+  ui_print_system(state, "  /addr               — .onion adresini göster");
+  ui_print_system(state, "  /connect <onion>    — peer'a bağlan");
+  ui_print_system(state, "  /add <onion> <isim> — rehbere kişi ekle");
+  ui_print_system(state, "  /msg <onion> <msj>  — kuyruklu mesaj gönder");
+  ui_print_system(state, "  /file <dosya_yolu>  — dosya gönder (aktif bağlantı)");
+  ui_print_system(state, "  /list               — rehberi listele");
+  ui_print_system(state, "  /switch <isim>      — aktif sohbeti değiştir");
+  ui_print_system(state, "  /disconnect         — bağlantıyı kes");
+  ui_print_system(state, "  Ctrl+P              — çıkış");
 }
 
 void process_stdin_events(struct app_state *state) {

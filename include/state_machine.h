@@ -18,6 +18,7 @@
 
 /* Forward declaration */
 struct app_state;
+struct peer_session;
 
 /* ================================================================
  * PEER DURUMLARI
@@ -64,11 +65,20 @@ typedef enum {
 /**
  * sm_dispatch — Olay gönder, geçiş tablosunda eşleşme ara, action çalıştır.
  *
- * @param state  Uygulama durumu (peer_state okunur/yazılır)
+ * @param ps     Peer oturumu (peer_state okunur/yazılır)
+ * @param state  Uygulama durumu (paylaşılan kaynaklar için)
  * @param event  Tetiklenen olay
  * @return NOX_OK başarılıysa, NOX_ERR_STATE geçersiz geçişse
  */
-nox_err_t sm_dispatch(struct app_state *state, peer_event_t event);
+nox_err_t sm_dispatch(struct peer_session *ps, struct app_state *state,
+                      peer_event_t event);
+
+/**
+ * sm_dispatch_active — Aktif peer'a event gönder (convenience wrapper).
+ *
+ * active_peer_idx < 0 ise NOX_ERR_NOT_FOUND döner.
+ */
+nox_err_t sm_dispatch_active(struct app_state *state, peer_event_t event);
 
 /**
  * sm_state_name — State enum'unu insan okunur stringe çevir (debug log).

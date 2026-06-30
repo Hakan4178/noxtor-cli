@@ -287,12 +287,9 @@ struct contact_payload {
   char onion[NOX_ONION_LEN + 1];
   char name[NOX_CONTACT_NAME_LEN + 1];
   uint8_t noise_key[NOX_KEY_LEN];
-  char my_onion[NOX_ONION_LEN + 1];
-  char my_onion_key[NOX_ONION_KEY_B64_LEN + 1];
 };
 
-nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t noise_key[NOX_KEY_LEN],
-                         const char *my_onion, const uint8_t *my_onion_key, size_t my_onion_key_len) {
+nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t noise_key[NOX_KEY_LEN]) {
   DB_LOCK();
   if (!g_state.ready) { DB_UNLOCK(); return NOX_ERR_STATE; }
   if (!onion || !name || !noise_key) { DB_UNLOCK(); return NOX_ERR_DB; }
@@ -311,17 +308,6 @@ nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t nois
   strncpy(cp.name, name, NOX_CONTACT_NAME_LEN);
   cp.name[NOX_CONTACT_NAME_LEN] = '\0';
   memcpy(cp.noise_key, noise_key, NOX_KEY_LEN);
-  if (my_onion) {
-    size_t my_onion_len = strnlen(my_onion, NOX_ONION_LEN + 1);
-    if (my_onion_len != NOX_ONION_LEN) { DB_UNLOCK(); return NOX_ERR_DB; }
-    strncpy(cp.my_onion, my_onion, NOX_ONION_LEN);
-    cp.my_onion[NOX_ONION_LEN] = '\0';
-  }
-  if (my_onion_key && my_onion_key_len > 0) {
-    size_t copy_len = my_onion_key_len > NOX_ONION_KEY_B64_LEN ? NOX_ONION_KEY_B64_LEN : my_onion_key_len;
-    memcpy(cp.my_onion_key, my_onion_key, copy_len);
-    cp.my_onion_key[copy_len < NOX_ONION_KEY_B64_LEN ? copy_len : NOX_ONION_KEY_B64_LEN] = '\0';
-  }
 
   uint8_t nonce[NOX_NONCE_LEN];
   uint8_t cipher[sizeof(struct contact_payload) + crypto_secretbox_MACBYTES];
@@ -383,9 +369,7 @@ cleanup:
   return err;
 }
 
-nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uint8_t noise_key_out[NOX_KEY_LEN],
-                         char *my_onion_out, size_t my_onion_len,
-                         uint8_t *my_onion_key_out, size_t *my_onion_key_len_out) {
+nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uint8_t noise_key_out[NOX_KEY_LEN]) {
   DB_LOCK();
   if (!g_state.ready) { DB_UNLOCK(); return NOX_ERR_STATE; }
   if (!onion || !name_out || !noise_key_out || name_len == 0) { DB_UNLOCK(); return NOX_ERR_DB; }
@@ -439,29 +423,13 @@ nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uin
   sqlite3_finalize(stmt);
 
   if (err != NOX_OK) { result = err; goto cleanup_cp; }
-  if (plain_len_out == sizeof(struct contact_payload_old)) {
-    memset(cp.my_onion, 0, sizeof(cp.my_onion));
-    memset(cp.my_onion_key, 0, sizeof(cp.my_onion_key));
-  } else if (plain_len_out != sizeof(struct contact_payload)) {
+  if (plain_len_out != sizeof(struct contact_payload)) {
     goto cleanup_cp;
   }
 
   strncpy(name_out, cp.name, name_len - 1);
   name_out[name_len - 1] = '\0';
   memcpy(noise_key_out, cp.noise_key, NOX_KEY_LEN);
-
-  if (my_onion_out && my_onion_len > 0) {
-    strncpy(my_onion_out, cp.my_onion, my_onion_len - 1);
-    my_onion_out[my_onion_len - 1] = '\0';
-  }
-  if (my_onion_key_out && my_onion_key_len_out) {
-    size_t key_len = strnlen(cp.my_onion_key, NOX_ONION_KEY_B64_LEN);
-    if (*my_onion_key_len_out < key_len) {
-      key_len = *my_onion_key_len_out;
-    }
-    memcpy(my_onion_key_out, cp.my_onion_key, key_len);
-    *my_onion_key_len_out = key_len;
-  }
 
   result = NOX_OK;
 
@@ -757,12 +725,7 @@ nox_err_t db_list_contacts(db_contact_visitor_fn visitor, void *ctx) {
                                     (const uint8_t *)nonce_ptr, (uint8_t *)&cp, sizeof(cp),
                                     &plain_len_out);
     if (err == NOX_OK) {
-      if (plain_len_out == sizeof(struct contact_payload_old)) {
-        memset(cp.my_onion, 0, sizeof(cp.my_onion));
-        memset(cp.my_onion_key, 0, sizeof(cp.my_onion_key));
-      }
-      visitor(cp.onion, cp.name, cp.noise_key, cp.my_onion,
-              (const uint8_t *)cp.my_onion_key, strnlen(cp.my_onion_key, NOX_ONION_KEY_B64_LEN), ctx);
+      visitor(cp.onion, cp.name, cp.noise_key, ctx);
     }
     sodium_memzero(&cp, sizeof(cp));
   }
@@ -985,12 +948,6 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
       continue;
     }
 
-    /* Eski format uyumluluğu: my_onion/my_onion_key alanları yoksa sıfırla */
-    if (plain_len_out == sizeof(struct contact_payload_old)) {
-      memset(cp.my_onion, 0, sizeof(cp.my_onion));
-      memset(cp.my_onion_key, 0, sizeof(cp.my_onion_key));
-    }
-
     /* Son mesajı getir ve deşifre et */
     char *last_msg_text = NULL;
     bool last_msg_outgoing = false;
@@ -1033,8 +990,7 @@ nox_err_t db_list_contacts_with_summary(db_contact_summary_visitor_fn visitor, v
     }
 
     /* Visitor callback: contact bilgisini ve son mesajı uygulamaya aktar */
-    visitor(cp.onion, cp.name, cp.noise_key, cp.my_onion,
-            (const uint8_t *)cp.my_onion_key, strnlen(cp.my_onion_key, NOX_ONION_KEY_B64_LEN),
+    visitor(cp.onion, cp.name, cp.noise_key,
             last_msg_text, last_msg_outgoing, last_msg_timestamp, ctx);
 
     /* Temizlik: hassas verileri sıfırla */

@@ -80,6 +80,7 @@ typedef enum {
     NOX_ERR_DB          = -11,  /* SQLite hatası                     */
     NOX_ERR_OVERFLOW    = -12,  /* arena / buffer taşması            */
     NOX_ERR_STATE       = -13,  /* geçersiz state geçişi             */
+    NOX_ERR_NOT_FOUND   = -14,  /* aranan öğe bulunamadı             */
 } nox_err_t;
 
 /* Hata kodu → okunabilir string */

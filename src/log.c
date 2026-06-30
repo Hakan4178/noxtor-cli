@@ -258,6 +258,7 @@ const char *nox_strerror(nox_err_t err)
     case NOX_ERR_DB:       return "veritabanı hatası";
     case NOX_ERR_OVERFLOW: return "taşma hatası";
     case NOX_ERR_STATE:    return "geçersiz durum geçişi";
+    case NOX_ERR_NOT_FOUND:return "öğe bulunamadı";
     }
     /* enum dışı değer (cast ile üretilmiş olabilir) */
     return "bilinmeyen hata kodu";

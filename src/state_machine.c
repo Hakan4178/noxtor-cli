@@ -78,17 +78,27 @@ const char *sm_event_name(peer_event_t ev)
  * ================================================================ */
 
 /* İleri bildirimler */
-typedef nox_err_t (*transition_fn)(struct app_state *, peer_event_t);
+typedef nox_err_t (*transition_fn)(struct peer_session *, struct app_state *,
+                                   peer_event_t);
 
-static nox_err_t action_cleanup(struct app_state *state, peer_event_t ev);
-static nox_err_t action_connect(struct app_state *state, peer_event_t ev);
-static nox_err_t action_accept(struct app_state *state, peer_event_t ev);
-static nox_err_t action_hs_process(struct app_state *state, peer_event_t ev);
-static nox_err_t action_tofu_prompt(struct app_state *state, peer_event_t ev);
-static nox_err_t action_tofu_accept(struct app_state *state, peer_event_t ev);
-static nox_err_t action_session_up(struct app_state *state, peer_event_t ev);
-static nox_err_t action_file_begin(struct app_state *state, peer_event_t ev);
-static nox_err_t action_file_end(struct app_state *state, peer_event_t ev);
+static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state,
+                                peer_event_t ev);
+static nox_err_t action_connect(struct peer_session *ps, struct app_state *state,
+                                peer_event_t ev);
+static nox_err_t action_accept(struct peer_session *ps, struct app_state *state,
+                               peer_event_t ev);
+static nox_err_t action_hs_process(struct peer_session *ps, struct app_state *state,
+                                   peer_event_t ev);
+static nox_err_t action_tofu_prompt(struct peer_session *ps, struct app_state *state,
+                                    peer_event_t ev);
+static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *state,
+                                    peer_event_t ev);
+static nox_err_t action_session_up(struct peer_session *ps, struct app_state *state,
+                                   peer_event_t ev);
+static nox_err_t action_file_begin(struct peer_session *ps, struct app_state *state,
+                                   peer_event_t ev);
+static nox_err_t action_file_end(struct peer_session *ps, struct app_state *state,
+                                 peer_event_t ev);
 
 /* ================================================================
  * GEÇİŞ TABLOSU
@@ -178,12 +188,13 @@ static const state_transition_t transitions[] = {
  * DISPATCH MOTORU
  * ================================================================ */
 
-nox_err_t sm_dispatch(struct app_state *state, peer_event_t event)
+nox_err_t sm_dispatch(struct peer_session *ps, struct app_state *state,
+                      peer_event_t event)
 {
     for (size_t i = 0; i < TRANSITION_COUNT; i++) {
         const state_transition_t *t = &transitions[i];
 
-        if (t->from != state->peer_state || t->event != event)
+        if (t->from != ps->state || t->event != event)
             continue;
 
         NOX_INFO(LOG_MOD_MAIN, "SM: %s + %s → %s",
@@ -191,17 +202,25 @@ nox_err_t sm_dispatch(struct app_state *state, peer_event_t event)
                  sm_event_name(event),
                  sm_state_name(t->to));
 
-        nox_err_t err = t->action(state, event);
+        nox_err_t err = t->action(ps, state, event);
         if (err == NOX_OK) {
-            state->peer_state = t->to;
+            ps->state = t->to;
         }
         return err;
     }
 
     /* Geçersiz geçiş — bu state'te bu event beklenmiyordu */
     NOX_WARN(LOG_MOD_MAIN, "SM: geçersiz geçiş %s + %s — yok sayılıyor",
-             sm_state_name(state->peer_state), sm_event_name(event));
+             sm_state_name(ps->state), sm_event_name(event));
     return NOX_ERR_STATE;
+}
+
+nox_err_t sm_dispatch_active(struct app_state *state, peer_event_t event)
+{
+    struct peer_session *ps = ACTIVE_PEER(state);
+    if (!ps)
+        return NOX_ERR_NOT_FOUND;
+    return sm_dispatch(ps, state, event);
 }
 
 /* ================================================================
@@ -213,50 +232,77 @@ nox_err_t sm_dispatch(struct app_state *state, peer_event_t event)
  * Bu fonksiyon, refactör öncesinde 18 farklı yerde tekrarlanan
  * cleanup kodunun tek noktasıdır.
  * ================================================================ */
-static nox_err_t action_cleanup(struct app_state *state, peer_event_t ev)
+static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state,
+                                peer_event_t ev)
 {
     (void)ev;
 
     /* 1. Soket temizliği */
-    if (state->peer_fd >= 0) {
-        epoll_remove_fd(state->epoll_fd, state->peer_fd);
-        close(state->peer_fd);
-        state->peer_fd = -1;
+    if (ps->fd >= 0) {
+        epoll_remove_fd(state->epoll_fd, ps->fd);
+        close(ps->fd);
+        ps->fd = -1;
     }
 
-    /* 2. Kriptografik state — arena restore ÖNCESİ key material'ı sıfırla */
-    if (state->hs) {
-        sodium_memzero(state->hs, sizeof(struct noise_handshake));
+    /* 2. Kriptografik state — key material'ı sıfırla ve serbest bırak */
+    if (ps->hs) {
+        sodium_memzero(ps->hs, sizeof(struct noise_handshake));
+        sodium_free(ps->hs);
     }
-    if (state->session) {
-        sodium_memzero(state->session, sizeof(struct noise_session));
+    if (ps->session) {
+        sodium_memzero(ps->session, sizeof(struct noise_session));
+        sodium_free(ps->session);
     }
-    state->hs      = NULL;
-    state->session  = NULL;
-    state->tx_seq   = 0;
-    state->rx_seq   = 0;
+    ps->hs      = NULL;
+    ps->session  = NULL;
+    ps->tx_seq   = 0;
+    ps->rx_seq   = 0;
 
     /* 3. Peer identity — Güvenli bir şekilde sıfırla */
-    sodium_memzero(state->active_peer_onion, sizeof(state->active_peer_onion));
-    sodium_memzero(state->connect_target, sizeof(state->connect_target));
+    sodium_memzero(ps->peer_onion, sizeof(ps->peer_onion));
+    sodium_memzero(ps->connect_target, sizeof(ps->connect_target));
 
-    /* 4. Arena — güvenli geri sarma (session allocations'ı temizle) */
-    arena_restore(&state->arena, state->session_arena_mark);
+    /* 4. TOFU state — Hassas verileri sıfırla */
+    ps->tofu_pending = false;
+    ps->tofu_peer_fd = -1;
+    sodium_memzero(ps->tofu_onion, sizeof(ps->tofu_onion));
+    sodium_memzero(ps->tofu_name, sizeof(ps->tofu_name));
+    sodium_memzero(ps->tofu_new_key, sizeof(ps->tofu_new_key));
 
-    /* 5. TOFU state — Hassas verileri sıfırla */
-    state->tofu_pending = false;
-    state->tofu_peer_fd = -1;
-    sodium_memzero(state->tofu_onion, sizeof(state->tofu_onion));
-    sodium_memzero(state->tofu_name, sizeof(state->tofu_name));
-    sodium_memzero(state->tofu_new_key, sizeof(state->tofu_new_key));
-    state->tofu_arena_mark = 0;
+    /* 5. Dosya transferleri — peer'a özel state */
+    ps->queue_flushed = false;
+    if (ps->rx_file.active) {
+        if (ps->rx_file.fd >= 0)
+            close(ps->rx_file.fd);
+        if (state->downloads_dir_fd >= 0 && ps->rx_file.local_name[0] != '\0')
+            unlinkat(state->downloads_dir_fd, ps->rx_file.local_name, 0);
+        sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
+        ps->rx_file.fd = -1;
+    }
+    if (ps->tx_file.active) {
+        if (ps->tx_file.fd >= 0)
+            close(ps->tx_file.fd);
+        if (ps->tx_file.plain_buf)
+            sodium_free(ps->tx_file.plain_buf);
+        sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
+        ps->tx_file.fd = -1;
+    }
 
-    /* 6. Dosya transferleri */
-    file_transfer_cleanup(state);
+    /* 6. Recv buffer sıfırlama */
+    sodium_memzero(ps->recv_buf, sizeof(ps->recv_buf));
+    ps->recv_pos = 0;
 
-    /* 7. Recv buffer sıfırlama — Plaintext mesaj veya peer identity kalıntısını önlemek için tüm buffer'ı sıfırla */
-    sodium_memzero(state->recv_buf, sizeof(state->recv_buf));
-    state->recv_pos = 0;
+    /* 7. Peer identity — name ve unread_count */
+    sodium_memzero(ps->name, sizeof(ps->name));
+    ps->unread_count = 0;
+
+    /* 8. Aktif peer index — eğer bu peer aktifse sıfırla */
+    if (state->active_peer_idx >= 0 &&
+        (unsigned)state->active_peer_idx < NOX_MAX_PEERS &&
+        &state->peers[state->active_peer_idx] == ps) {
+        state->active_peer_idx = -1;
+        sodium_memzero(state->active_peer_onion, sizeof(state->active_peer_onion));
+    }
 
     return NOX_OK;
 }
@@ -268,50 +314,54 @@ static nox_err_t action_cleanup(struct app_state *state, peer_event_t ev)
  * Gerçek implementasyon event loop kodundan taşınacak.
  * ================================================================ */
 
-static nox_err_t action_connect(struct app_state *state, peer_event_t ev)
+static nox_err_t action_connect(struct peer_session *ps, struct app_state *state,
+                                peer_event_t ev)
 {
-    (void)state; (void)ev;
+    (void)ps; (void)state; (void)ev;
     /* Adım 3'te stdin_handler.c /connect kodundan taşınacak */
     return NOX_OK;
 }
 
-static nox_err_t action_accept(struct app_state *state, peer_event_t ev)
+static nox_err_t action_accept(struct peer_session *ps, struct app_state *state,
+                               peer_event_t ev)
 {
-    (void)state; (void)ev;
+    (void)ps; (void)state; (void)ev;
     /* Adım 3'te main.c accept4 kodundan taşınacak */
     return NOX_OK;
 }
 
-static nox_err_t action_hs_process(struct app_state *state, peer_event_t ev)
+static nox_err_t action_hs_process(struct peer_session *ps, struct app_state *state,
+                                   peer_event_t ev)
 {
-    (void)state; (void)ev;
+    (void)ps; (void)state; (void)ev;
     /* Adım 3'te main.c handshake_read/write kodundan taşınacak */
     return NOX_OK;
 }
 
-static nox_err_t action_tofu_prompt(struct app_state *state, peer_event_t ev)
+static nox_err_t action_tofu_prompt(struct peer_session *ps, struct app_state *state,
+                                    peer_event_t ev)
 {
-    (void)state; (void)ev;
+    (void)ps; (void)state; (void)ev;
     /* Adım 4'te main.c TOFU UI kodundan taşınacak */
     return NOX_OK;
 }
 
-static nox_err_t action_tofu_accept(struct app_state *state, peer_event_t ev)
+static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *state,
+                                    peer_event_t ev)
 {
     (void)ev;
 
     /* hs geçerlilik kontrolü — peer TOFU bekleme sırasında ayrılmış olabilir */
-    if (!state->hs) {
+    if (!ps->hs) {
         ui_print_error(state,
             "Handshake durumu geçersiz (peer ayrılmış olabilir)");
-        sm_dispatch(state, EV_PEER_DISCONNECTED);
         return NOX_ERR_PROTO;
     }
 
     /* db_add_contact — rehbere kaydet */
     if (!state->ghost_mode) {
         nox_err_t db_err = db_add_contact(
-            state->tofu_onion, state->tofu_name, state->tofu_new_key, NULL, NULL, 0);
+            ps->tofu_onion, ps->tofu_name, ps->tofu_new_key);
         if (db_err != NOX_OK) {
             ui_print_error(state, "Rehbere kaydetme başarısız");
             /* devam et — session yine kurulabilir */
@@ -321,54 +371,63 @@ static nox_err_t action_tofu_accept(struct app_state *state, peer_event_t ev)
     }
 
     /* Session oluştur */
-    state->session = arena_alloc(&state->arena, sizeof(struct noise_session));
-    if (!state->session) {
+    ps->session = sodium_malloc(sizeof(struct noise_session));
+    if (!ps->session) {
         ui_print_error(state, "Arena bellek hatası");
-        sm_dispatch(state, EV_PEER_DISCONNECTED);
+        sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         return NOX_ERR_ALLOC;
     }
 
-    if (handshake_split(state->hs, state->session) != NOX_OK) {
+    if (handshake_split(ps->hs, ps->session) != NOX_OK) {
         ui_print_error(state, "session split başarısız");
-        state->session = NULL;
-        sm_dispatch(state, EV_PEER_DISCONNECTED);
+        ps->session = NULL;
+        sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         return NOX_ERR_PROTO;
     }
 
-    state->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
-    state->tx_seq = 0;
-    state->rx_seq = 0;
-    state->queue_flushed = false;
+    sodium_free(ps->hs);
+    ps->hs = NULL; /* handshake tüketildi — timeout tetiklemesin */
+    ps->tx_seq = 0;
+    ps->rx_seq = 0;
+    ps->queue_flushed = false;
     NOX_DEBUG(LOG_MOD_NOISE,
               "session setup (TOFU): tx_seq=0 rx_seq=0 queue_flushed=false");
-    state->tofu_pending = false;
-    snprintf(state->active_peer_onion, sizeof(state->active_peer_onion),
-             "%s", state->tofu_onion);
+    ps->tofu_pending = false;
+
+    /* Peer kimliğini ata */
+    snprintf(ps->peer_onion, sizeof(ps->peer_onion), "%s", ps->tofu_onion);
+    strncpy(ps->name, ps->tofu_name, NOX_CONTACT_NAME_LEN);
+    ps->name[NOX_CONTACT_NAME_LEN] = '\0';
+    strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
+    state->active_peer_onion[NOX_ONION_LEN] = '\0';
 
     NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
-    ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)", state->tofu_name);
+    ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)", ps->tofu_name);
     ui_reset_sender();
 
     return NOX_OK;
 }
 
-static nox_err_t action_session_up(struct app_state *state, peer_event_t ev)
+static nox_err_t action_session_up(struct peer_session *ps, struct app_state *state,
+                                   peer_event_t ev)
 {
-    (void)state; (void)ev;
+    (void)ps; (void)state; (void)ev;
     /* Adım 4'te main.c bilinen peer session kodundan taşınacak */
     return NOX_OK;
 }
 
-static nox_err_t action_file_begin(struct app_state *state, peer_event_t ev)
+static nox_err_t action_file_begin(struct peer_session *ps, struct app_state *state,
+                                   peer_event_t ev)
 {
-    (void)state; (void)ev;
+    (void)ps; (void)state; (void)ev;
     /* Adım 5'te dosya transfer state geçişi */
     return NOX_OK;
 }
 
-static nox_err_t action_file_end(struct app_state *state, peer_event_t ev)
+static nox_err_t action_file_end(struct peer_session *ps, struct app_state *state,
+                                 peer_event_t ev)
 {
-    (void)state; (void)ev;
+    (void)ps; (void)state; (void)ev;
     /* Adım 5'te dosya transfer tamamlanma */
     return NOX_OK;
 }

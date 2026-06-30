@@ -20,11 +20,12 @@ void sanitize_filename(char *name, size_t max_len);
 void file_transfer_start(struct app_state *state, const char *filepath);
 
 /* Peer soketi yazılabilir olduğunda (EPOLLOUT) sıradaki dosya parçasını gönderir */
-void file_transfer_handle_tx(struct app_state *state);
+void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps);
 
 /* Dosya paketlerini (Metadata veya chunk) alır, şifresini çözer ve diske yazar.
  * return: true = başarıyla işlendi (veya hata sonrası temizlendi), false = kritik hata (decryption/malloc) */
-bool file_transfer_handle_rx(struct app_state *state, const uint8_t *payload, uint32_t len);
+bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
+                             const uint8_t *payload, uint32_t len);
 
 /* Bağlantı koptuğunda yarım kalan transferlerin kaynaklarını temizler ve dosyaları siler */
 void file_transfer_cleanup(struct app_state *state);

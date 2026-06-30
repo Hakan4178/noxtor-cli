@@ -1403,9 +1403,12 @@ nox_err_t epoll_setup(struct app_state *state, int listen_fd) {
   if (err != NOX_OK)
     return err;
 
-  err = epoll_add_fd(efd, listen_fd);
-  if (err != NOX_OK)
-    return err;
+  /* Global listener */
+  if (listen_fd >= 0) {
+    err = epoll_add_fd(efd, listen_fd);
+    if (err != NOX_OK)
+      return err;
+  }
 
   NOX_INFO(LOG_MOD_NET, "epoll hazır (stdin + listener)");
   return NOX_OK;

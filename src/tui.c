@@ -191,13 +191,27 @@ void tui_print_welcome(struct app_state *state)
 
     tui_load_contacts(state);
 
-    ui_print_system(state, "=== Noxtor TUI'ya Hoş Geldiniz ===");
-    ui_print_system(state, "[*] Odak Değiştirme: Tab tuşuna basarak (veya Giriş satırında en soldayken Sol yön tuşuyla) Rehber ve Giriş panelleri arasında geçiş yapabilirsiniz.");
-    ui_print_system(state, "[*] Rehber Gezintisi: Yukarı/Aşağı yön tuşlarıyla gezip Enter tuşuna basarak bağlantı başlatabilirsiniz.");
-    ui_print_system(state, "[*] Sohbet Kaydırma: Sohbeti yukarı/aşağı kaydırmak için Page Up / Page Down tuşlarını veya Giriş odağındayken Yukarı/Aşağı yön tuşlarını kullanabilirsiniz.");
+    ui_print_system(state, "╔══════════════════════════════════════╗");
+    ui_print_system(state, "║       Noxtor — Anonymous Messenger   ║");
+    ui_print_system(state, "╚══════════════════════════════════════╝");
+    ui_print_system(state, "");
+    ui_print_system(state, " Komutlar:");
+    ui_print_system(state, "   /addr               — .onion adresini göster");
+    ui_print_system(state, "   /connect <onion>    — peer'a bağlan");
+    ui_print_system(state, "   /add <onion> <isim> — rehbere kişi ekle");
+    ui_print_system(state, "   /msg <onion> <msj>  — kuyruklu mesaj gönder");
+    ui_print_system(state, "   /file <dosya_yolu>  — dosya gönder");
+    ui_print_system(state, "   /list               — rehberi listele");
+    ui_print_system(state, "   /switch <isim>      — aktif sohbeti değiştir");
+    ui_print_system(state, "   /disconnect         — bağlantıyı kes");
+    ui_print_system(state, "   Ctrl+P              — çıkış");
+    ui_print_system(state, "");
+    ui_print_system(state, " Gezinti: Tab=panel geçişi  ↑↓=seçim  PgUp/PgDn=kaydır");
 
     if (g_tui.contact_count == 0) {
-        ui_print_system(state, "[!] Rehberinizde kayıtlı akran yok. '+ /connect' seçeneğini seçip Enter'a basarak veya '/add <onion> <isim>' yazarak ilk akranınızı ekleyebilirsiniz.");
+        ui_print_system(state, "");
+        ui_print_system(state, " [!] Rehberinizde kayıtlı akran yok.");
+        ui_print_system(state, "     /add <onion> <isim> ile ilk akranınızı ekleyin.");
     }
 }
 
@@ -231,18 +245,22 @@ void tui_resize(void)
  * ================================================================ */
 static void contact_visitor(const char *onion, const char *name,
                             const uint8_t noise_key[NOX_KEY_LEN],
-                            const char *my_onion,
-                            const uint8_t *my_onion_key,
-                            size_t onion_key_len,
                             void *ctx)
 {
-    (void)noise_key; (void)my_onion; (void)my_onion_key; (void)onion_key_len;
+    (void)noise_key;
     struct app_state *state = (struct app_state *)ctx;
     if (g_tui.contact_count < TUI_MAX_CONTACTS) {
         struct tui_contact *tc = &g_tui.contacts[g_tui.contact_count];
         snprintf(tc->name, sizeof(tc->name), "%s", name);
         snprintf(tc->onion, sizeof(tc->onion), "%s", onion);
-        tc->online = (state->peer_fd >= 0 && strcmp(state->active_peer_onion, onion) == 0);
+        tc->online = false;
+        for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+            if (state->peers[i].fd >= 0 &&
+                strcmp(state->peers[i].peer_onion, onion) == 0) {
+                tc->online = true;
+                break;
+            }
+        }
         g_tui.contact_count++;
     }
 }
@@ -254,7 +272,8 @@ static void tui_load_contacts(struct app_state *state)
         db_list_contacts(contact_visitor, state);
     }
 
-    if (state->peer_fd >= 0 && state->active_peer_onion[0] != '\0') {
+    struct peer_session *ps_load = ACTIVE_PEER(state);
+    if (ps_load && state->active_peer_onion[0] != '\0') {
         bool found = false;
         for (int i = 0; i < g_tui.contact_count; i++) {
             if (strcmp(g_tui.contacts[i].onion, state->active_peer_onion) == 0) {
@@ -311,7 +330,8 @@ void tui_draw_sidebar(struct app_state *state)
         }
 
         bool is_selected = (g_tui.focus == TUI_FOCUS_SIDEBAR && g_tui.selected_idx == i);
-        bool is_active_chat = (state->peer_fd >= 0 && strcmp(state->active_peer_onion, tc->onion) == 0);
+        struct peer_session *ps_active = ACTIVE_PEER(state);
+        bool is_active_chat = (ps_active && strcmp(state->active_peer_onion, tc->onion) == 0);
 
         uintattr_t fg = TC_SIDEBAR;
         uintattr_t bg = 0;

@@ -2,7 +2,7 @@
 
 ## Amaç ve Kapsam
 
-Bu faz, Noxtor-CLI'ı tek peer'lı basit bir CLI mesajlaşıcıdan, **Signal benzeri çoklu oturum destekleyen, ncurses tabanlı bir TUI uygulamasına** dönüştürür. Aynı zamanda **her peer için ayrı .onion adresi** (pairwise identity) kullanarak anonimlik korelasyonunu ortadan kaldırır.
+Bu faz, Noxtor-CLI'ı tek peer'lı basit bir CLI mesajlaşıcıdan, **çoklu oturum destekleyen, TUI tabanlı bir uygulamaya** dönüştürür. **Tek .onion adresi** ile çoklu bağlantı desteği sağlar. Noise protocol zaten pairwise şifreleme (forward secrecy + key freshness) sunar.
 
 ---
 
@@ -19,10 +19,11 @@ Bu faz, Noxtor-CLI'ı tek peer'lı basit bir CLI mesajlaşıcıdan, **Signal ben
 
 **Karar:** Tor Control Protocol'ün `ADD_ONION ED25519-V3:<base64_private_key>` özelliğini kullanarak onion özel anahtarını diske şifreli olarak kaydedip, her açılışta aynı adresi yeniden oluşturma.
 
-### 3. Pairwise Identity — Anonimlik Korelasyon Koruması
-**Sorun:** Tüm peer'lara aynı `.onion` adresini vermek, iki peer'ın iş birliği yaparak aynı kişiyle konuştuklarını anlamalarına olanak tanır.
+### 3. ~~Pairwise Identity — Anonimlik Korelasyon Koruması~~ İPTAL
 
-**Karar:** Her peer için **ayrı bir `.onion` adresi ve ayrı bir onion özel anahtarı** üretilip saklanır. Ali seni `abc.onion` olarak tanırken, Veli seni `xyz.onion` olarak tanır. İkisi bir araya gelse bile korelasyon kuramazlar.
+> **İPTAL (2026-06-28):** Pairwise onion modeli iptal edildi.
+> Noise protocol zaten her bağlantıyı ayrı şifreler (forward secrecy + key freshness).
+> Tek onion modeli yeterli anonimlik sağlıyor.
 
 ### 4. Çoklu Oturum Mimarisi
 **Karar:** `app_state` içindeki tek `peer_fd` + tek `session` yerine, bir oturum dizisi (`struct peer_session sessions[NOX_MAX_PEERS]`) tutulur. ncurses TUI ile kullanıcı oturumlar arasında geçiş yapar.
@@ -418,6 +419,38 @@ handshake_write(peers[idx].hs, (const uint8_t *)peers[idx].my_onion, NOX_ONION_L
 
 ## Kesinleşen Kararlar
 
+### S0: Tek Onion Modeli (2026-06-28 — Güncel)
+
+> **Karar:** Pairwise onion iptal, tek onion modeline geçiş.
+
+**Neden:**
+- Pairwise onion pratikte sıkıntılı: herkese ayrı onion vermek, out-of-band paylaşım, DB'de key saklama
+- Noise protocol zaten pairwise şifreleme sağlıyor (forward secrecy + key freshness)
+- Ghost mod zaten ephemeral key üretiyor
+- Tor anonimliği zaten koruyor
+
+**Nasıl çalışır:**
+```
+1. Uygulama açılır → tek HS üretilir → state->onion_addr dolar (kalıcı)
+2. /addr → her zaman state->onion_addr gösterir
+3. Yeni peer → /add <onion> <isim> → DB'ye kaydedilir
+4. Bağlantı gelir → Noise handshake → karşı taraf onion adresini gönderir
+5. DB'de aranır → isim/noise_key peers[idx]'ye yazılır
+6. Şifreli kanal hazır
+```
+
+**Kaldırılan:**
+- `ps->my_onion`, `ps->my_onion_key`, `ps->listen_fd`, `ps->listen_path`
+- `peer_init_visitor`, `listener_create_at`
+- DB'de `my_onion`/`my_onion_key` alanları
+
+**Korunan (Multi-Peer):**
+- `peers[NOX_MAX_PEERS]`, `active_peer_idx`, `peer_count`
+- `/list`, `/switch`, `/disconnect`, `/msg <onion> <msj>`
+- TUI sidebar, per-peer chat buffer
+
+---
+
 ### S1: Mesaj Geçmişi → EVET, Şifreli
 Mesaj geçmişi diske kaydedilecek. Mevcut `crypto_secretbox_easy` + `db_key` mekanizmasının aynısı kullanılacak. Her mesaj satırı ayrı nonce + şifreli payload olarak `history` tablosunda saklanır. Ghost modda geçmiş kaydedilmez.
 
@@ -638,35 +671,32 @@ Tor control port yanıtından `PrivateKey=` alanını parse:
 
 ---
 
-### Alt Faz 6.3.2 — Pairwise Onion Adresleri
+### ~~Alt Faz 6.3.2 — Pairwise Onion Adresleri~~ İPTAL
 
-**Hedef:** Her peer'a ayrı .onion adresi.
-**Tahmini Satır:** ~250
-**Dosyalar:** types.h, main.c, event_loop.c
+> **İPTAL (2026-06-28):** Pairwise onion modeli pratikte sıkıntılı:
+> - Her peer'a ayrı onion vermek gerekiyor (karmaşık)
+> - Onion'ları karşıya iletmek gerekiyor (out-of-band)
+> - DB'de `my_onion`/`my_onion_key` saklaman gerekiyor
+> - Buffer havuzu çok karmaşık
+> - Ghost mod zaten ephemeral key üretiyor
+> - Noise protocol zaten pairwise şifreleme sağlıyor
+>
+> **Yerine:** Tek onion modeli (herkese aynı .onion adresi).
+> Noise protocol zaten her bağlantıyı ayrı şifreler (forward secrecy + key freshness).
+>
+> Bu fazdaki per-peer HS kodu (`peer_init_visitor`, `listener_create_at`,
+> `ps->my_onion`, `ps->listen_fd`, `ps->listen_path`) kaldırılacaktır.
+> Multi-peer desteği (peers[], /list, /switch, /disconnect) aynen korunur.
 
-#### Veri Akışı
+#### ~~Veri Akışı~~ İPTAL
 
 ```
-Ali (/connect veli) →
-  1. db_get_contact("veli") → peer_onion, name, my_onion, my_onion_key
-  2. my_onion_key varsa → tor_create_persistent_hs(my_onion_key) → peers[i].my_onion
-  3. my_onion_key yoksa → tor_create_new_hs() → key'i DB'ye kaydet
-  4. SOCKS5 proxy üzerinden veli.onion'a bağlan
+~~Ali (/connect veli) →~~
+  ~~1. db_get_contact("veli") → peer_onion, name, my_onion, my_onion_key~~
+  ~~2. my_onion_key varsa → tor_create_persistent_hs(my_onion_key) → peers[i].my_onion~~
+  ~~3. my_onion_key yoksa → tor_create_new_hs() → key'i DB'ye kaydet~~
+  ~~4. SOCKS5 proxy üzerinden veli.onion'a bağlan~~
 ```
-
-#### Database API (Zaten var, değişiklik gerekmez)
-
-```c
-nox_err_t db_get_contact(sqlite3 *db,
-                          const uint8_t *onion_hash,
-                          struct contact **out);
-
-nox_err_t db_add_contact(sqlite3 *db,
-                          const char *onion_addr,
-                          const char *name,
-                          const uint8_t *noise_key,
-                          const char *my_onion,
-                          const char *my_onion_key);
 
 nox_err_t db_list_contacts(sqlite3 *db,
                             struct contact_list **out);
@@ -720,19 +750,38 @@ nox_err_t db_list_contacts(sqlite3 *db,
 
 ---
 
-### Alt Faz 6.3.4 — Mesaj Geçmişi
+### Alt Faz 6.3.4 — Mesaj Geçmişi + Peer Silme
 
-**Hedef:** `/history` komutu + TUI'da geçmiş gösterimi.
-**Tahmini Satır:** ~50
-**Dosyalar:** stdin_handler.c, tui.c
+**Hedef:** `/history` komutu + TUI'da geçmiş gösterimi + `/peer_delete` ile rehberden kişi silme.
+**Tahmini Satır:** ~100
+**Dosyalar:** stdin_handler.c, tui.c, database.c
 
 database.c zaten hazır:
 - `db_save_message()` ✅
 - `db_get_history()` ✅
+- `db_delete_conversation()` ✅
 
-Sadece:
-- `/history` komutunu stdin_handler.c'ye ekle
-- TUI'da geçmiş yükleme (chat scrollback'a DB'den mesajları bas)
+#### 6.3.4.1 — Mesaj Kaydetme (Send/Receive)
+- Giden mesaj: `send_segmented_message_to()` sonrası `db_save_message(..., true, ...)`
+- Gelen mesaj: `event_loop.c` decrypt sonrası `db_save_message(..., false, ...)`
+- Ghost modda kayıt yapılmaz
+
+#### 6.3.4.2 — `/history` Komutu
+- `db_get_history(onion, 50, history_visitor_cb, state)` ile son 50 mesajı göster
+- Aktif peer yoksa argümanla isim/onion belirtilebilir
+
+#### 6.3.4.3 — `/peer_delete <isim|onion>` Komutu
+- Rehberden kişiyi siler: `db_delete_contact(onion)` **(yeni fonksiyon — database.c'ye eklenecek)**
+- Bağlıysa önce disconnect: `sm_dispatch(ps, state, EV_PEER_DISCONNECTED)`
+- Listener'ı kapatır ve `.sock` dosyasını siler
+- TUI sidebar'dan kaldırır
+- Uyarı: `"[!] <isim> rehberden silinecek. Emin misiniz? (y/n): "` onay ister
+- Ghost modda devre dışı
+- DB: `DELETE FROM contacts WHERE peer_hash = ?` (hash_onion ile)
+
+#### 6.3.4.4 — TUI'da Geçmiş Yükleme
+- Contact'a geçiş yapıldığında `db_get_history(tc->onion, 200, ...)` ile chat panelini doldur
+- `TUI_CHAT_SCROLLBACK` (512) yeterli
 
 ---
 
@@ -758,7 +807,7 @@ Sadece:
 | 6.3.1 Kalıcı Onion | ~200 | network.c, network.h, main.c | — |
 | 6.3.2 Pairwise Onion | ~250 | types.h, main.c, event_loop.c | 6.3.1 |
 | 6.3.3 Çoklu Oturum | ~350 | event_loop.c, state_machine.c, stdin_handler.c | 6.3.2 |
-| 6.3.4 Mesaj Geçmişi | ~50 | stdin_handler.c, tui.c | 6.3.3 |
+| 6.3.4 Mesaj Geçmişi + Peer Silme | ~100 | stdin_handler.c, tui.c, database.c | 6.3.3 |
 | 6.3.5 TUI Genişletme | ~150 | tui.c | 6.3.3 |
 | **Toplam** | **~1000** | **~8 dosya** | — |
 
@@ -777,3 +826,272 @@ Her alt faz bağımsız derlenebilir ve test edilebilir.
 | noise_key ile contact lookup | Onion rotation koruması — ayrı bir iyileştirme |
 | Ortak fingerprint | Out-of-band doğrulama — ayrı bir tasarım kararı |
 | Key rotation | Gelecek optimizasyon — şimdilik gerek yok |
+
+---
+
+## Faz 6.3.3 — Çoklu Oturum Event Loop Detaylı Plan
+
+**Tarih:** 2026-06-28
+**Durum:** Planlandı, uygulanacak
+
+### Kesinleşen Kararlar
+
+| Karar | Seçim | Neden |
+|-------|-------|-------|
+| Per-peer listener | **Her peer ayrı listener (Seçenek B)** | Tam pairwise anonimlik gerekli |
+| Legacy alan kaldırma | **Faz 6.4'e ertelendi** | Riskli变更, bağımsız faz olarak yapılacak |
+| `peer_count` | **Kullan (bitmask yok)** | Tor varken ince optimizasyon gereksiz |
+| SM action stubs | **Boş kalsın** | Mevcut bypass zaten sm_dispatch kullanıyor |
+| Commit | **Manuel, her alt fazdan sonra** | GPG imzası için |
+
+### Ertelenen (Faz 6.4)
+
+- `app_state`'ten legacy tek-peer alanlarının kaldırılması (types.h:261-315)
+  - `session`, `hs`, `handshake_start`, `tofu_start`
+  - `peer_fd`, `tx_seq`, `rx_seq`, `session_arena_mark`
+  - `recv_buf`, `recv_pos`, `peer_state`, `connect_target`
+  - `queue_flushed`, `tofu_pending`, `tofu_peer_fd`, `tofu_onion`, `tofu_name`, `tofu_new_key`, `tofu_arena_mark`
+- `main.c` cleanup'dan eski tek-peer temizliği (satır 525-528: `state->peer_fd`)
+
+### Alt Faz 6.3.3.1 — Per-Peer Listener Wiring
+
+**Hedef:** Her peer'a ayrı listener + Tor HS.
+**Tahmini Satır:** ~120
+**Dosyalar:** main.c, event_loop.c, types.h
+
+#### Startup Akışı
+
+```
+Mevcut (main.c):
+  1. Tor spawn + bootstrap
+  2. listener_create() → state->listen_fd (tek)
+  3. tor_create_persistent_hs(onion.key) → state->onion_addr
+  4. epoll_add_fd(state->listen_fd)
+
+Yeni:
+  1. Tor spawn + bootstrap
+  2. db_list_contacts() ile rehberdeki her kişi için:
+     a. peers[i].listen_path = "<config_dir>/listen_<i>.sock"
+     b. listener_create(peers[i].listen_path) → peers[i].listen_fd
+     c. my_onion_key varsa → tor_create_persistent_hs(key) → peers[i].my_onion
+     d. my_onion_key yoksa → tor_create_new_hs() → key'i DB'ye kaydet
+     e. epoll_add_fd(peers[i].listen_fd)
+     f. peer_count++
+  3. Event loop
+```
+
+#### event_loop.c Değişiklikleri
+
+**Accept routing (satır 597-671):**
+```c
+// ESKİ:
+if (fd == state->listen_fd) { ... }
+
+// YENİ:
+for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+    if (fd == state->peers[i].listen_fd) {
+        // accept4 → state->peers[i].fd
+        // handshake_init(state->peers[i].hs, false, ...)
+        // sm_dispatch(&state->peers[i], state, EV_PEER_ACCEPTED)
+        break;
+    }
+}
+```
+
+**epoll_setup (main.c):**
+- `state->listen_fd` tek global listener olarak KALIR mı yoksa KALDIRILIR mı?
+  - **Karar:** KALDIRILIR. Her peer'ın kendi `listen_fd`'i var.
+  - `state->listen_fd = -1` yapılır, `epoll_setup()` sadece stdin ve peers[].listen_fd'leri kaydeder.
+
+**events[] boyutu:**
+```c
+// Zaten doğru:
+struct epoll_event events[1 + 2 * NOX_MAX_PEERS];  // 1 stdin + 2*16
+```
+
+#### main.c Cleanup
+
+```c
+// Tüm peers[] temizle
+for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+    if (state->peers[i].listen_fd >= 0) {
+        close(state->peers[i].listen_fd);
+        unlink(state->peers[i].listen_path);
+    }
+}
+// state->listen_fd artık kullanılmaz
+```
+
+#### Test
+- Uygulama başlatıldığında rehberdeki her kişi için ayrı `.sock` dosyası oluşur
+- `ls -la <config_dir>/listen_*.sock` → 16'ya kadar dosya
+- İki instance arasında bağlantı kurulabilir
+
+---
+
+### Alt Faz 6.3.3.2 — Yeni Komutlar
+
+**Hedef:** `/list`, `/switch`, `/disconnect` komutları.
+**Tahmini Satır:** ~80
+**Dosyalar:** stdin_handler.c, ui.c
+
+#### Komutlar
+
+| Komut | Davranış |
+|-------|----------|
+| `/list` | `db_list_contacts` → isim, onion kısaltma, çevrimiçi durum, unread count |
+| `/switch <isim\|onion>` | İsimle/onion ile peer bul → `active_peer_idx = i` → TUI refresh |
+| `/disconnect` | `sm_dispatch(ps, state, EV_PEER_DISCONNECTED)` → slot temizle |
+
+#### `/list` Implementasyonu
+
+```c
+// stdin_handler.c
+static void handle_list(struct app_state *state) {
+    // Rehberden kişileri listele
+    db_list_contacts(list_visitor_cb, state);
+    // Çevrimiçi durumunu peers[] ile kontrol et
+    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+        if (state->peers[i].state != ST_IDLE) {
+            // Bu peer çevrimiçi
+        }
+    }
+}
+```
+
+#### `/switch` Implementasyonu
+
+```c
+static void handle_switch(struct app_state *state, const char *arg) {
+    // İsimle veya onion ile peer bul
+    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+        if (strcmp(state->peers[i].name, arg) == 0 ||
+            strcmp(state->peers[i].peer_onion, arg) == 0) {
+            state->active_peer_idx = i;
+            strncpy(state->active_peer_onion, state->peers[i].peer_onion, ...);
+            ui_print_system(state, "Aktif peer: %s", state->peers[i].name);
+            return;
+        }
+    }
+    ui_print_error(state, "Peer bulunamadı: %s", arg);
+}
+```
+
+#### `/disconnect` Implementasyonu
+
+```c
+static void handle_disconnect(struct app_state *state) {
+    struct peer_session *ps = ACTIVE_PEER(state);
+    if (!ps) {
+        ui_print_error(state, "Aktif peer yok");
+        return;
+    }
+    sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
+    ui_print_system(state, "Bağlantı kesildi: %s", ps->name);
+}
+```
+
+#### Test
+- `/list` → rehberdeki tüm kişiler listelenir, çevrimiçi olanlar işaretli
+- `/switch ali` → aktif peer değişir
+- `/disconnect` → peer bağlantısı kesilir, slot temizlenir
+
+---
+
+### Alt Faz 6.3.3.3 — Multi-Peer Mesaj Yönlendirme
+
+**Hedef:** Mesajlar doğru peer'a gitsin, `ACTIVE_PEER` bağımlılığı azalsın.
+**Tahmini Satır:** ~60
+**Dosyalar:** stdin_handler.c, ui.c
+
+#### Değişiklikler
+
+**`send_segmented_message`:**
+```c
+// ESKİ:
+static void send_segmented_message(struct app_state *state, const char *text) {
+    struct peer_session *ps = ACTIVE_PEER(state);
+    ...
+}
+
+// YENİ:
+static void send_segmented_message(struct app_state *state, struct peer_session *ps,
+                                   const char *text) {
+    // ps parametre olarak alınır
+}
+```
+
+**`process_line`:**
+```c
+// ESKİ:
+send_segmented_message(state, text);
+
+// YENİ:
+struct peer_session *ps = ACTIVE_PEER(state);
+if (ps) send_segmented_message(state, ps, text);
+```
+
+**`/msg <isim> <text>`:**
+```c
+// YENİ: İsimle peer bul
+struct peer_session *find_peer_by_name(struct app_state *state, const char *name);
+// /msg → find_peer_by_name → ps'a gönder
+```
+
+**`ui_print_incoming`:**
+```c
+// ESKİ: sadece mesaj gösterir
+// YENİ: hangi peer'dan geldiği belli olsun
+// [Ali] merhaba  veya  [Veli] selam
+```
+
+#### Test
+- İki peer'a bağlıyken `/msg ali merhaba` → Ali'ye gider
+- `/msg veli selam` → Veli'ye gider
+- Gelen mesajlarda hangi peer'dan geldiği görünür
+
+---
+
+### Alt Faz 6.3.3.4 — Peer Count ve State Tracking
+
+**Hedef:** `peer_count` doğru tutulsun, peer bağlantı/kesinti durumları takip edilsin.
+**Tahmini Satır:** ~30
+**Dosyalar:** event_loop.c, stdin_handler.c, state_machine.c
+
+#### Değişiklikler
+
+**Accept handler:**
+```c
+state->peer_count++;
+```
+
+**action_cleanup:**
+```c
+state->peer_count--;
+```
+
+**Startup:**
+```c
+state->peer_count = 0;  // zaten {0} ile sıfırlanıyor
+```
+
+#### Test
+- İki peer bağlan → `peer_count = 2`
+- Birini disconnect et → `peer_count = 1`
+- `/list` → doğru peer sayısı gösterilir
+
+---
+
+### Uygulama Sırası
+
+```
+6.3.3.1 (per-peer listener) → 6.3.3.4 (peer count) → 6.3.3.2 (yeni komutlar) → 6.3.3.3 (mesaj yönlendirme) → test
+```
+
+### Doğrulama
+
+- `make clean && make` → sıfır hata
+- `make test` → tüm testler başarılı
+- İki terminal'de iki instance → pairwise onion ile bağlantı
+- `/list`, `/switch`, `/disconnect` manuel test
+- `/msg <isim> <text>` ile hedefli mesaj gönderme

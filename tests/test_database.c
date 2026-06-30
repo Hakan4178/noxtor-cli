@@ -83,20 +83,20 @@ static int test_db_contacts(void)
     memset(noise_key, 0xAA, NOX_KEY_LEN);
 
     /* Ekle */
-    err = db_add_contact(onion, name, noise_key, NULL, NULL, 0);
+    err = db_add_contact(onion, name, noise_key);
     TEST_ASSERT(err == NOX_OK);
 
     /* Oku */
     char name_out[NOX_CONTACT_NAME_LEN + 1];
     uint8_t key_out[NOX_KEY_LEN];
-    err = db_get_contact(onion, name_out, sizeof(name_out), key_out, NULL, 0, NULL, NULL);
+    err = db_get_contact(onion, name_out, sizeof(name_out), key_out);
     TEST_ASSERT(err == NOX_OK);
     TEST_ASSERT(strcmp(name_out, name) == 0);
     TEST_ASSERT(memcmp(key_out, noise_key, NOX_KEY_LEN) == 0);
 
     /* Bulunmayan kontaktı sorgula */
     const char *unknown_onion = "bcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrstu.onion";
-    err = db_get_contact(unknown_onion, name_out, sizeof(name_out), key_out, NULL, 0, NULL, NULL);
+    err = db_get_contact(unknown_onion, name_out, sizeof(name_out), key_out);
     TEST_ASSERT(err != NOX_OK);
 
     /* Güncelle */
@@ -104,10 +104,10 @@ static int test_db_contacts(void)
     uint8_t new_key[NOX_KEY_LEN];
     memset(new_key, 0xBB, NOX_KEY_LEN);
 
-    err = db_add_contact(onion, new_name, new_key, NULL, NULL, 0);
+    err = db_add_contact(onion, new_name, new_key);
     TEST_ASSERT(err == NOX_OK);
 
-    err = db_get_contact(onion, name_out, sizeof(name_out), key_out, NULL, 0, NULL, NULL);
+    err = db_get_contact(onion, name_out, sizeof(name_out), key_out);
     TEST_ASSERT(err == NOX_OK);
     TEST_ASSERT(strcmp(name_out, new_name) == 0);
     TEST_ASSERT(memcmp(key_out, new_key, NOX_KEY_LEN) == 0);
@@ -127,7 +127,7 @@ static int test_db_wrong_key(void)
     uint8_t noise_key[NOX_KEY_LEN];
     memset(noise_key, 0xCC, NOX_KEY_LEN);
 
-    err = db_add_contact(onion, name, noise_key, NULL, NULL, 0);
+    err = db_add_contact(onion, name, noise_key);
     TEST_ASSERT(err == NOX_OK);
     db_close();
 
@@ -141,7 +141,7 @@ static int test_db_wrong_key(void)
     /* Kaydı okumaya çalış, deşifre edilememeli veya bulunamamalı (yani NOX_OK dönmemeli) */
     char name_out[NOX_CONTACT_NAME_LEN + 1];
     uint8_t key_out[NOX_KEY_LEN];
-    err = db_get_contact(onion, name_out, sizeof(name_out), key_out, NULL, 0, NULL, NULL);
+    err = db_get_contact(onion, name_out, sizeof(name_out), key_out);
     TEST_ASSERT(err != NOX_OK);
 
     db_close();
@@ -196,10 +196,8 @@ static int test_db_queue(void)
 
 static void dummy_contact_visitor(const char *onion, const char *name,
                                   const uint8_t noise_key[NOX_KEY_LEN],
-                                  const char *my_onion,
-                                  const uint8_t *my_onion_key,
-                                  size_t onion_key_len,
                                   void *ctx) {
+  (void)onion; (void)name; (void)noise_key;
   int *cnt = (int *)ctx;
   (*cnt)++;
 }
@@ -214,14 +212,13 @@ static void dummy_summary_visitor(
     const char *onion,
     const char *name,
     const uint8_t noise_key[NOX_KEY_LEN],
-    const char *my_onion,
-    const uint8_t *my_onion_key,
-    size_t onion_key_len,
     const char *last_msg_text,
     bool last_msg_outgoing,
     time_t last_msg_timestamp,
     void *ctx
 ) {
+  (void)onion; (void)name; (void)noise_key;
+  (void)last_msg_outgoing; (void)last_msg_timestamp;
   char *last_msg_out = (char *)ctx;
   if (last_msg_text) {
     strcpy(last_msg_out, last_msg_text);
@@ -238,29 +235,18 @@ static int test_db_history(void)
     uint8_t noise_key[NOX_KEY_LEN];
     memset(noise_key, 0x11, NOX_KEY_LEN);
 
-    const char *my_onion = "nopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz1234567.onion";
-    const char *my_onion_key = "ED25519-V3:b64encodedkeygoeshereforourpersistentidentityonionaddresskey";
-    size_t my_onion_key_len = strlen(my_onion_key);
-
-    /* Ekle (full) */
-    err = db_add_contact(onion, name, noise_key, my_onion, (const uint8_t *)my_onion_key, my_onion_key_len);
+    /* Ekle */
+    err = db_add_contact(onion, name, noise_key);
     TEST_ASSERT(err == NOX_OK);
 
     /* Oku ve doğrula */
     char name_out[NOX_CONTACT_NAME_LEN + 1];
     uint8_t key_out[NOX_KEY_LEN];
-    char my_onion_out[NOX_ONION_LEN + 1];
-    uint8_t my_key_out[128];
-    size_t my_key_len = sizeof(my_key_out);
-    memset(my_key_out, 0, sizeof(my_key_out));
 
-    err = db_get_contact(onion, name_out, sizeof(name_out), key_out,
-                         my_onion_out, sizeof(my_onion_out), my_key_out, &my_key_len);
+    err = db_get_contact(onion, name_out, sizeof(name_out), key_out);
     TEST_ASSERT(err == NOX_OK);
     TEST_ASSERT(strcmp(name_out, name) == 0);
     TEST_ASSERT(memcmp(key_out, noise_key, NOX_KEY_LEN) == 0);
-    TEST_ASSERT(strcmp(my_onion_out, my_onion) == 0);
-    TEST_ASSERT(strcmp((char *)my_key_out, my_onion_key) == 0);
 
     /* Listele */
     int contact_count = 0;
