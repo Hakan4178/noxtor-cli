@@ -112,7 +112,8 @@ __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *s
 /*
  * handshake_init — HandshakeState başlat
  *
- * @hs:         Boş HandshakeState
+ * @hs:         Boş HandshakeState (sodium_malloc ile allocate edilmeli —
+ *              private key material swap/coredump koruması için)
  * @initiator:  true = bağlantı kuran taraf
  * @s_priv:     Static private key (32 byte, Curve25519)
  * @s_pub:      Static public key (32 byte)

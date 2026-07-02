@@ -152,17 +152,19 @@ static void strip_ansi_escape(char *str) {
           src++;
         if (*src) src++;
       } else if (src[1] == ']') {
-        /* OSC: ESC ] <cmd> ; <data> BEL or ESC \ */
+        /* OSC: ESC ] <cmd> ; <data> BEL or ESC \ — max 256 byte tara */
         src += 2;
-        while (*src && (unsigned char)*src != 0x07 &&
+        int osc_limit = 256;
+        while (*src && osc_limit-- > 0 && (unsigned char)*src != 0x07 &&
                !(src[0] == 0x1b && src[1] == '\\'))
           src++;
         if ((unsigned char)*src == 0x07) src++;
         else if (src[0] == 0x1b && src[1] == '\\') src += 2;
       } else if (src[1] == 'P') {
-        /* DCS: ESC P <data> ESC \ */
+        /* DCS: ESC P <data> ESC \ — max 256 byte tara */
         src += 2;
-        while (*src && !(src[0] == 0x1b && src[1] == '\\'))
+        int dcs_limit = 256;
+        while (*src && dcs_limit-- > 0 && !(src[0] == 0x1b && src[1] == '\\'))
           src++;
         if (src[0] == 0x1b && src[1] == '\\') src += 2;
       } else {

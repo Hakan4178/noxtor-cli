@@ -73,13 +73,15 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
     /* ABI versiyonunu kontrol et */
     int abi = landlock_abi_version();
     if (abi < 0) {
-        NOX_WARN(LOG_MOD_MAIN, "landlock: desteklenmiyor (abi=%d), atlanıyor", abi);
-        return NOX_OK;  /* Fallback — seccomp hâlâ aktif */
+        NOX_WARN(LOG_MOD_MAIN, "landlock: desteklenmiyor (abi=%d), "
+                 "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz", abi);
+        return NOX_ERR_CONFIG;
     }
 
     if (abi < 1) {
-        NOX_WARN(LOG_MOD_MAIN, "landlock: ABI v1 gerekli (abi=%d), atlanıyor", abi);
-        return NOX_OK;
+        NOX_WARN(LOG_MOD_MAIN, "landlock: ABI v1 gerekli (abi=%d), "
+                 "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz", abi);
+        return NOX_ERR_CONFIG;
     }
 
     NOX_INFO(LOG_MOD_MAIN, "landlock: ABI v%d tespit edildi", abi);
@@ -162,8 +164,15 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
                     LANDLOCK_ACCESS_FS_READ_DIR,
                 .parent_fd = config_fd,
             };
-            sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
-                                  &config_rule, 0);
+            rc = sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+                                      &config_rule, 0);
+            if (rc < 0) {
+                NOX_ERROR(LOG_MOD_MAIN, "landlock: config kuralı eklenemedi (%s)",
+                          strerror(errno));
+                close(config_fd);
+                close(ruleset_fd);
+                return NOX_ERR_CONFIG;
+            }
             close(config_fd);
         }
     }

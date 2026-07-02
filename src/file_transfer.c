@@ -78,9 +78,10 @@ void sanitize_filename(char *name, size_t max_len) {
 }
 
 /* PATCH: H-13 — downloads_dir_fd güvenlik doğrulaması */
-static nox_err_t verify_downloads_dir(const char *dir_path) {
+/* H-3: fd üzerinden doğrula — TOCTOU engeli (lstat(path) vs openat(fd) farkı) */
+static nox_err_t verify_downloads_dir_fd(int dir_fd) {
     struct stat st;
-    if (lstat(dir_path, &st) != 0)
+    if (fstat(dir_fd, &st) != 0)
         return NOX_ERR_IO;
     if (S_ISLNK(st.st_mode))
         return NOX_ERR_CONFIG;
@@ -452,9 +453,9 @@ static nox_err_t open_recv_file(struct app_state *state,
         return NOX_ERR_CONFIG;
     }
 
-    /* PATCH: H-13 — downloads_dir_fd güvenliğini doğrula */
+    /* H-3: fd üzerinden doğrula — TOCTOU engeli */
     if (state->downloads_dir_fd >= 0) {
-        if (verify_downloads_dir(state->downloads_dir) != NOX_OK) {
+        if (verify_downloads_dir_fd(state->downloads_dir_fd) != NOX_OK) {
             NOX_ERROR(LOG_MOD_MAIN, "downloads_dir_fd güvenlik doğrulaması başarısız");
             return NOX_ERR_CONFIG;
         }

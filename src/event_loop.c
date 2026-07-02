@@ -367,10 +367,14 @@ void event_loop(struct app_state *state) {
   /* ── Landlock sandbox — open/openat/creat'i kısıtla ──────────────
    * Landlock ÖNCE yüklenmeli (seccomp'tan önce).
    * Sadece downloads dizini okunabilir/yazılabilir.
-   * Kernel 5.13+ gerektirir, desteklemiyorsa sessizce atlar.
+   * Kernel 5.13+ gerektirir, desteklemiyorsa hata döner.
    * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez. */
   if (state->downloads_dir_fd >= 0) {
-    landlock_sandbox_init(state->downloads_dir_fd);
+    nox_err_t ll_err = landlock_sandbox_init(state->downloads_dir_fd);
+    if (ll_err != NOX_OK) {
+      NOX_WARN(LOG_MOD_MAIN, "landlock devre dışı — dosya erişimi kısıtsız "
+               "(kernel 5.13+ gerekli)");
+    }
   }
 
   /* ── Stage 3: Sıfır ağ sızıntısı garantisi ────────────────────

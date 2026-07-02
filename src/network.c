@@ -232,7 +232,12 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
 
 static nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
                                     int timeout_ms) {
+  /* H-2: Tor Control yanıtları çok nadiren 10+ satır olur.
+   * 64 satır limiti — sonsuz continuation saldırısını engeller. */
+  enum { MAX_RESPONSE_LINES = 64 };
+
   size_t total = 0;
+  size_t nlines = 0;
 
   for (;;) {
     char line[256];
@@ -241,6 +246,13 @@ static nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
       return err;
 
     size_t llen = strlen(line);
+
+    /* H-2: Satır sayısı limiti */
+    if (++nlines > MAX_RESPONSE_LINES) {
+      NOX_ERROR(LOG_MOD_NET, "ctrl yanıt satır sayısı aşıldı (%zu)",
+                nlines);
+      return NOX_ERR_OVERFLOW;
+    }
 
     /* Buffer taşma koruması */
     if (total + llen + 1 >= buf_size) {
@@ -1366,6 +1378,8 @@ nox_err_t epoll_add_fd(int epoll_fd, int fd) {
 
 nox_err_t epoll_remove_fd(int epoll_fd, int fd) {
   if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL) != 0) {
+    /* H-13: ENOENT — fd zaten kaldırılmış, temizlik sırasında normal */
+    if (errno == ENOENT) return NOX_OK;
     NOX_ERROR(LOG_MOD_NET, "epoll_ctl DEL: %s", strerror(errno));
     return NOX_ERR_NET;
   }

@@ -476,6 +476,7 @@ void tui_chat_append_colored(const char *line, uintattr_t fg)
                 g_tui.chat_line_count = TUI_CHAT_SCROLLBACK - 1;
             }
             g_tui.chat_lines[g_tui.chat_line_count] = strdup(row);
+            if (!g_tui.chat_lines[g_tui.chat_line_count]) return;
             g_tui.chat_line_colors[g_tui.chat_line_count] = fg;
             g_tui.chat_line_count++;
         }
@@ -564,6 +565,8 @@ void tui_draw_input(void)
     /* Kullanıcı girdisi — tb_printf UTF-8 destekler */
     int input_x = px + 2;
     int max_input_w = chat_w - 4;
+    for (int i = 0; i < max_input_w; i++)
+        tb_set_cell(input_x + i, py, ' ', 0, 0);
     if (g_tui.input_len > 0) {
         tb_printf(input_x, py, 0xFFFFFF, 0, "%.*s", max_input_w, g_tui.input_buf);
     }
@@ -726,6 +729,7 @@ const char *tui_handle_input(struct app_state *state, int ch)
                         (size_t)(g_tui.input_len - g_tui.input_cursor));
                 g_tui.input_len -= del;
                 g_tui.input_cursor -= del;
+                g_tui.input_buf[g_tui.input_len] = '\0';
             }
         }
         break;
@@ -740,6 +744,7 @@ const char *tui_handle_input(struct app_state *state, int ch)
                         &g_tui.input_buf[g_tui.input_cursor + del],
                         (size_t)(g_tui.input_len - g_tui.input_cursor - del));
                 g_tui.input_len -= del;
+                g_tui.input_buf[g_tui.input_len] = '\0';
             }
         }
         break;

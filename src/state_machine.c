@@ -380,6 +380,7 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
 
     if (handshake_split(ps->hs, ps->session) != NOX_OK) {
         ui_print_error(state, "session split başarısız");
+        sodium_free(ps->session);
         ps->session = NULL;
         sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         return NOX_ERR_PROTO;
