@@ -169,6 +169,14 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
           continue;
         }
 
+        /* Terminal injection koruması — base32 charset dışı karakter engeli */
+        if (!validate_onion_address(peer_onion)) {
+          NOX_ERROR(LOG_MOD_NOISE, "Geçersiz onion adresi formatı (injection?)");
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
+          sodium_free(payload);
+          continue;
+        }
+
         char name[NOX_CONTACT_NAME_LEN + 1];
         uint8_t stored_key[NOX_KEY_LEN];
         sodium_memzero(name, sizeof(name));
@@ -687,7 +695,16 @@ void event_loop(struct app_state *state) {
         if (ioctl(fd, FIONREAD, &avail) < 0) avail = 0;
         size_t space = sizeof(ps->recv_buf) - ps->recv_pos;
         size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
-        if (to_read == 0) continue;
+        if (to_read == 0) {
+          /* Buffer dolu — önce tamamlanmış frame'leri processing et */
+          process_peer_frames(ps, state, fd);
+          /* Hâlâ doluysa peer tıkanmış (DoS veya kapanma) — disconnect */
+          if (ps->fd >= 0) {
+            NOX_WARN(LOG_MOD_NET, "recv_buf dolu — peer tıkanmış, disconnect");
+            sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
+          }
+          continue;
+        }
 
         ssize_t r = recv(fd, ps->recv_buf + ps->recv_pos, to_read, MSG_DONTWAIT);
         if (r <= 0) {
