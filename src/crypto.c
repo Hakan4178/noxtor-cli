@@ -280,7 +280,7 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
         return NOX_ERR_CONFIG;
 
     /* [F-1] TOCTOU koruması — fd tabanlı izin kontrolü */
-    int dir_fd = open(config_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int dir_fd = open(config_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dir_fd >= 0) {
         struct stat dir_st;
         if (fstat(dir_fd, &dir_st) == 0) {
@@ -309,7 +309,7 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
         return NOX_ERR_CONFIG;
 
     /* Mevcut salt dosyasını oku */
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd >= 0) {
         /* [P7] Dosya boyutu kontrolü — fstat hata ayrımı UB önler */
         struct stat st;
@@ -355,7 +355,7 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
         return NOX_ERR_CONFIG;
 
     int tmp_fd = open(tmp_path,
-                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                       0600);
     if (tmp_fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
@@ -467,7 +467,7 @@ nox_err_t crypto_generate_identity(const char *identity_path,
         return NOX_ERR_CONFIG;
     }
     fd = open(tmp_path,
-              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
               0600);
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
@@ -548,7 +548,7 @@ nox_err_t crypto_load_identity(const char *identity_path,
         return NOX_ERR_CRYPTO;
     }
 
-    int fd = open(identity_path, O_RDONLY | O_CLOEXEC);
+    int fd = open(identity_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key açılamadı: %s", strerror(errno));

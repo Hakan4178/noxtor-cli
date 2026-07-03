@@ -242,7 +242,13 @@ static nox_err_t resolve_config_paths(struct app_state *state) {
 static nox_err_t ensure_config_dir(struct app_state *state) {
   struct stat st;
 
-  if (stat(state->config_dir, &st) == 0) {
+  if (lstat(state->config_dir, &st) == 0) {
+    /* Symlink hijacking koruması */
+    if (S_ISLNK(st.st_mode)) {
+      NOX_ERROR(LOG_MOD_MAIN, "%s bir symlink — config dizini hijack girişimi",
+                state->config_dir);
+      return NOX_ERR_CONFIG;
+    }
     /* Dizin zaten var */
     if (!S_ISDIR(st.st_mode)) {
       NOX_ERROR(LOG_MOD_MAIN, "%s bir dizin değil", state->config_dir);
@@ -720,7 +726,7 @@ int main(int argc, char *argv[]) {
           continue; /* dosya yok — sorun değil */
 
         /* Dosyayı sıfırlarla üzerine yaz */
-        int fd = open(all_files[i], O_WRONLY | O_CLOEXEC);
+        int fd = open(all_files[i], O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd >= 0) {
           uint8_t zeros[256];
           explicit_bzero(zeros, sizeof(zeros));
@@ -1170,7 +1176,7 @@ int main(int argc, char *argv[]) {
         char saved_key[NOX_ONION_KEY_B64_LEN + 1];
         saved_key[0] = '\0';
 
-        int key_fd = open(onion_key_path, O_RDONLY);
+        int key_fd = open(onion_key_path, O_RDONLY | O_NOFOLLOW);
         if (key_fd >= 0) {
           ssize_t n = read(key_fd, saved_key, NOX_ONION_KEY_B64_LEN);
           close(key_fd);
@@ -1208,7 +1214,7 @@ int main(int argc, char *argv[]) {
             return 1;
           }
 
-          key_fd = open(onion_key_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+          key_fd = open(onion_key_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
           if (key_fd >= 0) {
             nox_err_t werr = write_full(key_fd, saved_key, NOX_ONION_KEY_B64_LEN);
             close(key_fd);
