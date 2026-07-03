@@ -87,28 +87,30 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
     NOX_INFO(LOG_MOD_MAIN, "landlock: ABI v%d tespit edildi", abi);
 
     /* ── Ruleset oluştur ── */
-    struct landlock_ruleset_attr ruleset_attr = {
-        .handled_access_fs =
-            LANDLOCK_ACCESS_FS_EXECUTE      |
-            LANDLOCK_ACCESS_FS_WRITE_FILE   |
-            LANDLOCK_ACCESS_FS_READ_FILE    |
-            LANDLOCK_ACCESS_FS_READ_DIR     |
-            LANDLOCK_ACCESS_FS_REMOVE_DIR   |
-            LANDLOCK_ACCESS_FS_REMOVE_FILE  |
-            LANDLOCK_ACCESS_FS_MAKE_CHAR    |
-            LANDLOCK_ACCESS_FS_MAKE_DIR     |
-            LANDLOCK_ACCESS_FS_MAKE_REG     |
-            LANDLOCK_ACCESS_FS_MAKE_SOCK    |
-            LANDLOCK_ACCESS_FS_MAKE_FIFO    |
-            LANDLOCK_ACCESS_FS_MAKE_BLOCK   |
-            LANDLOCK_ACCESS_FS_MAKE_SYM     |
-            LANDLOCK_ACCESS_FS_REFER        |
+    /* ABI versiyonuna göre desteklenen flag'lericonditional ekle */
+    __u32 handled =
+        LANDLOCK_ACCESS_FS_EXECUTE      |
+        LANDLOCK_ACCESS_FS_WRITE_FILE   |
+        LANDLOCK_ACCESS_FS_READ_FILE    |
+        LANDLOCK_ACCESS_FS_READ_DIR     |
+        LANDLOCK_ACCESS_FS_REMOVE_DIR   |
+        LANDLOCK_ACCESS_FS_REMOVE_FILE  |
+        LANDLOCK_ACCESS_FS_MAKE_CHAR    |
+        LANDLOCK_ACCESS_FS_MAKE_DIR     |
+        LANDLOCK_ACCESS_FS_MAKE_REG     |
+        LANDLOCK_ACCESS_FS_MAKE_SOCK    |
+        LANDLOCK_ACCESS_FS_MAKE_FIFO    |
+        LANDLOCK_ACCESS_FS_MAKE_BLOCK   |
+        LANDLOCK_ACCESS_FS_MAKE_SYM;
+
+    if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
+    if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
 #ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
-            LANDLOCK_ACCESS_FS_TRUNCATE     |
-            LANDLOCK_ACCESS_FS_IOCTL_DEV,
-#else
-            LANDLOCK_ACCESS_FS_TRUNCATE,
+    if (abi >= 5) handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
 #endif
+
+    struct landlock_ruleset_attr ruleset_attr = {
+        .handled_access_fs = handled,
     };
 
     int ruleset_fd = sys_landlock_create_ruleset(&ruleset_attr,
@@ -156,7 +158,7 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
     if (home[0] == '/') {
         snprintf(config_dir, sizeof(config_dir), "%s/.config/paranoidcli", home);
 
-        int config_fd = open(config_dir, O_PATH | O_DIRECTORY);
+        int config_fd = open(config_dir, O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (config_fd >= 0) {
             struct landlock_path_beneath_attr config_rule = {
                 .allowed_access =

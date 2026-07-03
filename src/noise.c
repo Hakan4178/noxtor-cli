@@ -8,6 +8,18 @@
  *   2. SymmetricState — HKDF(BLAKE2b) + MixKey/MixHash
  *   3. HandshakeState — XX pattern: →e / ←e,ee,s,es / →s,se
  *   4. Transport     — Session-level encrypt/decrypt
+ *
+ * Testler:
+ *   tests/test_noise.c — 9 unit test (loopback handshake, transport roundtrip,
+ *       mac tamper, remote static key, wrong order, null safety, onion payload,
+ *       spec vectors, spec vectors payloads)
+ *   tests/fuzz_noise_differential.c — Differential fuzzing vs noise-c referansı
+ *       (13 hedefli test + 105 key × 12 prologue × 4 pattern × 10 payload brute-force,
+ *       error behavior, parametre boyut doğrulaması)
+ *   tests/fuzz_noise_differential_noise_star.c — noise-star formal verify referansı
+ *       ile differential fuzzing
+ *   tests/cbmc_noise_easy.c — ESBMC formal verification (12 kolay fonksiyon,
+ *       overflow/memory-leak check)
  */
 
 #include "noise.h"
