@@ -27,7 +27,7 @@
 
 ![CBMC Succesfull](Ekran%20Görüntüsü%202026-06-08%2023-39-54.png)
 
-CBMC and ESBMC VERIFICATION SUCCESSFUL (only log.c and arena.c, partial stdin_handler.c)
+CBMC and ESBMC VERIFICATION SUCCESSFUL (only log.c and arena.c and state_machine.c , partial stdin_handler.c)
 
 
 ## What is Noxtor?

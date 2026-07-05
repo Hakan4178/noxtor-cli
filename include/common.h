@@ -181,19 +181,19 @@ void nox_hexdump(log_module_t mod, const char *label,
 #define UNUSED(x)        ((void)(x))
 
 /* Compile-time assert (C23 static_assert zaten var ama alias) */
-#if defined(__CPROVER__)
-  /* CBMC: static_assert C23'ü parse edemiyor — skip */
-  #define NOX_STATIC_ASSERT(cond, msg)  extern int __CPROVER_constant_time_0[(cond) ? 1 : -1]
-#elif defined(__ESBMC__)
+#if defined(__ESBMC__)
   /* ESBMC: static_assert (C23) desteklenmiyor — _Static_assert (C11) kullan */
   #define NOX_STATIC_ASSERT(cond, msg)  _Static_assert((cond), msg)
+#elif defined(__CPROVER__)
+  /* CBMC: static_assert C23'ü parse edemiyor — skip */
+  #define NOX_STATIC_ASSERT(cond, msg)  extern int __CPROVER_constant_time_0[(cond) ? 1 : -1]
 #else
   #define NOX_STATIC_ASSERT(cond, msg)  static_assert((cond), msg)
 #endif
 
 /* Güvenli minimum/maksimum — çift değerlendirme yok (C23 typeof) */
-#ifdef __CPROVER__
-  /* CBMC: typeof GCC extension'ını parse edemiyor — basit makro */
+#if defined(__CPROVER__) || defined(__ESBMC__)
+  /* CBMC/ESBMC: typeof GCC extension'ını parse edemiyor — basit makro */
   #define NOX_MIN(a, b)  ((a) < (b) ? (a) : (b))
   #define NOX_MAX(a, b)  ((a) > (b) ? (a) : (b))
 #else
