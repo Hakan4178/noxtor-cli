@@ -90,17 +90,17 @@ jobs:
         build-mode: ${{ matrix.build-mode }}
         queries: security-extended,security-and-quality
 
-    - name: Install GCC 14
+    - name: Install GCC 15
       if: matrix.build-mode == 'manual'
       run: |
         sudo apt update
-        sudo apt install -y gcc-14 g++-14 make libsodium-dev libsqlite3-dev libseccomp-dev tor obfs4proxy
+        sudo apt install -y gcc-15 g++-15 make libsodium-dev libsqlite3-dev libseccomp-dev tor obfs4proxy
 
     - name: Run manual build steps
       if: matrix.build-mode == 'manual'
       shell: bash
       run: |
-        make CC=gcc-14
+        make CC=gcc-15
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
