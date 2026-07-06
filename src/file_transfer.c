@@ -6,6 +6,7 @@
 #include "common.h"
 #include "network.h"
 #include "noise.h"
+#include "state_machine.h"
 #include "ui.h"
 
 #include <assert.h>
@@ -561,10 +562,13 @@ bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
             strncpy(ps->rx_file.filename, safe_name, 255);
             ps->rx_file.filename[255] = '\0';
 
+            sm_dispatch(ps, state, EV_FILE_RX_START);
+
             if (crypto_generichash_init(&ps->rx_file.hash_state, NULL, 0, 32) != 0) {
               ui_print_error(state, "Hash state başlatılamadı");
               close(file_fd);
               explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+              sm_dispatch(ps, state, EV_FILE_DONE);
               return true;
             }
 
@@ -579,6 +583,7 @@ bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
               explicit_bzero(size_hdr, sizeof(size_hdr));
               close(file_fd);
               explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+              sm_dispatch(ps, state, EV_FILE_DONE);
               return true;
             }
             explicit_bzero(size_hdr, sizeof(size_hdr));
@@ -656,6 +661,7 @@ bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
       explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
       /* A-1 FIX: fd'yi -1 yap (explicit_bzero sonrası 0 olur) */
       ps->rx_file.fd = -1;
+      sm_dispatch(ps, state, EV_FILE_DONE);
     } else {
       ui_print_progress(state, ps->rx_file.filename,
                         ps->rx_file.received_bytes,
@@ -679,6 +685,7 @@ rx_abort:
   ui_print_error(state, "Transfer iptal edildi ve yarım kalan dosya silindi.");
   explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
   ps->rx_file.fd = -1;
+  sm_dispatch(ps, state, EV_FILE_DONE);
   sodium_free(pt);
   return true;
 }

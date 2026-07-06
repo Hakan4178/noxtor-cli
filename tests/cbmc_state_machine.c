@@ -201,14 +201,23 @@ static void test_transitions(void) {
     err = sm_dispatch(&ps, &g, EV_FILE_DONE);
     assert(err == NOX_OK); assert(ps.state == ST_ACTIVE);
 
+    /* P6b: Dosya alım döngüsü */
+    reset(); ps.state = ST_ACTIVE;
+    err = sm_dispatch(&ps, &g, EV_FILE_RX_START);
+    assert(err == NOX_OK); assert(ps.state == ST_FILE_RX);
+
+    reset(); ps.state = ST_FILE_RX;
+    err = sm_dispatch(&ps, &g, EV_FILE_DONE);
+    assert(err == NOX_OK); assert(ps.state == ST_ACTIVE);
+
     /* P7: IDLE'da geçersiz event'ler */
     {
         peer_event_t bad[] = {
             EV_HANDSHAKE_MSG, EV_HANDSHAKE_DONE, EV_SESSION_READY,
             EV_TOFU_ACCEPTED, EV_TOFU_REJECTED, EV_PEER_DISCONNECTED,
             EV_HANDSHAKE_TIMEOUT, EV_HANDSHAKE_ERROR, EV_FILE_START,
-            EV_FILE_DONE, EV_RATE_LIMIT, EV_SEQ_MISMATCH,
-            EV_ARENA_FAIL
+            EV_FILE_RX_START, EV_FILE_DONE, EV_RATE_LIMIT,
+            EV_SEQ_MISMATCH, EV_ARENA_FAIL
         };
         for (size_t i = 0; i < ARRAY_SIZE(bad); i++) {
             reset(); ps.state = ST_IDLE;
@@ -500,6 +509,11 @@ static void test_reachability(void) {
     reset(); ps.state = ST_ACTIVE;
     err = sm_dispatch(&ps, &g, EV_FILE_START);
     assert(err == NOX_OK); assert(ps.state == ST_FILE_TX);
+
+    /* P32b: ACTIVE → FILE_RX */
+    reset(); ps.state = ST_ACTIVE;
+    err = sm_dispatch(&ps, &g, EV_FILE_RX_START);
+    assert(err == NOX_OK); assert(ps.state == ST_FILE_RX);
 
     /* P33: Her state'ten IDLE */
     for (int s = 0; s < ST_COUNT; s++) {

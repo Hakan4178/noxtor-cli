@@ -52,6 +52,7 @@ static const char *const event_names[] = {
     [EV_HANDSHAKE_TIMEOUT] = "HANDSHAKE_TIMEOUT",
     [EV_HANDSHAKE_ERROR]   = "HANDSHAKE_ERROR",
     [EV_FILE_START]        = "FILE_START",
+    [EV_FILE_RX_START]     = "FILE_RX_START",
     [EV_FILE_DONE]         = "FILE_DONE",
     [EV_RATE_LIMIT]        = "RATE_LIMIT",
     [EV_SEQ_MISMATCH]      = "SEQ_MISMATCH",
@@ -98,7 +99,9 @@ static nox_err_t action_session_up(struct peer_session *ps, struct app_state *st
 static nox_err_t action_file_begin(struct peer_session *ps, struct app_state *state,
                                    peer_event_t ev);
 static nox_err_t action_file_end(struct peer_session *ps, struct app_state *state,
-                                 peer_event_t ev);
+                                peer_event_t ev);
+static nox_err_t action_file_begin_rx(struct peer_session *ps, struct app_state *state,
+                                       peer_event_t ev);
 
 /* ================================================================
  * GEÇİŞ TABLOSU
@@ -139,7 +142,9 @@ static const state_transition_t transitions[] = {
 
 /* ── ACTIVE → Dosya Transfer ───────────────────────────────────── */
   { ST_ACTIVE,         EV_FILE_START,          ST_FILE_TX,        action_file_begin   },
+  { ST_ACTIVE,         EV_FILE_RX_START,       ST_FILE_RX,        action_file_begin_rx },
   { ST_FILE_TX,        EV_FILE_DONE,           ST_ACTIVE,         action_file_end     },
+  { ST_FILE_RX,        EV_FILE_DONE,           ST_ACTIVE,         action_file_end     },
 
 /* ── Her Durumdan Disconnect ───────────────────────────────────── */
   { ST_CONNECTING,     EV_PEER_DISCONNECTED,   ST_IDLE,           action_cleanup      },
@@ -426,9 +431,17 @@ static nox_err_t action_file_begin(struct peer_session *ps, struct app_state *st
 }
 
 static nox_err_t action_file_end(struct peer_session *ps, struct app_state *state,
-                                 peer_event_t ev)
+                                peer_event_t ev)
 {
     (void)ps; (void)state; (void)ev;
     /* Adım 5'te dosya transfer tamamlanma */
+    return NOX_OK;
+}
+
+static nox_err_t action_file_begin_rx(struct peer_session *ps, struct app_state *state,
+                                       peer_event_t ev)
+{
+    (void)ps; (void)state; (void)ev;
+    /* Adım 5'te dosya alım state geçişi */
     return NOX_OK;
 }

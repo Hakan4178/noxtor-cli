@@ -34,6 +34,7 @@
  *
  * Return: NOX_OK veya NOX_ERR_ALLOC
  */
+__attribute__((strub))
 nox_err_t arena_init(struct secure_arena *a, size_t size);
 
 /*
@@ -46,6 +47,7 @@ nox_err_t arena_init(struct secure_arena *a, size_t size);
  *
  * Not: free() yoktur — arena bir bütün olarak destroy edilir.
  */
+__attribute__((strub))
 void *arena_alloc(struct secure_arena *a, size_t size);
 
 /*
@@ -58,6 +60,7 @@ void *arena_alloc(struct secure_arena *a, size_t size);
  *
  * Return: Rastgele byte'larla dolu pointer veya NULL
  */
+__attribute__((strub))
 void *arena_alloc_canary(struct secure_arena *a, size_t size);
 
 /*
@@ -66,6 +69,7 @@ void *arena_alloc_canary(struct secure_arena *a, size_t size);
  * Taşma tespiti. Canary bozulmuşsa programı sonlandırır (abort).
  * Kritik noktalarda çağrılmalı (alloc öncesi, destroy öncesi).
  */
+__attribute__((strub))
 void arena_check_canary(const struct secure_arena *a);
 
 /*
@@ -78,6 +82,7 @@ void arena_check_canary(const struct secure_arena *a);
  *   4. munmap(tüm alan)
  *   5. Struct'ı sıfırla
  */
+__attribute__((strub))
 void arena_destroy(struct secure_arena *a);
 
 /*

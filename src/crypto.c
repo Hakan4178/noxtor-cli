@@ -176,6 +176,7 @@ nox_err_t crypto_hash_blake2b(uint8_t *out, size_t outlen,
  *
  * [P9] PIN uzunluk kontrolü eklendi.
  * ================================================================ */
+__attribute__((strub))
 nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
                                     char *pin, size_t pin_len,
                                     const uint8_t salt[NOX_SALT_LEN])
@@ -227,6 +228,7 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
  *
  * [P10] Subkey ID'leri enum ile tanımlı.
  * ================================================================ */
+__attribute__((strub))
 nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
                                  uint8_t db_key[NOX_KEY_LEN],
                                  uint8_t identity_unlock_key[NOX_KEY_LEN],
@@ -273,6 +275,7 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
  * [P7] fstat — dosya boyutu kontrolü
  * [P8] config_dir izin kontrolü
  * ================================================================ */
+__attribute__((strub))
 nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
                                       const char *config_dir)
 {
@@ -405,6 +408,7 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
  * Dosya formatı:
  *   [nonce 24B][encrypted(sk) + MAC] = 24 + 64 + 16 = 104 byte
  * ================================================================ */
+__attribute__((strub))
 nox_err_t crypto_generate_identity(const char *identity_path,
                                     const uint8_t unlock_key[NOX_KEY_LEN],
                                     uint8_t public_key_out[NOX_KEY_LEN])
@@ -536,6 +540,7 @@ cleanup:
  *
  * Çözülen private key çağıranın sağladığı alana yazılır (arena olmalı).
  * ================================================================ */
+__attribute__((strub))
 nox_err_t crypto_load_identity(const char *identity_path,
                                 const uint8_t unlock_key[NOX_KEY_LEN],
                                 uint8_t secret_key_out[crypto_sign_SECRETKEYBYTES],
@@ -624,6 +629,7 @@ nox_err_t crypto_load_identity(const char *identity_path,
 /* ================================================================
  * 2.3: IDENTITY KEY CONVERSION — Ed25519 → Curve25519
  * ================================================================ */
+__attribute__((strub))
 nox_err_t crypto_ed25519_to_curve25519(
     uint8_t       curve25519_pk[NOX_KEY_LEN],
     uint8_t       curve25519_sk[NOX_KEY_LEN],

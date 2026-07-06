@@ -94,6 +94,7 @@ static size_t page_align(size_t size, size_t page_size)
  *
  * Bu fonksiyon wipe + abort gerçekleştirir.
  * ================================================================ */
+ __attribute__((strub))
 static void secure_abort(const struct secure_arena *a, const char *msg) {
     fprintf(stderr,
             "\n[FATAL] %s\n"
@@ -132,7 +133,8 @@ static void secure_abort(const struct secure_arena *a, const char *msg) {
  * Hata durumlarında NOX_ERR_ALLOC döner; kısmi tahsisler temizlenir.
  * NOX_ARENA_STRICT_LOCK tanımlıysa mlock başarısızliğinde de NOX_ERR_ALLOC döner.
  * ================================================================ */
-nox_err_t arena_init(struct secure_arena *a, size_t size)
+__attribute__((strub))
+ nox_err_t arena_init(struct secure_arena *a, size_t size)
 {
     if (!a || size == 0)
         return NOX_ERR_ALLOC;
@@ -336,7 +338,8 @@ nox_err_t arena_init(struct secure_arena *a, size_t size)
  * Her çağrı öncesi canary kontrolü yapılır.
  * NULL dönüşü: alan yetersiz veya struct bozuk.
  * ================================================================ */
-void *arena_alloc(struct secure_arena *a, size_t size)
+__attribute__((strub))
+ void *arena_alloc(struct secure_arena *a, size_t size)
 {
     if (!a || !a->base || size == 0)
         return NULL;
@@ -433,7 +436,8 @@ void *arena_alloc_canary(struct secure_arena *a, size_t size)
  * Sabit zamanlı karşılaştırma ile timing side-channel koruması.
  * Canary bozulmuşsa: secure_abort() ile temizlik + abort().
  * ================================================================ */
-void arena_check_canary(const struct secure_arena *a)
+__attribute__((strub))
+ void arena_check_canary(const struct secure_arena *a)
 {
     if (!a || !a->base)
         return;
@@ -478,6 +482,7 @@ void arena_check_canary(const struct secure_arena *a)
  *     işletim sistemine iade eder; kısa süreli PROT_WRITE
  *     açığı oluşmaz.
  * ================================================================ */
+__attribute__((strub))
 void arena_destroy(struct secure_arena *a)
 {
     if (!a || !a->base)

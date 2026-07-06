@@ -87,11 +87,11 @@ __attribute__((strub)) nox_err_t symmetric_mix_key(struct noise_symmetric_state 
                             const uint8_t *input_key_material, size_t len);
 
 /* MixHash — Veriyi handshake hash'e karıştır */
-void symmetric_mix_hash(struct noise_symmetric_state *ss,
+__attribute__((strub)) void symmetric_mix_hash(struct noise_symmetric_state *ss,
                         const uint8_t *data, size_t len);
 
 /* EncryptAndHash — Veriyi şifrele + hash'e karıştır */
-ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
+__attribute__((strub)) ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *plaintext, size_t pt_len,
                                    uint8_t *out);
 
@@ -168,6 +168,8 @@ bool handshake_is_complete(const struct noise_handshake *hs);
  *
  * Handshake state bu çağrıdan sonra explicit_bzero ile silinir.
  */
+
+__attribute__((strub))
 nox_err_t handshake_split(struct noise_handshake *hs,
                           struct noise_session *session);
 

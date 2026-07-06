@@ -49,8 +49,9 @@ typedef enum {
     EV_PEER_DISCONNECTED,   /* Soket kapandı / hata                    */
     EV_HANDSHAKE_TIMEOUT,   /* 30s timeout                              */
     EV_HANDSHAKE_ERROR,     /* Handshake okuma/yazma hatası             */
-    EV_FILE_START,          /* /file komutu veya METADATA frame alındı  */
-    EV_FILE_DONE,           /* Transfer tamamlandı                      */
+    EV_FILE_START,          /* /file komutu (gönderim başlangıcı)         */
+    EV_FILE_RX_START,       /* METADATA frame alındı (alım başlangıcı)  */
+    EV_FILE_DONE,           /* Transfer tamamlandı (gönderim veya alım) */
     EV_RATE_LIMIT,          /* Rate limit aşıldı                        */
     EV_SEQ_MISMATCH,        /* Beklenmeyen sequence number              */
     EV_ARENA_FAIL,          /* Arena allocation başarısız                */

@@ -174,6 +174,8 @@ void symmetric_init(struct noise_symmetric_state *ss,
 /*
  * MixHash(data): h = HASH(h || data)
  */
+
+__attribute__((strub))
 void symmetric_mix_hash(struct noise_symmetric_state *ss, const uint8_t *data,
                         size_t len) {
   crypto_generichash_blake2b_state state;
@@ -274,6 +276,8 @@ hmac_blake2b(const uint8_t *key, size_t key_len, const uint8_t *data,
  *   output1  = HMAC-HASH(temp_key, 0x01)
  *   output2  = HMAC-HASH(temp_key, output1 || 0x02)
  */
+
+__attribute__((strub))
 static nox_err_t hkdf_blake2b(const uint8_t ck[NOISE_HASHLEN],
                               const uint8_t *ikm, size_t ikm_len,
                               uint8_t out1[NOISE_HASHLEN],
@@ -351,6 +355,7 @@ __attribute__((strub)) nox_err_t symmetric_mix_key(struct noise_symmetric_state 
  *   MixHash(ciphertext)
  *   return ciphertext
  */
+ __attribute__((strub)) 
 ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *plaintext, size_t pt_len,
                                    uint8_t *out) {
@@ -447,6 +452,8 @@ __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *s
  * libsodium ≥1.0.16 crypto_scalarmult zaten identity (0) noktasını
  * reddeder.
  */
+
+__attribute__((strub))
 static nox_err_t noise_dh(uint8_t out[NOX_KEY_LEN],
                           const uint8_t priv[NOX_KEY_LEN],
                           const uint8_t pub[NOX_KEY_LEN]) {
@@ -827,6 +834,8 @@ bool handshake_is_complete(const struct noise_handshake *hs) {
   return hs && hs->msg_index >= 3;
 }
 
+
+__attribute__((strub))
 nox_err_t handshake_split(struct noise_handshake *hs,
                           struct noise_session *session) {
   if (!hs || !session)

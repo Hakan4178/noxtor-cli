@@ -54,6 +54,7 @@ nox_err_t crypto_hash_blake2b(uint8_t *out, size_t outlen,
  *
  * PIN fonksiyon dönmeden ÖNCE çağıran tarafından silinmeli.
  */
+__attribute__((strub))
 nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
                                    char *pin, size_t pin_len,
                                    const uint8_t salt[NOX_SALT_LEN]);
@@ -64,6 +65,7 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
  * BLAKE2b-based key derivation (libsodium crypto_kdf).
  * Her alt key farklı context string ile türetilir.
  */
+__attribute__((strub))
 nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
                                 uint8_t db_key[NOX_KEY_LEN],
                                 uint8_t identity_unlock_key[NOX_KEY_LEN],
@@ -81,6 +83,8 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
  * ================================================================ */
 
 /* Salt dosyasını oku veya oluştur */
+
+__attribute__((strub))
 nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
                                      const char *config_dir);
 
@@ -88,6 +92,7 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
  * İlk çalıştırma: yeni Ed25519 key pair üret ve disk'e yaz
  * identity_unlock_key ile secretbox şifreleme.
  */
+__attribute__((strub))
 nox_err_t crypto_generate_identity(const char *identity_path,
                                    const uint8_t unlock_key[NOX_KEY_LEN],
                                    uint8_t public_key_out[NOX_KEY_LEN]);
@@ -97,6 +102,7 @@ nox_err_t crypto_generate_identity(const char *identity_path,
  * Çözülen private key secure arena'da kalmalı.
  */
 
+__attribute__((strub))
 nox_err_t crypto_load_identity(const char *identity_path,
                                 const uint8_t unlock_key[NOX_KEY_LEN],
                                 uint8_t secret_key_out[crypto_sign_SECRETKEYBYTES],
@@ -105,6 +111,7 @@ nox_err_t crypto_load_identity(const char *identity_path,
  * Ed25519 anahtar çiftini Curve25519 (X25519) anahtar çiftine dönüştür.
  * Noise XX handshake'i için kalıcı kimlik (static key) olarak kullanılır.
  */
+__attribute__((strub))
 nox_err_t crypto_ed25519_to_curve25519(uint8_t curve25519_pk[NOX_KEY_LEN],
                                        uint8_t curve25519_sk[NOX_KEY_LEN],
                                        const uint8_t ed25519_pk[NOX_KEY_LEN],
