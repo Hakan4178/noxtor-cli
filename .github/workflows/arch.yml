@@ -1,0 +1,31 @@
+name: Build
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: archlinux:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          pacman -Sy --noconfirm
+          pacman -S --noconfirm \
+            base-devel \
+            gcc \
+            cmake \
+            ninja \
+            git
+
+      - name: Check compiler
+        run: |
+          gcc --version
+
+      - name: Build
+        run: |
+          make clean && make 
