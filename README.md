@@ -130,8 +130,10 @@ Please report vulnerabilities responsibly.
 
 **What hasn't been done yet:**
 - Independent third-party audit
-- TOFU (Trust On First Use) verification + QR support
-- Kernel < 5.15 fallback paths
+- QR support
+- Kernel < 5.15 fallback path
+- Group Chat
+
 
 ### Seccomp Policy (Three-Stage)
 
