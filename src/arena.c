@@ -422,6 +422,7 @@ __attribute__((strub))
  *
  * Return: Rastgele byte'larla dolu pointer veya NULL (taşma/NULL guard)
  * ================================================================ */
+__attribute__((strub))
 void *arena_alloc_canary(struct secure_arena *a, size_t size)
 {
     void *ptr = arena_alloc(a, size);
