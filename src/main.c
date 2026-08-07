@@ -1223,6 +1223,7 @@ int main(int argc, char *argv[]) {
     if (g_shutdown) goto shutdown_clean;
 
     /* ── 14. Tor auth → bootstrap ──────────────────── */
+    err = tor_authenticate(state.tor_ctrl_fd, state.tor_data_dir);
     if (err != NOX_OK) {
       if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Tor auth başarısız: %s", nox_strerror(err));
