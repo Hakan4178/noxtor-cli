@@ -23,11 +23,13 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <limits.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/prctl.h> /* A2: PR_SET_PDEATHSIG (Tor orphan koruması) */
 
 /* ── Timeout sabitleri ────────────────────────── */
 #define NOX_READ_TIMEOUT_MS       10000
@@ -92,10 +94,21 @@ bool validate_onion_address(const char *addr) {
  * Hassas veri 3. partiye gitmez — FP. */
 nox_err_t write_full(int fd, const void *buf, size_t len) {
   assert(buf != NULL || len == 0);
+  /* B5 FIX: Toplam monotonic deadline — write buffer dolarsa blocking
+   * fd'de write sonsuz bloklayabilir; POLLOUT beklenerek yalnız yazılabilir
+   * durumda write çağrılır. Toplam süre NOX_READ_TIMEOUT_MS ile sınırlı
+   * (read_full ile aynı tek tip desen). MAX_RETRIES sayacı gereksizleşir. */
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += NOX_READ_TIMEOUT_MS / 1000;
+  deadline.tv_nsec += (long)(NOX_READ_TIMEOUT_MS % 1000) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+
   const uint8_t *p = (const uint8_t *)buf;
   size_t written = 0;
-  int retries = 0;
-  const int MAX_RETRIES = 10;
   while (written < len) {
     assert(fd >= 0);
     ssize_t w = write(fd, p + written, len - written);
@@ -107,14 +120,24 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
 #else
       if (errno == EAGAIN) {
 #endif
-        if (++retries > MAX_RETRIES)
+        /* Kalan süreyi hesapla */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remaining_ms = (long)(deadline.tv_sec - now.tv_sec) * 1000 +
+                            (long)(deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        if (remaining_ms <= 0) {
+          NOX_ERROR(LOG_MOD_NET, "write_full timeout (deadline aşıldı)");
           return NOX_ERR_IO;
+        }
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        int pret = poll(&pfd, 1, 3000);
+        int poll_timeout = (remaining_ms > INT_MAX) ? INT_MAX : (int)remaining_ms;
+        int pret = poll(&pfd, 1, poll_timeout);
         if (pret < 0 && errno != EINTR)
           return NOX_ERR_IO;
-        if (pret == 0)
+        if (pret == 0) {
+          NOX_ERROR(LOG_MOD_NET, "write_full timeout (deadline aşıldı)");
           return NOX_ERR_IO;
+        }
         continue;
       }
       return NOX_ERR_IO;
@@ -122,31 +145,65 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
     if (w == 0)
       return NOX_ERR_IO;
     written += (size_t)w;
-    retries = 0;
   }
   return NOX_OK;
 }
 
 nox_err_t read_full(int fd, void *buf, size_t len) {
+  /* B5 FIX: Toplam monotonic deadline — slow loris'i engeller.
+   * Desen ctrl_read_line ile aynı: önce poll(kalan süre), sonra read.
+   * Blocking fd'de read() EAGAIN dönmez; poll-öncelikli desen hem
+   * blocking hem non-blocking fd'de gerçek timeout verir. */
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += NOX_READ_TIMEOUT_MS / 1000;
+  deadline.tv_nsec += (long)(NOX_READ_TIMEOUT_MS % 1000) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+
   uint8_t *p = (uint8_t *)buf;
   size_t received = 0;
   while (received < len) {
-    ssize_t r = read(fd, p + received, len - received);
-    if (r < 0) {
+    /* Kalan süreyi hesapla */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long remaining_ms = (long)(deadline.tv_sec - now.tv_sec) * 1000 +
+                        (long)(deadline.tv_nsec - now.tv_nsec) / 1000000L;
+    if (remaining_ms <= 0) {
+      NOX_ERROR(LOG_MOD_NET, "read_full timeout (deadline aşıldı)");
+      return NOX_ERR_IO; /* Timeout — toplam süre sınırlı */
+    }
+
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int poll_timeout = (remaining_ms > INT_MAX) ? INT_MAX : (int)remaining_ms;
+    int ret = poll(&pfd, 1, poll_timeout);
+    if (ret < 0) {
       if (errno == EINTR)
         continue;
+      NOX_ERROR(LOG_MOD_NET, "read_full poll: %s", strerror(errno));
+      return NOX_ERR_IO;
+    }
+    if (ret == 0) {
+      NOX_ERROR(LOG_MOD_NET, "read_full timeout (deadline aşıldı)");
+      return NOX_ERR_IO;
+    }
+
+    ssize_t r;
+    do {
+      r = read(fd, p + received, len - received);
+    } while (r < 0 && errno == EINTR);
+
+    if (r < 0) {
 #if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        continue; /* poll döndü ama veri başka tarafça tüketildi — tekrar bekle */
 #else
-      if (errno == EAGAIN) {
-#endif
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int poller = poll(&pfd, 1, NOX_READ_TIMEOUT_MS);
-        if (poller <= 0) {
-          return NOX_ERR_IO; /* Timeout veya hata */
-        }
+      if (errno == EAGAIN)
         continue;
-      }
+#endif
+      NOX_ERROR(LOG_MOD_NET, "read_full: %s", strerror(errno));
       return NOX_ERR_IO;
     }
     if (r == 0)
@@ -244,12 +301,36 @@ static nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
    * 64 satır limiti — sonsuz continuation saldırısını engeller. */
   enum { MAX_RESPONSE_LINES = 64 };
 
+  /* B1 FIX (2X): TOPLAM deadline. Her satır ayrı timeout alsaydı
+   * 64×timeout (~320s) teorik süre olurdu — saldırgan satırlar arası
+   * bekleyerek tutabilirdi. Artık tüm response tek monotonik deadline'ı
+   * paylaşıyor; her satıra kalan süre verilir. ctrl_read_line tek satır
+   * dilimindeyse yine aynı deadline'ı korur (taşma yok). */
+  struct timespec rdl;
+  clock_gettime(CLOCK_MONOTONIC, &rdl);
+  rdl.tv_sec += timeout_ms / 1000;
+  rdl.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+  if (rdl.tv_nsec >= 1000000000L) {
+    rdl.tv_sec++;
+    rdl.tv_nsec -= 1000000000L;
+  }
+
   size_t total = 0;
   size_t nlines = 0;
 
   for (;;) {
+    /* Her satır için kalan süre */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long remaining_ms = (long)(rdl.tv_sec - now.tv_sec) * 1000 +
+                        (long)(rdl.tv_nsec - now.tv_nsec) / 1000000L;
+    if (remaining_ms <= 0) {
+      NOX_ERROR(LOG_MOD_NET, "ctrl yanıt toplam timeout aşıldı");
+      return NOX_ERR_TOR;
+    }
+
     char line[256];
-    nox_err_t err = ctrl_read_line(fd, line, sizeof(line), timeout_ms);
+    nox_err_t err = ctrl_read_line(fd, line, sizeof(line), (int)remaining_ms);
     if (err != NOX_OK)
       return err;
 
@@ -456,6 +537,17 @@ static void cleanup_stale_tor_dirs(const char *config_dir) {
 /* ================================================================
  * TORRC ÜRETİMİ
  * ================================================================ */
+
+/* A3 FIX: path'in config_dir altında olduğunu doğrula — prefix + slash
+ * boundary. config_dir=/a/b + path=/a/b_evil → yanlış kabul edilmez.
+ * torrc_path ve tor_data_dir için ortak helper (3 uzmanın önerisi). */
+static bool path_under_dir(const char *path, const char *dir) {
+  size_t dlen = strlen(dir);
+  if (strncmp(path, dir, dlen) != 0)
+    return false;
+  return path[dlen] == '\0' || path[dlen] == '/';
+}
+
 static nox_err_t generate_torrc(struct app_state *state) {
   /* Temizlik: Stale (artık) Tor dizinlerini temizle */
   cleanup_stale_tor_dirs(state->config_dir);
@@ -480,12 +572,39 @@ static nox_err_t generate_torrc(struct app_state *state) {
     NOX_ERROR(LOG_MOD_NET, "tor_data_dir oluşturulamadı: %s", strerror(errno));
     return NOX_ERR_TOR;
   }
-  
+
+  /* C1 FIX: tor_data_dir açılışı fail-closed — 2. uzman.
+   * dd < 0 → sessiz devam yok; symlink (O_NOFOLLOW ELOOP) dahil her
+   * açma hatası başlatmayı iptal eder. Sahiplik ve tip doğrulaması:
+   * dizin başkasına aitse veya dizin değilse kullanma. */
   int dd = open(state->tor_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (dd >= 0) {
-    fchmod(dd, 0700);
-    close(dd);
+  if (dd < 0) {
+    NOX_ERROR(LOG_MOD_NET, "tor_data_dir açılamadı: %s", strerror(errno));
+    return NOX_ERR_TOR;
   }
+  struct stat ddst;
+  if (fstat(dd, &ddst) != 0) {
+    NOX_ERROR(LOG_MOD_NET, "tor_data_dir fstat: %s", strerror(errno));
+    close(dd);
+    return NOX_ERR_TOR;
+  }
+  if (!S_ISDIR(ddst.st_mode)) {
+    NOX_ERROR(LOG_MOD_NET, "tor_data_dir bir dizin değil — saldırı tespit edildi");
+    close(dd);
+    return NOX_ERR_TOR;
+  }
+  if (ddst.st_uid != geteuid()) {
+    NOX_ERROR(LOG_MOD_NET, "tor_data_dir başka kullanıcıya ait (uid=%d) — sahiplik doğrulanamadı",
+              (int)ddst.st_uid);
+    close(dd);
+    return NOX_ERR_TOR;
+  }
+  if (fchmod(dd, 0700) != 0) {
+    NOX_ERROR(LOG_MOD_NET, "tor_data_dir fchmod 0700: %s", strerror(errno));
+    close(dd);
+    return NOX_ERR_TOR;
+  }
+  close(dd);
 
   /* torrc yaz — V6 FIX: O_NOFOLLOW symlink Engellemesi */
   int fd =
@@ -550,7 +669,9 @@ static nox_err_t generate_torrc(struct app_state *state) {
       if (strchr(state->obfs4_bridge_line, '\n') != NULL ||
           strchr(state->obfs4_bridge_line, '\r') != NULL) {
         NOX_ERROR(LOG_MOD_NET, "obfs4 bridge line newline/carriage return karakteri içeriyor");
+        /* D5 FIX: kalıntı (yarım) torrc'yi diskte bırakma */
         close(fd);
+        unlink(state->torrc_path);
         return NOX_ERR_CONFIG;
       }
       clen =
@@ -593,7 +714,9 @@ static nox_err_t generate_torrc(struct app_state *state) {
 
   if (clen <= 0 || (size_t)clen >= sizeof(content)) {
     NOX_ERROR(LOG_MOD_NET, "torrc içeriği çok büyük");
+    /* D5 FIX: kalıntı torrc'yi diskte bırakma */
     close(fd);
+    unlink(state->torrc_path);
     return NOX_ERR_CONFIG;
   }
 
@@ -613,6 +736,54 @@ static nox_err_t generate_torrc(struct app_state *state) {
  * Kontrol portu ControlPortWriteToFile'dan okunur.
  * ================================================================ */
 
+/* 3. uzman önerisi (08-07): ortak terminasyon helper'ı —
+ * tor_child_cleanup (spawn hata yolları) ve tor_shutdown aynı
+ * "SIGTERM → 5s WNOHANG poll → SIGKILL → blocking waitpid" desenini
+ * kullanıyordu; iki kopya yerine tek helper. Mantıksal hata riski azalır.
+ *
+ * @return: child'ın son durumu — true = temiz çıkış, false = SIGKILL
+ * (5s doldu veya SIGTERM ulaşmadı). ESRCH/ECHILD sessiz kabul.
+ * SIGCHLD handler main'de waitpid(-1) ile reap edebilir → ECHILD beklenir. */
+static bool terminate_and_reap(pid_t pid) {
+  if (pid <= 0)
+    return false;
+
+  /* SIGTERM gönder; child zaten ölmüşse ESRCH döner, sorun değil */
+  bool sigterm_sent = (kill(pid, SIGTERM) == 0);
+  if (!sigterm_sent)
+    NOX_WARN(LOG_MOD_NET, "Tor SIGTERM başarısız (%s), SIGKILL deneniyor",
+             strerror(errno));
+
+  int status;
+  for (int i = 0; i < 50; i++) {
+    pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r > 0)
+      return true; /* temiz çıkış */
+    if (r < 0 && errno == ECHILD)
+      return true; /* child zaten reap edildi (SIGCHLD handler) */
+    /* D3: tekrarlanan `ts` adı — fonksiyon bağlma göre anlamlı isim */
+    const struct timespec reap_delay = {.tv_sec = 0, .tv_nsec = 100000000};
+    safe_nanosleep(&reap_delay);
+  }
+
+  /* 5s doldu — SIGKILL zorla, blocking waitpid ile reap et */
+  if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+    NOX_WARN(LOG_MOD_NET, "Tor SIGKILL başarısız: %s", strerror(errno));
+  }
+  if (waitpid(pid, &status, 0) < 0 && errno != ECHILD)
+    NOX_WARN(LOG_MOD_NET, "Tor child reap başarısız: %s", strerror(errno));
+  return false;
+}
+
+/* A2 FIX: Tor child'ını yıldır ve reapt et — başarısız bir spawn
+ * yolunda child orphan veya zombie kalmaz; PID reuse riski kapansın. */
+static void tor_child_cleanup(pid_t pid) {
+  if (pid <= 0)
+    return;
+  terminate_and_reap(pid);
+  NOX_INFO(LOG_MOD_NET, "Tor orphan child temizlendi (PID=%d)", pid);
+}
+
 /* control.sock dosyasının oluşmasını bekler, Tor sürecini takip eder.
  * access() TOCTOU yarışı yerine direkt connect() kullanılır:
  *   - connect() başarısızsa → soket henüz hazır değil, retry
@@ -620,14 +791,23 @@ static nox_err_t generate_torrc(struct app_state *state) {
  * Aynı zamanda soketin gerçekten bir AF_UNIX soketi olduğunu doğrular. */
 static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
                                          int timeout_sec) {
-  const struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; /* 100 ms */
+  const struct timespec probe_delay = {.tv_sec = 0, .tv_nsec = 100000000}; /* 100 ms */
   int max_tries = timeout_sec * 10;
 
   for (int i = 0; i < max_tries; i++) {
     if (g_shutdown)
       return NOX_ERR_TOR;
 
-    /* Tor child sürecini kontrol et (zombi veya çökmüş mü?) */
+    /* Tor child sürecini kontrol et (zombi veya çökmüş mü?)
+     * 3. uzman: SIGCHLD handler main.c'de waitpid(-1) ile child'ı reap
+     * edebilir — buradaki waitpid(tor_pid) ECHILD döner. ECHILD sessizce
+     * yutulmasın: crash tespiti anında olsun (30s yerine). Ayrıca
+     * handler'ın set ettiği g_tor_died bayrağı da doğrudan izlenir. */
+    if (g_tor_died) {
+      NOX_ERROR(LOG_MOD_NET,
+                "Tor beklenmedik şekilde sonlandı (SIGCHLD bayrağı)");
+      return NOX_ERR_TOR;
+    }
     int status;
     pid_t res = waitpid(tor_pid, &status, WNOHANG);
     if (res > 0) {
@@ -643,11 +823,17 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
 
       return NOX_ERR_TOR;
     }
+    if (res < 0 && errno == ECHILD) {
+      /* SIGCHLD handler çoktan reapt etti → çocuk öldü */
+      NOX_ERROR(LOG_MOD_NET,
+                "Tor çocuğu SIGCHLD handler tarafından reap edildi — çöktü");
+      return NOX_ERR_TOR;
+    }
 
     /* access() TOCTOU yarışı yok: connect() ile hem varlık hem bağlantı */
     int probe_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (probe_fd < 0) {
-      safe_nanosleep(&ts);
+      safe_nanosleep(&probe_delay);
       continue;
     }
 
@@ -666,7 +852,7 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
     }
     close(probe_fd);
 
-    safe_nanosleep(&ts);
+    safe_nanosleep(&probe_delay);
   }
 
   return NOX_ERR_TOR;
@@ -720,7 +906,23 @@ nox_err_t tor_spawn(struct app_state *state) {
     /* PR_SET_DUMPABLE=0 main'de seccomp ÖNCESİ ayarlandı,
      * fork() ile child'a miras kalır — core dump üretilmez. */
 
-    setsid();
+    /* A2 FIX (2. uzman önerisi): parent ölürse Tor orphan kalmasın.
+     * PDEATHSIG: parent death → SIGTERM. fork→set arası race'i
+     * getppid() doğrulaması ile kapat. seccomp prctl'i PKLL etmiyor
+     * (sadece belirli option'lar stage 2'de) — bu option serbest. */
+    pid_t parent_pid = getppid();
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) != 0) {
+      _exit(127);
+    }
+    if (getppid() != parent_pid)
+      _exit(127);
+
+    /* M-19 FIX: setsid() başarısızsa (çağıran zaten session leader
+     * olabilir) Tor, parent'in terminal sinyallerine maruz kalır.
+     * Hata yönetimi — child burada _exit ile başarısız başlatmayı
+     * işaretler; parent tor_child_cleanup ile temizler. */
+    if (setsid() < 0)
+      _exit(126);
     int devnull = open("/dev/null", O_RDWR);
     if (devnull >= 0) {
       dup2(devnull, STDIN_FILENO);
@@ -743,11 +945,25 @@ nox_err_t tor_spawn(struct app_state *state) {
      * Tor sürecin açık kalmasına neden olur (epoll, peer, vb.)
      * veya beklenmedik davranışa yol açar. stdin/stdout/stderr
      * zaten /dev/null'a yönlendirildi, geri kalan her şeyi kapat. */
+#ifdef __linux__
+    /* D4 (3. uzman): close_range (Linux 5.9+) — tek syscall ile 3..max
+     * fd kapatır; döngüden daha hızlı + yarışsız tam kapanma.
+     * Seccomp stage 1 bloklist'inde yok → izinli (doğrulandı).
+     * Eski kernel (ENOSYS/EINVAL) veya EINTR → döngü fallback'i. */
+    if (syscall(SYS_close_range, 3, ~0U, 0) != 0) {
+      long max_fds = sysconf(_SC_OPEN_MAX);
+      if (max_fds < 0 || max_fds > 4096)
+        max_fds = 4096;
+      for (int fd_i = 3; fd_i < max_fds; fd_i++)
+        close(fd_i);
+    }
+#else
     long max_fds = sysconf(_SC_OPEN_MAX);
     if (max_fds < 0 || max_fds > 4096)
       max_fds = 4096;
     for (int fd_i = 3; fd_i < max_fds; fd_i++)
       close(fd_i);
+#endif
 
     char arg0[] = "tor";
     char arg1[] = "-f";
@@ -764,16 +980,17 @@ nox_err_t tor_spawn(struct app_state *state) {
   }
 
   /* Parent — child'ın çökmediğini doğrula */
-  state->tor_pid = pid;
   NOX_INFO(LOG_MOD_NET, "Tor başlatıldı (PID=%d)", pid);
 
-  const struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+  const struct timespec retry_delay = {.tv_sec = 1, .tv_nsec = 0};
 
   /* Control soket dosyasını bekle (Tor async oluşturur) */
   err = wait_for_control_socket(pid, socket_path, NOX_CTRL_SOCK_WAIT_SEC);
   if (err != NOX_OK) {
     NOX_ERROR(LOG_MOD_NET,
               "control.sock dosyası oluşturulamadı veya Tor çöktü");
+    /* A2 FIX: Tor child'ı orphan bırakma — kill + reap */
+    tor_child_cleanup(pid);
     return NOX_ERR_TOR;
   }
 
@@ -783,6 +1000,8 @@ nox_err_t tor_spawn(struct app_state *state) {
   int ctrl_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (ctrl_fd < 0) {
     NOX_ERROR(LOG_MOD_NET, "ctrl socket oluşturulamadı");
+    /* A2 FIX: child orphan kalmasın */
+    tor_child_cleanup(pid);
     return NOX_ERR_NET;
   }
 
@@ -802,21 +1021,29 @@ nox_err_t tor_spawn(struct app_state *state) {
   for (int retry = 0; retry < NOX_CTRL_CONNECT_RETRIES; retry++) {
     if (g_shutdown) {
       close(ctrl_fd);
+      /* A2 FIX: child orphan kalmasın */
+      tor_child_cleanup(pid);
       return NOX_ERR_TOR;
     }
     if (connect(ctrl_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
       connected = 1;
       break;
     }
-    safe_nanosleep(&ts);
+    safe_nanosleep(&retry_delay);
   }
 
   if (!connected) {
     NOX_ERROR(LOG_MOD_NET, "Tor control soketine bağlanılamadı");
     close(ctrl_fd);
+    /* A2 FIX: child orphan kalmasın */
+    tor_child_cleanup(pid);
     return NOX_ERR_TOR;
   }
 
+  /* A2 FIX: tor_pid YALNIZCA tam başarı sonrası atanır. Başarısız
+   * yolların hepsinde child temizlendi (tor_child_cleanup) ve
+   * state->tor_pid hiç dolmadı — stale PID riski yok. */
+  state->tor_pid = pid;
   state->tor_ctrl_fd = ctrl_fd;
   NOX_INFO(LOG_MOD_NET, "Tor control soketine başarıyla bağlanıldı");
   return NOX_OK;
@@ -917,7 +1144,7 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
   NOX_INFO(LOG_MOD_NET, "Tor bootstrap bekleniyor (timeout=%ds)...",
            timeout_sec);
 
-  const struct timespec ts = {.tv_sec = 2, .tv_nsec = 0};
+  const struct timespec bootstrap_poll = {.tv_sec = 2, .tv_nsec = 0};
 
   for (int elapsed = 0; elapsed < timeout_sec; elapsed += 2) {
     if (g_shutdown) {
@@ -954,7 +1181,7 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
       }
     }
 
-    safe_nanosleep(&ts);
+    safe_nanosleep(&bootstrap_poll);
   }
 
   NOX_ERROR(LOG_MOD_NET, "Tor bootstrap timeout (%ds)", timeout_sec);
@@ -1155,37 +1382,21 @@ void tor_shutdown(struct app_state *state) {
   if (state->tor_pid > 0) {
     NOX_INFO(LOG_MOD_NET, "Tor sonlandırılıyor (PID=%d)", state->tor_pid);
 
-    if (kill(state->tor_pid, SIGTERM) == 0) {
-      int status;
-      bool stopped = false;
-      for (int i = 0; i < 50; i++) {
-        pid_t r = waitpid(state->tor_pid, &status, WNOHANG);
-        if (r > 0) {
-          NOX_INFO(LOG_MOD_NET, "Tor temiz kapandı");
-          stopped = true;
-          break;
-        }
-        const struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000};
-        safe_nanosleep(&ts);
-      }
-      if (!stopped) {
-        kill(state->tor_pid, SIGKILL);
-        waitpid(state->tor_pid, &status, 0);
-        NOX_WARN(LOG_MOD_NET, "Tor SIGKILL ile sonlandırıldı");
-      }
-    } else {
-      NOX_WARN(LOG_MOD_NET, "Tor SIGTERM başarısız: %s", strerror(errno));
-    }
+    /* 3. uzman: tor_child_cleanup ile aynı desen — ortak helper. */
+    bool clean = terminate_and_reap(state->tor_pid);
+    if (clean)
+      NOX_INFO(LOG_MOD_NET, "Tor tamamlandı");
+    else
+      NOX_WARN(LOG_MOD_NET, "Tor SIGKILL ile sonlandırıldı (PID=%d)", state->tor_pid);
     state->tor_pid = 0;
   }
 
   /* torrc dosyasını sil */
   if (state->torrc_path[0] != '\0') {
-    /* CodeQL #15 cpp/path-injection: torrc_path config_dir'den türetilmiştir */
-    assert(strncmp(state->torrc_path, state->config_dir, strlen(state->config_dir)) == 0);
-    size_t cfg_len2 = strlen(state->config_dir);
-    if (strncmp(state->torrc_path, state->config_dir, cfg_len2) != 0 ||
-        (state->torrc_path[cfg_len2] != '\0' && state->torrc_path[cfg_len2] != '/')) {
+    /* CodeQL #15 cpp/path-injection: torrc_path config_dir'den türetilmiştir.
+     * A3: prefix + slash boundary — /a/.nox ve /a/.nox_evil karışmaz. */
+    assert(path_under_dir(state->torrc_path, state->config_dir));
+    if (!path_under_dir(state->torrc_path, state->config_dir)) {
       NOX_ERROR(LOG_MOD_MAIN, "torrc_path config_dir altında değil — silme engellendi");
     } else {
       unlink(state->torrc_path);
@@ -1194,9 +1405,11 @@ void tor_shutdown(struct app_state *state) {
   }
   /* tor_data dizinini temizle */
   if (state->tor_data_dir[0] != '\0') {
-    /* CodeQL #15 cpp/path-injection: tor_data_dir config_dir'den türetilmiştir */
-    assert(strncmp(state->tor_data_dir, state->config_dir, strlen(state->config_dir)) == 0);
-    if (strncmp(state->tor_data_dir, state->config_dir, strlen(state->config_dir)) != 0) {
+    /* CodeQL #15 cpp/path-injection: tor_data_dir config_dir'den türetilmiştir.
+     * A3: 3 uzmanın ortak bulgusu — slash boundary eksikti; torrc_path
+     * ile aynı kural artık helper'da. */
+    assert(path_under_dir(state->tor_data_dir, state->config_dir));
+    if (!path_under_dir(state->tor_data_dir, state->config_dir)) {
       NOX_ERROR(LOG_MOD_MAIN, "tor_data_dir config_dir altında değil — silme engellendi");
     } else {
       rm_rf(state->tor_data_dir);
@@ -1391,9 +1604,18 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
   }
 
   /* Make socket non-blocking for asynchronous I/O */
+  /* B2 FIX (2X): F_SETFL başarısızlığı sessiz yutma — blocking fd
+   * event loop'u blokabilir; fail-closed. */
   int flags = fcntl(fd, F_GETFL, 0);
-  if (flags >= 0) {
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  if (flags < 0) {
+    NOX_ERROR(LOG_MOD_NET, "socks fd F_GETFL: %s", strerror(errno));
+    close(fd);
+    return NOX_ERR_NET;
+  }
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    NOX_ERROR(LOG_MOD_NET, "socks fd O_NONBLOCK: %s", strerror(errno));
+    close(fd);
+    return NOX_ERR_NET;
   }
 
   *fd_out = fd;

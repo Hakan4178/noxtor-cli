@@ -105,6 +105,9 @@ static const struct {
   { .num = SCMP_SYS(execveat),          .name = "execveat",          .stage = 2 },
   { .num = SCMP_SYS(fork),              .name = "fork",              .stage = 2 },
   { .num = SCMP_SYS(vfork),             .name = "vfork",             .stage = 2 },
+  /* acct: process accounting — kök hakıyla çağrılır; nox root değil, kodda
+   * hiç kullanılmıyor. İzleyici/telemetri vektörünü kapat (08-07). */
+  { .num = SCMP_SYS(acct),              .name = "acct",              .stage = 2 },
   { .num = SCMP_SYS(pidfd_open),        .name = "pidfd_open",        .stage = 2 },
   { .num = SCMP_SYS(process_madvise),   .name = "process_madvise",   .stage = 2 },
   { .num = SCMP_SYS(kcmp),             .name = "kcmp",              .stage = 2 },
