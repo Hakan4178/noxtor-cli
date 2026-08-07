@@ -90,14 +90,14 @@ jobs:
         build-mode: ${{ matrix.build-mode }}
         queries: security-extended,security-and-quality
 
-    - name: Install GCC 15
+    - name: Install GCC 14
       if: matrix.build-mode == 'manual'
       run: |
        cat /etc/os-release
        apt-cache policy gcc
        apt-cache search '^gcc-[0-9]+$'
         sudo apt update
-        sudo apt install -y gcc-15 g++-15 make libsodium-dev libsqlite3-dev libseccomp-dev tor obfs4proxy
+        sudo apt install -y gcc-14 g++-14 make libsodium-dev libsqlite3-dev libseccomp-dev tor obfs4proxy
 
     - name: Run manual build steps
       if: matrix.build-mode == 'manual'
