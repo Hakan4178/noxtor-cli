@@ -3,12 +3,13 @@
  *
  * noxtor-cli'nin kullanmadığı tehlikeli syscall'ları engeller.
  *
- * Aşama 1 (key_derive sonrası): 120s Tor bootstrap penceresini korur.
+ * Aşama 1 (constructor, main öncesi): init + tor_spawn penceresini korur.
  *   process_vm_readv, ptrace, io_uring, userfaultfd, perf_event_open
  *   Bu kurallar kalıcıdır — stage 2 ile kaldırılamaz (seccomp-bpf additive).
  *
- * Aşama 2 (Tor HS sonrası): Tam blacklist + raw socket engelleme.
- *   fork, execve, mount, reboot vs. — Tor artık fork/execve kullanmaz.
+ * Aşama 2 (tor_spawn + TUI init sonrası): Tam blacklist + raw socket engelleme.
+ *   fork, execve, mount, reboot vs. — tor_spawn() son fork/exec.
+ *   Auth, bootstrap, listener ve HS bu koruma altında koşar.
  *   AF_PACKET/SOCK_RAW raw socket'lar engellenir.
  *
  * Aşama 3 (Event loop başı): Sıfır ağ sızıntısı garantisi.

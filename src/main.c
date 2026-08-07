@@ -24,15 +24,23 @@
  * main.c — noxtor-cli giriş noktası
  *
  * Init sırası:
- *   1. Log sistemi 
- *   2. libsodium init
- *   3. Config dizin kontrolü / bootstrap
- *   4. PIN oku (echo kapalı)
- *   5. Secure arena init
- *   6. Key derivation 
- *   7. Tor spawn 
- *   8. epoll event loop 
- *   9. Cleanup: arena_destroy, tor kill, exit
+ *   0.  CLI argümanları
+ *   1.  Log sistemi
+ *   2.  Signal + terminal
+ *   3.  libsodium init
+ *   4.  CPU (CET-SZ) kontrolü
+ *   5.  Config dizin bootstrap
+ *   6.  PIN oku (echo kapalı)
+ *   7.  RLIMIT_MEMLOCK
+ *   8.  Arena init · 8b. dumpable · 8c. CET-SS · 8d. CAP_NET_RAW
+ *   9.  Salt yükle/oluştur · 9b. key derivation
+ *   10. Subkey türetimi
+ *   11. Identity key + Curve25519 · 11b. seccomp stage 1 (constructor)
+ *   12. Transport seçimi
+ *   13. Tor spawn · 13b. TUI init + seccomp stage 2
+ *   14. Tor auth + bootstrap (120s)
+ *   15. Listener + HS
+ *   16. epoll event loop (stage 3) → cleanup
  *
  * Signal handling:
  *   SIGINT/SIGTERM → g_shutdown = 1 (async-signal-safe flag)
@@ -931,7 +939,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    /* ── 9. Key derivation: PIN → master_key ──────────── */
+    /* ── 9b. Key derivation: PIN → master_key ─────── */
     scatter_honeypots(&state.arena, 0, 3);
     state.master_key = arena_alloc(&state.arena, NOX_KEY_LEN);
     scatter_honeypots(&state.arena, 0, 3);
@@ -1082,11 +1090,11 @@ int main(int argc, char *argv[]) {
     identity_unlock = NULL;
     NOX_DEBUG(LOG_MOD_MAIN, "identity_unlock bellekten silindi");
 
-    /* ── 10b. Seccomp Stage 1 ──────────────────────────────────
-     * Artık __attribute__((constructor)) ile main'den önce yükleniyor.
-     * Bak: seccomp_stage1_early() fonksiyonu. */
+/* ── 11b. Seccomp Stage 1 ─────────────────────────
+ * Artık __attribute__((constructor)) ile main'den önce yükleniyor.
+ * Bak: seccomp_stage1_early() fonksiyonu. */
 
-    /* ── Pluggable Transport Seçimi (Faz 6.2) ── */
+/* ── 12. Pluggable Transport Seçimi (Faz 6.2) ── */
     prompt_transport_selection(&state);
     if (g_shutdown) {
       cleanup(&state);
@@ -1114,7 +1122,7 @@ int main(int argc, char *argv[]) {
             1024);
 
 #ifdef DEBUG
-    /* ── 12. Noise XX loopback demo (geçici — Tor gelince kalkacak) ── */
+    /* ── DEBUG: Noise XX loopback demo (geçici — zincir adımı değil) ── */
     NOX_INFO(LOG_MOD_MAIN, "=== Noise XX loopback demo ===");
     {
       /* Curve25519 keypair'ler — Ed25519 ile karıştırma! */
@@ -1186,7 +1194,7 @@ int main(int argc, char *argv[]) {
     NOX_INFO(LOG_MOD_MAIN, "=== Noise demo tamamlandı ===");
 #endif
 
-    /* ── 13. Tor spawn → bootstrap → HS ─────────────── */
+    /* ── 13. Tor spawn ─────────────────────────────── */
     err = tor_spawn(&state);
     if (err != NOX_OK) {
       if (g_shutdown) goto shutdown_clean;
@@ -1197,7 +1205,24 @@ int main(int argc, char *argv[]) {
 
     if (g_shutdown) goto shutdown_clean;
 
-    err = tor_authenticate(state.tor_ctrl_fd, state.tor_data_dir);
+    /* ── 13b. TUI init + Seccomp Stage 2 ─────────────
+     * tor_spawn() son fork/exec — auth, bootstrap, HS ve listener artık
+     * tam blacklist + raw socket engeli altında koşar. TUI init stage 2
+     * ÖNCESİ: ncurses/terminfo bazı sistemlerde fork/clone kullanabiliyor. */
+    tui_init();
+    tui_refresh_all(&state);
+
+#ifndef NO_SECCOMP
+    if (seccomp_policy_load(2) != NOX_OK) {
+      NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
+      cleanup(&state);
+      return 1;
+    }
+#endif
+
+    if (g_shutdown) goto shutdown_clean;
+
+    /* ── 14. Tor auth → bootstrap ──────────────────── */
     if (err != NOX_OK) {
       if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Tor auth başarısız: %s", nox_strerror(err));
@@ -1217,7 +1242,7 @@ int main(int argc, char *argv[]) {
 
     if (g_shutdown) goto shutdown_clean;
 
-    /* ── 14. Tek Global Listener + Hidden Service ─────────── */
+    /* ── 15. Tek Global Listener + Hidden Service ─── */
     /* Tek onion modeli: tek listener, tek HS, tüm peer'lar buraya bağlanır. */
     {
       err = listener_create(state.tor_data_dir, state.listen_path,
@@ -1267,7 +1292,7 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    /* ── 15. epoll event loop ─────────────────────────── */
+    /* ── 16. epoll event loop ─────────────────────────── */
     err = epoll_setup(&state, state.listen_fd);
     if (err != NOX_OK) {
       if (g_shutdown) goto shutdown_clean;
@@ -1281,21 +1306,6 @@ int main(int argc, char *argv[]) {
              arena_bytes_used(&state.arena),
              (arena_bytes_used(&state.arena) + arena_bytes_free(&state.arena)) /
                  1024);
-
-    tui_init();
-    tui_refresh_all(&state);
-
-#ifndef NO_SECCOMP
-    /* ── 15b. Seccomp Stage 2 — Tam blacklist ────────────────
-     * Tor/HS hazır, TUI init bitti. Fork/execve artık gerekmez.
-     * TUI init'i stage 1'de bırakıyoruz: ncurses/terminfo bazı sistemlerde
-     * fork/clone kullanabiliyor; event loop stage 2 ile korunuyor. */
-    if (seccomp_policy_load(2) != NOX_OK) {
-      NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
-      cleanup(&state);
-      return 1;
-    }
-#endif
 
     if (g_shutdown) goto shutdown_clean;
 
