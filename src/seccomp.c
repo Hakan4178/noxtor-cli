@@ -192,10 +192,17 @@ static const struct {
    * (shm/msg = prosesler arası veri kanalı), memfd ve mount keşfi.
    * Hiçbiri kodda yok (08-05 grep + strace doğrulaması), stage 3'e özel. */
   { .num = SCMP_SYS(mount_setattr),     .name = "mount_setattr",     .stage = 3 },
-  /* open_tree_attr/file_setattr (kernel 6.9+) libseccomp 2.6 tablosunda yok —
-   * SCMP_SYS(__SNR_) derlenmez; doğrudan __NR_ sabitleri kullanılır. */
+  /* Yeni nesil syscall'lar farklı sürümlerde farklı bağımlılıklara sahip:
+   *  - open_tree_attr/file_setattr (Linux 6.13+) yalnız __NR_ sabidi olarak
+   *  - statmount/listmount (Linux 6.8+, libseccomp 2.6+) kernel header'da var
+   * Eski bağımlılık (örn. Ubuntu 24.04) kuralları üretmez — syscall kernel'de
+   * yoksa çağrılamaz, engellenmesi gerekmez (runtime -EDOM tolerant). */
+#if defined(__NR_open_tree_attr)
   { .num = __NR_open_tree_attr,         .name = "open_tree_attr",    .stage = 3 },
+#endif
+#if defined(__NR_file_setattr)
   { .num = __NR_file_setattr,           .name = "file_setattr",      .stage = 3 },
+#endif
   { .num = SCMP_SYS(splice),            .name = "splice",            .stage = 3 },
   { .num = SCMP_SYS(shmget),            .name = "shmget",            .stage = 3 },
   { .num = SCMP_SYS(shmat),             .name = "shmat",             .stage = 3 },
@@ -205,8 +212,12 @@ static const struct {
   { .num = SCMP_SYS(msgrcv),            .name = "msgrcv",            .stage = 3 },
   { .num = SCMP_SYS(msgctl),            .name = "msgctl",            .stage = 3 },
   { .num = SCMP_SYS(memfd_create),      .name = "memfd_create",      .stage = 3 },
-  { .num = SCMP_SYS(statmount),         .name = "statmount",         .stage = 3 },
-  { .num = SCMP_SYS(listmount),         .name = "listmount",         .stage = 3 },
+#if defined(__NR_statmount)
+  { .num = __NR_statmount,              .name = "statmount",         .stage = 3 },
+#endif
+#if defined(__NR_listmount)
+  { .num = __NR_listmount,              .name = "listmount",         .stage = 3 },
+#endif
 };
 
 /* ================================================================
