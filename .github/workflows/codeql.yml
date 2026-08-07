@@ -103,7 +103,7 @@ jobs:
       if: matrix.build-mode == 'manual'
       shell: bash
       run: |
-        make CC=gcc-15
+        make CC=gcc-14
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
