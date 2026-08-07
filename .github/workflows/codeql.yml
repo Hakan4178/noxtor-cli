@@ -97,6 +97,7 @@ jobs:
        apt-cache policy gcc
        apt-cache search '^gcc-[0-9]+$'
         sudo apt update
+        uname -r
         sudo apt install -y gcc-14 g++-14 make libsodium-dev libsqlite3-dev libseccomp-dev tor obfs4proxy
 
     - name: Run manual build steps
