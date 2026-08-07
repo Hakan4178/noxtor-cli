@@ -1,4 +1,4 @@
-/* ================================================================
+/* SPDX-License-Identifier: GPL-3.0-or-later
  * seccomp.c — Seccomp Blacklist Policy (Üç Aşamalı)
  *
  * noxtor-cli'nin kullanmadığı tehlikeli syscall'ları engeller.
@@ -16,7 +16,8 @@
  *   AF_NETLINK, symlink, link, chmod, chown.
  *   Tüm iletişim AF_UNIX üzerinden (Tor control, SOCKS, peer).
  *
- * Mod: SCMP_ACT_KILL — engellenen syscall çağrılırsa process SIGSYS ile öldürülür.
+ * Mod: SCMP_ACT_KILL_PROCESS — engellenen syscall çağrılırsa TÜM process
+ * SIGSYS ile öldürülür (KILL yalnızca ihlal eden thread'i öldürürdü).
  *
  * Yeni syscall eklemek için:
  *   1. strace -c ./noxtor-cli 2>&1 | sort -rnk1
@@ -25,18 +26,21 @@
 #include "common.h"
 #include "seccomp_policy.h"
 
+#include <asm/prctl.h> /* ARCH_SHSTK_DISABLE/UNLOCK (CET-SS) */
 #include <errno.h>
 #include <seccomp.h>
 #include <stdint.h>
-#include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
 
 /* ── Blacklist tablosu ── */
 #define KILL(ctx, name) \
-  seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(name), 0)
+  seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(name), 0)
 
 static int add_socket_domain_rule(scmp_filter_ctx ctx, uint64_t domain, const char *name) {
-  int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 1,
+  int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
                             SCMP_A0(SCMP_CMP_EQ, domain));
   if (rc == 0 || rc == -EDOM)
     return rc == 0 ? 0 : 1;
@@ -46,7 +50,7 @@ static int add_socket_domain_rule(scmp_filter_ctx ctx, uint64_t domain, const ch
 }
 
 static int add_socket_raw_rule(scmp_filter_ctx ctx, uint64_t domain, const char *name) {
-  int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 2,
+  int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 2,
                             SCMP_A0(SCMP_CMP_EQ, domain),
                             SCMP_A1(SCMP_CMP_MASKED_EQ,
                                     (uint64_t)SOCK_RAW, (uint64_t)SOCK_RAW));
@@ -117,7 +121,6 @@ static const struct {
   { .num = SCMP_SYS(umount),            .name = "umount",            .stage = 2 },
   { .num = SCMP_SYS(pivot_root),        .name = "pivot_root",        .stage = 2 },
   { .num = SCMP_SYS(open_by_handle_at), .name = "open_by_handle_at", .stage = 2 },
-  { .num = SCMP_SYS(openat2),           .name = "openat2",           .stage = 2 },
 
   /* System */
   { .num = SCMP_SYS(reboot),            .name = "reboot",            .stage = 2 },
@@ -159,6 +162,51 @@ static const struct {
   { .num = SCMP_SYS(chown),             .name = "chown",             .stage = 3 },
   { .num = SCMP_SYS(fchown),            .name = "fchown",            .stage = 3 },
   { .num = SCMP_SYS(fchownat),          .name = "fchownat",          .stage = 3 },
+
+  /* H-6 (kalan): exfil/privilege syscall'ları — strace kanıtı: event loop
+   * bunların hiçbirini kullanmıyor (sendto/sendmsg/mknod/modify_ldt/iopl/
+   * syslog = 0 çağrı). Stage 3 ana process'e özel — Tor çocuğu etkilenmez. */
+  { .num = SCMP_SYS(sendto),            .name = "sendto",            .stage = 3 },
+  { .num = SCMP_SYS(mknod),             .name = "mknod",             .stage = 3 },
+  { .num = SCMP_SYS(mknodat),           .name = "mknodat",           .stage = 3 },
+  { .num = SCMP_SYS(modify_ldt),        .name = "modify_ldt",        .stage = 3 },
+  { .num = SCMP_SYS(iopl),              .name = "iopl",              .stage = 3 },
+  { .num = SCMP_SYS(ioperm),            .name = "ioperm",            .stage = 3 },
+  { .num = SCMP_SYS(syslog),            .name = "syslog",            .stage = 3 },
+
+  /* H-6 (kalan): mevcut kuralların bypass'ları + exfil vektörleri.
+   * pkey_mprotect → W^X kuralını deler (varsayılan pkey 0 üzerinde mprotect
+   * gibi çalışır), fchmodat2 → fchmodat kuralını deler. Kodda hiçbiri yok
+   * (08-05 grep + strace doğrulaması), hepsi stage 3 — Tor çocuğu etkilenmez. */
+  { .num = SCMP_SYS(pkey_mprotect),     .name = "pkey_mprotect",     .stage = 3 },
+  { .num = SCMP_SYS(pkey_alloc),        .name = "pkey_alloc",        .stage = 3 },
+  { .num = SCMP_SYS(pkey_free),         .name = "pkey_free",         .stage = 3 },
+  { .num = SCMP_SYS(fchmodat2),         .name = "fchmodat2",         .stage = 3 },
+  { .num = SCMP_SYS(name_to_handle_at), .name = "name_to_handle_at", .stage = 3 },
+  { .num = SCMP_SYS(pidfd_getfd),       .name = "pidfd_getfd",       .stage = 3 },
+  { .num = SCMP_SYS(memfd_secret),      .name = "memfd_secret",      .stage = 3 },
+  { .num = SCMP_SYS(vmsplice),          .name = "vmsplice",          .stage = 3 },
+
+  /* H-6 (kalan): sandbox escape + exfil kanalları — mount sistemi eksik
+   * üyesi, yeni nesil file-attr syscall'ları (fchmodat2 ailesi), SysV IPC
+   * (shm/msg = prosesler arası veri kanalı), memfd ve mount keşfi.
+   * Hiçbiri kodda yok (08-05 grep + strace doğrulaması), stage 3'e özel. */
+  { .num = SCMP_SYS(mount_setattr),     .name = "mount_setattr",     .stage = 3 },
+  /* open_tree_attr/file_setattr (kernel 6.9+) libseccomp 2.6 tablosunda yok —
+   * SCMP_SYS(__SNR_) derlenmez; doğrudan __NR_ sabitleri kullanılır. */
+  { .num = __NR_open_tree_attr,         .name = "open_tree_attr",    .stage = 3 },
+  { .num = __NR_file_setattr,           .name = "file_setattr",      .stage = 3 },
+  { .num = SCMP_SYS(splice),            .name = "splice",            .stage = 3 },
+  { .num = SCMP_SYS(shmget),            .name = "shmget",            .stage = 3 },
+  { .num = SCMP_SYS(shmat),             .name = "shmat",             .stage = 3 },
+  { .num = SCMP_SYS(shmctl),            .name = "shmctl",            .stage = 3 },
+  { .num = SCMP_SYS(msgget),            .name = "msgget",            .stage = 3 },
+  { .num = SCMP_SYS(msgsnd),            .name = "msgsnd",            .stage = 3 },
+  { .num = SCMP_SYS(msgrcv),            .name = "msgrcv",            .stage = 3 },
+  { .num = SCMP_SYS(msgctl),            .name = "msgctl",            .stage = 3 },
+  { .num = SCMP_SYS(memfd_create),      .name = "memfd_create",      .stage = 3 },
+  { .num = SCMP_SYS(statmount),         .name = "statmount",         .stage = 3 },
+  { .num = SCMP_SYS(listmount),         .name = "listmount",         .stage = 3 },
 };
 
 /* ================================================================
@@ -177,6 +225,7 @@ nox_err_t seccomp_policy_load(int stage) {
   scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
   if (!ctx)
     return NOX_ERR_CRYPTO;
+
 
   /* ── 32-bit compat modunu tamamen devre dışı bırak ────────────────
    * x86_64 process'lerde i386 compat modu farklı syscall numaraları
@@ -208,7 +257,7 @@ nox_err_t seccomp_policy_load(int stage) {
   for (size_t i = 0; i < sizeof(blacklist) / sizeof(blacklist[0]); i++) {
     if (blacklist[i].stage > stage)
       continue;  /* bu stage henüz aktif değil */
-    int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, blacklist[i].num, 0);
+    int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, blacklist[i].num, 0);
     if (rc == 0) {
       n_blocked++;
     } else if (rc != -EDOM) {
@@ -238,17 +287,19 @@ nox_err_t seccomp_policy_load(int stage) {
      *   SCMP_A2 = ptid (eski hata: wrong argument index)
      * CLONE_THREAD bit'i set ise → izin ver (pthread_create çalışsın).
      * CLONE_THREAD bit'i set değilse → KILL (fork/vfork engellenir). */
-    if (seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 1,
+    if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(clone), 1,
           SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_THREAD, 0)) != 0) {
       NOX_ERROR(LOG_MOD_MAIN, "seccomp: clone kuralı eklenemedi");
       seccomp_release(ctx);
       return NOX_ERR_CRYPTO;
     }
 
-    /* clone3: flags 1. argümanın (clone_args*) offset 16'sında.
-     * Seccomp argument komutları pointer arithmetic desteklemez →
-     * clone3 tamamen yasak. */
-    int rc_clone3 = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone3), 0);
+    /* clone3: ENOSYS döndür — KILL_PROCESS olsa modern glibc (2.34+)
+     * pthread_create clone3'ü dener ve seccomp sinyali fallback'e izin
+     * vermez, process ölürdü. ENOSYS ile glibc güvenle clone'a düşer
+     * (CLONE_THREAD izni yukarıdaki clone kuralında). Fork/vfork yine
+     * imkânsız — clone kuralı CLONE_THREAD'siz çağrıyı KILL eder. */
+    int rc_clone3 = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0);
     if (rc_clone3 != 0 && rc_clone3 != -EDOM) {
       NOX_ERROR(LOG_MOD_MAIN, "seccomp: clone3 kuralı eklenemedi");
       seccomp_release(ctx);
@@ -256,6 +307,40 @@ nox_err_t seccomp_policy_load(int stage) {
     }
     if (rc_clone3 == 0)
       n_custom_blocked++;
+
+    /* ── arch_prctl: CET-SS yönetimini engelle (sadece stage 2) ──
+     * Kilit (ARCH_SHSTK_LOCK, 0x5003) main'de seccomp ÖNCESİ çağrıldı
+     * (main.c 8c). Burada yalnızca kilidi atlatma yolları kapatılır:
+     * DISABLE (0x5002) shadow stack'i kapatır; UNLOCK (0x5004) kilitli
+     * bitleri açar (kernelde şu an işlevsiz ama header'da mevcut).
+     * Meşru glibc TLS çağrısı ARCH_SET_FS (0x1002) serbest kalır —
+     * arch_prctl tamamen engellenemez. */
+#ifdef ARCH_SHSTK_DISABLE
+    int rc_prctl_ss = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS,
+                                       SCMP_SYS(arch_prctl), 1,
+                                       SCMP_A0(SCMP_CMP_EQ,
+                                               (uint64_t)ARCH_SHSTK_DISABLE));
+    if (rc_prctl_ss != 0 && rc_prctl_ss != -EDOM) {
+      NOX_ERROR(LOG_MOD_MAIN, "seccomp: arch_prctl(DISABLE) kuralı eklenemedi");
+      seccomp_release(ctx);
+      return NOX_ERR_CRYPTO;
+    }
+    if (rc_prctl_ss == 0)
+      n_custom_blocked++;
+#endif
+#ifdef ARCH_SHSTK_UNLOCK
+    int rc_prctl_ul = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS,
+                                       SCMP_SYS(arch_prctl), 1,
+                                       SCMP_A0(SCMP_CMP_EQ,
+                                               (uint64_t)ARCH_SHSTK_UNLOCK));
+    if (rc_prctl_ul != 0 && rc_prctl_ul != -EDOM) {
+      NOX_ERROR(LOG_MOD_MAIN, "seccomp: arch_prctl(UNLOCK) kuralı eklenemedi");
+      seccomp_release(ctx);
+      return NOX_ERR_CRYPTO;
+    }
+    if (rc_prctl_ul == 0)
+      n_custom_blocked++;
+#endif
 
     /* ── prctl: option'a göre filtreleme ─────────────────────────
      * prctl() tamamen yasaklanmaz — seccomp_load() prctl(PR_SET_SECCOMP)
@@ -279,7 +364,7 @@ nox_err_t seccomp_policy_load(int stage) {
         { PR_SET_MDWE,                  "prctl(PR_SET_MDWE)" },
       };
       for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
-        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(prctl), 1,
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(prctl), 1,
                                   SCMP_A0(SCMP_CMP_EQ, (uint64_t)blocked[i].op));
         if (rc != 0 && rc != -EDOM) {
           NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi", blocked[i].name);
@@ -330,6 +415,64 @@ nox_err_t seccomp_policy_load(int stage) {
         n_custom_blocked++;
     }
 #endif
+
+    /* H-6 (kalan): exfil alternatifleri — Tor spawn sonrası ana process
+     * hiçbirini kullanmıyor (strace kanıtı: socket yalnızca AF_UNIX). */
+#ifdef AF_CAN
+    {
+      int rc = add_socket_domain_rule(ctx, AF_CAN, "socket(AF_CAN)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
+#ifdef AF_KEY
+    {
+      int rc = add_socket_domain_rule(ctx, AF_KEY, "socket(AF_KEY)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
+#ifdef AF_NFC
+    {
+      int rc = add_socket_domain_rule(ctx, AF_NFC, "socket(AF_NFC)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
+#ifdef AF_APPLETALK
+    {
+      int rc = add_socket_domain_rule(ctx, AF_APPLETALK, "socket(AF_APPLETALK)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
+#ifdef AF_IPX
+    {
+      int rc = add_socket_domain_rule(ctx, AF_IPX, "socket(AF_IPX)");
+      if (rc < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
+      }
+      if (rc == 0)
+        n_custom_blocked++;
+    }
+#endif
   }
 
   /* ── Stage 3: Event loop başı — Sıfır ağ sızıntısı garantisi ──────
@@ -339,7 +482,7 @@ nox_err_t seccomp_policy_load(int stage) {
    * ─────────────────────────────────────────────────────────────── */
   if (stage >= 3) {
     /* clone tamamen yasak — event loop tek thread, thread gerekmez */
-    int rc_clone = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 0);
+    int rc_clone = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(clone), 0);
     if (rc_clone != 0 && rc_clone != -EDOM) {
       NOX_ERROR(LOG_MOD_MAIN, "seccomp: stage 3 clone kuralı eklenemedi");
       seccomp_release(ctx);
@@ -357,9 +500,22 @@ nox_err_t seccomp_policy_load(int stage) {
 #ifdef AF_INET6
         { AF_INET6, "socket(AF_INET6)" },
 #endif
+        /* H-6 FIX: Alternatif sızıntı yolları — hepsi AF_UNIX dışı
+         * AF_XDP:  raw paket I/O (driver bypass, packet capture/exfil)
+         * AF_ALG:  kernel crypto API erişimi
+         * AF_VSOCK: VM/host iletişimi (container escape / sızıntı kanalı) */
+#ifdef AF_XDP
+        { AF_XDP,   "socket(AF_XDP)" },
+#endif
+#ifdef AF_ALG
+        { AF_ALG,   "socket(AF_ALG)" },
+#endif
+#ifdef AF_VSOCK
+        { AF_VSOCK, "socket(AF_VSOCK)" },
+#endif
       };
       for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
-        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 1,
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
                                   SCMP_A0(SCMP_CMP_EQ, (uint64_t)blocked[i].domain));
         if (rc != 0 && rc != -EDOM) {
           NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi", blocked[i].name);
@@ -383,6 +539,31 @@ nox_err_t seccomp_policy_load(int stage) {
         n_custom_blocked++;
     }
 #endif
+
+    /* W^X: çalışma zamanında yeni executable bellek yaratma (mprotect+mmap).
+     * JIT yok, lazy binding yok (BIND_NOW) — PROT_EXEC içeren hiçbir çağrı
+     * yok; maskeli karşılaştırma yalnızca EXEC bitini test eder (READ/WRITE
+     * serbest). Shellcode için RX bölge yaratma girişimi process'i öldürür. */
+    {
+      static const struct { int sys; const char *name; } exec_blocked[] = {
+        { SCMP_SYS(mprotect), "mprotect(PROT_EXEC)" },
+        { SCMP_SYS(mmap),     "mmap(PROT_EXEC)"     },
+      };
+      for (size_t i = 0; i < sizeof(exec_blocked)/sizeof(exec_blocked[0]); i++) {
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS,
+                                  exec_blocked[i].sys, 1,
+                                  SCMP_A2(SCMP_CMP_MASKED_EQ,
+                                          (uint64_t)PROT_EXEC, (uint64_t)PROT_EXEC));
+        if (rc != 0 && rc != -EDOM) {
+          NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi",
+                    exec_blocked[i].name);
+          seccomp_release(ctx);
+          return NOX_ERR_CRYPTO;
+        }
+        if (rc == 0)
+          n_custom_blocked++;
+      }
+    }
   }
 
   int rc = seccomp_load(ctx);

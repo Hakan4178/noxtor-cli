@@ -259,9 +259,9 @@ const char *nox_strerror(nox_err_t err)
     case NOX_ERR_OVERFLOW: return "taşma hatası";
     case NOX_ERR_STATE:    return "geçersiz durum geçişi";
     case NOX_ERR_NOT_FOUND:return "öğe bulunamadı";
+    case NOX_ERR_LANDLOCK_UNSUPPORTED: return "Landlock desteklenmiyor (kernel 5.13+ gerekli)";
+    default:                          return "bilinmeyen hata kodu";
     }
-    /* enum dışı değer (cast ile üretilmiş olabilir) */
-    return "bilinmeyen hata kodu";
 }
 
 /* ================================================================

@@ -98,7 +98,11 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
     }
     ps->recv_pos = remaining;
 
-    if (fh.type == NOX_MSG_CTRL && ps->hs) {
+    /* Y-2 FIX: Handshake tamamlanmış (msg_index >= 3) bir peer'ın ek CTRL
+     * frame'leri handshake_read'e giderse NOX_ERR_STATE → EV_HANDSHAKE_ERROR
+     * → TOFU-PENDING bekleyen slot ölür. CTRL yalnızca handshake aktifken
+     * (msg_index < 3) handshake'e verilir; fazlası sessizce düşürülür. */
+    if (fh.type == NOX_MSG_CTRL && ps->hs && ps->hs->msg_index < 3) {
       uint8_t pl[64];
       size_t pl_len = sizeof(pl);
       nox_err_t hs_err =
@@ -221,6 +225,12 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
               NOX_DEBUG(LOG_MOD_NOISE,
                         "session setup: tx_seq=0 rx_seq=0 queue_flushed=false");
               sm_dispatch(ps, state, EV_SESSION_READY);
+
+              /* M-3 FIX: bilinen-peer inbound yolunda peer_onion hiç
+               * set edilmiyordu → db_process_queue("") hiç eşleşmez,
+               * çevrimdışı mesajlar iletilmezdi. TOFU yoluyla aynı
+               * desen: session hazır olunca onion'u peer slotuna yaz. */
+              snprintf(ps->peer_onion, sizeof(ps->peer_onion), "%s", peer_onion);
 
               strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
               state->active_peer_onion[NOX_ONION_LEN] = '\0';
@@ -379,9 +389,38 @@ void event_loop(struct app_state *state) {
    * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez. */
   if (state->downloads_dir_fd >= 0) {
     nox_err_t ll_err = landlock_sandbox_init(state->downloads_dir_fd);
-    if (ll_err != NOX_OK) {
-      NOX_WARN(LOG_MOD_MAIN, "landlock devre dışı — dosya erişimi kısıtsız "
-               "(kernel 5.13+ gerekli)");
+
+    if (ll_err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
+      if (!state->allow_unsandboxed_fs) {
+        /* C-2 FIX: varsayılan fail-closed — seccomp ile simetrik.
+         * Sandbox'sız çalışmak açık bayrak gerektiren bilinçli bir tercih. */
+        ui_print_error(state,
+            "Bu çekirdek Landlock desteklemiyor (Linux 5.13+ gerekli). "
+            "Dosya sistemi sandbox'ı olmadan çalışmak engellendi. "
+            "Bilinçli olarak devam etmek için --allow-unsandboxed-fs kullanın.");
+        NOX_FATAL(LOG_MOD_MAIN,
+                  "landlock kurulamadı — kullanıcı onayı yok, çıkılıyor");
+        state->running = false;
+        return;
+      }
+      /* Kullanıcı bilerek onayladıysa: devam et ama görünür şekilde uyar —
+       * sadece log'a değil, TUI/terminal ekranına da. */
+      NOX_WARN(LOG_MOD_MAIN,
+               "landlock devre dışı — KULLANICI ONAYIYLA sandbox'sız çalışılıyor");
+      ui_print_error(state, "Dosya sistemi sandbox'ı KAPALI "
+                            "(--allow-unsandboxed-fs ile onaylandı).");
+    } else if (ll_err != NOX_OK) {
+      NOX_ERROR(LOG_MOD_MAIN, "landlock: yapılandırma hatası");
+      ui_print_error(state, "Sandbox yapılandırma hatası.");
+      state->running = false;
+      return;
+    }
+
+    /* C-2 FIX: landlock_is_active() artık ölü kod değil — sandbox
+     * gerçekten uygulanmadıysa (herhangi bir nedenle) görünür uyarı. */
+    if (!landlock_is_active()) {
+      NOX_WARN(LOG_MOD_MAIN, "landlock: sandbox aktif DEĞİL — dosya erişimi kısıtsız");
+      ui_print_error(state, "⚠ Dosya sistemi sandbox'ı AKTİF DEĞİL.");
     }
   }
 
@@ -551,8 +590,12 @@ void event_loop(struct app_state *state) {
             sm_dispatch(ps, state, EV_TOR_DIED);
         }
 
+        /* L-5 FIX: control fd close edilmeden -1 yapılıyordu — fd sızıntısı */
+        if (state->tor_ctrl_fd >= 0) {
+          close(state->tor_ctrl_fd);
+          state->tor_ctrl_fd = -1;
+        }
         state->tor_pid = 0;
-        state->tor_ctrl_fd = -1;
 
         /* Tüm arena'yı güvenli şekilde sil — Tor gitti, key'ler
          * işe yaramaz. Yeniden başlatmada PIN ile yeniden türetilir. */
@@ -619,8 +662,11 @@ void event_loop(struct app_state *state) {
         }
 
         /* Handshake rate limiting — 60 saniyede max 5 deneme. */
+        /* M-12 FIX: duvar saati değil CLOCK_MONOTONIC */
         {
-          time_t now = time(NULL);
+          struct timespec hs_ts;
+          clock_gettime(CLOCK_MONOTONIC, &hs_ts);
+          time_t now = (time_t)hs_ts.tv_sec;
           if (now - state->hs_window_start >= 60) {
             state->hs_attempt_count = 0;
             state->hs_window_start = now;

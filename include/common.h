@@ -51,7 +51,7 @@
 /* Onion adresi */
 #define NOX_ONION_LEN          62U       /* 56 + ".onion" */
 #define NOX_VIRTUAL_PORT       9876U     /* HS virtual port (sabit) */
-#define NOX_ONION_KEY_B64_LEN  88U       /* ED25519-V3 private key base64 */
+#define NOX_ONION_KEY_B64_MAX 88U  /* ED25519-V3 private key base64 (buffer sınırı) */
 
 /* Contact */
 #define NOX_CONTACT_NAME_LEN   64U
@@ -81,6 +81,7 @@ typedef enum {
     NOX_ERR_OVERFLOW    = -12,  /* arena / buffer taşması            */
     NOX_ERR_STATE       = -13,  /* geçersiz state geçişi             */
     NOX_ERR_NOT_FOUND   = -14,  /* aranan öğe bulunamadı             */
+    NOX_ERR_LANDLOCK_UNSUPPORTED = -15,  /* sandbox kurulamadı (C-2)  */
 } nox_err_t;
 
 /* Hata kodu → okunabilir string */

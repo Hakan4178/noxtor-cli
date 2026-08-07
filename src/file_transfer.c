@@ -90,6 +90,10 @@ static nox_err_t verify_downloads_dir_fd(int dir_fd) {
         return NOX_ERR_CONFIG;
     if (st.st_uid != getuid())
         return NOX_ERR_CONFIG;
+    /* M-6 FIX: Grup/dünya yazılabilir dizin, aynı makinedeki başka
+     * kullanıcının transferi bozmasına (silme/EEXIST DoS) izin verir. */
+    if ((st.st_mode & 0777) != 0700)
+        return NOX_ERR_CONFIG;
     return NOX_OK;
 }
 
@@ -410,6 +414,15 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
         explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
         epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
       }
+    } else if (r == 0) {
+      /* M-8 FIX: Gönderim sırasında beklenenden erken EOF — dosya kısaldı.
+       * Hash doğrulanamaz; busy loop'a düşmemek için transfer iptal edilir. */
+      ui_print_error(state, "Dosya gönderim sırasında kısaldı — transfer iptal");
+      close(ps->tx_file.fd);
+      ps->tx_file.fd = -1;
+      sodium_free(ps->tx_file.plain_buf);
+      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
     } else if (r < 0 && errno != EINTR) {
       ui_print_error(state, "Yerel dosya okuma başarısız");
       close(ps->tx_file.fd);
@@ -643,13 +656,20 @@ bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
       }
 
       /* PATCH: HIGH‑1 — fd kapatıldıktan hemen sonra -1 yap */
+      /* M-7 FIX: Hash bellektedir; close() öncesi fsync diske garanti verir */
       if (ps->rx_file.fd >= 0) {
+          if (fsync(ps->rx_file.fd) != 0)
+              NOX_WARN(LOG_MOD_MAIN, "dosya fsync başarısız: %s", strerror(errno));
           close(ps->rx_file.fd);
           ps->rx_file.fd = -1;
       }
 
       /* C-1 FIX: memcmp -> sodium_memcmp (sabit zamanlı) */
       if (sodium_memcmp(final_hash, ps->rx_file.expected_hash, 32) == 0) {
+        /* M-7 FIX: dizin fsync — güç kesintisinde dosya adı kaydının kalıcılığı */
+        if (state->downloads_dir_fd >= 0 && fsync(state->downloads_dir_fd) != 0)
+            NOX_WARN(LOG_MOD_MAIN, "downloads dizin fsync başarısız: %s",
+                     strerror(errno));
         ui_print_system(state, "[✓] Dosya başarıyla alındı: %s",
                         ps->rx_file.filename);
       } else {

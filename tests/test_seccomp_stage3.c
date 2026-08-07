@@ -93,6 +93,14 @@ static int apply_stage3(void) {
   seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 1,
                    SCMP_A0(SCMP_CMP_EQ, (uint64_t)AF_PACKET));
 
+  /* Stage 3 — W^X: çalışma zamanında executable bellek yaratma yasak */
+  seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(mprotect), 1,
+                   SCMP_A2(SCMP_CMP_MASKED_EQ, (uint64_t)PROT_EXEC,
+                           (uint64_t)PROT_EXEC));
+  seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(mmap), 1,
+                   SCMP_A2(SCMP_CMP_MASKED_EQ, (uint64_t)PROT_EXEC,
+                           (uint64_t)PROT_EXEC));
+
   /* Stage 3 — symlink, link, chmod, chown */
   seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(symlink), 0);
   seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(link), 0);
@@ -196,6 +204,39 @@ static void test_af_unix_should_work(void) {
   _exit(1);
 }
 
+/* ── W^X: executable bellek yaratma engelleme testleri ── */
+
+static void test_mprotect_exec(void) {
+  if (apply_stage3() < 0) _exit(2);
+  /* Önce RW mapping al (serbest), sonra RX'e çevir → SIGSYS beklenir */
+  void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) _exit(1);
+  mprotect(p, 4096, PROT_READ | PROT_EXEC);
+  munmap(p, 4096);
+  _exit(1);  /* buraya ulaşılırsa filtre çalışmadı */
+}
+
+static void test_mmap_exec(void) {
+  if (apply_stage3() < 0) _exit(2);
+  /* Doğrudan executable mmap → SIGSYS beklenir */
+  void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) _exit(1);
+  munmap(p, 4096);
+  _exit(1);  /* buraya ulaşılırsa filtre çalışmadı */
+}
+
+static void test_mmap_rw_allow(void) {
+  if (apply_stage3() < 0) _exit(2);
+  /* RW mapping serbest olmalı — normal bellek kullanımı bozulmamalı */
+  void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) _exit(1);
+  munmap(p, 4096);
+  _exit(0);  /* BAŞARILI: RW mmap serbest */
+}
+
 /* ── prctl option filtreleme testleri ── */
 
 static void test_prctl_dumpable_kill(void) {
@@ -292,6 +333,11 @@ int main(void) {
   total++; passed += run_test("prctl_dump", "prctl(PR_SET_DUMPABLE)         ", test_prctl_dumpable_kill, 1);
   total++; passed += run_test("prctl_ptr",  "prctl(PR_SET_PTRACER)          ", test_prctl_ptracer_kill, 1);
   total++; passed += run_test("prctl_nnp",  "prctl(PR_SET_NO_NEW_PRIVS)     ", test_prctl_nonewprivs_allow, 0);
+
+  /* W^X: executable bellek yaratma */
+  total++; passed += run_test("mprotect_exec", "mprotect(PROT_READ|PROT_EXEC)   ", test_mprotect_exec, 1);
+  total++; passed += run_test("mmap_exec",     "mmap(PROT_READ|WRITE|EXEC)      ", test_mmap_exec, 1);
+  total++; passed += run_test("mmap_rw",       "mmap(PROT_READ|WRITE) serbest   ", test_mmap_rw_allow, 0);
 
   printf("\nSonuç: %d/%d test başarılı\n", passed, total);
   return (passed == total) ? 0 : 1;

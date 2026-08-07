@@ -222,6 +222,8 @@ static void print_label(enum ui_label label)
         break;
     case UI_LABEL_NONE:
         break;
+    default:
+        break;
     }
 }
 
@@ -348,7 +350,10 @@ static void strip_ansi_escape(char *str) {
         if (src[0] == 0x1b && src[1] == '\\') src += 2;
       } else {
         /* Diğer tüm ESC sequence'leri (ST, tek ESC, vs.) — atla */
-        src += 2;
+        if (src[1] != '\0')
+          src += 2;
+        else
+          src++;  /* bare ESC — NUL'a kadar atla */
       }
     } else {
       *dst++ = *src++;

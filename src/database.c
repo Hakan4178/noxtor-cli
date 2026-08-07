@@ -6,11 +6,14 @@
 #include "asm_utils.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <sodium.h>
 #include <sqlite3.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <pthread.h>
 
 /* ================================================================
@@ -222,10 +225,11 @@ nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
     return NOX_ERR_CONFIG;
   }
 
-  /* SQLite bağlantısını aç — uygulama kendi lock'unu yönetiyor (g_state.lock) */
+  /* M-10 FIX: NOFOLLOW — db_path symlink ise ELOOP ile başarısız ol;
+   * symlink yönlendirmesiyle farklı bir dosyaya açılamaz. */
   int rc = sqlite3_open_v2(
       db_path, &g_state.db,
-      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOFOLLOW, NULL);
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Veritabanı açılamadı: %s", DB_ERRMSG());
     if (g_state.db) {
@@ -235,6 +239,13 @@ nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
     g_state.db_key = NULL;
     DB_UNLOCK();
     return NOX_ERR_DB;
+  }
+
+  /* M-10 FIX: SQLite varsayılanı 0666&~umask (tipik 0644) kullanır —
+   * metadata sızıntısını (satır sayısı, boyut, zaman damgası) kapat:
+   * DB dosyasını açılışta 0600'e indir. */
+  if (chmod(db_path, 0600) != 0) {
+    NOX_WARN(LOG_MOD_DB, "db chmod 0600 başarısız: %s", strerror(errno));
   }
 
   /* SQLite güvenlik optimizasyonları + tablolar */
@@ -709,7 +720,7 @@ nox_err_t db_save_message(const char *peer_onion, const char *text,
 
   size_t text_len = strlen(text);
   if (text_len > DB_MAX_MSG_LEN) {
-      NOX_ERROR(LOG_MOD_DB, "Kaydedilecek mesaj çok uzun: %zu byte (maksimum %d)", text_len, DB_MAX_MSG_LEN);
+      NOX_ERROR(LOG_MOD_DB, "Kaydedilecek mesaj çok uzun: %zu byte (maksimum %u)", text_len, DB_MAX_MSG_LEN);
       DB_UNLOCK(); return NOX_ERR_DB;
   }
   size_t payload_len = text_len + 1;

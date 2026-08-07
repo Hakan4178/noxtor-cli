@@ -588,8 +588,12 @@ void process_line(struct app_state *state, const char *line) {
     }
 
     /* BUG-6 FIX: Rate limit kontrolü SOCKS5 öncesi */
+    /* M-12 FIX: duvar saati (time()) değil CLOCK_MONOTONIC —
+     * NTP/yerel saat oynatması pencereyi sıfırlayamaz. */
     {
-      time_t now = time(NULL);
+      struct timespec hs_ts;
+      clock_gettime(CLOCK_MONOTONIC, &hs_ts);
+      time_t now = (time_t)hs_ts.tv_sec;
       if (now - state->hs_window_start >= 60) {
         state->hs_attempt_count = 0;
         state->hs_window_start = now;
@@ -603,6 +607,9 @@ void process_line(struct app_state *state, const char *line) {
     }
 
     NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
+    /* M-12 FIX: sayaç connect BAŞARISINDAN önce artır —
+     * ölü onion'lara hızlı /connect fırtınası bütçeyi tüketebilsin. */
+    state->hs_attempt_count++;
     int peer_fd = -1;
     nox_err_t err =
         socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
@@ -642,8 +649,6 @@ void process_line(struct app_state *state, const char *line) {
 
     /* State geçişi: IDLE → HANDSHAKE_INIT */
     sm_dispatch(target_ps, state, EV_CONNECT_CMD);
-
-    state->hs_attempt_count++;
 
     uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
     size_t hslen = sizeof(hsbuf);
@@ -930,6 +935,15 @@ void process_stdin_events(struct app_state *state) {
       }
       state->stdin_len = remaining;
       state->stdin_buf[state->stdin_len] = '\0';
+
+      /* L-16 FIX: Gömülü NUL içeren satırı reddet — NUL sonrası
+       * strncmp/strnlen'de sessizce düşer, komut ayrıştırmayı keser.
+       * Not: \r temizliğinden önce yapılır (temizlik son byte'ı \0 yapar). */
+      if (memchr(line, '\0', line_len) != NULL) {
+        ui_print_error(state, "Satır geçersiz (NUL byte içeriyor) — atlandı");
+        sodium_free(line);
+        continue;
+      }
 
       /* Satır sonundaki satır başı karakterini (\r) temizle */
       if (line_len > 0 && line[line_len - 1] == '\r') {

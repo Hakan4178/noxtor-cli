@@ -1,4 +1,4 @@
-/* ================================================================
+/* SPDX-License-Identifier: GPL-3.0-or-later
  * landlock_sandbox.c — Landlock LSM dosya erişim kısıtlaması
  *
  * open/openat/creat'i sadece downloads dizinine kısıtlar.
@@ -88,21 +88,7 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
 
     /* ── Ruleset oluştur ── */
     /* ABI versiyonuna göre desteklenen flag'lericonditional ekle */
-    __u32 handled =
-        LANDLOCK_ACCESS_FS_EXECUTE      |
-        LANDLOCK_ACCESS_FS_WRITE_FILE   |
-        LANDLOCK_ACCESS_FS_READ_FILE    |
-        LANDLOCK_ACCESS_FS_READ_DIR     |
-        LANDLOCK_ACCESS_FS_REMOVE_DIR   |
-        LANDLOCK_ACCESS_FS_REMOVE_FILE  |
-        LANDLOCK_ACCESS_FS_MAKE_CHAR    |
-        LANDLOCK_ACCESS_FS_MAKE_DIR     |
-        LANDLOCK_ACCESS_FS_MAKE_REG     |
-        LANDLOCK_ACCESS_FS_MAKE_SOCK    |
-        LANDLOCK_ACCESS_FS_MAKE_FIFO    |
-        LANDLOCK_ACCESS_FS_MAKE_BLOCK   |
-        LANDLOCK_ACCESS_FS_MAKE_SYM;
-
+    __u32 handled = NOX_LL_BASE_RIGHTS;
     if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
     if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
 #ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
@@ -117,24 +103,42 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
                                                   sizeof(ruleset_attr), 0);
     if (ruleset_fd < 0) {
         if (errno == EOPNOTSUPP) {
-            NOX_WARN(LOG_MOD_MAIN, "landlock: desteklenmiyor, atlanıyor");
-            return NOX_OK;
+            /* C-2 EK FIX: artık NOX_OK DEĞİL — sandbox kurulamadıysa
+             * bunu çağırana "başarı" diye yalan söylemiyoruz. */
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: kernel'de devre dışı (lsm= boot parametresi?) "
+                      "— dosya sistemi sandbox'ı KURULAMADI");
+            return NOX_ERR_LANDLOCK_UNSUPPORTED;
         }
         NOX_ERROR(LOG_MOD_MAIN, "landlock: ruleset oluşturulamadı (%s)",
                   strerror(errno));
         return NOX_ERR_CONFIG;
     }
 
-    /* ── Downloads dizini için kural ekle ──
-     * Sadece okuma, yazma, dizin listeleme ve dosya silme izni.
-     * Execute, symlink oluşturma, hardlink vs. yasak. */
+    /* ── Downloads dizini kuralı — C-1 + C-2 BİRLEŞİK FIX ──
+     *
+     * "wanted" = uygulamanın downloads/ dizininde GERÇEKTEN ihtiyaç duyduğu
+     * haklar, ABI farkı gözetmeden tam liste olarak yazılır.
+     * Gerçek allowed_access, bunun `handled` ile kesişimidir.
+     *
+     * Bu tek satır (`wanted & handled`) hem C-1'i hem C-2'yi yapısal
+     * olarak imkansız hale getirir:
+     *   - C-1: MAKE_REG artık wanted'da → allowed'da da var → EACCES yok.
+     *   - C-2: TRUNCATE, handled'da yoksa (ABI<3) maskeden otomatik düşer →
+     *          allowed ⊄ handled durumu asla oluşamaz → EINVAL yok.
+     */
+    __u64 wanted =
+        LANDLOCK_ACCESS_FS_READ_FILE    |
+        LANDLOCK_ACCESS_FS_WRITE_FILE   |
+        LANDLOCK_ACCESS_FS_READ_DIR     |
+        LANDLOCK_ACCESS_FS_REMOVE_FILE  |
+        LANDLOCK_ACCESS_FS_MAKE_REG     |   /* C-1 FIX: yeni dosya oluşturmak için zorunlu */
+        LANDLOCK_ACCESS_FS_TRUNCATE;
+        /* MAKE_DIR / REFER bilerek eklenmedi — least-privilege:
+         * downloads/ içinde alt dizin veya cross-dir rename kullanılmıyor */
+
     struct landlock_path_beneath_attr downloads_rule = {
-        .allowed_access =
-            LANDLOCK_ACCESS_FS_READ_FILE    |
-            LANDLOCK_ACCESS_FS_WRITE_FILE   |
-            LANDLOCK_ACCESS_FS_READ_DIR     |
-            LANDLOCK_ACCESS_FS_REMOVE_FILE  |
-            LANDLOCK_ACCESS_FS_TRUNCATE,
+        .allowed_access = nox_ll_compute_rule_rights(wanted, handled),
         .parent_fd = downloads_dir_fd,
     };
 
@@ -163,7 +167,10 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
             struct landlock_path_beneath_attr config_rule = {
                 .allowed_access =
                     LANDLOCK_ACCESS_FS_READ_FILE |
-                    LANDLOCK_ACCESS_FS_READ_DIR,
+                    LANDLOCK_ACCESS_FS_READ_DIR |
+                    LANDLOCK_ACCESS_FS_REMOVE_FILE, /* L-21 FIX: shutdown'da
+                    listen.sock unlink'i EPERM almadan çalışsın — yoksa bayat
+                    socket dosyası bir sonraki bind()'i engeller */
                 .parent_fd = config_fd,
             };
             rc = sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
@@ -220,4 +227,19 @@ bool landlock_is_available(void) {
 
 bool landlock_is_active(void) {
     return s_landlock_active;
+}
+
+/* ================================================================
+ * nox_ll_compute_rule_rights — C-1/C-2 için SAF maskeleme fonksiyonu
+ *
+ * Kernel syscall'ı içermez → herhangi bir CI runner'da test edilebilir
+ * (tests/test_landlock_rights.c). Gerçek kernel gerekmez.
+ *
+ * Invariant: dönen değer her zaman @handled'ın alt kümesidir:
+ *     (allowed | handled) == handled
+ * Bu sayede kernel'in landlock_add_rule'da uyguladığı EINVAL
+ * (allowed ⊄ handled) koşulu yapısal olarak asla oluşamaz.
+ * ================================================================ */
+__u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled) {
+    return wanted & handled;
 }

@@ -516,6 +516,10 @@ static nox_err_t write_msg0(struct noise_handshake *hs, const uint8_t *payload,
                             size_t pl_len, uint8_t *out, size_t *out_len) {
   size_t offset = 0;
 
+  /* H-5 FIX: msg0 = 32 (e) + pl_len + 16 (MAC) — *out_len kapasitedir */
+  if (NOX_KEY_LEN + pl_len + 16U > *out_len)
+    return NOX_ERR_PROTO;
+
   /* Generate ephemeral key pair */
 #ifndef NOISE_TEST_DETERMINISTIC
   crypto_box_curve25519xsalsa20poly1305_keypair(hs->e_pub, hs->e);
@@ -549,6 +553,10 @@ static nox_err_t write_msg1(struct noise_handshake *hs, const uint8_t *payload,
   size_t offset = 0;
   uint8_t dh_out[NOX_KEY_LEN];
   nox_err_t err;
+
+  /* H-5 FIX: msg1 → 32 (e) + 48 (s_pub+MAC) + pl_len + 16 (MAC) = 96 + pl_len */
+  if (NOX_KEY_LEN + NOX_KEY_LEN + 16U + pl_len + 16U > *out_len)
+    return NOX_ERR_PROTO;
 
   /* Generate ephemeral key pair */
 #ifndef NOISE_TEST_DETERMINISTIC
@@ -611,6 +619,10 @@ static nox_err_t write_msg2(struct noise_handshake *hs, const uint8_t *payload,
   uint8_t dh_out[NOX_KEY_LEN];
   nox_err_t err;
 
+  /* H-5 FIX: msg2 → 48 (s_pub+MAC) + pl_len + 16 (MAC) = 64 + pl_len */
+  if (NOX_KEY_LEN + 16U + pl_len + 16U > *out_len)
+    return NOX_ERR_PROTO;
+
   /* s: EncryptAndHash(s_pub) */
   ssize_t ct =
       symmetric_encrypt_and_hash(&hs->ss, hs->s_pub, NOX_KEY_LEN, out + offset);
@@ -644,6 +656,12 @@ nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
     return NOX_ERR_PROTO;
   if (!payload)
     pl_len = 0;
+
+  /* H-5 FIX: payload üst sınırı — 256 byte'lık bufferlar için.
+   * Tek başına yeterli değil (en büyük mesaj msg1 = 96 + pl_len);
+   * kapasite asıl write_msg* içinde *out_len üzerinden denetlenir. */
+  if (pl_len > NOISE_MAX_HANDSHAKE_LEN)
+    return NOX_ERR_PROTO;
 
   nox_err_t err;
 

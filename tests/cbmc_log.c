@@ -40,7 +40,7 @@ extern char __VERIFIER_nondet_char(void);
 
 /* ================================================================
  * P1 + P2: nox_strerror穷举 — tüm enum değerleri
- * Geçerli enum sınırları: NOX_OK..NOX_ERR_STATE (14 değer)
+ * Geçerli enum sınırları: NOX_OK..NOX_ERR_LANDLOCK_UNSUPPORTED (16 değer)
  * ================================================================ */
 static void test_nox_strerror(void) {
     struct { nox_err_t code; const char *expected; } cases[] = {
@@ -58,9 +58,11 @@ static void test_nox_strerror(void) {
         { NOX_ERR_DB,       "veritabanı hatası" },
         { NOX_ERR_OVERFLOW, "taşma hatası" },
         { NOX_ERR_STATE,    "geçersiz durum geçişi" },
+        { NOX_ERR_NOT_FOUND,"öğe bulunamadı" },
+        { NOX_ERR_LANDLOCK_UNSUPPORTED, "Landlock desteklenmiyor (kernel 5.13+ gerekli)" },
     };
     size_t n = sizeof(cases) / sizeof(cases[0]);
-    assert(n == 14);
+    assert(n == 16);
 
     for (size_t i = 0; i < n; i++) {
         const char *s = nox_strerror(cases[i].code);

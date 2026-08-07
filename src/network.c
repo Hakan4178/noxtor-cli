@@ -5,6 +5,7 @@
 #include "network.h"
 #include "common.h"
 #include "types.h"
+#include "crypto.h"
 #include "seccomp_policy.h"
 
 #include <arpa/inet.h>
@@ -226,6 +227,13 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
       break;
   }
 
+  /* C3 FIX: buffer dolu ve newline yoksa parçalı parse'ı engelle —
+   * satır ikiye bölünüp ikinci yarı yeni satır gibi işlenmesin. */
+  if (pos == 0 || buf[pos - 1] != '\n') {
+    NOX_ERROR(LOG_MOD_NET, "ctrl satırı buffer boyutunu aştı (newline yok)");
+    return NOX_ERR_OVERFLOW;
+  }
+
   buf[pos] = '\0';
   return NOX_OK;
 }
@@ -361,7 +369,10 @@ static bool is_our_stale_entry(const char *full_path, long pid) {
     return false;
 
   /* PID hâlâ çalışıyor mu kontrol et */
-  if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) {
+  int k = kill((pid_t)pid, 0);
+  int kerr = errno; /* C5 FIX: errno'yu hemen değişkene al —
+                       kill sonucu ve errno atomik okunur. */
+  if (k == 0) {
     /* Process var — Tor mu kontrol et (/proc/<pid>/comm) */
     char proc_path[64];
     snprintf(proc_path, sizeof(proc_path), "/proc/%ld/comm", pid);
@@ -381,6 +392,11 @@ static bool is_our_stale_entry(const char *full_path, long pid) {
     /* /proc okunamazsa da silme (process hâlâ canlı olabilir) */
     if (kill((pid_t)pid, 0) == 0)
       return false;
+  } else if (kerr != ESRCH) {
+    /* C5 FIX: ESRCH değilse (EPERM ve diğerleri) emin değiliz —
+     * canlı say, silme. Kırılgan `errno != ESRCH` bölmesi yerine
+     * açık dal: yalnız ESRCH "kesin ölü" anlamına gelir. */
+    return false;
   }
 
   return true;
@@ -476,14 +492,15 @@ static nox_err_t generate_torrc(struct app_state *state) {
       open(state->torrc_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (fd < 0) {
     if (errno == ELOOP) {
-      NOX_ERROR(LOG_MOD_NET, "torrc yolu symlink — saldırı tespit edildi, siliniyor");
-      unlink(state->torrc_path);
-      fd = open(state->torrc_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-    }
-    if (fd < 0) {
-      NOX_ERROR(LOG_MOD_NET, "torrc oluşturulamadı: %s", strerror(errno));
+      /* C2 FIX: symlink tespit edildiğinde fail-closed — silip yeniden
+       * açmak yerine hata dön. Saldırgan dosyayı kontrol ediyorsa silme
+       * isteğini de engelleyebilir; güvenli yön hata vermektir. */
+      NOX_ERROR(LOG_MOD_NET,
+                "torrc yolu symlink — saldırı tespit edildi, başlatma iptal");
       return NOX_ERR_TOR;
     }
+    NOX_ERROR(LOG_MOD_NET, "torrc açılamadı: %s", strerror(errno));
+    return NOX_ERR_TOR;
   }
 
   /* fstat ile dosya tipini doğrula — regular file değilse kapat */
@@ -995,113 +1012,134 @@ static nox_err_t parse_service_id(const char *resp,
   return NOX_OK;
 }
 
+/* Ghost mod: ADD_ONION NEW:ED25519-V3 Flags=DiscardPK
+ * - Key'i TOR üretir (deterministik türetim YOK — her açılışta farklı adres)
+ * - DiscardPK: PrivateKey yanıtı GELMEZ — key sadece Tor process belleğinde
+ *   yaşar, ne diskte ne client'ta kopya (D6)
+ * - Detach YOK: control connection kapanınca hizmet otomatik silinir (D5)
+ * - key_out parametresi KALKMIŞTIR (D8) — key parse/saklama kodu tamamen ölü */
 __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
-                             char *onion_out, size_t onion_len,
-                             char *key_out, size_t key_len) {
+                             char *onion_out, size_t onion_len) {
   /* NET-4 FIX: CRLF injection koruması */
   if (strchr(listen_path, '\r') || strchr(listen_path, '\n')) {
     NOX_ERROR(LOG_MOD_NET, "listen_path CRLF injection engellendi");
     return NOX_ERR_CONFIG;
   }
 
-  char cmd[128];
-  int n = snprintf(cmd, sizeof(cmd),
-                   "ADD_ONION NEW:ED25519-V3 Port=%u,unix:%s\r\n",
-                   NOX_VIRTUAL_PORT, listen_path);
-  if (n <= 0 || (size_t)n >= sizeof(cmd))
-    return NOX_ERR_OVERFLOW;
-
-  nox_err_t err = ctrl_send_command(ctrl_fd, cmd);
-  if (err != NOX_OK)
-    return err;
-
+  char cmd[160];
   char resp[512];
+  nox_err_t err;
+  int n = snprintf(cmd, sizeof(cmd),
+                   "ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port=%u,unix:%s\r\n",
+                   NOX_VIRTUAL_PORT, listen_path);
+  if (n <= 0 || (size_t)n >= sizeof(cmd)) {
+    err = NOX_ERR_OVERFLOW;
+    goto cleanup;
+  }
+
+  err = ctrl_send_command(ctrl_fd, cmd);
+  if (err != NOX_OK)
+    goto cleanup;
+
   err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_READ_TIMEOUT_MS);
   if (err != NOX_OK)
-    return err;
+    goto cleanup;
 
-  /* ServiceID parse */
+  /* ServiceID parse (DiscardPK ile PrivateKey parse YOK — D6/D8) */
   err = parse_service_id(resp, onion_out, onion_len);
   if (err != NOX_OK)
-    return err;
+    goto cleanup;
 
-  /* PrivateKey parse — ADD_ONION NEW:ED25519-V3 yanıtı:
-   *   250-ServiceID=abc123.onion
-   *   250-PrivateKey=ED25519-V3:<88_byte_base64>
-   *   250 OK
-   * Format sabittir: ED25519-V3: prefix + 88 byte base64 (64 byte raw). */
-  if (key_len < 89) {
-    NOX_ERROR(LOG_MOD_NET, "key_out buffer çok küçük (%zu byte)", key_len);
-    return NOX_ERR_OVERFLOW;
-  }
+  NOX_INFO(LOG_MOD_NET, "Hidden Service (ghost): %s", onion_out);
 
-  char *priv = strstr(resp, "PrivateKey=ED25519-V3:");
-  if (!priv) {
-    NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtında PrivateKey yok");
-    return NOX_ERR_TOR;
-  }
-  priv += 22; /* strlen("PrivateKey=ED25519-V3:") */
-
-  /* Buffer taşma koruması — 88 byte base64 + sonraki satır kontrolü */
-  size_t priv_remaining = strlen(priv);
-  if (priv_remaining < 88) {
-    NOX_ERROR(LOG_MOD_NET, "PrivateKey base64 truncated (%zu byte)", priv_remaining);
-    return NOX_ERR_TOR;
-  }
-
-  size_t pi = 0;
-  while (pi < 88 && priv[pi] && priv[pi] != '\r' && priv[pi] != '\n')
-    pi++;
-  if (pi != 88) {
-    NOX_ERROR(LOG_MOD_NET, "PrivateKey base64 uzunluğu hatalı: %zu", pi);
-    return NOX_ERR_TOR;
-  }
-
-  memcpy(key_out, priv, 88);
-  key_out[88] = '\0';
-
-  NOX_INFO(LOG_MOD_NET, "Hidden Service (yeni): %s", onion_out);
-  explicit_bzero(resp, sizeof(resp)); /* Tor yanıt buffer'ındaki hassas veriyi temizle */
-  return NOX_OK;
+cleanup:
+  explicit_bzero(cmd, sizeof(cmd));
+  explicit_bzero(resp, sizeof(resp));
+  return err;
 }
 
-__attribute__((strub)) nox_err_t tor_create_persistent_hs(int ctrl_fd, const char *listen_path,
-                                    const char *onion_key_b64,
-                                    char *onion_out, size_t onion_len) {
+/* Normal mod: ADD_ONION ED25519-V3:b64 — seed'den expanded türetip gönderir.
+ * Dosyadan b64 okumak YOK (D3). D4: tüm çıkış yollarında buffer'lar sıfırlanır.
+ * D5: Flags=Detach YOK. D10: master_key parametre — state'ten bağımsız. */
+__attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *listen_path,
+                                  const uint8_t master_key[NOX_KEY_LEN],
+                                  char *onion_out, size_t onion_len) {
   /* NET-4 FIX: CRLF injection koruması */
   if (strchr(listen_path, '\r') || strchr(listen_path, '\n')) {
     NOX_ERROR(LOG_MOD_NET, "listen_path CRLF injection engellendi");
     return NOX_ERR_CONFIG;
   }
-  if (!onion_key_b64 || strnlen(onion_key_b64, 89) != 88) {
-    NOX_ERROR(LOG_MOD_NET, "geçersiz onion key (88 byte base64 bekleniyor)");
-    return NOX_ERR_CONFIG;
+
+  uint8_t onion_seed[32];
+  uint8_t pub[32];
+  uint8_t expanded_sk[64];
+  char b64_key[NOX_ONION_KEY_B64_MAX + 1];
+  char cmd[256];
+  char resp[512];
+  int n;
+  nox_err_t err = NOX_ERR_TOR;
+
+  sodium_memzero(onion_seed, sizeof(onion_seed));
+  sodium_memzero(pub, sizeof(pub));
+  sodium_memzero(expanded_sk, sizeof(expanded_sk));
+  b64_key[0] = '\0';
+
+  /* 1. Seed türet (disk YOK — master_key'den, D3) */
+  if ((err = crypto_derive_onion_seed(onion_seed, master_key)) != NOX_OK)
+    goto cleanup;
+
+  /* 2. Seed → DOĞRU Tor formatında expanded key + pub (3. tur KRİTİK:
+   *    crypto_sign_seed_keypair'ın sk'si [seed||pub] üretir; Tor
+   *    [clamped_scalar||prefix] bekler. derive_tor_expanded_key ŞART.) */
+  if (derive_tor_expanded_key(expanded_sk, pub, onion_seed) != NOX_OK) {
+    err = NOX_ERR_CRYPTO;
+    goto cleanup;
   }
 
-  char cmd[256];
-  int n = snprintf(cmd, sizeof(cmd),
+  /* 3. 64B expanded → base64 (88 char + NUL) */
+  if (sodium_bin2base64(b64_key, sizeof(b64_key),
+                        expanded_sk, sizeof(expanded_sk),
+                        sodium_base64_VARIANT_ORIGINAL) == NULL) {
+    err = NOX_ERR_CRYPTO;
+    goto cleanup;
+  }
+
+  /* 4. D7 (M-4 fix): charset doğrulaması — Tor'a gitmeden ÖNCE */
+  if (strspn(b64_key,
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != NOX_ONION_KEY_B64_MAX) {
+    NOX_ERROR(LOG_MOD_NET, "derived b64 charset dışı — türetme hatası");
+    err = NOX_ERR_CRYPTO;
+    goto cleanup;
+  }
+
+  /* 5. ADD_ONION — CRLF injection koruması (listen_path) aynen kalır */
+  n = snprintf(cmd, sizeof(cmd),
                    "ADD_ONION ED25519-V3:%s Port=%u,unix:%s\r\n",
-                   onion_key_b64, NOX_VIRTUAL_PORT, listen_path);
-  if (n <= 0 || (size_t)n >= sizeof(cmd))
-    return NOX_ERR_OVERFLOW;
+                   b64_key, NOX_VIRTUAL_PORT, listen_path);
+  if (n <= 0 || (size_t)n >= sizeof(cmd)) {
+    err = NOX_ERR_OVERFLOW;
+    goto cleanup;
+  }
 
-  nox_err_t err = ctrl_send_command(ctrl_fd, cmd);
-  explicit_bzero(cmd, sizeof(cmd)); /* Hassas key'i stack'ten temizle */
-  if (err != NOX_OK)
-    return err;
+  if ((err = ctrl_send_command(ctrl_fd, cmd)) != NOX_OK)
+    goto cleanup;
 
-  char resp[512];
+  /* 6. ServiceID parse */
   err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_READ_TIMEOUT_MS);
-  if (err != NOX_OK)
-    return err;
+  if (err == NOX_OK)
+    err = parse_service_id(resp, onion_out, onion_len);
 
-  /* Persistent HS'ta PrivateKey yanıtı olmaz — sadece ServiceID */
-  err = parse_service_id(resp, onion_out, onion_len);
-  if (err != NOX_OK)
-    return err;
-
-  NOX_INFO(LOG_MOD_NET, "Hidden Service (kalıcı): %s", onion_out);
-  return NOX_OK;
+cleanup:
+  /* D4 — TEK noktadan temizlik, başarı veya hata fark etmez */
+  sodium_memzero(onion_seed, sizeof(onion_seed));
+  sodium_memzero(pub, sizeof(pub));          /* Q3: pub da sıfırlanır */
+  sodium_memzero(expanded_sk, sizeof(expanded_sk));
+  sodium_memzero(b64_key, sizeof(b64_key));
+  explicit_bzero(cmd, sizeof(cmd));
+  explicit_bzero(resp, sizeof(resp));
+  NOX_DEBUG(LOG_MOD_NET,
+            "onion materyali bellekten silindi (seed, pub, expanded, b64)");
+  return err;
 }
 
 /* ================================================================
@@ -1414,14 +1452,22 @@ nox_err_t epoll_setup(struct app_state *state, int listen_fd) {
   }
 
   nox_err_t err = epoll_add_fd(efd, STDIN_FILENO);
-  if (err != NOX_OK)
+  if (err != NOX_OK) {
+    /* B4 FIX: epoll_add_fd başarısızsa efd'yi kapat — leak yok. */
+    close(efd);
+    state->epoll_fd = -1;
     return err;
+  }
 
   /* Global listener */
   if (listen_fd >= 0) {
     err = epoll_add_fd(efd, listen_fd);
-    if (err != NOX_OK)
+    if (err != NOX_OK) {
+      /* B4 FIX: aynı — hata yolunda efd kapat. */
+      close(efd);
+      state->epoll_fd = -1;
       return err;
+    }
   }
 
   NOX_INFO(LOG_MOD_NET, "epoll hazır (stdin + listener)");
@@ -1458,6 +1504,12 @@ nox_err_t frame_header_decode(const uint8_t *wire, struct frame_header *hdr) {
 
   if (hdr->magic != NOX_FRAME_MAGIC) {
     NOX_ERROR(LOG_MOD_NET, "frame magic hatalı: 0x%08x", hdr->magic);
+    return NOX_ERR_PROTO;
+  }
+
+  /* L-7 FIX: bilinmeyen frame tipi sessizce yutulmasın */
+  if (hdr->type < NOX_MSG_TEXT || hdr->type > NOX_MSG_CTRL) {
+    NOX_ERROR(LOG_MOD_NET, "frame tipi bilinmiyor: %u", hdr->type);
     return NOX_ERR_PROTO;
   }
 

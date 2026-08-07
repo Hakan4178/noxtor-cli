@@ -64,7 +64,7 @@ enum nox_subkey_id {
     NOX_SUBKEY_DB               = 1,
     NOX_SUBKEY_IDENTITY_UNLOCK  = 2,
     NOX_SUBKEY_SESSION          = 3,
-    /* Gelecekte: NOX_SUBKEY_RATCHET_ROOT = 4, ... */
+    NOX_SUBKEY_ONION_SEED       = 4,
 };
 
 /* ================================================================
@@ -262,9 +262,79 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
     }
 
     NOX_INFO(LOG_MOD_CRYPTO,
-             "subkey'ler türetildi (db, identity_unlock, session)");
+             "subkey'ler türetildi (db, identity_unlock, session, onion)");
     return NOX_OK;
 }
+
+/* ================================================================
+ * 2.2: ONION SEED TÜRETME — master_key → onion_seed
+ *
+ * D1 (onion-key-derived-plan): NOX_SUBKEY_ONION_SEED = 4.
+ * D2: mevcut NOX_KDF_CTX "noxtor__" kullanılır — sadece subkey_id ayırır.
+ * Seed hiçbir yerde saklanmaz (D3) — her açılışta yeniden türetilir.
+ * ================================================================ */
+__attribute__((strub))
+nox_err_t crypto_derive_onion_seed(uint8_t onion_seed[32],
+                                   const uint8_t master_key[NOX_KEY_LEN])
+{
+    if (!onion_seed || !master_key)
+        return NOX_ERR_CRYPTO;
+    if (crypto_kdf_derive_from_key(onion_seed, 32,
+                                   NOX_SUBKEY_ONION_SEED,
+                                   NOX_KDF_CTX, master_key) != 0) {
+        sodium_memzero(onion_seed, 32);
+        return NOX_ERR_CRYPTO;
+    }
+    NOX_DEBUG(LOG_MOD_CRYPTO, "onion seed türetildi");
+    return NOX_OK;
+}
+
+/* ================================================================
+ * 2.2: TOR EXPANDED KEY TÜRETME — seed → [clamped_scalar || prefix]
+ *
+ * KRİTİK (3. tur): libsodium sk = [seed(32)||pub(32)] — Tor ADD_ONION
+ * ED25519-V3 BU FORMATI BEKLEMEZ. Tor formatı = [clamped_scalar(32)||
+ * prefix(32)] (RFC 8032 §5.1.5 expanded secret key). Bu fonksiyon SHA-512
+ * + clamp ile Tor'un kendi ed25519_secret_key_from_seed'ine BİREBİR uyumlu
+ * expanded key üretir. pub, crypto_sign_seed_keypair'den alınır — aynı
+ * clamp+scalarmult'u içerdiği için Tor'un scalar'dan türeteceği pub ile
+ * birebir aynıdır (kanıt: tests/test_onion_derive.c vektör testi).
+ * ================================================================ */
+__attribute__((strub))
+nox_err_t derive_tor_expanded_key(uint8_t expanded_out[64],
+                                  uint8_t pub_out[32],
+                                  const uint8_t seed[32])
+{
+    if (!expanded_out || !pub_out || !seed)
+        return NOX_ERR_CRYPTO;
+
+    uint8_t h[64];
+    crypto_hash_sha512(h, seed, 32);
+
+    /* Clamp — RFC 8032 §5.1.5: h[0] &= 248; h[31] &= 63; h[31] |= 64.
+     * Not: h[31] &= 63 (0x3F) yerine & 127 de yazılabilirdi — bit 6 zaten
+     * sonraki |= 64 ile kayıtsız şartsız 1 yapılıyor, sonuç özdeş.
+     * 0x3F, RFC 8032'nin orijinal formülüyle birebir yazılımı. */
+    h[0]  &= 248;
+    h[31] &= 63;
+    h[31] |= 64;
+
+    memcpy(expanded_out, h, 64);   /* Tor'a gidecek gerçek KeyBlob */
+    sodium_memzero(h, sizeof(h));  /* clamp'lenmiş scalar (private key) stack'te
+                                    * crypto_sign_seed_keypair boyunca bekletilmez */
+
+    /* pub: libsodium pk çıktısı GÜVENİLİR (aynı clamp+scalarmult).
+     * sk dummy olarak alınıp hemen sıfırlanır — içeriği kullanılmaz. */
+    uint8_t dummy_sk[64];
+    if (crypto_sign_seed_keypair(pub_out, dummy_sk, seed) != 0) {
+        sodium_memzero(expanded_out, 64);
+        sodium_memzero(dummy_sk, sizeof(dummy_sk));
+        return NOX_ERR_CRYPTO;
+    }
+    sodium_memzero(dummy_sk, sizeof(dummy_sk));
+    return NOX_OK;
+}
+
 
 /* ================================================================
  * 2.2: SALT YÖNETİMİ
@@ -462,6 +532,11 @@ nox_err_t crypto_generate_identity(const char *identity_path,
         goto cleanup;
     }
 
+    /* sk'nin son kullanımı buradaydı — dosya I/O'su (open/write/fsync/rename)
+     * boyunca private key canlı tutulmasın. sodium_free kendi memzero yapar. */
+    sodium_free(sk);
+    sk = NULL;
+
     /* [A-1] Dosyaya yaz: tmp + O_EXCL (atomic write) */
     /* CodeQL #9 cpp/path-injection: tmp_path identity_path + ".tmp.PID.RND" */
     assert(strncmp(tmp_path, identity_path, strlen(identity_path)) == 0);
@@ -523,7 +598,8 @@ cleanup:
     }
 
     /* [P6] Tek noktadan temizleme */
-    sodium_free(sk);                                  /* sk — sodium heap */
+    if (sk)
+        sodium_free(sk);                              /* sk — sodium heap */
     explicit_bzero(ciphertext, sizeof(ciphertext));
     explicit_bzero(nonce,      sizeof(nonce));
     explicit_bzero(pk,         sizeof(pk));

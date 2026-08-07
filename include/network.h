@@ -28,8 +28,10 @@
  *
  * tor_authenticate: Cookie dosyasını okur, hex olarak gönderir + siler.
  * tor_wait_bootstrap: timeout ile %100 bootstrap bekler.
- * tor_create_new_hs: ADD_ONION NEW:ED25519-V3 — yeni HS + PrivateKey kaydet.
- * tor_create_persistent_hs: ADD_ONION ED25519-V3:<key> — kayıtlı key ile HS.
+ * tor_create_new_hs: ADD_ONION NEW:ED25519-V3 Flags=DiscardPK — ghost mod
+ *                    (ephemeral, key Tor'da kalır, client'a dönmez).
+ * tor_create_derived_hs: ADD_ONION ED25519-V3:<derived key> — normal mod
+ *                    (master_key'den deterministik türetme, dosya YOK).
  * tor_shutdown: SIGNAL SHUTDOWN + waitpid + dizin temizliği.
  * ================================================================ */
 
@@ -42,20 +44,21 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir);
 /* Bootstrap %100 olana kadar bekle */
 nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec);
 
-/* Yeni Hidden Service üret — ServiceID + PrivateKey döndür.
+/* Ghost mod Hidden Service — ADD_ONION NEW:ED25519-V3 Flags=DiscardPK (D6).
+ * Key'i TOR üretir, PrivateKey yanıtı GELMEZ, her açılışta farklı adres.
+ * Detach YOK: control connection kapanınca hizmet otomatik silinir (D5).
  * listen_path: AF_UNIX socket yolu (ADD_ONION unix: prefix ile)
- * onion_out: 63 byte (56 base32 + ".onion\0")
- * key_out: 89 byte (88 base64 + "\0") */
-__attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
-                             char *onion_out, size_t onion_len,
-                             char *key_out, size_t key_len);
-
-/* Kayıtlı ED25519-V3 private key ile Hidden Service oluştur.
- * onion_key_b64: 88 byte base64 key (ED25519-V3: prefix'siz)
  * onion_out: 63 byte (56 base32 + ".onion\0") */
-__attribute__((strub)) nox_err_t tor_create_persistent_hs(int ctrl_fd, const char *listen_path,
-                                    const char *onion_key_b64,
-                                    char *onion_out, size_t onion_len);
+__attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
+                             char *onion_out, size_t onion_len);
+
+/* Normal mod Hidden Service — master_key'den deterministik türetme (D3/D10).
+ * onion_seed → expanded key → ADD_ONION ED25519-V3:<b64>. Dosya okumak YOK.
+ * master_key: PIN+salt → Argon2id çıktısı (state'ten bağımsız, birim test edilir)
+ * onion_out: 63 byte (56 base32 + ".onion\0") */
+__attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *listen_path,
+                                  const uint8_t master_key[NOX_KEY_LEN],
+                                  char *onion_out, size_t onion_len);
 
 /* Onion v3 adres doğrulaması — base32 + ".onion" suffix.
  * 62 karakter tam v3 .onion adresi için true döner.

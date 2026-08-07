@@ -204,6 +204,7 @@ static void dummy_contact_visitor(const char *onion, const char *name,
 
 static void dummy_history_visitor(const char *text, bool is_outgoing,
                                   time_t timestamp, void *ctx) {
+  (void)text; (void)is_outgoing; (void)timestamp;
   int *cnt = (int *)ctx;
   (*cnt)++;
 }
@@ -293,7 +294,10 @@ static int test_db_history(void)
  * ================================================================ */
 int main(void)
 {
-    sodium_init();
+    if (sodium_init() < 0) {
+        fprintf(stderr, "libsodium başlatılamadı\n");
+        return 1;
+    }
     randombytes_buf(g_dummy_key, NOX_KEY_LEN);
 
     fprintf(stderr, "=== DATABASE MODÜLÜ TESTLERİ ===\n");

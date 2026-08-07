@@ -117,6 +117,14 @@ WARN_BASE := \
     -Wvla \
     -Wformat-overflow=2 \
     -Wstrict-overflow=5 \
+    -Wswitch-enum \
+    -Wswitch-default \
+    -Wconversion \
+    -Wsign-conversion \
+    -Wpointer-arith \
+    -Wsuggest-attribute=noreturn \
+    -Wformat-nonliteral \
+    -Wformat-signedness \
     -Wundef \
     -Wredundant-decls
 
@@ -157,7 +165,9 @@ DEBUG_FLAGS := \
     -fsanitize-address-use-after-scope \
     -fsanitize=float-divide-by-zero \
     -fsanitize=signed-integer-overflow \
-    -fno-sanitize-recover=all
+    -fno-sanitize-recover=all \
+    -ftrivial-auto-var-init=zero \
+    -Wtrivial-auto-var-init
 
 # ================================================================
 # RELEASE BUILD (make release)
@@ -170,6 +180,15 @@ RELEASE_FLAGS := \
     -fno-omit-frame-pointer \
     -fcf-protection=full \
     -fhardened \
+    -Wuse-after-free=3 \
+    -Wdangling-pointer=2 \
+    -Warray-bounds=2 \
+    -Wstringop-overflow=4 \
+    -ftrivial-auto-var-init=zero \
+    -Wtrivial-auto-var-init \
+    -fzero-call-used-regs=used-gpr \
+    -fno-plt \
+    -Whardened \
     -DNDEBUG
 
 RELEASE_LINK := \
@@ -210,9 +229,11 @@ UBSAN_OPTS := print_stacktrace=1:halt_on_error=1
 # ================================================================
 # HEDEFLER
 # ================================================================
-.PHONY: all debug release _release_build analyze test fuzz fuzz-run clean
+.PHONY: all debug release _release_build analyze test test-onion fuzz fuzz-run clean
 
-# Varsayılan hedef
+# Varsayılan hedef — -include edilen .d dosyalarındaki kuralların ilk hedef
+# hâline gelmesini (src/arena.o) engellemek için açıkça belirtilir
+.DEFAULT_GOAL := all
 all: debug
 
 # ----------------------------------------------------------------
@@ -293,7 +314,17 @@ test: $(TEST_BINS)
 	        failed=1; \
 	    fi; \
 	done; \
+	if [ $$failed -eq 0 ] && [ -x $(TEST_DIR)/test_onion_derive.sh ]; then \
+	    echo ">> onion e2e (determinizm + canlı Tor)"; \
+	    $(TEST_DIR)/test_onion_derive.sh || failed=1; \
+	fi; \
 	[ $$failed -eq 0 ] && echo "=== Tüm testler başarılı ===" || exit 1
+
+# ----------------------------------------------------------------
+# ONION E2E — determinizm + canlı Tor ADD_ONION (kriptograf 3. tur kanıtı)
+# ----------------------------------------------------------------
+test-onion: $(TEST_DIR)/test_onion_derive
+	$(Q)$(TEST_DIR)/test_onion_derive.sh
 
 # Test binary kuralı — .test.o objelerine link eder (main.test.o hariç)
 # Testlerin kendi main() fonksiyonu var, src/main.test.o çakışır

@@ -63,10 +63,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/syscall.h> /* SYS_arch_prctl */
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h> /* nanosleep, struct timespec */
 #include <unistd.h>
 
+#include <asm/prctl.h> /* ARCH_SHSTK_LOCK (x86_64 CET-SS) */
 #include <errno.h>
 #include <libgen.h> /* basename */
 #include <sodium.h>
@@ -97,6 +100,11 @@ static void signal_handler(int sig) {
 static void sigchld_handler(int sig) {
   (void)sig;
   g_tor_died = 1;
+  /* L-5 FIX: zombie reap — waitpid async-signal-safe, WNOHANG ile
+   * kilitlenmeden çalışır; yoksa Tor çocuğu zombie kalır ve
+   * kill(pid,0)==0 zombie'de de true döndüğünden yedek kontrol
+   * çalışmaz. */
+  waitpid(-1, NULL, WNOHANG);
 }
 
 /* ================================================================
@@ -336,9 +344,14 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
   bool is_terminal = (tcgetattr(STDIN_FILENO, &old_term) == 0);
 
   if (is_terminal) {
-    /* Terminal modu — echo kapat */
+    /* Terminal modu — echo kapat, canonical aç.
+     * setup_terminal() ICANON kapatmıştı (raw): backspace/erase satır
+     * düzenleyici tarafından işlenmezdi ve PIN'e 0x7f karakteri girer,
+     * "geçersiz PIN"e yol açardı. ICANON geri açılınca terminal kendi
+     * silme/düzenleme özelliklerini çalıştırır. */
     struct termios new_term = old_term;
     new_term.c_lflag &= ~((tcflag_t)ECHO);
+    new_term.c_lflag |= ICANON;
     tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
   } else {
     NOX_DEBUG(LOG_MOD_MAIN, "stdin terminal değil — pipe modu");
@@ -658,12 +671,16 @@ int main(int argc, char *argv[]) {
 
     /* ── 0. Komut satırı argümanları ───────────────────── */
     bool ghost_mode = false;
+    bool allow_unsandboxed_fs = false;
     for (int i = 1; i < argc; i++) {
       if (strcmp(argv[i], "--ghost") == 0 || strcmp(argv[i], "-ghost") == 0) {
         ghost_mode = true;
+      } else if (strcmp(argv[i], "--allow-unsandboxed-fs") == 0) {
+        allow_unsandboxed_fs = true;
       }
     }
     state.ghost_mode = ghost_mode;
+    state.allow_unsandboxed_fs = allow_unsandboxed_fs;
 
     if (argc >= 2 && strcmp(argv[1], "--full_cleankeys") == 0) {
       /*
@@ -845,7 +862,49 @@ int main(int argc, char *argv[]) {
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 #endif
 
-    /* ── 8c. CAP_NET_RAW ──────────────────────────────────────
+    /* ── 8c. CET-SS kilidi + self-test (release-only) ──────────
+     * Kernel/glibc, ELF shstk notuna göre (-Wl,-z,shstk) main thread'i
+     * shadow stack'li başlatır — ARCH_SHSTK_ENABLE gerekmez. Burada
+     * mevcut durum dondurulur: ARCH_SHSTK_LOCK sonrası ENABLE/DISABLE
+     * imkânsız (geri dönüşümsüz). WRSS da kilitlenir — açılırsa shadow
+     * stack'e yazılabildiği için korumayı etkisiz kılardı.
+     * Kilitlenmemiş shadow stack, RCE sonrası tek syscall ile
+     * kapatılabilen kozmetik savunma olurdu (THREAT_MODEL.md madde).
+     * CPU desteklemiyorsa (cpu_has_shstk) sessizce atlanır. */
+#ifdef NDEBUG
+    if (cpu_has_shstk()) {
+#ifdef ARCH_SHSTK_LOCK
+      long rc_lock = syscall(SYS_arch_prctl, ARCH_SHSTK_LOCK,
+                             ARCH_SHSTK_SHSTK | ARCH_SHSTK_WRSS);
+      if (rc_lock != 0)
+        NOX_WARN(LOG_MOD_HARD,
+                 "CET-SS kilitlenemedi (errno=%d) — shadow stack koruması kapatılabilir",
+                 errno);
+#endif
+      /* Self-test: /proc/self/status doğrulaması — "derlendi" ile
+       * "runtime'da kilitli" arasındaki fark asla varsayılmaz. */
+      int fd_st = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+      if (fd_st >= 0) {
+        /* static: 16KB stack'i şişirmemek için .bss'e alınır (tek seferlik) */
+        static char stbuf[16384];
+        ssize_t n_st = read(fd_st, stbuf, sizeof(stbuf) - 1);
+        close(fd_st);
+        if (n_st > 0) {
+          stbuf[n_st] = '\0';
+          const char *feat = strstr(stbuf, "x86_Thread_features_locked:");
+          if (feat != NULL && strstr(feat, "shstk") != NULL)
+            NOX_INFO(LOG_MOD_HARD, "CET-SS: shadow stack AKTİF ve KİLİTLİ");
+          else
+            NOX_WARN(LOG_MOD_HARD,
+                     "CET-SS self-test: kilitli shadow stack doğrulanamadı — koruma kapalı olabilir");
+          /* sodium_init'e bağımlı değil — glibc explicit_bzero */
+          explicit_bzero(stbuf, sizeof(stbuf));
+        }
+      }
+    }
+#endif
+
+    /* ── 8d. CAP_NET_RAW ──────────────────────────────────────
      * PR_CAPBSET_DROP normal kullanıcıda çalışmaz (CAP_SETPCAP gerekir).
      * Raw socket engelleme seccomp stage 2'de yapılıyor (AF_PACKET,
      * SOCK_RAW KILL kuralı). Bu blok sadece root/sudo için korunuyor. */
@@ -921,6 +980,16 @@ int main(int argc, char *argv[]) {
                 nox_strerror(err));
       arena_destroy(&state.arena);
       return 1;
+    }
+
+    if (state.ghost_mode) {
+      /* Ghost: master_key bundan sonra hiçbir yerde kullanılmıyor (HS
+       * NEW:ED25519-V3 — deterministik türetme yok) — en erken sil. */
+      sodium_memzero(state.master_key, NOX_KEY_LEN);
+      memory_barrier();
+      state.master_key = NULL;
+      NOX_INFO(LOG_MOD_MAIN,
+               "MASTER_KEY BELLEKTEN SİLİNDİ (GHOST MOD — SUBKEY'LER YETERLİ)");
     }
 
     /* ── 11. Identity key yükle, oluştur ve Curve25519'a dönüştür ── */
@@ -1160,79 +1229,41 @@ int main(int argc, char *argv[]) {
         return 1;
       }
 
-      /* HS — onion.key dosyasından veya yeni üret */
-      {
-        char onion_key_path[NOX_PATH_MAX];
-        {
-          size_t okp_len = strlen(state.config_dir);
-          if (okp_len + 10 < NOX_PATH_MAX) {
-            memcpy(onion_key_path, state.config_dir, okp_len);
-            memcpy(onion_key_path + okp_len, "/onion.key", 10);
-          } else {
-            onion_key_path[0] = '\0';
-          }
+      /* HS — ghost: NEW + DiscardPK (her açılışta farklı adres, key hiçbir
+       * yerde — ne diskte ne client'ta). Normal: master_key'den deterministik
+       * türetme (her açılışta AYNI adres, onion.key dosyası YOK). */
+      if (state.ghost_mode) {
+        NOX_DEBUG(LOG_MOD_MAIN,
+                  "onion seed türetilmedi (ghost mod — key Tor'da, DiscardPK)");
+        err = tor_create_new_hs(state.tor_ctrl_fd, state.listen_path,
+                                state.onion_addr, sizeof(state.onion_addr));
+        if (err != NOX_OK) {
+          if (g_shutdown) goto shutdown_clean;
+          NOX_FATAL(LOG_MOD_MAIN, "HS kurulumu başarısız: %s",
+                    nox_strerror(err));
+          cleanup(&state);
+          return 1;
         }
-
-        char saved_key[NOX_ONION_KEY_B64_LEN + 1];
-        saved_key[0] = '\0';
-
-        int key_fd = open(onion_key_path, O_RDONLY | O_NOFOLLOW);
-        if (key_fd >= 0) {
-          ssize_t n = read(key_fd, saved_key, NOX_ONION_KEY_B64_LEN);
-          close(key_fd);
-          if (n == (ssize_t)NOX_ONION_KEY_B64_LEN) {
-            saved_key[NOX_ONION_KEY_B64_LEN] = '\0';
-          } else {
-            saved_key[0] = '\0';
-          }
+        NOX_INFO(LOG_MOD_MAIN, "adresiniz (geçici): %s", state.onion_addr);
+      } else {
+        err = tor_create_derived_hs(state.tor_ctrl_fd, state.listen_path,
+                                    state.master_key,
+                                    state.onion_addr, sizeof(state.onion_addr));
+        /* master_key'in SON kullanımı buradaydı — hemen sil (başarı/hata
+         * fark etmez; hata yolunda arena_destroy zaten wipe eder) */
+        sodium_memzero(state.master_key, NOX_KEY_LEN);
+        memory_barrier();
+        state.master_key = NULL;
+        NOX_INFO(LOG_MOD_MAIN,
+                 "MASTER_KEY BELLEKTEN SİLİNDİ (HS KURULUMU TAMAM)");
+        if (err != NOX_OK) {
+          if (g_shutdown) goto shutdown_clean;
+          NOX_FATAL(LOG_MOD_MAIN, "HS kurulumu başarısız: %s",
+                    nox_strerror(err));
+          cleanup(&state);
+          return 1;
         }
-
-        if (saved_key[0] != '\0') {
-          err = tor_create_persistent_hs(state.tor_ctrl_fd, state.listen_path,
-                                          saved_key,
-                                          state.onion_addr,
-                                          sizeof(state.onion_addr));
-          explicit_bzero(saved_key, sizeof(saved_key));
-          if (err != NOX_OK) {
-            if (g_shutdown) goto shutdown_clean;
-            NOX_FATAL(LOG_MOD_MAIN, "Persistent HS başarısız: %s",
-                      nox_strerror(err));
-            cleanup(&state);
-            return 1;
-          }
-          NOX_INFO(LOG_MOD_MAIN, "adresiniz (kalıcı): %s", state.onion_addr);
-        } else {
-          err = tor_create_new_hs(state.tor_ctrl_fd, state.listen_path,
-                                   state.onion_addr, sizeof(state.onion_addr),
-                                   saved_key, sizeof(saved_key));
-          if (err != NOX_OK) {
-            explicit_bzero(saved_key, sizeof(saved_key));
-            if (g_shutdown) goto shutdown_clean;
-            NOX_FATAL(LOG_MOD_MAIN, "Yeni HS başarısız: %s",
-                      nox_strerror(err));
-            cleanup(&state);
-            return 1;
-          }
-
-          key_fd = open(onion_key_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-          if (key_fd >= 0) {
-            nox_err_t werr = write_full(key_fd, saved_key, NOX_ONION_KEY_B64_LEN);
-            close(key_fd);
-            if (werr != NOX_OK) {
-              NOX_WARN(LOG_MOD_MAIN, "onion key yazılamadı: %s",
-                       nox_strerror(werr));
-            } else {
-              NOX_INFO(LOG_MOD_MAIN, "onion key kaydedildi: %s",
-                       onion_key_path);
-            }
-          } else {
-            NOX_WARN(LOG_MOD_MAIN, "onion key dosyaya yazılamadı: %s",
-                     strerror(errno));
-          }
-
-          explicit_bzero(saved_key, sizeof(saved_key));
-          NOX_INFO(LOG_MOD_MAIN, "adresiniz: %s", state.onion_addr);
-        }
+        NOX_INFO(LOG_MOD_MAIN, "adresiniz (kalıcı): %s", state.onion_addr);
       }
     }
 

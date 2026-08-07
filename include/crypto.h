@@ -71,6 +71,31 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
                                 uint8_t identity_unlock_key[NOX_KEY_LEN],
                                 uint8_t session_key[NOX_KEY_LEN]);
 
+/*
+ * crypto_derive_onion_seed — master_key'den onion seed türet (D1/D2)
+ *
+ * Subkey ID = NOX_SUBKEY_ONION_SEED (4), ctx = NOX_KDF_CTX.
+ * Seed diskte SAKLANMAZ (D3) — her açılışta yeniden türetilir.
+ * @onion_seed: Çıktı, 32 byte
+ * @master_key: master_key (PIN + salt → Argon2id çıktısı)
+ */
+__attribute__((strub))
+nox_err_t crypto_derive_onion_seed(uint8_t onion_seed[32],
+                                   const uint8_t master_key[NOX_KEY_LEN]);
+
+/*
+ * derive_tor_expanded_key — onion seed → Tor ADD_ONION KeyBlob (3. tur KRİTİK)
+ *
+ * libsodium crypto_sign_seed_keypair'ın sk çıktısı [seed||pub] üretir —
+ * Tor'un beklediği [clamped_scalar||prefix] (RFC 8032 §5.1.5 expanded)
+ * DEĞİLDİR. Bu fonksiyon SHA-512 + clamp ile Tor uyumlu 64-byte key üretir.
+ * pub_out, Tor'un scalar'dan türeteceği public key ile birebir aynıdır.
+ */
+__attribute__((strub))
+nox_err_t derive_tor_expanded_key(uint8_t expanded_out[64],
+                                  uint8_t pub_out[32],
+                                  const uint8_t seed[32]);
+
 /* ================================================================
  * IDENTITY KEY YÖNETİMİ
  *

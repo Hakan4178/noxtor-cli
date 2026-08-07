@@ -289,6 +289,7 @@ struct app_state {
     bool     running;            /* false olunca event loop çıkar    */
     bool     first_run;          /* ilk çalıştırma mı                */
     bool     ghost_mode;         /* --ghost veya -ghost: SQLite yok  */
+    bool     allow_unsandboxed_fs; /* --allow-unsandboxed-fs: Landlock yoksa da devam */
     bool     queue_flushed;      /* kuyruk ilk peer mesajında gönderildi */
     size_t   prompt_display_len; /* prompt'un terminal karakter genişliği */
 
