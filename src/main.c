@@ -83,6 +83,15 @@
 #include <sodium.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+
+/* K-4 FIX: ASan/LSan build'lerinde exit() → LSan leak-check fork() → seccomp
+ * stage 2 SIGSYS. NDEBUG (release) build'lerde LSan yok — exit() güvenli,
+ * atexit(restore_terminal) + stdio flush korunur. */
+#ifdef NDEBUG
+#define NOX_EXIT(code) return (code)
+#else
+#define NOX_EXIT(code) _exit(code)
+#endif
 #include <sys/resource.h>
 #include <sys/uio.h>
 #include <assert.h>
@@ -107,12 +116,18 @@ static void signal_handler(int sig) {
 
 static void sigchld_handler(int sig) {
   (void)sig;
-  g_tor_died = 1;
-  /* L-5 FIX: zombie reap — waitpid async-signal-safe, WNOHANG ile
-   * kilitlenmeden çalışır; yoksa Tor çocuğu zombie kalır ve
-   * kill(pid,0)==0 zombie'de de true döndüğünden yedek kontrol
-   * çalışmaz. */
-  waitpid(-1, NULL, WNOHANG);
+  /* K-2 FIX: errno'yu koru (handler async — ana akış EINTR/EAGAIN
+   * kontrollerini bozar), while ile TÜM zombileri topla (sinyal
+   * birleşmesi — tek SIGCHLD'de birden çok çocuk ölebilir) ve
+   * g_tor_died yalnızca TOR çocuğu öldüğünde set et (obfs4proxy vb.
+   * gelecekteki fork'lardan false positive gelmesin). */
+  int saved_errno = errno;
+  pid_t p;
+  while ((p = waitpid(-1, NULL, WNOHANG)) > 0) {
+    if (p == (pid_t)g_tor_pid)
+      g_tor_died = 1;
+  }
+  errno = saved_errno;
 }
 
 /* ================================================================
@@ -135,6 +150,18 @@ static void seccomp_stage1_early(void) {
   }
 }
 #endif
+
+/* K-7/Y-1 FIX: main()'den ÖNCE dumpable + core dump engeli. Eski kod adım
+ * 8b'de yapıyordu — PIN (adım 6) o noktada HENÜZ OKUNMUŞTU ve süreç
+ * ptrace/core-dump'a açıktı. Constructor seccomp stage 1'den bile önce
+ * çalışır (seccomp'ta PR_SET_DUMPABLE KILL kuralı stage 2'de, çakışma yok;
+ * setrlimit seccomp'ta yasaklı değil). NO_SECCOMP build'de de aktif. */
+__attribute__((constructor))
+static void early_hardening_init(void) {
+  prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+  struct rlimit core_zero = {0, 0};
+  (void)setrlimit(RLIMIT_CORE, &core_zero);
+}
 
 static void setup_signal_handlers(void) {
   struct sigaction sa = {
@@ -347,6 +374,38 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
  * Terminal echo'su kapatılır → PIN ekranda görünmez.
  * Interrupt gelirse echo geri açılır (cleanup).
  * ================================================================ */
+/* K-7 FIX: byte-by-byte read — stdio katmanı tamamen devre dışı. glibc'nin
+ * BUFSIZ heap tamponu hiç oluşmaz; kernel read() doğrudan arayanın
+ * sodium_malloc sayfasına yazar (guard page + mlock). Kısmi read imkânsız
+ * (1 byte'lık çağrılar), EINTR'da retry, cap dolduysa truncation bildirilir.
+ * Dönüş: 0 = tam satır (NUL-terminated, \r\n strip'li), -1 = hata/EOF/truncation. */
+static int read_line_secure(char *buf, size_t cap) {
+  size_t n = 0;
+  while (n + 1 < cap) {
+    char c;
+    ssize_t r = read(STDIN_FILENO, &c, 1);
+    if (r < 0) {
+      if (errno == EINTR) continue; /* K-2: sigchld handler errno'yu korur */
+      sodium_memzero(buf, n);
+      return -1;
+    }
+    if (r == 0) { /* EOF — kalanları satır say */
+      if (n == 0) { sodium_memzero(buf, cap); return -1; }
+      buf[n] = '\0';
+      return 0;
+    }
+    if (c == '\n') {
+      buf[n] = '\0';
+      if (n > 0 && buf[n - 1] == '\r') buf[n - 1] = '\0'; /* \r\n strip */
+      return 0;
+    }
+    buf[n++] = c;
+  }
+  /* Truncation: cap-1 karakter doldu, \n yok → PIN kesildi */
+  sodium_memzero(buf, cap);
+  return -1;
+}
+
 static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
   struct termios old_term;
   bool is_terminal = (tcgetattr(STDIN_FILENO, &old_term) == 0);
@@ -368,8 +427,8 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
   fprintf(stderr, "[%s] PIN: ", PARANOID_APP_NAME);
   fflush(stderr);
 
-  /* PIN oku */
-  if (!fgets(pin_buf, (int)buf_size, stdin)) {
+  /* PIN oku — doğrudan read() syscall'ı, stdio yok */
+  if (read_line_secure(pin_buf, buf_size) != 0) {
     if (is_terminal)
       tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
     fprintf(stderr, "\n");
@@ -377,22 +436,7 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
   }
   fprintf(stderr, "\n");
 
-  /* Truncation tespiti — fgets buffer'ı doldurmuşsa PIN kesilmiş */
   size_t len = strlen(pin_buf);
-  if (len == buf_size - 1 && pin_buf[len - 1] != '\n') {
-    if (is_terminal)
-      tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
-    NOX_ERROR(LOG_MOD_MAIN, "PIN çok uzun: buffer aşıldı (maksimum %u byte)",
-              NOX_PIN_MAX_LEN);
-    sodium_memzero(pin_buf, buf_size);
-    return NOX_ERR_PIN;
-  }
-
-  /* Newline'ı kaldır */
-  if (len > 0 && pin_buf[len - 1] == '\n') {
-    pin_buf[len - 1] = '\0';
-    len--;
-  }
 
   /* Doğrulama — test edilebilir fonksiyon */
   nox_err_t err = validate_pin(pin_buf, len);
@@ -405,35 +449,27 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
 
   /* İlk çalıştırmada onay iste */
   if (confirm) {
-    char confirm_buf[NOX_PIN_MAX_LEN + 2];
+    /* K-7: onay PIN'i de mlock'lu heap'te — stack'te plaintext kalmasın */
+    char *confirm_buf = sodium_malloc(NOX_PIN_MAX_LEN + 2);
+    if (!confirm_buf) {
+      if (is_terminal)
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+      sodium_memzero(pin_buf, buf_size);
+      return NOX_ERR_PIN;
+    }
 
     fprintf(stderr, "[%s] PIN tekrar: ", PARANOID_APP_NAME);
     fflush(stderr);
 
-    if (!fgets(confirm_buf, (int)sizeof(confirm_buf), stdin)) {
+    if (read_line_secure(confirm_buf, NOX_PIN_MAX_LEN + 2) != 0) {
       if (is_terminal)
         tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+      sodium_free(confirm_buf);
       sodium_memzero(pin_buf, buf_size);
-      sodium_memzero(confirm_buf, sizeof(confirm_buf));
       fprintf(stderr, "\n");
       return NOX_ERR_PIN;
     }
     fprintf(stderr, "\n");
-
-    /* Truncation tespiti — confirm_buf için */
-    size_t clen = strlen(confirm_buf);
-    if (clen == sizeof(confirm_buf) - 1 && confirm_buf[clen - 1] != '\n') {
-      if (is_terminal)
-        tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
-      NOX_ERROR(LOG_MOD_MAIN, "Onay PIN çok uzun: buffer aşıldı");
-      sodium_memzero(pin_buf, buf_size);
-      sodium_memzero(confirm_buf, sizeof(confirm_buf));
-      return NOX_ERR_PIN;
-    }
-
-    /* Newline kaldır */
-    if (clen > 0 && confirm_buf[clen - 1] == '\n')
-      confirm_buf[clen - 1] = '\0';
 
     /*
      * Sabit zamanlı karşılaştırma — her iki PIN'i de
@@ -453,7 +489,7 @@ static nox_err_t read_pin(char *pin_buf, size_t buf_size, bool confirm) {
 
     sodium_memzero(pad_a, sizeof(pad_a));
     sodium_memzero(pad_b, sizeof(pad_b));
-    sodium_memzero(confirm_buf, sizeof(confirm_buf));
+    sodium_free(confirm_buf); /* sodium_free otomatik wipe eder */
 
     if (match != 0) {
       if (is_terminal)
@@ -495,6 +531,13 @@ static void cleanup(struct app_state *state) {
   state->db_key = NULL;
   state->session_key = NULL;
 
+  /* Dosya transferi temizliği — peers CANLIYKEN yapılmalı:
+   * tx_file.active/rx_file.active state'leri okunur; sonraki peer
+   * loop'u state'leri sıfırlar (memzero). Bu sıra bozulursa yarım
+   * .part dosyaları diske sızabilir (K-3). FD'ler kapanır, yarım
+   * dosyalar silinir, plain_buf sodium_free edilir. */
+  file_transfer_cleanup(state);
+
   /* Tüm peer session'ları temizle */
   for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
     struct peer_session *ps = &state->peers[i];
@@ -512,9 +555,6 @@ static void cleanup(struct app_state *state) {
 
   /* Secure arena — explicit_bzero + munmap */
   arena_destroy(&state->arena);
-
-  /* Dosya transferi temizliği — FD'leri kapat, yarım dosyaları sil */
-  file_transfer_cleanup(state);
 
   /* Async stdin buffer scrubbing and free */
   if (state->stdin_buf) {
@@ -566,6 +606,17 @@ static void cleanup(struct app_state *state) {
  * TRANSPORT SEÇİMİ — Pluggable Transport (Faz 6.2)
  * ================================================================ */
 static void prompt_transport_selection(struct app_state *state) {
+    /* Terminal raw modda olduğundan (setup_terminal: ECHO+ICANON kapalı)
+     * seçim/bridge girişinde harfler görünmez ve backspace çalışmaz.
+     * Burada geçici olarak ECHO+ICANON açılır — CLI sonrası yine raw kalır. */
+    struct termios saved_term;
+    bool tty = (tcgetattr(STDIN_FILENO, &saved_term) == 0);
+    if (tty) {
+      struct termios sel_term = saved_term;
+      sel_term.c_lflag |= ((tcflag_t)(ECHO | ICANON));
+      tcsetattr(STDIN_FILENO, TCSANOW, &sel_term);
+    }
+
     fprintf(stderr, "\n[?] Bağlantı yöntemi seçin:\n"
                     "    [D] Direct (Doğrudan Tor bağlantısı)\n"
                     "    [S] Snowflake (Sansür delme - WebRTC)\n"
@@ -640,6 +691,10 @@ static void prompt_transport_selection(struct app_state *state) {
     } else {
       state->transport_type = TRANSPORT_DIRECT;
     }
+
+    /* Raw moda geri dön — TUI kendi çizimine geçecek */
+    if (tty)
+      tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
   }
 
   /* ================================================================
@@ -725,7 +780,7 @@ int main(int argc, char *argv[]) {
       size_t okp_len = strlen(state.config_dir);
       if (okp_len + 10 < NOX_PATH_MAX) {
         memcpy(onion_key_path, state.config_dir, okp_len);
-        memcpy(onion_key_path + okp_len, "/onion.key", 10);
+        memcpy(onion_key_path + okp_len, "/onion.key", 11); /* 10 karakter + NUL */
       } else {
         onion_key_path[0] = '\0';
       }
@@ -795,6 +850,7 @@ int main(int argc, char *argv[]) {
     /* ── 2. Signal handler'lar ─────────────────────────── */
     setup_signal_handlers();
     setup_terminal();
+    atexit(restore_terminal);
 
     /* ── 3. libsodium init ─────────────────────────────── */
     if (sodium_init() < 0) {
@@ -824,11 +880,17 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 6. PIN oku ────────────────────────────────────── */
-    char pin_buf[NOX_PIN_MAX_LEN + 2];
-    err = read_pin(pin_buf, sizeof(pin_buf), state.first_run);
+    /* K-7 FIX: sodium_malloc — mlock'lu + guard page'li heap. Eski stack
+     * tamponu swap'e/hibernate imajına düşebiliyordu. */
+    char *pin_buf = sodium_malloc(NOX_PIN_MAX_LEN + 2);
+    if (!pin_buf) {
+      NOX_FATAL(LOG_MOD_MAIN, "PIN tamponu ayrılamadı");
+      return 1;
+    }
+    err = read_pin(pin_buf, NOX_PIN_MAX_LEN + 2, state.first_run);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "PIN hatası: %s", nox_strerror(err));
-      sodium_memzero(pin_buf, sizeof(pin_buf));
+      sodium_free(pin_buf);
       return 1;
     }
 
@@ -845,7 +907,7 @@ int main(int argc, char *argv[]) {
                     "RLIMIT_MEMLOCK yetersiz: %lu < %zu byte "
                     "(arena + sodium_heap)",
                     (unsigned long)rl.rlim_cur, needed);
-          sodium_memzero(pin_buf, sizeof(pin_buf));
+          sodium_free(pin_buf);
           return NOX_ERR_LOCKED;
         }
         NOX_INFO(LOG_MOD_MAIN, "RLIMIT_MEMLOCK: %lu byte (gerekli: %zu)",
@@ -857,18 +919,12 @@ int main(int argc, char *argv[]) {
     err = arena_init(&state.arena, NOX_ARENA_DEFAULT_SIZE);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "arena başlatılamadı: %s", nox_strerror(err));
-      sodium_memzero(pin_buf, sizeof(pin_buf));
+      sodium_free(pin_buf);
       return 1;
     }
 
-    /* ── 8b. PR_SET_DUMPABLE=0 —mümkün olduğunca erken ──────
-     * Arena mmap'landı, key'ler oluşmaya başlayacak.
-     * /proc/PID/mem ve ptrace ile okuma engellenir.
-     * Terminal I/O dumpable gerektirmez.
-     * Core dump üretilmez (PR_SET_DUMPABLE=0 kernel-level engel). */
-#ifdef PR_SET_DUMPABLE
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
+    /* (8b kaldırıldı — PR_SET_DUMPABLE + RLIMIT_CORE artık main'den ÖNCE
+     * early_hardening_init() constructor'ında set ediliyor; K-7/Y-1 fix.) */
 
     /* ── 8c. CET-SS kilidi + self-test (release-only) ──────────
      * Kernel/glibc, ELF shstk notuna göre (-Wl,-z,shstk) main thread'i
@@ -913,19 +969,22 @@ int main(int argc, char *argv[]) {
 #endif
 
     /* ── 8d. CAP_NET_RAW ──────────────────────────────────────
-     * PR_CAPBSET_DROP normal kullanıcıda çalışmaz (CAP_SETPCAP gerekir).
-     * Raw socket engelleme seccomp stage 2'de yapılıyor (AF_PACKET,
-     * SOCK_RAW KILL kuralı). Bu blok sadece root/sudo için korunuyor. */
-#ifdef PR_CAPBSET_QUERY
-    if (prctl(PR_CAPBSET_QUERY, CAP_NET_RAW, 0, 0, 0) == 0) {
-      /* CAP_NET_RAW zaten bounding set dışında — bir şey yapma */
-    } else if (prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0) == 0) {
-      NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW düşürüldü");
+     * K-6 FIX: eski kod olmayan PR_CAPBSET_QUERY sabitini #ifdef'liyordu —
+     * blok hiç derlenmiyordu. Doğrusu: PR_CAPBSET_READ 1 döndürürse set'te
+     * var, 0 ise yok; PR_CAPBSET_DROP CAP_SETPCAP gerektirir (normal
+     * kullanıcıda EPERM). Raw socket engelleme asıl seccomp stage 2'de
+     * (AF_PACKET, SOCK_RAW KILL) — bu blok yalnızca root/sudo için ek katman. */
+    if (geteuid() == 0) {
+      NOX_WARN(LOG_MOD_HARD,
+               "PROGRAM ROOT OLARAK ÇALIŞIYOR — güvenlik garantileri kapsam dışı");
     }
-    /* Normal kullanıcı: EPERM beklenir, sessizce atla */
-#else
-    prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0);
-#endif
+    if (prctl(PR_CAPBSET_READ, CAP_NET_RAW, 0, 0, 0) == 1) {
+      /* CAP_NET_RAW bounding set'te var → düşürmeyi dene */
+      if (prctl(PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0) == 0)
+        NOX_INFO(LOG_MOD_HARD, "CAP_NET_RAW düşürüldü");
+      /* CAP_SETPCAP yoksa EPERM: normal kullanıcı — sessizce atla */
+    }
+    /* READ == 0: zaten set dışında — bir şey yapma; -1: EINVAL (imkânsız) */
 
     /* ── 9. Salt yükle veya oluştur ───────────────────── */
     uint8_t salt[NOX_SALT_LEN];
@@ -934,7 +993,7 @@ int main(int argc, char *argv[]) {
     err = crypto_load_or_create_salt(salt, state.config_dir);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "salt hatası: %s", nox_strerror(err));
-      sodium_memzero(pin_buf, sizeof(pin_buf));
+      sodium_free(pin_buf);
       arena_destroy(&state.arena);
       return 1;
     }
@@ -945,7 +1004,7 @@ int main(int argc, char *argv[]) {
     scatter_honeypots(&state.arena, 0, 3);
     if (!state.master_key) {
       NOX_FATAL(LOG_MOD_MAIN, "arena alloc başarısız (master_key)");
-      sodium_memzero(pin_buf, sizeof(pin_buf));
+      sodium_free(pin_buf);
       arena_destroy(&state.arena);
       return 1;
     }
@@ -953,8 +1012,12 @@ int main(int argc, char *argv[]) {
     err = crypto_derive_master_key(state.master_key, pin_buf, strlen(pin_buf),
                                    salt);
 
-    /* Kontrat: crypto_derive_master_key pin_buf'ı kendi siler (P9).
-     * Main'de tekrar silmeye gerek yok — idempotent ama gereksiz. */
+    /* K-7: derive pin'i sodium_memzero ile sildi (P9) — şimdi heap'i de
+     * iade et (sodium_free wipe + munlock + guard page geri verir). */
+    sodium_free(pin_buf);
+    pin_buf = NULL;
+
+    /* Kontrat: crypto_derive_master_key pin_buf'ı kendi siler (P9). */
     sodium_memzero(salt, sizeof(salt));
     memory_barrier();
     NOX_INFO(LOG_MOD_MAIN, "Salt bellekten silindi");
@@ -1208,7 +1271,7 @@ int main(int argc, char *argv[]) {
     /* ── 13b. TUI init + Seccomp Stage 2 ─────────────
      * tor_spawn() son fork/exec — auth, bootstrap, HS ve listener artık
      * tam blacklist + raw socket engeli altında koşar. TUI init stage 2
-     * ÖNCESİ: ncurses/terminfo bazı sistemlerde fork/clone kullanabiliyor. */
+     * ÖNCESİ: termbox2/terminfo bazı sistemlerde fork/clone kullanabiliyor. */
     tui_init();
     tui_refresh_all(&state);
 
@@ -1216,7 +1279,7 @@ int main(int argc, char *argv[]) {
     if (seccomp_policy_load(2) != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
       cleanup(&state);
-      return 1;
+      NOX_EXIT(1);
     }
 #endif
 
@@ -1228,7 +1291,7 @@ int main(int argc, char *argv[]) {
       if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Tor auth başarısız: %s", nox_strerror(err));
       cleanup(&state);
-      return 1;
+      NOX_EXIT(1);
     }
 
     if (g_shutdown) goto shutdown_clean;
@@ -1238,7 +1301,7 @@ int main(int argc, char *argv[]) {
       if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "Tor bootstrap başarısız: %s", nox_strerror(err));
       cleanup(&state);
-      return 1;
+      NOX_EXIT(1);
     }
 
     if (g_shutdown) goto shutdown_clean;
@@ -1252,7 +1315,7 @@ int main(int argc, char *argv[]) {
         if (g_shutdown) goto shutdown_clean;
         NOX_FATAL(LOG_MOD_MAIN, "listener başarısız: %s", nox_strerror(err));
         cleanup(&state);
-        return 1;
+        NOX_EXIT(1);
       }
 
       /* HS — ghost: NEW + DiscardPK (her açılışta farklı adres, key hiçbir
@@ -1268,7 +1331,7 @@ int main(int argc, char *argv[]) {
           NOX_FATAL(LOG_MOD_MAIN, "HS kurulumu başarısız: %s",
                     nox_strerror(err));
           cleanup(&state);
-          return 1;
+          NOX_EXIT(1);
         }
         NOX_INFO(LOG_MOD_MAIN, "adresiniz (geçici): %s", state.onion_addr);
       } else {
@@ -1287,7 +1350,7 @@ int main(int argc, char *argv[]) {
           NOX_FATAL(LOG_MOD_MAIN, "HS kurulumu başarısız: %s",
                     nox_strerror(err));
           cleanup(&state);
-          return 1;
+          NOX_EXIT(1);
         }
         NOX_INFO(LOG_MOD_MAIN, "adresiniz (kalıcı): %s", state.onion_addr);
       }
@@ -1299,7 +1362,7 @@ int main(int argc, char *argv[]) {
       if (g_shutdown) goto shutdown_clean;
       NOX_FATAL(LOG_MOD_MAIN, "epoll setup başarısız: %s", nox_strerror(err));
       cleanup(&state);
-      return 1;
+      NOX_EXIT(1);
     }
 
     NOX_INFO(LOG_MOD_MAIN, "init tamamlandı — event loop başlıyor");
@@ -1319,5 +1382,5 @@ shutdown_clean:
     cleanup(&state);
 
     NOX_INFO(LOG_MOD_MAIN, "%s kapatıldı", PARANOID_APP_NAME);
-    _exit(0); /* atexit handler'larını atla — clone() SIGSYS'e yol açar */
+    NOX_EXIT(0); /* K-4: debug'da _exit (LSan fork → SIGSYS), release'de exit() — makroya bak */
   }

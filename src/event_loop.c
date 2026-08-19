@@ -550,7 +550,7 @@ void event_loop(struct app_state *state) {
           if (ps->rx_file.fd >= 0) {
             close(ps->rx_file.fd);
           }
-          explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+          sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
           ps->rx_file.fd = -1;
         }
       }
@@ -575,7 +575,10 @@ void event_loop(struct app_state *state) {
       /* Periyodik kill(pid, 0) — SIGCHLD yedek */
       else if (state->tor_pid > 0 && (now - last_tor_check >= 5)) {
         last_tor_check = now;
-        if (kill(state->tor_pid, 0) != 0 && errno == ESRCH) {
+        int kres = kill(state->tor_pid, 0);
+        int kerr = errno; /* K-2 FIX: errno'yu hemen değişkene al —
+                             SIGCHLD handler araya girebilir (C5 deseni) */
+        if (kres != 0 && kerr == ESRCH) {
           tor_dead = true;
         }
       }
@@ -596,6 +599,7 @@ void event_loop(struct app_state *state) {
           state->tor_ctrl_fd = -1;
         }
         state->tor_pid = 0;
+        g_tor_pid = 0; /* K-2: stale PID eşleşmesini sıfırla */
 
         /* Tüm arena'yı güvenli şekilde sil — Tor gitti, key'ler
          * işe yaramaz. Yeniden başlatmada PIN ile yeniden türetilir. */

@@ -24,6 +24,7 @@
 /* Global flags — tanım burada, extern types.h'de */
 volatile sig_atomic_t g_shutdown = 0;
 volatile sig_atomic_t g_tor_died = 0;
+volatile sig_atomic_t g_tor_pid = 0;
 
 /* ================================================================
  * ANSI RENK KODLARI
@@ -308,7 +309,7 @@ nox_err_t validate_pin(const char *pin, size_t raw_len)
      *
      * UTF-8: 0x80-0xFF arası byte'lara dokunulmaz (UTF-8 passthrough).
      * Geçersiz UTF-8 başlangıç byte'ları (0xC0, 0xC1, 0xFE, 0xFF)
-     * kontrol edilmez — PIN için prati risk yok.
+     * kontrol edilmez PIN için pratik risk yok.
      *
      * CBMC: pointer aliasing ile unsigned char erişimi — signed→unsigned
      * cast false positive'ini önlemek için.

@@ -433,7 +433,10 @@ static long safe_parse_pid(const char *str) {
   char *endptr;
   errno = 0;
   long pid = strtol(str, &endptr, 10);
-  if (errno != 0 || *endptr != '\0' || pid <= 0 || pid > INT_MAX)
+  int parse_errno = errno; /* K-2 FIX: errno'yu hemen değişkene al —
+                              SIGCHLD handler araya girip ECHILD
+                              basabilir, sonraki okuma yanlış olur. */
+  if (parse_errno != 0 || *endptr != '\0' || pid <= 0 || pid > INT_MAX)
     return -1;
   return pid;
 }
@@ -1044,6 +1047,7 @@ nox_err_t tor_spawn(struct app_state *state) {
    * yolların hepsinde child temizlendi (tor_child_cleanup) ve
    * state->tor_pid hiç dolmadı — stale PID riski yok. */
   state->tor_pid = pid;
+  g_tor_pid = pid; /* K-2: SIGCHLD handler eşleştirme için dosya-scope kopya */
   state->tor_ctrl_fd = ctrl_fd;
   NOX_INFO(LOG_MOD_NET, "Tor control soketine başarıyla bağlanıldı");
   return NOX_OK;
@@ -1173,8 +1177,9 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
       char *endptr = NULL;
       errno = 0;
       long pct = strtol(prog + 9, &endptr, 10);
-      
-      if (errno == 0 && endptr != prog + 9 && pct >= 0 && pct <= 100) {
+      int parse_errno = errno; /* K-2 FIX: errno'yu hemen değişkene al */
+
+      if (parse_errno == 0 && endptr != prog + 9 && pct >= 0 && pct <= 100) {
         NOX_INFO(LOG_MOD_NET, "Tor bootstrap: %%%ld", pct);
       } else {
         NOX_WARN(LOG_MOD_NET, "Tor bootstrap PROGRESS parse hatası");
@@ -1389,6 +1394,7 @@ void tor_shutdown(struct app_state *state) {
     else
       NOX_WARN(LOG_MOD_NET, "Tor SIGKILL ile sonlandırıldı (PID=%d)", state->tor_pid);
     state->tor_pid = 0;
+    g_tor_pid = 0; /* K-2: stale PID eşleşmesini sıfırla */
   }
 
   /* torrc dosyasını sil */

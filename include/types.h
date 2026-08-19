@@ -326,5 +326,6 @@ struct app_state {
 
 extern volatile sig_atomic_t g_shutdown;
 extern volatile sig_atomic_t g_tor_died;
+extern volatile sig_atomic_t g_tor_pid;
 
 #endif /* PARANOID_TYPES_H */

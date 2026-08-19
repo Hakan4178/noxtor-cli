@@ -6,7 +6,7 @@
 #   make release      → release build (CET, Shadow Stack, -fhardened)
 #   make analyze      → -fanalyzer ile statik analiz
 #   make test         → testleri ASan/UBSan altında çalıştırır
-#   make TUI=1        → ncurses arayüzü (varsayılan: ANSI_ONLY)
+#   make TUI=1        → termbox2 arayüzü (varsayılan: ANSI_ONLY)
 #   make clean        → tüm üretilmiş dosyaları siler
 #
 # Gereksinimler:
@@ -48,7 +48,7 @@ TEST_DIR := tests
 # ================================================================
 # KAYNAK VE NESNE DOSYALARI
 # ================================================================
-SRCS_ALL := $(wildcard $(SRC_DIR)/*.c)
+SRCS_ALL := $(wildcard $(SRC_DIR)/*.c) $(wildcard vendor/linenoise/*.c)
 # NO_SECCOMP=1 ise seccomp.c'yi hariç tut
 ifeq ($(NO_SECCOMP),1)
     SRCS := $(filter-out $(SRC_DIR)/seccomp.c, $(SRCS_ALL))
@@ -294,8 +294,9 @@ TEST_CFLAGS  = $(STD) $(WARN_BASE) $(HARDEN_COMMON) $(DEBUG_FLAGS) \
                -DNOISE_TEST_DETERMINISTIC
 TEST_LDFLAGS = $(LINK_COMMON)
 
-# Test-specific src objeler — NOISE_TEST_DETERMINISTIC ile derlenir
-TEST_SRC_OBJS = $(filter-out $(SRC_DIR)/main.test.o, $(SRCS:%.c=%.test.o))
+# Test-specific src objeler — NOISE_TEST_DETERMINISTIC ile derlenir.
+# vendor/linenoise test'lerde kullanılmaz: hariç tut.
+TEST_SRC_OBJS = $(filter-out $(SRC_DIR)/main.test.o vendor/linenoise/linenoise.test.o, $(SRCS:%.c=%.test.o))
 
 $(SRC_DIR)/%.test.o: $(SRC_DIR)/%.c
 	$(MSG) 'CC' '$< (test)'
