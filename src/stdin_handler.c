@@ -747,6 +747,7 @@ void process_line(struct app_state *state, const char *line) {
       return;
     }
     target_ps->tx_seq++;
+    clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
 
     NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", target_ps->tx_seq);
     ui_print_system(state, "[*] handshake başlatıldı");

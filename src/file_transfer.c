@@ -344,6 +344,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
               ps->tx_file.tx_len - ps->tx_file.tx_offset);
     if (w > 0) {
       ps->tx_file.tx_offset += (size_t)w;
+      clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
       if (ps->tx_file.tx_offset == ps->tx_file.tx_len) {
         ps->tx_seq++;
         ps->tx_file.tx_len = 0;

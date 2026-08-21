@@ -411,6 +411,9 @@ static void atomic_message(struct app_state *state, enum ui_label label,
         print_timestamp_short();
         print_label(label);
         fprintf(stderr, " %s\n", safe_msg);
+        /* H-2: mesaj kopyası heap'te iz bırakmasın (sodium_memzero:
+         * dead-store elimination'a dayanıklı) */
+        sodium_memzero(safe_msg, msg_len + 1);
         free(safe_msg);
         fflush(stderr);
         g_last_label = label;
@@ -429,6 +432,8 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     print_timestamp_short();
     print_label(label);
     fprintf(stderr, " %s\n", safe_msg);
+    /* H-2: mesaj kopyası heap'te iz bırakmasın */
+    sodium_memzero(safe_msg, msg_len + 1);
     free(safe_msg);
     fflush(stderr);
 
@@ -664,5 +669,7 @@ void ui_print_progress(struct app_state *state, const char *filename,
             done_str, total_str,
             g_theme->clr_reset);
     fflush(stderr);
+    /* H-2: dosya adı kopyası heap'te iz bırakmasın */
+    sodium_memzero(safe_fn, fn_len + 1);
     free(safe_fn);
 }

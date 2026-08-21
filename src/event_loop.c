@@ -155,6 +155,7 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
           break;
         }
         ps->tx_seq++;
+        clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
         NOX_INFO(LOG_MOD_NOISE, "handshake yanıt (tx_seq→%u)", ps->tx_seq);
       }
 
@@ -854,7 +855,7 @@ void event_loop(struct app_state *state) {
 #else
           if (r < 0 && (errno == EAGAIN))
 #endif
-            break;
+            continue;
           if (r < 0 && errno == EINTR)
             continue;
 
