@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "state_machine.h"
+#include "linenoise.h"
 #include <sodium.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -217,10 +218,17 @@ struct peer_session {
     char     tofu_onion[NOX_ONION_LEN + 1];
     char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
     struct   timespec tofu_start;
+    bool     tofu_was_zero_key; /* H-1 FIX: ilk anahtar bağlaması mı? kuyruk sızıntısını önlemek için */
+
+    /* ── H-1/H-2: queue flush sadece doğrulanmış peer için ── */
+    bool     peer_verified; /* true = SESSION_READY ile kuruldu, false = TOFU ile */
 
     /* ── Recv buffer ── */
     uint8_t  recv_buf[RECV_BUF_CAPACITY];
     size_t   recv_pos;
+
+    /* ── M-2 FIX: idle timeout için son aktivite ── */
+    struct timespec last_active;
 
     /* ── Dosya transfer ── */
     struct file_rx_state rx_file;
@@ -257,9 +265,13 @@ struct app_state {
     struct timespec handshake_start; /* handshake başlangıç zamanı     */
     struct timespec tofu_start;    /* TOFU_PENDING başlangıç zamanı  */
 
-    /* Handshake rate limiting — 60 saniyede max 5 deneme */
-    int      hs_attempt_count;   /* penceredeki deneme sayısı         */
-    time_t   hs_window_start;    /* pencere başlangıcı                */
+    /* Handshake rate limiting — 60 saniyede max 5 deneme
+     * Y-4 FIX: inbound ve outbound ayrı bütçe — biri diğerini DoS edemez.
+     * Eski hs_attempt_count/hs_window_start outbound için korunur (compat). */
+    int      hs_attempt_count;   /* outbound penceredeki deneme       */
+    time_t   hs_window_start;    /* outbound pencere başlangıcı       */
+    int      hs_inbound_count;   /* inbound penceredeki deneme        */
+    time_t   hs_inbound_window_start;
 
     /* Tor */
     int      tor_ctrl_fd;        /* Tor Control Protocol fd          */
@@ -310,6 +322,11 @@ struct app_state {
     char    *stdin_buf;
     size_t   stdin_len;
     size_t   stdin_cap;
+
+    /* Linenoise editör (Faz E — TTY multiplexing, yalnızca ln_active iken) */
+    struct linenoiseState ln_state;
+    char    *ln_buf;           /* sodium_malloc(NOX_EDIT_CAP), TTY modunda */
+    int      ln_active;        /* 1 = TTY'de linenoise aktif (isatty) */
 
     /* Pluggable Transport (Faz 6.2) */
     enum tor_transport_type transport_type;

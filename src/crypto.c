@@ -381,7 +381,11 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
     if (ret < 0 || (size_t)ret >= sizeof(path))
         return NOX_ERR_CONFIG;
 
-    /* Mevcut salt dosyasını oku */
+    /* Mevcut salt dosyasını oku
+     * H-4 FIX: yalnızca ENOENT → yeni salt üret; diğer tüm hatalar (EACCES,
+     * EIO, boyut uyumsuzluğu, fstat hatası) abort etmeli — aksi halde
+     * master_key = Argon2id(PIN, yeni_salt) tüm şifreli veriyi kalıcı
+     * erişilemez kılar ve "yanlış PIN" gibi görünür. */
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd >= 0) {
         /* [P7] Dosya boyutu kontrolü — fstat hata ayrımı UB önler */
@@ -392,11 +396,11 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
             close(fd);
             return NOX_ERR_IO;
         } else if (st.st_size != (off_t)NOX_SALT_LEN) {
-            NOX_WARN(LOG_MOD_CRYPTO,
-                     "salt dosyası boyutu hatalı (%lld byte), yeniden üretiliyor",
-                     (long long)st.st_size);
+            NOX_ERROR(LOG_MOD_CRYPTO,
+                      "salt dosyası boyutu hatalı (%lld byte, beklenen %u) — yeniden üretilmiyor, müdahale gerekli",
+                      (long long)st.st_size, NOX_SALT_LEN);
             close(fd);
-            fd = -1;
+            return NOX_ERR_IO;
         } else {
             nox_err_t err = read_exact(fd, salt, NOX_SALT_LEN);
             close(fd);
@@ -411,9 +415,18 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
                       "salt okunamadı (I/O hatası, dosya dokunulmuyor)");
             return err;
         }
+    } else {
+        /* open başarısız — yalnızca ENOENT yeni salt'ı hak eder */
+        if (errno != ENOENT) {
+            NOX_ERROR(LOG_MOD_CRYPTO,
+                      "salt dosyası açılamadı (I/O hatası, dosya dokunulmuyor): %s",
+                      strerror(errno));
+            return NOX_ERR_IO;
+        }
+        NOX_INFO(LOG_MOD_CRYPTO, "salt dosyası yok — yeni üretilecek");
     }
 
-    /* Yeni salt üret */
+    /* Yeni salt üret (yalnızca ENOENT yolu buraya düşer) */
     randombytes_buf(salt, NOX_SALT_LEN);
 
     /* [F-2] PID + random suffix — PID race koruması */

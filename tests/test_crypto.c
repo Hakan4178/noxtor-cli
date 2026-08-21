@@ -379,27 +379,35 @@ static int test_salt_exists_no_identity(void)
 }
 
 /* ================================================================
- * TEST: Bozuk salt dosyası → yeniden üretilmeli
+ * TEST: Bozuk salt dosyası → H-4 FIX: yeniden ÜRETİLMEMELİ (abort)
  *
  * salt dosyası 16 byte yerine 5 byte → bozuk sayılır,
- * crypto_load_or_create_salt yeni salt üretmeli.
+ * crypto_load_or_create_salt artık NOX_ERR_IO dönmeli (sessiz
+ * yeniden üretim tüm şifreli veriyi erişilemez kılardı). Kullanıcı
+ * bozuk dosyayı silerse bir sonraki çağrıda yeni salt üretilir.
  * ================================================================ */
 static int test_corrupt_salt_recovery(void)
 {
     setup_test_dir();
 
-    /* Bozuk salt yaz (5 byte) */
+    /* Önce temiz salt bırakma — önceki testin artığını sil */
     char salt_path[256];
     snprintf(salt_path, sizeof(salt_path), "%s/salt", TEST_DIR);
+    unlink(salt_path);
 
+    /* Bozuk salt yaz (5 byte) */
     FILE *f = fopen(salt_path, "wb");
     TEST_ASSERT(f != NULL);
     uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
     fwrite(garbage, 1, sizeof(garbage), f);
     fclose(f);
 
-    /* Okuma — bozuk tespit edip yeniden üretmeli */
+    /* Okuma — bozuk tespit edip abort etmeli (sessiz üretim yok) */
     uint8_t salt[NOX_SALT_LEN];
+    TEST_ASSERT(crypto_load_or_create_salt(salt, TEST_DIR) == NOX_ERR_IO);
+
+    /* Bozuk dosya müdahale sonrası silinirse yeni salt üretilmeli */
+    unlink(salt_path);
     TEST_ASSERT(crypto_load_or_create_salt(salt, TEST_DIR) == NOX_OK);
 
     /* Yeni salt sıfır olmamalı */
@@ -423,6 +431,15 @@ static int test_corrupt_salt_recovery(void)
 static int test_full_chain_wrong_pin(void)
 {
     setup_test_dir();
+    /* H-4 sonrası: önceki test bozuk salt'ı sildikten sonra geçerli salt bırakır —
+     * bu test sıfırdan başlamalı; aksi halde salt reuse testi bulandırır. */
+    {
+        char cleanup_path[256];
+        snprintf(cleanup_path, sizeof(cleanup_path), "%s/salt", TEST_DIR);
+        unlink(cleanup_path);
+        snprintf(cleanup_path, sizeof(cleanup_path), "%s/identity.key", TEST_DIR);
+        unlink(cleanup_path);
+    }
 
     char id_path[256];
     snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);

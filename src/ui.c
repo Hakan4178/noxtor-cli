@@ -401,6 +401,22 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     memcpy(safe_msg, msg, msg_len + 1);
     strip_ansi_escape(safe_msg);
 
+    if (state->ln_active) {
+        /* Linenoise modu (Faz G-1): terminal satırının sahibi linenoise'dır
+         * (Hide/Show/EditStart). Eski input-satır mekanizması burada
+         * prompt'u silip kendi prompt'unu bastığı için atlanır — yalnız
+         * içerik yazılır. */
+        if (g_last_label != UI_LABEL_NONE && g_last_label != label)
+            fprintf(stderr, "\n");
+        print_timestamp_short();
+        print_label(label);
+        fprintf(stderr, " %s\n", safe_msg);
+        free(safe_msg);
+        fflush(stderr);
+        g_last_label = label;
+        return;
+    }
+
     int clear_lines = calc_current_input_lines(state);
 
     fprintf(stderr, "\033[?25l");
@@ -494,6 +510,16 @@ void ui_print_system(struct app_state *state, const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
+    if (state->ln_active) {
+        /* Linenoise modu (Faz G-1): yalnız içerik — satır yönetimi
+         * linenoise'da (bkz. atomic_message notu). */
+        print_timestamp_short();
+        fprintf(stderr, "  %s%s%s\n", g_theme->clr_system, msg, g_theme->clr_reset);
+        fflush(stderr);
+        sodium_memzero(msg, sizeof(msg));
+        return;
+    }
+
     int clear_lines = calc_current_input_lines(state);
 
     fprintf(stderr, "\033[?25l");
@@ -535,6 +561,16 @@ void ui_print_error(struct app_state *state, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+
+    if (state->ln_active) {
+        /* Linenoise modu (Faz G-1): yalnız içerik — satır yönetimi
+         * linenoise'da (bkz. atomic_message notu). */
+        print_timestamp_short();
+        fprintf(stderr, "  %s[!] %s%s\n", g_theme->clr_error, msg, g_theme->clr_reset);
+        fflush(stderr);
+        sodium_memzero(msg, sizeof(msg));
+        return;
+    }
 
     int clear_lines = calc_current_input_lines(state);
 

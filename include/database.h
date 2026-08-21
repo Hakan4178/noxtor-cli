@@ -58,6 +58,9 @@ nox_err_t db_get_contact(const char *onion, char *name_out, size_t name_len, uin
  */
 nox_err_t db_queue_message(const char *recipient_onion, const char *text);
 
+/* M-14 FIX: kesik mesaj kuyrukta kalmasın — son N kuyruk girdisini geri al */
+nox_err_t db_queue_rollback_last(const char *recipient_onion, int count);
+
 /*
  * db_process_queue — Kuyruktaki mesajları işleme sok (gönder ve sil)
  *

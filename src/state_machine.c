@@ -270,6 +270,9 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
     /* 4. TOFU state — Hassas verileri sıfırla */
     ps->tofu_pending = false;
     ps->tofu_peer_fd = -1;
+    ps->tofu_was_zero_key = false;
+    ps->peer_verified = false;
+    sodium_memzero(&ps->last_active, sizeof(ps->last_active));
     sodium_memzero(ps->tofu_onion, sizeof(ps->tofu_onion));
     sodium_memzero(ps->tofu_name, sizeof(ps->tofu_name));
     sodium_memzero(ps->tofu_new_key, sizeof(ps->tofu_new_key));
@@ -396,8 +399,14 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
     ps->tx_seq = 0;
     ps->rx_seq = 0;
     ps->queue_flushed = false;
+    /* H-1 FIX: TOFU ile kurulan oturum doğrulanmamış sayılır — kuyruk
+     * sızıntısını önlemek için peer_verified=false bırakılır. İlk
+     * doğrulanmış SESSION_READY oturumunda peer_verified=true olacak. */
+    ps->peer_verified = false;
+    clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
     NOX_DEBUG(LOG_MOD_NOISE,
-              "session setup (TOFU): tx_seq=0 rx_seq=0 queue_flushed=false");
+              "session setup (TOFU): tx_seq=0 rx_seq=0 queue_flushed=false verified=0 tofu_zero=%d",
+              ps->tofu_was_zero_key);
     ps->tofu_pending = false;
 
     /* Peer kimliğini ata */

@@ -543,6 +543,41 @@ nox_err_t db_queue_message(const char *recipient_onion, const char *text) {
   DB_UNLOCK(); return NOX_OK;
 }
 
+/* M-14 FIX: kesik mesajın kuyruğa eklenmiş parçalarını sil — atomicity
+ * queue_segmented_message aynı mantıksal mesajın N chunk'ını ayrı row olarak
+ * yazar; N'inci chunk başarısız olursa önceki N-1 row'lar kuyrukta
+ * "yarım mesaj" bırakır (alıcıya kesik metin). Bu helper son `count`
+ * row'u aynı recipient için siler (ORDER BY id DESC LIMIT ?). */
+nox_err_t db_queue_rollback_last(const char *recipient_onion, int count) {
+  if (!recipient_onion || count <= 0) return NOX_ERR_DB;
+  DB_BEGIN(recipient_onion);
+  uint8_t hash[32];
+  nox_err_t err = hash_onion(recipient_onion, hash);
+  if (err != NOX_OK) { sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return err; }
+  sqlite3_stmt *stmt = NULL;
+  const char *sql = "DELETE FROM queue WHERE id IN "
+                    "(SELECT id FROM queue WHERE recipient_hash = ? ORDER BY id DESC LIMIT ?);";
+  int rc = sqlite3_prepare_v2(g_state.db, sql, -1, &stmt, NULL);
+  if (rc != SQLITE_OK) {
+    NOX_ERROR(LOG_MOD_DB, "Rollback statement hazırlanamadı: %s", DB_ERRMSG());
+    sodium_memzero(hash, sizeof(hash));
+    DB_UNLOCK(); return NOX_ERR_DB;
+  }
+  rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_memzero(hash,sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
+  rc = sqlite3_bind_int(stmt, 2, count);
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_memzero(hash,sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  sodium_memzero(hash, sizeof(hash));
+  if (rc != SQLITE_DONE) {
+    NOX_WARN(LOG_MOD_DB, "Rollback silme hatası: %s", DB_ERRMSG());
+    DB_UNLOCK(); return NOX_ERR_DB;
+  }
+  NOX_INFO(LOG_MOD_DB, "Kuyruk rollback: %d chunk silindi (%s)", count, recipient_onion);
+  DB_UNLOCK(); return NOX_OK;
+}
+
 /**
  * db_process_queue — Kuyruktaki şifreli mesajları işler ve gönderir.
  *

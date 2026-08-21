@@ -13,6 +13,14 @@ void process_line(struct app_state *state, const char *line);
 /* Non-blocking girdi okuma, tamponlama ve satır bölme işlemlerini yürütür */
 void process_stdin_events(struct app_state *state);
 
+/* Linenoise editörü başlatır (Faz E): TTY + linenoise olmayan modda no-op.
+ * Event loop başlamadan hemen önce çağrılır; ln_buf'u sodium_malloc ile
+ * ayırır (NOX_EDIT_CAP), allocator hook'larını sodium'a bağlar. */
+void ln_edit_init(struct app_state *state);
+
+/* Linenoise editörünü kapatır: raw mode geri, ln_buf sodium_free (zeroize). */
+void ln_edit_deinit(struct app_state *state);
+
 /* Uzun mesajları parçalara ayırıp peer'a gönderir */
 nox_err_t send_segmented_message(struct app_state *state, const char *msg);
 

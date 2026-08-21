@@ -41,6 +41,7 @@
 
 /* Mesajlaşma sabitleri */
 #define NOX_MAX_MSG_LEN        4096U     /* tek mesaj üst sınır (frame kapasitesi ile uyumlu) */
+#define NOX_EDIT_CAP           NOX_MAX_MSG_LEN /* linenoise edit buffer cap = tek mesaj (Faz E) */
 #define NOX_CHUNK_SIZE         4096U     /* dosya transfer chunk */
 #define NOX_FRAME_MAGIC        0xDEADC0DEU
 

@@ -72,6 +72,12 @@ struct linenoiseState {
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
     size_t fold_end[LINENOISE_MAX_FOLDS];   /* Folded range end offsets. */
+    int status_warn;   /* Set when a warning (e.g. edit cap reached) must be
+                        * drawn above the prompt on the next refresh. */
+    int prompt_drawn;  /* Prompt line is currently on screen with the cursor
+                        * on it. EditStop writes the closing newline only in
+                        * that case, so shutdown logs don't get a stray blank
+                        * line when the caller already closed the line. */
 };
 
 typedef struct linenoiseCompletions {
@@ -105,6 +111,14 @@ void linenoiseSetMultiLine(int ml);
 void linenoisePrintKeyCodes(void);
 void linenoiseMaskModeEnable(void);
 void linenoiseMaskModeDisable(void);
+
+/* Allocator hooks. By default linenoise uses plain malloc/free. When a
+ * secure allocator is available (e.g. libsodium's sodium_malloc/sodium_free),
+ * it can be plugged in here so that every internal allocation is zeroized on
+ * free. The free hook is expected to wipe the memory before releasing it. */
+typedef void *(*ln_alloc_fn)(size_t size);
+typedef void  (*ln_free_fn)(void *ptr);
+void linenoiseSetAllocators(ln_alloc_fn alloc_fn, ln_free_fn free_fn);
 
 #ifdef __cplusplus
 }

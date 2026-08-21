@@ -236,9 +236,22 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
 
   nox_err_t err = NOX_OK;
   if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
+    /* Y-1/M-1 FIX: writev kısmi/EAGAIN desenkronizasyonu — peer'da yarım
+     * frame kalır, sonraki frame aynı seq ile karışır → MAC fail → kalıcı
+     * desenkron. Tam buffering (file_transfer gibi EPOLLOUT kuyruğu)
+     * ideal çözüm; kısa vadede bağlantıyı kopararak desenkronu önle —
+     * seq 0'dan yeniden başlar. */
+    if (written < 0) {
+      NOX_WARN(LOG_MOD_NET, "writev hatası (queued): %s", strerror(errno));
+    } else {
+      NOX_WARN(LOG_MOD_NET, "writev kısmi (%zd/%zu) — peer disconnect",
+               written, FRAME_HEADER_WIRE_SIZE + (size_t)ct_len);
+    }
+    sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
     err = NOX_ERR_IO;
   } else {
     ps->tx_seq++;
+    clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
   }
 
   sodium_free(payload);   /* her durumda, otomatik sıfırlar */
@@ -298,11 +311,21 @@ nox_err_t send_segmented_message_to(struct app_state *state,
     };
     ssize_t written = writev(ps->fd, iov, 2);
     if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
+      if (written < 0) {
+        NOX_WARN(LOG_MOD_NET, "writev hatası (segmented): %s", strerror(errno));
+      } else {
+        NOX_WARN(LOG_MOD_NET, "writev kısmi (%zd/%zu) — peer disconnect",
+                 written, FRAME_HEADER_WIRE_SIZE + (size_t)ct_len);
+      }
+      sodium_memzero(chunk, 4096 + 1);
       sodium_free(chunk);
       sodium_free(ct);
+      /* Y-1 FIX: yukarıdaki gerekçeyle bağlantıyı kopar */
+      sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
       return NOX_ERR_IO;
     }
     ps->tx_seq++;
+    clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
 
     offset += chunk_len;
   }
@@ -312,7 +335,9 @@ nox_err_t send_segmented_message_to(struct app_state *state,
   return NOX_OK;
 }
 
-/* Uzun bir mesajı güvenli chunk'lara ayırıp SQLite veritabanı kuyruğuna yazar */
+/* Uzun bir mesajı güvenli chunk'lara ayırıp SQLite veritabanı kuyruğuna yazar
+ * M-14 FIX: chunk N başarısız olursa önceki 1..N-1 chunk'lar rollback edilir — yarım
+ * mesaj alıcıya iletilmez, retry'da kopya oluşmaz. */
 nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) {
   size_t total_len = strlen(msg);
   size_t offset = 0;
@@ -322,6 +347,7 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
     return NOX_ERR_ALLOC;
 
   nox_err_t first_err = NOX_OK;
+  int queued = 0;
 
   while (offset < total_len) {
     size_t chunk_len = get_next_chunk_size(msg, offset, total_len);
@@ -331,16 +357,21 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
     nox_err_t err = db_queue_message(recipient_onion, chunk);
     if (err != NOX_OK) {
       if (first_err == NOX_OK) {
-        NOX_WARN(LOG_MOD_MAIN, "chunk %zu/%zu kuyruğa eklenemedi — kalan parça atlanıyor",
-                 offset / 4096 + 1, (total_len + 4095) / 4096);
+        NOX_WARN(LOG_MOD_MAIN, "chunk %zu/%zu kuyruğa eklenemedi — önceki %d chunk rollback ediliyor",
+                 offset / 4096 + 1, (total_len + 4095) / 4096, queued);
         first_err = err;
+      }
+      if (queued > 0) {
+        db_queue_rollback_last(recipient_onion, queued);
       }
       break; /* kısmi kuyruklama veri bütünlüğünü bozar */
     }
 
+    queued++;
     offset += chunk_len;
   }
 
+  sodium_memzero(chunk, 4096 + 1);
   sodium_free(chunk);
   return first_err;
 }
@@ -352,22 +383,56 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
 void process_line(struct app_state *state, const char *line) {
   struct peer_session *ps = ACTIVE_PEER(state);
 
-  /* ── TOFU Onay Modu ─────────────────── */
-  if (ps && ps->state == ST_TOFU_PENDING) {
-    if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
-      if (sm_dispatch(ps, state, EV_TOFU_ACCEPTED) != NOX_OK) {
-        /* Session oluşturma başarısız — temizle */
-        sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
-      }
-    } else if (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0) {
-      ui_print_system(state, "[*] Bağlantı reddedildi.");
-      sm_dispatch(ps, state, EV_TOFU_REJECTED);
-    } else {
-      fprintf(
-          stderr,
-          "  [?] Lütfen 'y' veya 'n' giriniz (y/n): "); /* raw — prompt değil */
+  /* ── TOFU Onay Modu (H-2 FIX) ───────────────
+   * Önceki kod yalnız ACTIVE_PEER'i kontrol ediyordu — aktif peer A iken
+   * saldırgan B'nin TOFU prompt'u basılırsa 'y' cevabı A'ya şifreli mesaj
+   * olarak giderdi. Şimdi tüm slotlar taranır; tek TOFU varsa ona yönlendirir,
+   * birden fazla varsa kullanıcıdan net seçim ister. Ayrıca TOFU beklerken
+   * normal mesaj yolu tamamen bloke edilir (girdi sızıntısı kapalı). */
+  struct peer_session *tofu_ps = NULL;
+  unsigned tofu_cnt = 0;
+  for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+    if (state->peers[i].state == ST_TOFU_PENDING) {
+      tofu_ps = &state->peers[i];
+      tofu_cnt++;
     }
-    return;
+  }
+  if (tofu_cnt > 0) {
+    bool is_yes = (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0);
+    bool is_no  = (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0);
+    if (is_yes || is_no) {
+      if (tofu_cnt > 1) {
+        ui_print_error(state,
+          "Birden fazla TOFU bekleyen bağlantı var (%u). Lütfen önce "
+          "/disconnect ile birini kapatın veya tek TOFU kalana dek bekleyin.",
+          tofu_cnt);
+        for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+          if (state->peers[i].state == ST_TOFU_PENDING) {
+            ui_print_system(state, "  - slot %u: %s (%s)", i,
+              state->peers[i].tofu_onion[0] ? state->peers[i].tofu_onion : "?",
+              state->peers[i].tofu_name[0]  ? state->peers[i].tofu_name  : "?");
+          }
+        }
+        return;
+      }
+      if (is_yes) {
+        if (sm_dispatch(tofu_ps, state, EV_TOFU_ACCEPTED) != NOX_OK) {
+          sm_dispatch(tofu_ps, state, EV_PEER_DISCONNECTED);
+        }
+      } else {
+        ui_print_system(state, "[*] Bağlantı reddedildi.");
+        sm_dispatch(tofu_ps, state, EV_TOFU_REJECTED);
+      }
+      return;
+    }
+    /* y/n değil ve TOFU bekliyor — mesaj sızıntısını engelle */
+    if (line[0] != '/') {
+      ui_print_error(state,
+        "TOFU onayı bekleniyor — önce 'y' veya 'n' girin (veya /disconnect). "
+        "Girdiniz şifreli kanala gönderilmedi.");
+      return;
+    }
+    /* '/' ile başlayan komutlar aşağıda normal komut yoluna düşer */
   }
 
   /* ── Komut modu — her zaman kontrol et (session aktif olsa bile) ─── */
@@ -646,6 +711,7 @@ void process_line(struct app_state *state, const char *line) {
                state->my_static_priv,
                state->my_static_pub);
     clock_gettime(CLOCK_MONOTONIC, &target_ps->handshake_start);
+    clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
 
     /* State geçişi: IDLE → HANDSHAKE_INIT */
     sm_dispatch(target_ps, state, EV_CONNECT_CMD);
@@ -769,6 +835,42 @@ void process_line(struct app_state *state, const char *line) {
   ui_print_system(state, "  Ctrl+P              — çıkış");
 }
 
+void ln_edit_init(struct app_state *state) {
+  state->ln_active = 0;
+  state->ln_buf = NULL;
+  if (tui_is_active() || !isatty(STDIN_FILENO)) {
+    return; /* TUI veya pipe/script — linenoise yok */
+  }
+  state->ln_buf = sodium_malloc(NOX_EDIT_CAP + 1); /* +1: EditStart buflen--
+                                                    * sonrası NUL için gerekli
+                                                    * (F-6 segfault düzeltmesi) */
+  if (!state->ln_buf) {
+    NOX_ERROR(LOG_MOD_MAIN,
+              "ln_buf sodium_malloc başarısız — linenoise etkinleştirilemedi");
+    return;
+  }
+  linenoiseSetAllocators(sodium_malloc, sodium_free);
+  if (linenoiseEditStart(&state->ln_state, STDIN_FILENO, STDOUT_FILENO,
+                         state->ln_buf, NOX_EDIT_CAP + 1, "> ") != 0) {
+    NOX_ERROR(LOG_MOD_MAIN, "linenoiseEditStart başarısız");
+    sodium_free(state->ln_buf);
+    state->ln_buf = NULL;
+    return;
+  }
+  state->ln_active = 1;
+}
+
+void ln_edit_deinit(struct app_state *state) {
+  if (state->ln_active) {
+    linenoiseEditStop(&state->ln_state);
+    state->ln_active = 0;
+  }
+  if (state->ln_buf) {
+    sodium_free(state->ln_buf); /* otomatik zeroize */
+    state->ln_buf = NULL;
+  }
+}
+
 void process_stdin_events(struct app_state *state) {
   if (tui_is_active()) {
 #ifdef HAVE_TERMBOX
@@ -800,6 +902,35 @@ void process_stdin_events(struct app_state *state) {
       }
     }
 #endif
+    return;
+  }
+
+  if (state->ln_active) {
+    /* TTY — linenoise multiplexing (Faz E, 7.2):
+     * EditFeed tek çağrı (EPOLLIN her tuşta yeniden tetikler — EditMore'da
+     * tekrar bekle; ENTER/CTRL-D/CTRL-C'de satır tamamlanır). */
+    char *res = linenoiseEditFeed(&state->ln_state);
+    if (res == linenoiseEditMore)
+      return;
+if (res != NULL) {
+      /* Satır tamamlandı: imleci yeni satır başına al — çıktılar prompt
+       * satırına yapışmasın, prompt her mesajda aşağı kaymasın (F-6).
+       * Raw modda OPOST/ONLCR kapalı olduğundan "\r\n" ZORUNLU: yalın
+       * "\n" imleci kolonda bırakır, sonraki çıktılar sağa kayar. */
+      if (write(STDOUT_FILENO, "\r\n", 2) != 2) {}
+      process_line(state, res);
+      sodium_free(res); /* ENTER strdup kopyası — otomatik zeroize */
+    }
+    /* CTRL-C (EAGAIN) / boş CTRL-D (ENOENT): satır iptal — sessiz reset.
+     * /quit (running=false) sonrası yeniden başlatma YOK — çıkışta
+     * gereksiz prompt kalıntısı çizilmesin (F-6). */
+    sodium_memzero(state->ln_buf, NOX_EDIT_CAP);
+    if (state->running) {
+      if (linenoiseEditStart(&state->ln_state, STDIN_FILENO, STDOUT_FILENO,
+                             state->ln_buf, NOX_EDIT_CAP + 1, "> ") != 0) {
+        ln_edit_deinit(state);
+      }
+    }
     return;
   }
 

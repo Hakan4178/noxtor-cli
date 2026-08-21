@@ -48,7 +48,7 @@ TEST_DIR := tests
 # ================================================================
 # KAYNAK VE NESNE DOSYALARI
 # ================================================================
-SRCS_ALL := $(wildcard $(SRC_DIR)/*.c) $(wildcard vendor/linenoise/*.c)
+SRCS_ALL := $(wildcard $(SRC_DIR)/*.c)
 # NO_SECCOMP=1 ise seccomp.c'yi hariç tut
 ifeq ($(NO_SECCOMP),1)
     SRCS := $(filter-out $(SRC_DIR)/seccomp.c, $(SRCS_ALL))
@@ -186,7 +186,7 @@ RELEASE_FLAGS := \
     -Wstringop-overflow=4 \
     -ftrivial-auto-var-init=zero \
     -Wtrivial-auto-var-init \
-    -fzero-call-used-regs=used-gpr \
+    -fzero-call-used-regs=used \
     -fno-plt \
     -Whardened \
     -DNDEBUG
@@ -295,8 +295,8 @@ TEST_CFLAGS  = $(STD) $(WARN_BASE) $(HARDEN_COMMON) $(DEBUG_FLAGS) \
 TEST_LDFLAGS = $(LINK_COMMON)
 
 # Test-specific src objeler — NOISE_TEST_DETERMINISTIC ile derlenir.
-# vendor/linenoise test'lerde kullanılmaz: hariç tut.
-TEST_SRC_OBJS = $(filter-out $(SRC_DIR)/main.test.o vendor/linenoise/linenoise.test.o, $(SRCS:%.c=%.test.o))
+# Faz E'den itibaren linenoise de dahil (stdin_handler entegrasyonu).
+TEST_SRC_OBJS = $(filter-out $(SRC_DIR)/main.test.o, $(SRCS:%.c=%.test.o))
 
 $(SRC_DIR)/%.test.o: $(SRC_DIR)/%.c
 	$(MSG) 'CC' '$< (test)'

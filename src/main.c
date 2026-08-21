@@ -519,6 +519,10 @@ static void cleanup(struct app_state *state) {
 #endif
 
   NOX_INFO(LOG_MOD_MAIN, "temizlik başlıyor...");
+  /* Linenoise editör — raw mode geri + ln_buf zeroize (Faz E).
+   * restore_terminal'den ÖNCE: deinit termios'a dokunur, restore
+   * terminal modunu son kez yazar (F-6 sıralama düzeltmesi). */
+  ln_edit_deinit(state);
   tui_shutdown();
   restore_terminal();
 
@@ -895,9 +899,27 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 7. RLIMIT_MEMLOCK kontrolü ──────────────────────
-     * Arena + sodium_malloc tahmini toplamı mevcut kilitten
-     * fazlaysa NOX_ERR_LOCKED ile başlattırmıyoruz. */
-#define NOX_SODIUM_LOCKED_BUDGET  (64U * 1024U) /* tahmini sodium heap */
+     * Arena + sodium_malloc toplamı mevcut kilitten
+     * fazlaysa NOX_ERR_LOCKED ile başlattırmıyoruz.
+     *
+     * sodium_malloc envanteri (32 çağrı — E-3 ölçümü, 2026-08-20):
+     *   main.c          4: confirm_buf(453), pin_buf(885), ed_pub/ed_sk(1078-79)
+     *   stdin_handler   7: payload(211), ct(264), chunk(265), chunk(320),
+     *                      hs(636), stdin_buf(829, pipe), line(917, pipe)
+     *   crypto.c        2: sk(511), file_buf(656)
+     *   database.c      6: cipher(497/616/731), plain(634/827/943)
+     *   noise.c         6: k/ipad/opad(201-03), inner(204), temp_key(285), buf(286)
+     *   event_loop.c    4: payload(88), session(212), pt(344), hs(695)
+     *   file_transfer.c 2: plain_buf(259), pt(516)
+     *   state_machine.c 1: session(379)
+     *   +Faz E linenoise: ln_buf(4096, kalıcı), ENTER strdup(4097, geçici),
+     *    paste buffer(4097, yalnız paste sırasında)
+     *
+     * Eşzamanlı tepe (aktif sohbet; session+ln_buf+strdup+payload+ct+chunk
+     * +HMAC×4+temp_key+buf) VmLck ile ÖLÇÜLDÜ = 68KB (guard page'ler mlock'a
+     * dahil DEĞİL). En kötü durum (+paste buffer 12KB, +hs 8KB) ≈ 88KB.
+     * Bütçe 96KB — 64KB eski tahmin YETERSİZDİ (ölçümle revize). */
+#define NOX_SODIUM_LOCKED_BUDGET  (96U * 1024U) /* ölçülen tepe 68KB + marj */
     {
       struct rlimit rl;
       if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
