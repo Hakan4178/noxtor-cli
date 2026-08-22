@@ -74,6 +74,13 @@ void clear_prompt_area_lines(int lines);
 /* Bağlam duyarlı prompt bas (bağlantı durumu + onion kısaltma) */
 void ui_print_prompt(struct app_state *state);
 
+/* G-2: Terminal satır sahipliği — YALNIZCA event_loop.c top-level
+ * handler'larından çağrılır. ui_print_* veya log.c gibi yardımcılar içine
+ * asla eklenmemeli (refcount nesting'i kırar, kuraldan sapma riskini geri getirir). */
+void ui_line_suspend(struct app_state *state);      /* ln_active && depth++==0 → Hide */
+void ui_line_resume(struct app_state *state);       /* --depth==0 → Show */
+void ui_line_force_resume(struct app_state *state); /* acil kurtarma: depth→0, Show (yalnızca ln_edit_deinit'te) */
+
 /* ── Dosya Transferi ─────────────────────────────────────── */
 
 /* In-place progress bar (aynı satırı günceller) */

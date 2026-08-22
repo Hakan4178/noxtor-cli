@@ -136,6 +136,8 @@ void clear_prompt_area(struct app_state *state)
     struct peer_session *ps = ACTIVE_PEER(state);
     if (ps && ps->tofu_pending)
         return;  /* TOFU interaktif modunda temizleme yapma */
+    if (state->ln_active)
+        return;  /* G-2: linenoise satır sahibi — clear suspend altında yapılır */
 
     int lines = calc_input_lines(state);
     if (lines < 1) lines = 1;
@@ -153,6 +155,29 @@ void clear_prompt_area_lines(int lines)
     if (lines > 1)
         fprintf(stderr, "\033[%dA", lines - 1);
     fprintf(stderr, "\033[1G\033[J");
+}
+
+/* G-2: Linenoise satır sahipliği — refcount suspend/resume.
+ * YALNIZCA event_loop.c top-level handler'larından çağrılır. */
+void ui_line_suspend(struct app_state *state) {
+    if (!state->ln_active) return;
+    if (state->ln_suspend_depth++ == 0) {
+        linenoiseHide(&state->ln_state);
+    }
+}
+void ui_line_resume(struct app_state *state) {
+    if (!state->ln_active) return;
+    if (state->ln_suspend_depth == 0) return;
+    if (--state->ln_suspend_depth == 0) {
+        linenoiseShow(&state->ln_state);
+    }
+}
+void ui_line_force_resume(struct app_state *state) {
+    if (!state->ln_active) return;
+    if (state->ln_suspend_depth > 0) {
+        state->ln_suspend_depth = 0;
+        linenoiseShow(&state->ln_state);
+    }
 }
 
 /* Mevcut input'un wrap satır sayısını dinamik hesapla */
@@ -355,6 +380,11 @@ static void strip_ansi_escape(char *str) {
         else
           src++;  /* bare ESC — NUL'a kadar atla */
       }
+    } else if ((unsigned char)*src < 32 && *src != '\t' && *src != '\n' && *src != '\r') {
+      /* LN-1: C0 control (except TAB/LF/CR) — drop, UTF-8 continuation korunur */
+      src++;
+    } else if ((unsigned char)*src == 0x7F) {
+      src++;
     } else {
       *dst++ = *src++;
     }

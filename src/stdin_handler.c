@@ -174,6 +174,11 @@ static void strip_ansi_escape(char *str) {
         else
           src++;  /* bare ESC — NUL'a kadar atla */
       }
+    } else if ((unsigned char)*src < 32 && *src != '\t' && *src != '\n' && *src != '\r') {
+      /* LN-1: C0 control (except TAB/LF/CR) — drop, UTF-8 continuation korunur */
+      src++;
+    } else if ((unsigned char)*src == 0x7F) {
+      src++;
     } else {
       *dst++ = *src++;
     }
@@ -851,6 +856,7 @@ void ln_edit_init(struct app_state *state) {
     return;
   }
   linenoiseSetAllocators(sodium_malloc, sodium_free);
+  state->ln_suspend_depth = 0;
   if (linenoiseEditStart(&state->ln_state, STDIN_FILENO, STDOUT_FILENO,
                          state->ln_buf, NOX_EDIT_CAP + 1, "> ") != 0) {
     NOX_ERROR(LOG_MOD_MAIN, "linenoiseEditStart başarısız");
@@ -863,9 +869,11 @@ void ln_edit_init(struct app_state *state) {
 
 void ln_edit_deinit(struct app_state *state) {
   if (state->ln_active) {
+    ui_line_force_resume(state);
     linenoiseEditStop(&state->ln_state);
     state->ln_active = 0;
   }
+  state->ln_suspend_depth = 0;
   if (state->ln_buf) {
     sodium_free(state->ln_buf); /* otomatik zeroize */
     state->ln_buf = NULL;
@@ -1001,6 +1009,13 @@ if (res != NULL) {
         process_line(state, state->stdin_buf);
         sodium_memzero(state->stdin_buf, state->stdin_cap);
         state->stdin_len = 0;
+      }
+      /* K-4 FIX: EOF sonrası epoll busy-loop (CPU %100) — stdin’i epoll’den çıkar ve bir daha okuma deneme.
+       * Level-triggered epoll her turda EPOLLIN|HUP verir, return ile dönmek sonsuz sıkı döngüye yol açar.
+       * Pipe/script (`nox < cmd.txt`) ve Ctrl-D sonrası da tetiklenir. */
+      if (!state->stdin_closed) {
+        epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, STDIN_FILENO, NULL);
+        state->stdin_closed = true;
       }
       return;
     }

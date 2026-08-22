@@ -44,25 +44,26 @@ noxtor-cli, Tor üzerinden anonim mesajlaşma uygulaması. Çoklu peer bağlant�
 
 ## 2. Sistem Bileşenleri
 
-### 2.1 Kaynak Dosyaları (15 adet)
+### 2.1 Kaynak Dosyaları (16 adet)
 
 | Dosya | Satır | Görev |
 |-------|-------|-------|
-| `src/arena.c` | 668 | mmap tabanlı güvenli bellek havuzu |
-| `src/crypto.c` | 698 | Argon2id, Ed25519, Curve25519 dönüşümü |
-| `src/database.c` | 1008 | SQLite: kontakt, mesaj kuyruğu, geçmiş |
-| `src/event_loop.c` | 773 | Ana epoll event loop, frame işleme |
-| `src/file_transfer.c` | 727 | Dosya gönderme/alma (BLAKE2b) |
+| `src/arena.c` | 669 | mmap tabanlı güvenli bellek havuzu |
+| `src/crypto.c` | 787 | Argon2id, Ed25519, Curve25519 dönüşümü, onion seed türetme |
+| `src/database.c` | 1043 | SQLite: kontakt, mesaj kuyruğu, geçmiş |
+| `src/event_loop.c` | 874 | Ana epoll event loop, frame işleme |
+| `src/file_transfer.c` | 748 | Dosya gönderme/alma (BLAKE2b) |
 | `src/landlock_sandbox.c` | 245 | Landlock LSM dosya erişim kontrolü |
-| `src/log.c` | 337 | Modül bazlı loglama (TUI entegre) |
-| `src/main.c` | 1291 | Başlatma, PIN, key derivation, args |
-| `src/network.c` | 1470 | Tor spawn, SOCKS5, epoll, frame encode/decode |
-| `src/noise.c` | 944 | Noise XX protocol implementasyonu |
-| `src/seccomp.c` | 412 | 3 aşamalı seccomp-bpf loading |
-| `src/state_machine.c` | 447 | Peer durum makinesi (8 durum, 17 olay, 40 geçiş) |
-| `src/stdin_handler.c` | 949 | Komut işleme, mesaj segmentasyonu |
+| `src/linenoise.c` | 2347 | linenoise secure fork — satır düzenleme (sodium allocator hook'ları) |
+| `src/log.c` | 338 | Modül bazlı loglama (TUI entegre) |
+| `src/main.c` | 1408 | Başlatma, PIN, key derivation, args |
+| `src/network.c` | 1750 | Tor spawn, SOCKS5, epoll, frame encode/decode, ADD_ONION |
+| `src/noise.c` | 962 | Noise XX protocol implementasyonu |
+| `src/seccomp.c` | 595 | 3 aşamalı seccomp-bpf loading |
+| `src/state_machine.c` | 456 | Peer durum makinesi (8 durum, 17 olay, 40 geçiş) |
+| `src/stdin_handler.c` | 1090 | Komut işleme, mesaj segmentasyonu |
 | `src/tui.c` | 797 | termbox2 tabanlı TUI (3 panel) |
-| `src/ui.c` | 632 | Terminal/ANSI çıktı katmanı |
+| `src/ui.c` | 675 | Terminal/ANSI çıktı katmanı |
 
 ### 2.2 Header Dosyaları
 
@@ -76,6 +77,7 @@ noxtor-cli, Tor üzerinden anonim mesajlaşma uygulaması. Çoklu peer bağlant�
 | `include/event_loop.h` | Event loop API |
 | `include/file_transfer.h` | Dosya transfer API |
 | `include/landlock_sandbox.h` | Landlock API |
+| `include/linenoise.h` | linenoise secure fork API (sodium allocator hook'ları) |
 | `include/network.h` | Network API + frame sabitleri |
 | `include/noise.h` | Noise API |
 | `include/seccomp_policy.h` | Seccomp API |
@@ -95,31 +97,31 @@ Tor'dan veri gelişi → ekrana mesaj display. Tam yol:
 ```
 Tor daemon
   ↓ (Tor SOCKS5 → AF_UNIX socket)
-event_loop.c:377  event_loop()           ← epoll_wait()
+event_loop.c:429  event_loop()           ← epoll_wait()
   ↓
-event_loop.c:720  peer_fd ready          ← EPOLLIN (epoll_wait sonrası)
+event_loop.c:842  peer_fd ready          ← EPOLLIN (epoll_wait sonrası)
   ↓
 event_loop.c:55   process_peer_frames()  ← frame parsing döngüsü
   ↓
-network.c:1450    frame_header_decode()  ← 13-byte header decode
+network.c:1724    frame_header_decode()  ← 13-byte header decode
   ↓
-  ├─ CTRL frame (handshake) ──→ event_loop.c:105 handshake_read()
+  ├─ CTRL frame (handshake) ──→ event_loop.c:109 handshake_read()
   │                               ↓
   │                          noise.c:371 symmetric_decrypt_and_hash()
   │                               ↓
-  │                          event_loop.c:121 handshake_write() → yanıt
+  │                          event_loop.c:125 handshake_write() → yanıt
   │                          State: ST_HANDSHAKE_INIT/RESP
   │
-  ├─ TEXT frame (mesaj) ────→ event_loop.c:323 seq doğrulaması
+  ├─ TEXT frame (mesaj) ────→ event_loop.c:354 seq doğrulaması
   │                               ↓
-  │                          noise.c:881 noise_decrypt()
+  │                          noise.c:899 noise_decrypt()
   │                               ↓
-  │                          ui.c:426 ui_print_incoming()
+  │                          ui.c:447 ui_print_incoming()
   │                               ↓
   │                          tui.c:380 tui_chat_append() veya
   │                          stdout'a atomik yazdırma (atomic_message)
   │
-  └─ FILE frame (dosya) ───→ file_transfer.c:496 file_transfer_handle_rx()
+  └─ FILE frame (dosya) ───→ file_transfer.c:510 file_transfer_handle_rx()
                                   ↓
                              BLAKE2b hash doğrulama
                              disk'e yazma (O_EXCL, O_NOFOLLOW)
@@ -127,16 +129,16 @@ network.c:1450    frame_header_decode()  ← 13-byte header decode
 
 ### 3.1 RX Anahtar Fonksiyonlar
 
-| Fonksiyon | Dosya:Satr | Görev |
+| Fonksiyon | Dosya:Satır | Görev |
 |-----------|-----------|-------|
-| `event_loop()` | `event_loop.c:377` | Ana döngü, epoll_wait |
+| `event_loop()` | `event_loop.c:429` | Ana döngü, epoll_wait |
 | `process_peer_frames()` | `event_loop.c:55` | Frame parsing + routing (static) |
-| `frame_header_decode()` | `network.c:1450` | 13-byte header → struct |
+| `frame_header_decode()` | `network.c:1724` | 13-byte header → struct |
 | `recv()` | system call | Ham veri okuma |
-| `noise_decrypt()` | `noise.c:881` | ChaCha20-Poly1305 IETF AEAD decrypt |
-| `handshake_read()` | `noise.c:791` | Noise XX mesaj okuma |
-| `file_transfer_handle_rx()` | `file_transfer.c:496` | Dosya frame işleme |
-| `ui_print_incoming()` | `ui.c:426` | Mesajı ekrana yazdır |
+| `noise_decrypt()` | `noise.c:899` | ChaCha20-Poly1305 IETF AEAD decrypt |
+| `handshake_read()` | `noise.c:809` | Noise XX mesaj okuma |
+| `file_transfer_handle_rx()` | `file_transfer.c:510` | Dosya frame işleme |
+| `ui_print_incoming()` | `ui.c:447` | Mesajı ekrana yazdır |
 | `tui_chat_append()` | `tui.c:380` | TUI chat buffer'a ekle |
 
 ### 3.2 RX Veri Akışı Detayı
@@ -174,57 +176,57 @@ Kullanıcı girdisi → Tor'a veri gönderme. Tam yol:
 ```
 Kullanıcı (stdin veya TUI)
   ↓
-stdin_handler.c:772  process_stdin_events()
+stdin_handler.c:875  process_stdin_events()
   ↓
-stdin_handler.c:352  process_line()         ← komut routing
+stdin_handler.c:383  process_line()         ← komut routing
   ↓
-  ├─ /connect ──→ stdin_handler.c:615 socks5_connect()
+  ├─ /connect ──→ stdin_handler.c:680 socks5_connect()
   │                    ↓
-  │               network.c:1243 socks5_connect()
+  │               network.c:1500 socks5_connect()
   │                    ↓
   │               Tor SOCKS5 → onion adresi (rate limit + self-connect
   │               + duplicate kontrolünden sonra)
   │
   ├─ /add ─────→ database.c:339 db_add_contact()
   │
-  ├─ /msg ─────→ stdin_handler.c:249 send_segmented_message()
+  ├─ /msg ─────→ stdin_handler.c:262 send_segmented_message()
   │                    ↓
-  │               stdin_handler.c:254 send_segmented_message_to()
+  │               stdin_handler.c:267 send_segmented_message_to()
   │                    ↓
   │               stdin_handler.c:34 get_next_chunk_size()
   │               (4000 byte UTF-8 güvenli chunk'lar)
   │                    ↓
-  │               noise.c:874 noise_encrypt()
+  │               noise.c:892 noise_encrypt()
   │                    ↓
-  │               network.c:1434 frame_header_encode()
+  │               network.c:1708 frame_header_encode()
   │                    ↓
   │               writev() ile atomic gönderme
   │
-  └─ /file ────→ file_transfer.c:100 file_transfer_start()
+  └─ /file ────→ file_transfer.c:104 file_transfer_start()
                        ↓
                   BLAKE2b hash hesapla
                   METADATA frame gönder
                   EPOLLOUT aktif et
                        ↓
-                  file_transfer.c:330 file_transfer_handle_tx()
+                  file_transfer.c:334 file_transfer_handle_tx()
                   (4KB chunk'lar halinde gönderim)
 ```
 
 ### 4.1 TX Anahtar Fonksiyonlar
 
-| Fonksiyon | Dosya:Satr | Görev |
+| Fonksiyon | Dosya:Satır | Görev |
 |-----------|-----------|-------|
-| `process_stdin_events()` | `stdin_handler.c:772` | stdin/TUI girdisi oku |
-| `process_line()` | `stdin_handler.c:352` | Komut ayrıştır ve yönlendir |
-| `send_segmented_message()` | `stdin_handler.c:249` | Uzun mesajı chunk'lara böl |
-| `send_segmented_message_to()` | `stdin_handler.c:254` | Belirli peer'a segmentli gönder |
+| `process_stdin_events()` | `stdin_handler.c:875` | stdin/TUI girdisi oku |
+| `process_line()` | `stdin_handler.c:383` | Komut ayrıştır ve yönlendir |
+| `send_segmented_message()` | `stdin_handler.c:262` | Uzun mesajı chunk'lara böl |
+| `send_segmented_message_to()` | `stdin_handler.c:267` | Belirli peer'a segmentli gönder |
 | `get_next_chunk_size()` | `stdin_handler.c:34` | UTF-8 güvenli chunk noktası bul |
-| `noise_encrypt()` | `noise.c:874` | ChaCha20-Poly1305 IETF AEAD encrypt |
-| `frame_header_encode()` | `network.c:1434` | struct → 13-byte wire format |
-| `write_full()` | `network.c:92` | EINTR retry ile tam yazma |
-| `socks5_connect()` | `network.c:1243` | Tor SOCKS5 bağlantısı |
-| `file_transfer_start()` | `file_transfer.c:100` | Dosya transferini başlat |
-| `file_transfer_handle_tx()` | `file_transfer.c:330` | 4KB chunk gönderimi |
+| `noise_encrypt()` | `noise.c:892` | ChaCha20-Poly1305 IETF AEAD encrypt |
+| `frame_header_encode()` | `network.c:1708` | struct → 13-byte wire format |
+| `write_full()` | `network.c:95` | EINTR retry ile tam yazma |
+| `socks5_connect()` | `network.c:1500` | Tor SOCKS5 bağlantısı |
+| `file_transfer_start()` | `file_transfer.c:104` | Dosya transferini başlat |
+| `file_transfer_handle_tx()` | `file_transfer.c:334` | 4KB chunk gönderimi |
 
 ### 4.2 TX Frame Yapısı
 
@@ -297,7 +299,7 @@ EV_TOR_DIED            // Tor process öldü
 
 ### 5.3 Geçiş Tablosu (40 geçiş — `transitions[]`, state_machine.c:122)
 
-Gerçek geçiş tablosu kaynak koddan (`src/state_machine.c:122-190`):
+Gerçek geçiş tablosu kaynak koddan (`src/state_machine.c:122-188`):
 
 ```
 { ST_IDLE,           EV_CONNECT_CMD,        ST_HANDSHAKE_INIT, action_connect      }
@@ -382,17 +384,17 @@ ST_IDLE dışındaki tüm durumlarda:
 | Fonksiyon | Dosya:Satr | Görev |
 |-----------|-----------|-------|
 | `sm_dispatch()` | `state_machine.c:196` | Ana dispatch motoru (linear search) |
-| `sm_dispatch_active()` | `state_machine.c:222` | Aktif peer'a event dispatch |
+| `sm_dispatch_active()` | `state_machine.c:223` | Aktif peer'a event dispatch |
 | `action_cleanup()` | `state_machine.c:240` | fd kapat, key sıfırla, arena restore |
-| `action_connect()` | `state_machine.c:322` | Outbound connect (stub — /connect stdin_handler.c'de) |
-| `action_accept()` | `state_machine.c:330` | Inbound accept (stub — main.c accept4'te) |
-| `action_hs_process()` | `state_machine.c:338` | Handshake işleme (stub) |
-| `action_tofu_prompt()` | `state_machine.c:346` | TOFU onayı iste |
-| `action_tofu_accept()` | `state_machine.c:354` | TOFU onayla: DB'ye kaydet, session kur |
-| `action_session_up()` | `state_machine.c:417` | Session hazır (stub) |
-| `action_file_begin()` | `state_machine.c:425` | Dosya TX başlat (stub) |
-| `action_file_end()` | `state_machine.c:433` | Dosya transferi bitir (stub) |
-| `action_file_begin_rx()` | `state_machine.c:441` | Dosya RX başlat (stub) |
+| `action_connect()` | `state_machine.c:325` | Outbound connect (stub — /connect stdin_handler.c'de) |
+| `action_accept()` | `state_machine.c:333` | Inbound accept (stub — main.c accept4'te) |
+| `action_hs_process()` | `state_machine.c:341` | Handshake işleme (stub) |
+| `action_tofu_prompt()` | `state_machine.c:349` | TOFU onayı iste |
+| `action_tofu_accept()` | `state_machine.c:357` | TOFU onayla: DB'ye kaydet, session kur |
+| `action_session_up()` | `state_machine.c:426` | Session hazır (stub) |
+| `action_file_begin()` | `state_machine.c:434` | Dosya TX başlat (stub) |
+| `action_file_end()` | `state_machine.c:442` | Dosya transferi bitir (stub) |
+| `action_file_begin_rx()` | `state_machine.c:450` | Dosya RX başlat (stub) |
 
 ---
 
@@ -412,8 +414,16 @@ crypto_kdf_derive_from_key (BLAKE2b)
   ↓
   ├─ db_key (32 byte)            ← NOX_SUBKEY_DB = 1
   ├─ identity_unlock (32 byte)   ← NOX_SUBKEY_IDENTITY_UNLOCK = 2
-  └─ session_key (32 byte)       ← NOX_SUBKEY_SESSION = 3
+  ├─ session_key (32 byte)       ← NOX_SUBKEY_SESSION = 3
+  └─ onion_seed (32 byte)        ← NOX_SUBKEY_ONION_SEED = 4
 ```
+
+Onion adresi artık diskteki `onion.key` dosyasından değil, master_key'den
+deterministik türetiliyor (`crypto_derive_onion_seed`, D3 — disk YOK):
+seed → `derive_tor_expanded_key` → Tor `ADD_ONION ED25519-V3:<b64>` KeyBlob.
+`crypto_sign_seed_keypair`'ın sk çıktısı `[seed||pub]` olduğu için Tor'un
+beklediği `[clamped_scalar||prefix]` formatı expanded key türetmeyle üretilir
+(ayrıntı: `docs/onion-key-derived-plan.md`).
 
 ### 6.2 Identity Key Çözümü
 
@@ -458,11 +468,13 @@ noise_decrypt(session, ciphertext):
 |-----------|-----------|-------|
 | `crypto_global_init()` | `crypto.c:142` | libsodium init |
 | `crypto_derive_master_key()` | `crypto.c:180` | PIN → Argon2id → master_key |
-| `crypto_derive_subkeys()` | `crypto.c:232` | master_key → 3 subkey (NOX_SUBKEY_DB=1, IDENTITY_UNLOCK=2, SESSION=3) |
-| `crypto_load_or_create_salt()` | `crypto.c:279` | Salt yönetimi (atomic write) |
-| `crypto_generate_identity()` | `crypto.c:412` | Ed25519 keypair üret + şifrele |
-| `crypto_load_identity()` | `crypto.c:544` | identity.key çöz ve yükle (secretbox) |
-| `crypto_ed25519_to_curve25519()` | `crypto.c:633` | Ed25519 → Curve25519 dönüştür |
+| `crypto_derive_subkeys()` | `crypto.c:232` | master_key → 4 subkey (NOX_SUBKEY_DB=1, IDENTITY_UNLOCK=2, SESSION=3, ONION_SEED=4) |
+| `crypto_derive_onion_seed()` | `crypto.c:277` | master_key → onion seed (deterministik, D1/D2) |
+| `derive_tor_expanded_key()` | `crypto.c:304` | onion seed → Tor ADD_ONION KeyBlob (3. tur KRİTİK düzeltme) |
+| `crypto_load_or_create_salt()` | `crypto.c:349` | Salt yönetimi (atomic write) |
+| `crypto_generate_identity()` | `crypto.c:495` | Ed25519 keypair üret + şifrele |
+| `crypto_load_identity()` | `crypto.c:633` | identity.key çöz ve yükle (secretbox) |
+| `crypto_ed25519_to_curve25519()` | `crypto.c:722` | Ed25519 → Curve25519 dönüştür |
 | `cipher_encrypt()` | `noise.c:79` | ChaCha20-Poly1305 IETF AEAD encrypt |
 | `cipher_decrypt()` | `noise.c:112` | ChaCha20-Poly1305 IETF AEAD decrypt |
 
@@ -514,12 +526,12 @@ Split():  (tx, rx) = HKDF(ck, "")
 | Fonksiyon | Dosya:Satr | Görev |
 |-----------|-----------|-------|
 | `handshake_init()` | `noise.c:485` | XX handshake başlat |
-| `handshake_write()` | `noise.c:641` | Sıradaki handshake mesajını yaz |
-| `handshake_read()` | `noise.c:791` | Gelen handshake mesajını oku |
-| `handshake_is_complete()` | `noise.c:833` | Handshake tamamlandı mı? |
-| `handshake_split()` | `noise.c:839` | Session'a dönüştür |
-| `noise_encrypt()` | `noise.c:874` | Transport encrypt |
-| `noise_decrypt()` | `noise.c:881` | Transport decrypt |
+| `handshake_write()` | `noise.c:653` | Sıradaki handshake mesajını yaz |
+| `handshake_read()` | `noise.c:809` | Gelen handshake mesajını oku |
+| `handshake_is_complete()` | `noise.c:851` | Handshake tamamlandı mı? |
+| `handshake_split()` | `noise.c:857` | Session'a dönüştür |
+| `noise_encrypt()` | `noise.c:892` | Transport encrypt |
+| `noise_decrypt()` | `noise.c:899` | Transport decrypt |
 | `symmetric_init()` | `noise.c:155` | SymmetricState başlat |
 | `symmetric_mix_hash()` | `noise.c:179` | MixHash |
 | `symmetric_mix_key()` | `noise.c:337` | MixKey (HKDF) |
@@ -536,7 +548,7 @@ Split():  (tx, rx) = HKDF(ck, "")
 ```
 /file /path/to/file
   ↓
-file_transfer_start()                    [file_transfer.c:100]
+file_transfer_start()                    [file_transfer.c:104]
   ├─ open(filepath, O_RDONLY)
   ├─ fstat() → dosya boyutu
   ├─ BLAKE2b hash hesapla (boyut dahil)
@@ -545,7 +557,7 @@ file_transfer_start()                    [file_transfer.c:100]
   │    payload: filename_len(1) + filename + filesize(8) + hash(32)
   └─ EPOLLOUT aktif et
   ↓
-file_transfer_handle_tx()                [file_transfer.c:330]
+file_transfer_handle_tx()                [file_transfer.c:334]
   ├─ read(fd, chunk, 4096)
   ├─ noise_encrypt(chunk)
   ├─ frame_header_encode() + writev()
@@ -562,7 +574,7 @@ Tamamlandı:
 ```
 FILE frame geldi → process_peer_frames()
   ↓
-file_transfer_handle_rx()                [file_transfer.c:496]
+file_transfer_handle_rx()                [file_transfer.c:510]
   ├─ METADATA frame?
   │    ├─ dosya adını sanitize et (whitelist filter)
   │    ├─ downloads_dir_fd ile openat() (TOCTOU koruması)
@@ -598,14 +610,14 @@ file_transfer_handle_rx()                [file_transfer.c:496]
 
 | Fonksiyon | Dosya:Satr | Görev |
 |-----------|-----------|-------|
-| `file_transfer_start()` | `file_transfer.c:100` | TX başlat |
-| `file_transfer_handle_tx()` | `file_transfer.c:330` | TX chunk gönder |
-| `file_transfer_handle_rx()` | `file_transfer.c:496` | RX frame işle |
-| `file_transfer_cleanup()` | `file_transfer.c:697` | Temizlik |
+| `file_transfer_start()` | `file_transfer.c:104` | TX başlat |
+| `file_transfer_handle_tx()` | `file_transfer.c:334` | TX chunk gönder |
+| `file_transfer_handle_rx()` | `file_transfer.c:510` | RX frame işle |
+| `file_transfer_cleanup()` | `file_transfer.c:718` | Temizlik |
 | `sanitize_filename()` | `file_transfer.c:29` | Dosya adı temizleme |
 | `verify_downloads_dir_fd()` | `file_transfer.c:83` | Downloads dizin doğrulama (fd tabanlı) |
-| `open_recv_file()` | `file_transfer.c:446` | Güvenli dosya açma |
-| `write_to_file()` | `file_transfer.c:429` | Kısmi yazma yardımı |
+| `open_recv_file()` | `file_transfer.c:460` | Güvenli dosya açma |
+| `write_to_file()` | `file_transfer.c:443` | Kısmi yazma yardımı |
 
 ---
 
@@ -659,11 +671,11 @@ file_transfer_handle_rx()                [file_transfer.c:496]
 | `clear_prompt_area()` | `ui.c:132` | Prompt alanını temizle |
 | `ui_print_prompt()` | `ui.c:243` | Prompt çiz |
 | `atomic_message()` | `ui.c:391` | Atomik terminal çıktısı (static) |
-| `ui_print_incoming()` | `ui.c:426` | Gelen mesaj yazdır |
-| `ui_print_outgoing()` | `ui.c:446` | Giden mesaj yazdır |
-| `ui_print_system()` | `ui.c:468` | Sistem mesajı yazdır |
-| `ui_print_error()` | `ui.c:510` | Hata mesajı yazdır |
-| `ui_print_progress()` | `ui.c:582` | Dosya transfer ilerleme çubuğu |
+| `ui_print_incoming()` | `ui.c:447` | Gelen mesaj yazdır |
+| `ui_print_outgoing()` | `ui.c:467` | Giden mesaj yazdır |
+| `ui_print_system()` | `ui.c:489` | Sistem mesajı yazdır |
+| `ui_print_error()` | `ui.c:541` | Hata mesajı yazdır |
+| `ui_print_progress()` | `ui.c:623` | Dosya transfer ilerleme çubuğu |
 
 ---
 
@@ -703,19 +715,20 @@ file_transfer_handle_rx()                [file_transfer.c:496]
 │  • writev() atomic gönderim (AF_UNIX kernel garantisi)  │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 2: Sistem Çağrısı Kısıtlamaları                  │
-│  • Seccomp stage 1 (constructor, main.c:121):          │
+│  • Seccomp stage 1 (constructor, main.c:141):          │
 │    process_vm_readv/writev, ptrace, io_uring_setup/    │
 │    enter/register, userfaultfd, perf_event_open, bpf,  │
 │    kexec_file_load, finit_module, personality          │
-│  • Seccomp stage 2 (Tor spawn sonrası, main.c:1272):   │
+│  • Seccomp stage 2 (Tor spawn sonrası, main.c:1301):   │
 │    fork, vfork, execve, execveat, mount, umount2,      │
 │    pivot_root, swapon, swapoff, init_module,           │
 │    delete_module, sethostname, setdomainname, keyctl,  │
 │    unshare, setns, reboot + fs api + clone (thread     │
 │    filter) + prctl (8 tehlikeli option) + raw socket   │
-│  • Seccomp stage 3 (event loop başı, event_loop.c:429):│
+│  • Seccomp stage 3 (event loop başı, event_loop.c:481):│
 │    symlink/link/chmod/chown, clone, socket(AF_INET,    │
-│    AF_INET6, AF_XDP, AF_ALG, AF_VSOCK, AF_NETLINK)     │
+│    AF_INET6, AF_XDP, AF_ALG, AF_VSOCK, AF_NETLINK),    │
+│    W^X (mprotect/mmap PROT_EXEC), SysV IPC, memfd      │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 1: Process İzolasyonu                             │
 │  • TSYNC: 32-bit seccomp bypass engeli                  │
@@ -726,10 +739,10 @@ file_transfer_handle_rx()                [file_transfer.c:496]
 
 ### 10.2 Seccomp Aşamaları
 
-Seccomp-bpf additive'tir: stage 1 kuralları kalıcıdır, her stage yalnızca yeni kural ekler. `seccomp_policy_load(stage)` (seccomp.c:176) — `SCMP_ACT_KILL` (SIGSYS).
+Seccomp-bpf additive'tir: stage 1 kuralları kalıcıdır, her stage yalnızca yeni kural ekler. `seccomp_policy_load(stage)` (seccomp.c:239) — `SCMP_ACT_KILL_PROCESS` (SIGSYS).
 
 ```
-Stage 1 (constructor, main.c:121 — main'den önce):
+Stage 1 (constructor, main.c:141 — main'den önce):
   process_vm_readv, process_vm_writev          ← process memory okuma engeli
   ptrace (yalnızca NDEBUG)                     ← attach engeli
   io_uring_setup, io_uring_enter, io_uring_register
@@ -737,12 +750,13 @@ Stage 1 (constructor, main.c:121 — main'den önce):
   bpf, kexec_file_load, finit_module           ← kernel injection
   personality                                  ← ABI bypass engeli
 
-Stage 2 (Tor spawn sonrası, main.c:1272 — fork/execve artık gerekmez):
+Stage 2 (Tor spawn sonrası, main.c:1301 — fork/execve artık gerekmez):
   execve, execveat, fork, vfork                ← process manipulation
+  acct                                         ← telemetri vektörü
   pidfd_open, process_madvise, kcmp
   mount, umount2, fsopen, fsconfig, fsmount, fspick,
   move_mount, open_tree, umount, pivot_root,
-  open_by_handle_at, openat2                   ← filesystem API
+  open_by_handle_at                            ← filesystem API
   reboot, sethostname, setdomainname, kexec_load
   init_module, delete_module
   unshare, setns                               ← namespace
@@ -752,22 +766,34 @@ Stage 2 (Tor spawn sonrası, main.c:1272 — fork/execve artık gerekmez):
   + özel kurallar:
     clone: CLONE_THREAD biti set değilse KILL (pthread_create izinli,
            fork/vfork yolu kapatılır — H-2 fix)
-    clone3: tamamen KILL
+    clone3: ENOSYS döner (tamamen etkisizleştirilir)
     prctl: 8 tehlikeli option KILL (PR_SET_DUMPABLE, PR_SET_PTRACER,
            PR_SET_TIMING, PR_SET_MM, PR_SET_TSC, PR_SET_SECUREBITS,
            PR_SET_SYSCALL_USER_DISPATCH, PR_SET_MDWE)
     socket(AF_PACKET), socket(AF_INET, SOCK_RAW),
     socket(AF_INET6, SOCK_RAW)                 ← raw paket engeli
 
-Stage 3 (event loop başı, event_loop.c:429):
+Stage 3 (event loop başı, event_loop.c:481):
   symlink, symlinkat, link, linkat             ← fs manipulation
-  chmod, fchmod, fchmodat, chown, fchown, fchownat
+  chmod, fchmod, fchmodat, chown, fchown, fchownat,
+  fchmodat2                                    ← H-6 bypass engeli
+  + H-6 exfil/privilege engelleri:
+    sendto, mknod, mknodat, modify_ldt, iopl, ioperm, syslog
+    pkey_mprotect, pkey_alloc, pkey_free       ← W^X bypass engeli
+    name_to_handle_at, pidfd_getfd, memfd_secret, vmsplice
+    mount_setattr, splice, memfd_create
+    + koşullu (kernel header'a bağlı): open_tree_attr, file_setattr,
+      statmount, listmount
+  + SysV IPC (prosesler arası veri kanalı):
+    shmget, shmat, shmctl, msgget, msgsnd, msgrcv, msgctl
   + özel kurallar:
     clone: tamamen KILL (event loop tek thread)
     socket(AF_INET), socket(AF_INET6)          ← TCP/UDP tamamen yasak
     socket(AF_XDP), socket(AF_ALG), socket(AF_VSOCK)  ← H-6 fix:
        alternatif sızıntı yolları (raw paket / kernel crypto / VM)
     socket(AF_NETLINK)                         ← kernel network config
+    mprotect(PROT_EXEC), mmap(PROT_EXEC)       ← W^X: çalışma zamanında
+       executable bellek yaratımı KILL (JIT yok, BIND_NOW)
 
 İzinli kalanlar: AF_UNIX socket (Tor control/SOCKS/peer bağlantısı),
 getaddrinfo yalnızca stage 3 öncesi (bootstrap sırasında).
@@ -792,9 +818,9 @@ getaddrinfo yalnızca stage 3 öncesi (bootstrap sırasında).
 └──────────────────────────────────┘
 ```
 
-Gerçek yerleşim (main.c:887-940): her gerçek key alloc'undan ÖNCE
+Gerçek yerleşim (main.c:1024-1026): her gerçek key alloc'undan ÖNCE
 `scatter_honeypots(&state.arena, 0, 3)` çağrılır — 0-3 arası rastgele
-adette sahte key (`arena_alloc_canary`, arena.c:408) yerleştirilir.
+adette sahte key (`arena_alloc_canary`, arena.c:426) yerleştirilir.
 Böylece key'lerin arena içindeki konumu her çalıştırmada farklıdır ve
 saldırgan hangi 32-byte bloğun gerçek key olduğunu tahmin edemez.
 
@@ -807,7 +833,7 @@ destroy'da sodium_memzero ile temizleme.
 
 ## 11. Test Kapsamı
 
-### 11.1 Unit Testler (80/80 — `make test`)
+### 11.1 Unit Testler (90/90 — `make test`)
 
 | Test Dosyası | Test Sayısı | Kapsadığı Fonksiyonlar |
 |--------------|-------------|------------------------|
@@ -817,10 +843,13 @@ destroy'da sodium_memzero ile temizleme.
 | `test_landlock_rights.c` | 12 | Landlock hak maskeleme (birim 12 + entegrasyon) |
 | `test_network.c` | 7 | Frame encode/decode, listener create, UTF-8 chunking |
 | `test_noise.c` | 9 | Null safety, loopback handshake, transport roundtrip, MAC tamper, spec vectors |
+| `test_onion_derive.c` | 7 | Onion seed determinizmi, subkey ayrımı, expanded key format, sabit vektörler |
 | `test_pin.c` | 12 | PIN validation (min, max, empty, null, control chars, UTF-8, spaces) |
-| `test_seccomp_stage3.c` | 11 | AF_INET, AF_INET6, clone, DNS, connect, AF_NETLINK, AF_UNIX, prctl |
+| `test_seccomp_stage3.c` | 14 | AF_INET, AF_INET6, clone, DNS, connect, AF_NETLINK, AF_UNIX, prctl, W^X |
 
-Ayrıca: `test_seccomp.c` (make seccomp-test) — tüm seccomp kural dizisinin
+Ayrıca: `test_onion_derive.sh` — onion e2e: determinizm + canlı Tor
+`ADD_ONION` ServiceID eşleşmesi (`make test` sonunda koşar).
+`test_seccomp.c` (make seccomp-test) — tüm seccomp kural dizisinin
 canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
 
 ### 11.2 Formal Doğrulama (CBMC + ESBMC + ProVerif)
@@ -858,7 +887,7 @@ canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
 
 ```bash
 # Unit testler
-make test                    # 80/80, ASan+UBSan altında (8 suite)
+make test                    # 90/90, ASan+UBSan altında (9 suite + onion e2e)
 make seccomp-test            # Seccomp canlı kural testi
 
 # Formal doğrulama
@@ -888,6 +917,7 @@ noxtor-cli/
 │   ├── event_loop.h         # Event loop API
 │   ├── file_transfer.h      # Dosya transfer API
 │   ├── landlock_sandbox.h   # Landlock API
+│   ├── linenoise.h           # linenoise secure fork API
 │   ├── network.h            # Network API + frame sabitleri
 │   ├── noise.h              # Noise API
 │   ├── seccomp_policy.h     # Seccomp API
@@ -904,6 +934,7 @@ noxtor-cli/
 │   ├── event_loop.c         # epoll + frame processing
 │   ├── file_transfer.c      # BLAKE2b + streaming
 │   ├── landlock_sandbox.c   # Landlock LSM
+│   ├── linenoise.c           # secure fork — satır düzenleme (sodium alloc)
 │   ├── log.c                # Module-based logging
 │   ├── main.c               # Entry point + key derivation
 │   ├── network.c            # Tor + SOCKS5 + frame codec
@@ -932,9 +963,11 @@ noxtor-cli/
 │   ├── test_landlock_rights.c # Landlock rights tests (12)
 │   ├── test_network.c       # Network unit tests (7)
 │   ├── test_noise.c         # Noise unit tests (9)
+│   ├── test_onion_derive.c  # Onion türetme unit tests (7)
+│   ├── test_onion_derive.sh # Onion e2e (determinizm + canlı Tor ADD_ONION)
 │   ├── test_pin.c           # PIN unit tests (12)
 │   ├── test_seccomp.c       # Seccomp live tests (make seccomp-test)
-│   └── test_seccomp_stage3.c # Seccomp stage-3 tests (11)
+│   └── test_seccomp_stage3.c # Seccomp stage-3 tests (14)
 ├── fuzz/
 │   ├── fuzz_arena.c
 │   ├── fuzz_ctrl.c
@@ -949,7 +982,7 @@ noxtor-cli/
 │   ├── corpus/
 │   └── findings*/
 │
-├── .github/workflows/      # arch.yml (make) + codeql.yml
+├── .github/workflows/      # codeql.yml (CodeQL statik analiz)
 ├── LICENSE                 # GPL-3.0
 ├── Makefile
 ├── README.md

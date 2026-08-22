@@ -249,6 +249,17 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
               sm_dispatch(ps, state, EV_ARENA_FAIL);
             }
           } else {
+            /* G-2 madde 0: tofu_pending guard'ı print bloğundan önce aktif et —
+             * clear_prompt_area içindeki early-return ancak böyle devreye girer. */
+            ps->tofu_pending = true;
+            ps->tofu_peer_fd = fd;
+            ps->tofu_was_zero_key = false; /* H-1 FIX: mevcut key değişimi */
+            ps->peer_verified = false;
+            strncpy(ps->tofu_onion, peer_onion, NOX_ONION_LEN);
+            ps->tofu_onion[NOX_ONION_LEN] = '\0';
+            strncpy(ps->tofu_name, name, NOX_CONTACT_NAME_LEN);
+            ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+            memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
             /* Atomic ANSI: cursor hide → clear → print warning → prompt */
             if (tui_is_active()) {
               ui_print_error(state, "[!] UYARI: AKRANIN ANAHTARI DEĞİŞMİŞ! (MITM RİSKİ)");
@@ -271,81 +282,73 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
             fflush(stderr);
             }
 
-            ps->tofu_pending = true;
-            ps->tofu_peer_fd = fd;
-            ps->tofu_was_zero_key = false; /* H-1 FIX: mevcut key değişimi */
-            ps->peer_verified = false;
-            strncpy(ps->tofu_onion, peer_onion, NOX_ONION_LEN);
-            ps->tofu_onion[NOX_ONION_LEN] = '\0';
-            strncpy(ps->tofu_name, name, NOX_CONTACT_NAME_LEN);
-            ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
-            memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
             /* State geçişi: HANDSHAKE → TOFU_PENDING */
             clock_gettime(CLOCK_MONOTONIC, &ps->tofu_start);
             sm_dispatch(ps, state, EV_HANDSHAKE_DONE);
           }
-         } else {
-          if (tui_is_active()) {
-            ui_print_system(state, "[!] TOFU: Yeni peer bağlantısı");
-            ui_print_system(state, "      Adres: %s", peer_onion);
-            ui_print_system(state, "      Fingerprint: %s", fp_str);
-            ui_print_system(state, "  [?] Bu bağlantıyı onaylıyor ve rehbere "
-                            "kaydediyor musunuz? (y/n): ");
           } else {
-          fprintf(stderr, "\033[?25l");
-          clear_prompt_area(state);
-          fprintf(stderr,
-                  "\n\033[33m  [!] TOFU: Yeni peer bağlantısı\033[0m\n");
-          fprintf(stderr, "      Adres: %s\n", peer_onion);
-          fprintf(stderr, "      \033[1;36mFingerprint: %s\033[0m\n", fp_str);
-          fprintf(stderr, "  [?] Bu bağlantıyı onaylıyor ve rehbere "
-                          "kaydediyor musunuz? (y/n): ");
-          fflush(stderr);
-          fprintf(stderr, "\033[?25h");
-          fflush(stderr);
-          }
+           /* G-2 madde 0: default_name önce hesaplanmalı — tofu_name ona bağlı */
+           char default_name[NOX_CONTACT_NAME_LEN + 1];
+           bool is_placeholder = (db_err == NOX_OK && zero_key);
+           if (is_placeholder && name[0] != '\0') {
+             snprintf(default_name, sizeof(default_name), "%s", name);
+           } else {
+             snprintf(default_name, sizeof(default_name), "peer_%.8s",
+                      peer_onion);
+           }
+           default_name[NOX_CONTACT_NAME_LEN] = '\0';
+           /* G-2 madde 0: guard print bloğundan önce aktif — clear_prompt_area artık no-op */
+           ps->tofu_pending = true;
+           ps->tofu_peer_fd = fd;
+           ps->tofu_was_zero_key = is_placeholder; /* H-1 FIX: kuyruk flush kontrolü için */
+           ps->peer_verified = false;
+           strncpy(ps->tofu_onion, peer_onion, NOX_ONION_LEN);
+           ps->tofu_onion[NOX_ONION_LEN] = '\0';
+           strncpy(ps->tofu_name, default_name, NOX_CONTACT_NAME_LEN);
+           ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+           memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
+           if (tui_is_active()) {
+             ui_print_system(state, "[!] TOFU: Yeni peer bağlantısı");
+             ui_print_system(state, "      Adres: %s", peer_onion);
+             ui_print_system(state, "      Fingerprint: %s", fp_str);
+             ui_print_system(state, "  [?] Bu bağlantıyı onaylıyor ve rehbere "
+                             "kaydediyor musunuz? (y/n): ");
+           } else {
+           fprintf(stderr, "\033[?25l");
+           clear_prompt_area(state);
+           fprintf(stderr,
+                   "\n\033[33m  [!] TOFU: Yeni peer bağlantısı\033[0m\n");
+           fprintf(stderr, "      Adres: %s\n", peer_onion);
+           fprintf(stderr, "      \033[1;36mFingerprint: %s\033[0m\n", fp_str);
+           fprintf(stderr, "  [?] Bu bağlantıyı onaylıyor ve rehbere "
+                           "kaydediyor musunuz? (y/n): ");
+           fflush(stderr);
+           fprintf(stderr, "\033[?25h");
+           fflush(stderr);
+           }
 
-          char default_name[NOX_CONTACT_NAME_LEN + 1];
-          bool is_placeholder = (db_err == NOX_OK && zero_key);
-          if (is_placeholder && name[0] != '\0') {
-            snprintf(default_name, sizeof(default_name), "%s", name);
-          } else {
-            snprintf(default_name, sizeof(default_name), "peer_%.8s",
-                     peer_onion);
-          }
-          default_name[NOX_CONTACT_NAME_LEN] = '\0';
+           /* H-1 FIX: zero_key placeholder için ek uyarı — rehber zehirlenmesi
+            * riski: /add ile sıfır key eklenmiş kişiye saldırgan ilk bağlanan
+            * olursa slot'u zehirler. Kullanıcıya bağlam ver. */
+           if (is_placeholder) {
+             if (tui_is_active()) {
+               ui_print_error(state, "[!] DİKKAT: Bu onion rehberinizde '%s' olarak kayıtlı ama anahtarı henüz doğrulanmadı.", default_name);
+               ui_print_error(state, "    İlk bağlantı anahtarı kalıcı olarak bağlayacak — bu işlemi SİZ başlatmadıysanız MITM olabilir.");
+             } else {
+               fprintf(stderr, "\033[?25l");
+               clear_prompt_area(state);
+               fprintf(stderr, "\n\033[33m  [!] DİKKAT: Bu onion rehberinizde '%s' olarak kayıtlı ama anahtarı henüz doğrulanmadı.\033[0m\n", default_name);
+               fprintf(stderr, "      İlk bağlantı anahtarı kalıcı olarak bağlayacak — bu işlemi SİZ başlatmadıysanız MITM olabilir.\n");
+               fflush(stderr);
+               fprintf(stderr, "\033[?25h");
+               fflush(stderr);
+             }
+           }
 
-          /* H-1 FIX: zero_key placeholder için ek uyarı — rehber zehirlenmesi
-           * riski: /add ile sıfır key eklenmiş kişiye saldırgan ilk bağlanan
-           * olursa slot'u zehirler. Kullanıcıya bağlam ver. */
-          if (is_placeholder) {
-            if (tui_is_active()) {
-              ui_print_error(state, "[!] DİKKAT: Bu onion rehberinizde '%s' olarak kayıtlı ama anahtarı henüz doğrulanmadı.", default_name);
-              ui_print_error(state, "    İlk bağlantı anahtarı kalıcı olarak bağlayacak — bu işlemi SİZ başlatmadıysanız MITM olabilir.");
-            } else {
-              fprintf(stderr, "\033[?25l");
-              clear_prompt_area(state);
-              fprintf(stderr, "\n\033[33m  [!] DİKKAT: Bu onion rehberinizde '%s' olarak kayıtlı ama anahtarı henüz doğrulanmadı.\033[0m\n", default_name);
-              fprintf(stderr, "      İlk bağlantı anahtarı kalıcı olarak bağlayacak — bu işlemi SİZ başlatmadıysanız MITM olabilir.\n");
-              fflush(stderr);
-              fprintf(stderr, "\033[?25h");
-              fflush(stderr);
-            }
-          }
-
-          ps->tofu_pending = true;
-          ps->tofu_peer_fd = fd;
-          ps->tofu_was_zero_key = is_placeholder; /* H-1 FIX: kuyruk flush kontrolü için */
-          ps->peer_verified = false;
-          strncpy(ps->tofu_onion, peer_onion, NOX_ONION_LEN);
-          ps->tofu_onion[NOX_ONION_LEN] = '\0';
-          strncpy(ps->tofu_name, default_name, NOX_CONTACT_NAME_LEN);
-          ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
-          memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
-          /* State geçişi: HANDSHAKE → TOFU_PENDING */
-          clock_gettime(CLOCK_MONOTONIC, &ps->tofu_start);
-          sm_dispatch(ps, state, EV_HANDSHAKE_DONE);
-        }
+           /* State geçişi: HANDSHAKE → TOFU_PENDING */
+           clock_gettime(CLOCK_MONOTONIC, &ps->tofu_start);
+           sm_dispatch(ps, state, EV_HANDSHAKE_DONE);
+         }
       }
       sodium_memzero(remote_pub, NOX_KEY_LEN);
     } else if ((fh.type == NOX_MSG_TEXT || fh.type == NOX_MSG_FILE) &&
@@ -614,7 +617,7 @@ void event_loop(struct app_state *state) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         long idle = (long)(now.tv_sec - ps->last_active.tv_sec);
-        if (idle > 120) {
+        if (idle > 3600) {
           NOX_WARN(LOG_MOD_NET, "Peer idle timeout (%lds) — slot %u disconnect", idle, pi);
           ui_print_error(state, "Bağlantı zaman aşımı — peer sessiz (idle).");
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
@@ -703,8 +706,7 @@ void event_loop(struct app_state *state) {
           break;
         }
       }
-      if (has_frames && state->ln_active)
-        linenoiseHide(&state->ln_state);
+      if (has_frames) ui_line_suspend(state);
       for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
         struct peer_session *ps = &state->peers[pi];
         if (ps->session && ps->fd >= 0 &&
@@ -712,8 +714,7 @@ void event_loop(struct app_state *state) {
           process_peer_frames(ps, state, ps->fd);
         }
       }
-      if (has_frames && state->ln_active)
-        linenoiseShow(&state->ln_state);
+      if (has_frames) ui_line_resume(state);
     }
 
     int nfds = epoll_wait(state->epoll_fd, events,
@@ -736,10 +737,13 @@ void event_loop(struct app_state *state) {
 
       /* ── Gelen peer bağlantısı — tek global listener ── */
       if (fd == state->listen_fd) {
+        ui_line_suspend(state);
         int peer_fd =
             accept4(fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
-        if (peer_fd < 0)
+        if (peer_fd < 0) {
+          ui_line_resume(state);
           continue;
+        }
 
         /* Boş peer slotu bul */
         struct peer_session *listener_ps = NULL;
@@ -753,6 +757,7 @@ void event_loop(struct app_state *state) {
         if (!listener_ps) {
           NOX_WARN(LOG_MOD_MAIN, "maksimum peer sayısına ulaşıldı — bağlantı reddedildi");
           close(peer_fd);
+          ui_line_resume(state);
           continue;
         }
 
@@ -771,6 +776,7 @@ void event_loop(struct app_state *state) {
                      "Inbound handshake rate limit aşıldı (5/60s) — bağlantı reddedildi");
             ui_print_error(state, "Çok fazla gelen handshake denemesi — biraz bekleyin.");
             close(peer_fd);
+            ui_line_resume(state);
             continue;
           }
         }
@@ -780,6 +786,7 @@ void event_loop(struct app_state *state) {
             NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı reddedildi");
             close(peer_fd);
             listener_ps->fd = -1;
+            ui_line_resume(state);
             continue;
           }
 
@@ -787,6 +794,7 @@ void event_loop(struct app_state *state) {
           if (!listener_ps->hs) {
             close(peer_fd);
             listener_ps->fd = -1;
+            ui_line_resume(state);
             continue;
           }
 
@@ -814,6 +822,7 @@ void event_loop(struct app_state *state) {
                    (unsigned long)(listener_ps - state->peers),
                    active_peer_count(state));
           ui_print_system(state, "[*] gelen bağlantı — handshake bekleniyor");
+          ui_line_resume(state);
           continue;
         }
 
@@ -839,7 +848,9 @@ void event_loop(struct app_state *state) {
         size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
         if (to_read == 0) {
           /* Buffer dolu — önce tamamlanmış frame'leri processing et */
+          ui_line_suspend(state);
           process_peer_frames(ps, state, fd);
+          ui_line_resume(state);
           /* Hâlâ doluysa peer tıkanmış (DoS veya kapanma) — disconnect */
           if (ps->fd >= 0) {
             NOX_WARN(LOG_MOD_NET, "recv_buf dolu — peer tıkanmış, disconnect");
@@ -867,7 +878,9 @@ void event_loop(struct app_state *state) {
         ps->recv_pos += (size_t)r;
         clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
 
+        ui_line_suspend(state);
         process_peer_frames(ps, state, fd);
+        ui_line_resume(state);
       }
     }
   }

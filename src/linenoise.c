@@ -628,8 +628,9 @@ static int enableRawMode(int fd) {
     /* input modes: no break, no CR to NL, no parity check, no strip char,
      * no start/stop output control. */
     raw.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    /* output modes - disable post processing */
-    raw.c_oflag &= ~(tcflag_t)(OPOST);
+    /* output modes - keep OPOST/ONLCR so kernel translates \n → \r\n
+     * (G-2 fix for cumulative drift; escape sequences unaffected). */
+    raw.c_oflag |= (tcflag_t)(OPOST | ONLCR);
     /* control modes - set 8 bit chars */
     raw.c_cflag |= (CS8);
     /* local modes - choing off, canonical off, no extended functions,
@@ -2103,6 +2104,13 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         /* A NUL byte must never reach the edit buffer: it would silently
          * truncate the line for strlen()/render. Beep and drop it. */
         if (c == 0) {
+            linenoiseBeep();
+            break;
+        }
+        /* LN-1: Non-printable C0 controls (except TAB) must not reach the
+         * buffer — they would be sent to the peer (terminal injection).
+         * TAB is intentionally preserved (user decision). */
+        if ((unsigned char)c < 32 && c != '\t') {
             linenoiseBeep();
             break;
         }

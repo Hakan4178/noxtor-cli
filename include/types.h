@@ -322,11 +322,13 @@ struct app_state {
     char    *stdin_buf;
     size_t   stdin_len;
     size_t   stdin_cap;
+    bool     stdin_closed;    /* K-4 FIX: EOF sonrası epoll busy-loop önleme */
 
     /* Linenoise editör (Faz E — TTY multiplexing, yalnızca ln_active iken) */
     struct linenoiseState ln_state;
     char    *ln_buf;           /* sodium_malloc(NOX_EDIT_CAP), TTY modunda */
     int      ln_active;        /* 1 = TTY'de linenoise aktif (isatty) */
+    int      ln_suspend_depth; /* G-2: refcount — suspend nesting güvenli, 0=görünür */
 
     /* Pluggable Transport (Faz 6.2) */
     enum tor_transport_type transport_type;
