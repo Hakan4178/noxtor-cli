@@ -1990,8 +1990,12 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         }
         l->prompt_drawn = 0; /* Caller closes the line with its own newline. */
         return ln_strdup(l->buf);
-    case CTRL_C:     /* ctrl-c */
-        errno = EAGAIN;
+    case CTRL_C:     /* ctrl-c — /quit ile aynı etki (TOFU'da bloklu) */
+        errno = ECANCELED;
+        l->prompt_drawn = 0;
+        return NULL;
+    case CTRL_P:     /* ctrl-p — /quit ile aynı etki */
+        errno = ECANCELED;
         l->prompt_drawn = 0;
         return NULL;
     case BACKSPACE:   /* backspace */

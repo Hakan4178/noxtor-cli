@@ -48,15 +48,31 @@ If an assumption is false, the corresponding mitigation claim is void.
 
 ## 2. Assets (What We're Protecting)
 
-| Asset | Description |
-|---|---|
-| Message confidentiality | Contents of messages/files in transit and, unless Ghost Mode is on, at rest |
-| Message integrity | Detecting tampering or injection by a network-level attacker |
-| Metadata minimization | Who is talking to whom, when, and how often |
-| Forward secrecy | Past sessions stay safe if a long-term key is later compromised |
-| Sender/peer authentication | Confidence you're talking to the peer you think you are (post-TOFU) |
-| Availability under censorship | Ability to connect at all when Tor is blocked/throttled |
-| Local plausible deniability | Ghost Mode: no data written to disk at all, vs. the encrypted-at-rest baseline that applies even with Ghost Mode off (confirmed in `database.c`, §4.3) |
+Every row is a **crown jewel** — an attacker who obtains it wins that row's
+security goal. Almost all crypto material is transitively derived from the
+first row (`PIN → master_key`); compromise there cascades.
+
+| # | Asset (what it is) | Where it lives | Security goal(s) it serves |
+|---|---|---|---|
+| **A1** | **User PIN / passphrase** (8–128 bytes, `main.c` prompt, `crypto.c:180`) | User memory only, never written to disk | Root of all trust — Argon2id input |
+| **A2** | **`master_key` (32B, `crypto.c:180` Argon2id `OPSLIMIT_MODERATE/MEMLIMIT_MODERATE` + 16B salt `crypto.c:349`)** | `arena.c` only (mlock'd), per-run derived | **Crown jewel** — all subkeys below derive from this via `crypto_kdf_derive_from_key` (`crypto.c:63` `NOX_SUBKEY_*=1..4`) |
+| **A3** | **Subkeys (4×32B)** — `db_key` (1), `identity_unlock` (2), `session_key` (3), `onion_seed` (4) (`crypto.c:232/277`, `NOX_KDF_CTX="noxtor__"`) | `arena.c` (`db_key` also in `database.c` handle) | DB encryption, identity decrypt, Tor HS identity, onion address |
+| **A4** | **Salt file** (16B, `~/.config/paranoidcli/salt`, `crypto.c:349` `openat(O_NOFOLLOW)`) | Filesystem (world-readable if `config_dir` 0700 fails) | `master_key` determinism — wrong salt = permanent loss (H-4) |
+| **A5** | **Onion identity** — `onion_seed` (A3/4) → `derive_tor_expanded_key` (`crypto.c:304`, 64B `[clamped_scalar||prefix]` — 3rd-round critical fix) → `ADD_ONION ED25519-V3:<b64>` → 56-char `ServiceID` / `.onion` address (`network.c:1301`) | RAM only (never a plaintext `onion.key` file — deterministic, `onion-key-derived-plan.md`) + Tor control channel `PrivateKey=` | Long-term pseudonym — if leaked, permanent impersonation |
+| **A6** | **Ed25519 long-term identity** (64B secret `crypto_sign_SECRETKEYBYTES` + 32B pub, `identity.key` file `crypto.c:495/633` `secretbox` under `identity_unlock`) → **Curve25519 static** `my_static_priv/pub` (32B, `crypto.c:722` conversion) | `arena.c` (`my_static_*`), `identity.key` on disk (ciphertext) | E2E authenticity — Noise XX `s` token |
+| **A7** | **Noise XX ephemeral + handshake state** — `hs->e` priv (32B), `hs->ss.h/ck` (`noise.c:155/179/337`), `re`/`rs` | `arena.c` per-peer `ps->hs` (freed via `action_cleanup` + `strub`) | Forward secrecy, MITM resistance — zeroed on fail (`state_machine.c:240`) |
+| **A8** | **Session transport keys + nonces** — `ps->session->tx/rx` `CipherState` (`noise.c:408` `symmetric_split`), `tx_seq/rx_seq` (`event_loop.c:354`, `_Atomic` `noise.c`) — `NOX_MAX_PEERS=16` slots (`types.h`) | `arena.c` per-peer session | Per-message AEAD (ChaCha20-Poly1305) — nonce reuse = catastrophic |
+| **A9** | **Tor control auth cookie** (32B, `network.c` `fstat==32` check) + `torrc`/`tor_data_dir`/`tor.log` | Filesystem (`tor_data_dir`) + RAM `resp` buffer (`network.c` `strub`) | HS creation — if leaked, attacker can control HS |
+| **A10** | **Contact DB / social graph** — onion addresses + display names + peer `noise_key` (`database.c:339` `db_add_contact`, `crypto_secretbox_easy` under `db_key`) | `contacts.db` (WAL mode, `secure_delete=ON`) | Who you talk to — often more sensitive than content |
+| **A11** | **Message history + offline queue** (ciphertext `nonce+XSalsa20-Poly1305`, `database.c:124`) + **queue decrypt/MAC** (`database.c` `db_process_queue`) | `contacts.db` / queue table | Past/future message confidentiality |
+| **A12** | **Downloaded files (plaintext after decrypt)** — `file_transfer.c:510` `BLAKE2b`+`O_EXCL|O_NOFOLLOW` → `downloads/` | Filesystem `downloads/` (Landlock-bounded) | File confidentiality at-rest — user-executed, see §4.7/§5.7 |
+| **A13** | **Metadata / reachability** — who/when/how often, HS uptime, guard timing (no padding, A4) | Network (guard-visible volume/timing) | Relationship unlinkability / traffic confirmation (§4.4, LINDDUN §5) |
+| **A14** | **Availability** — Tor HS reachability, obfs4/Snowflake bridge, listener socket | Network / `event_loop.c` epoll | Censorship circumvention — if blocked, no communication at all |
+
+> **Reading guide:** A1→A2→A3→A5/A6→A7→A8 is the derivation chain. Break any
+> link and everything below falls. Ghost Mode removes A11/A12 persistence but
+> does **not** remove A10 encryption-at-rest (A10 stays encrypted under A3/1
+> even with Ghost Mode off — see §4.3).
 
 ## 3. Actors & Trust Boundaries
 
@@ -69,26 +85,29 @@ If an assumption is false, the corresponding mitigation claim is void.
 - **Noxtor's own dependencies** (libsodium, libsqlite3, libseccomp, Tor,
   obfs4proxy, Snowflake) — trusted-but-verify; see supply-chain in §4.5.
 
-### 3.1 Attack Surface / Entry Points (DRAFT STUB — verify parser → handler routing)
+### 3.1 Attack Surface / Entry Points (verified against source 2026-08-23)
 
 Every row is an input boundary an adversary can influence. "Who controls it" is the
 adversary who can craft it; "Worst case if parser fails" is what the TM must
-assume.
+assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
 
 | # | Entry point | Parser / handler | Who controls it | Worst case if unhandled |
 |---|---|---|---|---|
-| E1 | **Wire frame header** (13B: `0xDEADC0DE` + type + seq + len) | `network.c:1724` `frame_header_decode` → `event_loop.c:55` `process_peer_frames` | Malicious peer (remote) | OOB, buffer over-read, state-machine bypass |
-| E2 | **Wire payload** (TEXT/FILE/CTRL/ACK, ≤4096+16) | `event_loop.c:355` seq check + `noise.c:892/899` decrypt | Malicious peer | Decrypt oracle, silent tamper (see §4.2.6), heap disclosure |
-| E3 | **Noise handshake blobs** (XX `e`/`ee`/`es`/`se` + `s` + payload) | `noise.c:653`/`809` `handshake_write/read` + `symmetric_*` | Malicious peer (pre-auth) | Key-compromise, prologue bypass, DoS via `hs` exhaustion |
-| E4 | **SOCKS5 reply** (Tor → Noxtor) | `network.c:1500` `socks5_connect` | Local Tor / network MitM on loopback | Peer impersonation, connection hijack |
-| E5 | **Tor control channel** (`ADD_ONION` ServiceID, PrivateKey, cookie) | `network.c` `parse_service_id` / `validate_onion_address` / `ctrl_read_response` | Compromised Tor / control-socket injector (S3, §4.6) | Identity hijack, peer-handshake confusion |
-| E6 | **File METADATA + chunks** (filename, size, BLAKE2b hash, DATA frames) | `file_transfer.c:104/510` `file_transfer_start/handle_rx` + `sanitize_filename` `file_transfer.c:29` | Verified peer (post-TOFU) — **untrusted content** | Path traversal, symlink TOCTOU, disk exhaustion, malicious content (user-executed — see §4.7) |
-| E7 | **Downloaded file bytes** (written to `downloads/` via `openat(O_EXCL|O_NOFOLLOW)`) | `file_transfer.c:460` `open_recv_file` → `file_transfer.c:443` | Verified peer | User opens malware (Landlock limits write scope, not execution — user responsibility, §4.7) |
-| E8 | **CLI args / env / config dir** | `main.c:1408` arg parsing + `crypto.c:349` salt load | Local user / co-tenant | Config injection, salt downgrade |
-| E9 | **TTY / stdin input** (commands `/connect` `/msg` etc., TOFU `y/n`) | `stdin_handler.c:875` `process_stdin_events` → `stdin_handler.c:383` `process_line` + linenoise `src/linenoise.c:2347` | Local user + terminal emulator (§5.3) | Command injection, TOFU slot-recycling (see §7) |
-| E10 | **SQLite rows** (contacts, history, queue — at-rest ciphertext) | `database.c` `crypto_secretbox_*` decrypt on load | Forensic examiner with DB file (±PIN) | Offline brute-force if PIN weak (A1); WAL/SSD remnants (§4.3.4) |
+| E1 | **Wire frame header** (13B: `0xDEADC0DE` + type + seq + len, `network.c:1724`) | `frame_header_decode` → `event_loop.c:55` `process_peer_frames` (cap `len==0 \|\| len>4096+16` → drop) | Malicious peer (remote) | OOB, buffer over-read, state-machine bypass |
+| E2 | **Wire payload** (TEXT/FILE/CTRL/ACK, `≤4096+NOX_MAC_LEN` per frame) | `event_loop.c:354` `seq` check + `noise.c:892/899` `noise_decrypt` (AEAD, `rx_seq` only on success) | Malicious peer | Decrypt oracle, silent tamper (see §4.2.6), heap disclosure |
+| E3 | **Noise handshake blobs** (XX `e`/`ee`/`es`/`se` + `s` + payload) | `noise.c:653/809` `handshake_write/read` + `symmetric_*` (`noise.c:155`/`371`) | Malicious peer (pre-auth) | Key-compromise, prologue bypass, DoS via `hs` exhaustion (`sodium_malloc` per peer) |
+| E4 | **SOCKS5 reply** (Tor → Noxtor, loopback) | `network.c:1500` `socks5_connect` (local `127.0.0.1:9050` / `socks_path`) | Local Tor / loopback MitM (not remote peer) | Peer impersonation, connection hijack |
+| E5 | **Tor control channel** (`ADD_ONION` ServiceID 56-char, `PrivateKey`, cookie 32B) | `network.c` `parse_service_id` / `validate_onion_address` / `ctrl_read_response` (cap `64` lines) | Compromised Tor / control-socket injector (S3, §4.6) | Identity hijack, peer-handshake confusion |
+| E6 | **File METADATA + chunks** — METADATA = `1B len + ≤255B name + 8B LE size + 32B BLAKE2b` (`file_transfer.c:104`), DATA = 4KB chunks, `NOX_MAX_FILE_SIZE=100 GiB` (`file_transfer.h:13`), name via `sanitize_filename` (`file_transfer.c:29` whitelist+`..`→`__`) + `verify_downloads_dir_fd` (`file_transfer.c:83` 0700+UID) | Verified peer (post-TOFU) — **untrusted content** | Path traversal, symlink TOCTOU, disk exhaustion, malicious content (user-executed — see §4.7) |
+| E7 | **Downloaded file bytes** (written to `downloads/` via `openat(O_EXCL\|O_NOFOLLOW)`  `file_transfer.c:460` → `file_transfer.c:443` `write_to_file`) | Verified peer | User opens malware (Landlock limits write scope, not execution — user responsibility, §4.7) |
+| E8 | **CLI args / env / config dir** (`--ghost`, `--allow-unsandboxed-fs`, `HOME/.config/paranoidcli/salt` `NOX_PATH_MAX=512`) | `main.c:716` `argv` parsing + `crypto.c:349` `openat(dir_fd,"salt")` keep-alive | Local user / co-tenant (§5.5 shared-system) | Config injection, salt downgrade / TOCTOU (now keep-alive fd) |
+| E9 | **TTY / stdin input** (commands `/connect` `/msg` `/file`, TOFU `y/n`) | `stdin_handler.c:875` `process_stdin_events` → `stdin_handler.c:383` `process_line` + linenoise `src/linenoise.c:2347` (sodium allocator) | Local user + terminal emulator (§5.3/5.6 scrollback) | Command injection, **TOFU slot-recycling** (see §7 — highest priority, still open) |
+| E10 | **SQLite rows** (contacts, history, queue — at-rest `nonce+XSalsa20-Poly1305` `database.c:124`) | `database.c` `crypto_secretbox_*` decrypt on load, `PRAGMA journal_mode=WAL` + `secure_delete=ON` | Forensic examiner with DB file (±PIN, A1 weak PIN → offline brute-force) | WAL/SSD remnants (§4.3.4), queue decrypt-then-delete (§4.3.5) |
 
-`[TODO: maintainer — confirm routing for E4/E5 (does any peer input ever reach control-channel parsers or vice versa?); confirm E6 max filename / size enforcement limits; confirm E9 TOFU binding is per-session not per-slot]`
+**Verification notes (2026-08-23, code-traced):**
+- **E4/E5 routing isolation — VERIFIED:** `tor_ctrl_fd` and `ps->fd` (peer) are distinct `epoll` registrations (`event_loop.c:38` `find_peer_by_fd` vs `tor_ctrl_fd`); peer `recv` data never reaches `ctrl_read_response` / `parse_service_id` and vice-versa.
+- **E6 limits — DOCUMENTED:** filename capped to `255B` (`safe_name[256]`), sanitized via whitelist (`[^a-zA-Z0-9._-]`→`_` `file_transfer.c:51`), `..`→`__`, leading `.`→`_`, empty→`file_<hex>`; file size capped `100 GiB`; DATA chunks 4KB; METADATA+DATA both inside Noise AEAD + BLAKE2b (size-in-hash `file_transfer.c:192`).
+- **E9 TOFU binding — STILL OPEN:** whether `y/n` binds to originating `ps` or active slot is the §7 highest-priority question for `stdin_handler.c` review (next step).
 
 ## 4. Adversary Models (In Scope)
 
@@ -303,17 +322,7 @@ assume.
      swap)? Does Ghost Mode also suppress shell history / process-list
      evidence (argv, environment) or only the DB layer?
 
-  2. **Cleanup only happens on graceful shutdown.** `rm_rf(tor_data_dir)`
-     and the torrc unlink both run inside `tor_shutdown()`, which is only
-     reached on a clean exit path. On `SIGKILL`, an unhandled crash, or a
-     power-loss/seizure scenario, the per-instance directory — including
-     Tor's own `tor.log` (`Log notice file %s/tor.log`, timestamped) —
-     survives on disk. `cleanup_stale_tor_dirs` will eventually remove it
-     on a *future* run, but only once the owning PID is confirmed dead and
-     not a live `tor` process, and only if the app is launched again. This
-     is a real forensic-recovery window: a seized device from an
-     ungracefully-terminated session can yield a timestamped log of when a
-     hidden service was running.
+   2. **Cleanup only happens on graceful shutdown (and `tor.log` is build-dependent).** `rm_rf(tor_data_dir)` and the torrc unlink both run inside `tor_shutdown()`, which is only reached on a clean exit path. On `SIGKILL`, an unhandled crash, or a power-loss/seizure scenario, the per-instance directory survives on disk. In **debug** builds this includes Tor's own `tor.log` (`Log notice file %s/tor.log`, `src/network.c:652` `#else` branch, timestamped) — a real forensic-recovery window: a seized device from an ungracefully-terminated session can yield a timestamped log of when a hidden service was running. In **release** builds (`-DNDEBUG`, `Makefile:192`) Tor logs to `/dev/null` (`src/network.c:652` `#ifdef NDEBUG`) and **no `tor.log` file is ever created** — the forensic window is closed in release, open in debug for post-mortem. `cleanup_stale_tor_dirs` will eventually remove the stale directory on a *future* run, but only once the owning PID is confirmed dead.
 
    3. **[RESOLVED — onion-key derivation, `src/crypto.c:277` + `src/network.c:1301`] Persistent hidden-service identity is no longer a plaintext `onion.key` file.** Current design deterministically derives the onion seed from `master_key` (`crypto_derive_onion_seed`, `NOX_SUBKEY_ONION_SEED=4`) and expands it via `derive_tor_expanded_key` to the Tor `ADD_ONION ED25519-V3:<b64>` KeyBlob sent over the control port. No private key is persisted to disk at rest; a seized device without the PIN yields no onion identity. See `docs/onion-key-derived-plan.md` and `docs/architecture.md` §6.1. Remaining forensic question for this section is only the ephemeral per-run Tor working directory (`tor.log` gap, #2 above) — not a long-term identity file.
 

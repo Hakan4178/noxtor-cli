@@ -643,6 +643,26 @@ static nox_err_t generate_torrc(struct app_state *state) {
     if (access("/usr/local/bin/snowflake-client", X_OK) == 0) {
       snowflake_path = "/usr/local/bin/snowflake-client";
     }
+    /* Release: Log → /dev/null (forensic iz yok), Debug: file (teşhis) */
+#ifdef NDEBUG
+    clen = snprintf(
+        content, sizeof(content),
+        "SocksPort unix:%s/socks.sock\n"
+        "ControlSocket %s/control.sock\n"
+        "CookieAuthentication 1\n"
+        "DataDirectory %s\n"
+        "Log notice file /dev/null\n"
+        "UseBridges 1\n"
+        "UpdateBridgesFromAuthority 1\n"
+        "ClientTransportPlugin snowflake exec %s\n"
+        "Bridge snowflake 192.0.2.3:80 "
+        "2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 "
+        "fingerprint=2B280B2313E81E262C97C20B2F2B4B2F5714EAB1 "
+        "url=https://snowflake-broker.torproject.net/ front=cdn.sstatic.net "
+        "ice=stun:stun.l.google.com:19302 utls-imitation=hellorandomizedalpn\n",
+        state->tor_data_dir, state->tor_data_dir, state->tor_data_dir,
+        snowflake_path);
+#else
     clen = snprintf(
         content, sizeof(content),
         "SocksPort unix:%s/socks.sock\n"
@@ -660,6 +680,7 @@ static nox_err_t generate_torrc(struct app_state *state) {
         "ice=stun:stun.l.google.com:19302 utls-imitation=hellorandomizedalpn\n",
         state->tor_data_dir, state->tor_data_dir, state->tor_data_dir,
         state->tor_data_dir, snowflake_path);
+#endif
   } else if (state->transport_type == TRANSPORT_OBFS4) {
     const char *obfs4_path = "/usr/bin/obfs4proxy";
     if (access("/usr/local/bin/obfs4proxy", X_OK) == 0) {
@@ -677,6 +698,22 @@ static nox_err_t generate_torrc(struct app_state *state) {
         unlink(state->torrc_path);
         return NOX_ERR_CONFIG;
       }
+      /* Release: /dev/null, Debug: file */
+#ifdef NDEBUG
+      clen =
+          snprintf(content, sizeof(content),
+                   "SocksPort unix:%s/socks.sock\n"
+                   "ControlSocket %s/control.sock\n"
+                   "CookieAuthentication 1\n"
+                   "DataDirectory %s\n"
+                   "Log notice file /dev/null\n"
+                   "UseBridges 1\n"
+                   "Bridge %s\n"
+                   "ClientTransportPlugin obfs4 exec %s\n",
+                   state->tor_data_dir, state->tor_data_dir,
+                   state->tor_data_dir,
+                   state->obfs4_bridge_line, obfs4_path);
+#else
       clen =
           snprintf(content, sizeof(content),
                    "SocksPort unix:%s/socks.sock\n"
@@ -690,7 +727,22 @@ static nox_err_t generate_torrc(struct app_state *state) {
                    state->tor_data_dir, state->tor_data_dir,
                    state->tor_data_dir, state->tor_data_dir,
                    state->obfs4_bridge_line, obfs4_path);
+#endif
     } else {
+      /* Release: /dev/null, Debug: file */
+#ifdef NDEBUG
+      clen = snprintf(content, sizeof(content),
+                      "SocksPort unix:%s/socks.sock\n"
+                      "ControlSocket %s/control.sock\n"
+                      "CookieAuthentication 1\n"
+                      "DataDirectory %s\n"
+                      "Log notice file /dev/null\n"
+                      "UseBridges 1\n"
+                      "UpdateBridgesFromAuthority 1\n"
+                      "ClientTransportPlugin obfs4 exec %s\n",
+                      state->tor_data_dir, state->tor_data_dir,
+                      state->tor_data_dir, obfs4_path);
+#else
       clen = snprintf(content, sizeof(content),
                       "SocksPort unix:%s/socks.sock\n"
                       "ControlSocket %s/control.sock\n"
@@ -702,8 +754,21 @@ static nox_err_t generate_torrc(struct app_state *state) {
                       "ClientTransportPlugin obfs4 exec %s\n",
                       state->tor_data_dir, state->tor_data_dir,
                       state->tor_data_dir, state->tor_data_dir, obfs4_path);
+#endif
     }
   } else {
+    /* Release: /dev/null, Debug: file */
+#ifdef NDEBUG
+    clen =
+        snprintf(content, sizeof(content),
+                 "SocksPort unix:%s/socks.sock\n"
+                 "ControlSocket %s/control.sock\n"
+                 "CookieAuthentication 1\n"
+                 "DataDirectory %s\n"
+                 "Log notice file /dev/null\n",
+                 state->tor_data_dir, state->tor_data_dir,
+                 state->tor_data_dir);
+#else
     clen =
         snprintf(content, sizeof(content),
                  "SocksPort unix:%s/socks.sock\n"
@@ -713,6 +778,7 @@ static nox_err_t generate_torrc(struct app_state *state) {
                  "Log notice file %s/tor.log\n",
                  state->tor_data_dir, state->tor_data_dir,
                  state->tor_data_dir, state->tor_data_dir);
+#endif
   }
 
   if (clen <= 0 || (size_t)clen >= sizeof(content)) {

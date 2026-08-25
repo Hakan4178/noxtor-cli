@@ -251,6 +251,7 @@ release:
 	$(MAKE) clean
 	$(MAKE) _release_build TUI=$(TUI)
 	strip --strip-debug $(TARGET)
+	@if objdump -T $(TARGET) 2>/dev/null | grep -q "__sanitizer"; then echo "[!] HATA: release binary sanitizer sembolü içeriyor"; exit 1; fi
 	@echo "[*] Binary: $(TARGET)"
 	@echo "[*] Boyut: $$(du -sh $(TARGET) | cut -f1)"
 

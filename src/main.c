@@ -84,14 +84,10 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 
-/* K-4 FIX: ASan/LSan build'lerinde exit() → LSan leak-check fork() → seccomp
- * stage 2 SIGSYS. NDEBUG (release) build'lerde LSan yok — exit() güvenli,
- * atexit(restore_terminal) + stdio flush korunur. */
-#ifdef NDEBUG
-#define NOX_EXIT(code) return (code)
-#else
+/* K-4 FIX: exit() → atexit/_IO_cleanup/_dl_fini/LSan fork() → clone SIGSYS
+ * (seccomp stage 2/3). Her iki build'de de _exit ile atla — cleanup()
+ * zaten terminal restore + gerekli flush'ları yapıyor. */
 #define NOX_EXIT(code) _exit(code)
-#endif
 #include <sys/resource.h>
 #include <sys/uio.h>
 #include <assert.h>
@@ -1404,5 +1400,5 @@ shutdown_clean:
     cleanup(&state);
 
     NOX_INFO(LOG_MOD_MAIN, "%s kapatıldı", PARANOID_APP_NAME);
-    NOX_EXIT(0); /* K-4: debug'da _exit (LSan fork → SIGSYS), release'de exit() — makroya bak */
+    NOX_EXIT(0); /* K-4: her iki build'de _exit — exit() clone SIGSYS */
   }

@@ -380,20 +380,10 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
   sodium_free(chunk);
   return first_err;
 }
-
-/* ================================================================
- * ÇEKİRDEK GİRDİ İŞLEME
- * ================================================================ */
-
 void process_line(struct app_state *state, const char *line) {
   struct peer_session *ps = ACTIVE_PEER(state);
 
-  /* ── TOFU Onay Modu (H-2 FIX) ───────────────
-   * Önceki kod yalnız ACTIVE_PEER'i kontrol ediyordu — aktif peer A iken
-   * saldırgan B'nin TOFU prompt'u basılırsa 'y' cevabı A'ya şifreli mesaj
-   * olarak giderdi. Şimdi tüm slotlar taranır; tek TOFU varsa ona yönlendirir,
-   * birden fazla varsa kullanıcıdan net seçim ister. Ayrıca TOFU beklerken
-   * normal mesaj yolu tamamen bloke edilir (girdi sızıntısı kapalı). */
+  /* ── TOFU Onay Modu (H-2 paranoid + K-1 ile entegre) ─────────────── */
   struct peer_session *tofu_ps = NULL;
   unsigned tofu_cnt = 0;
   for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
@@ -430,23 +420,45 @@ void process_line(struct app_state *state, const char *line) {
       }
       return;
     }
-    /* y/n değil ve TOFU bekliyor — mesaj sızıntısını engelle */
+    /* y/n değil ve TOFU bekliyor — // dahil hiçbir slash-mesaj gönderme */
     if (line[0] != '/') {
       ui_print_error(state,
         "TOFU onayı bekleniyor — önce 'y' veya 'n' girin (veya /disconnect). "
         "Girdiniz şifreli kanala gönderilmedi.");
       return;
     }
-    /* '/' ile başlayan komutlar aşağıda normal komut yoluna düşer */
+    /* '/' ile başlayan komutlar aşağıda normal komut yoluna düşer, ama // kaçış TOFU’da bloklanır */
+    size_t _tofuslash = 0;
+    while (line[_tofuslash] == '/') _tofuslash++;
+    if (_tofuslash >= 2) {
+      ui_print_error(state,
+        "TOFU onayı bekleniyor — // ile mesaj gönderilemez, önce y/n veya /disconnect");
+      return;
+    }
   }
 
-  /* ── Komut modu — her zaman kontrol et (session aktif olsa bile) ─── */
+  /* ── KOMUT YOLU — her zaman önce, session’a bakmadan (K-1 paranoid) ─── */
   if (line[0] == '/') {
+    /* 1a. Literal kaçış: N slash → N-1 slash mesaj (///hello → //hello) */
+    size_t slash_cnt = 0;
+    while (line[slash_cnt] == '/') slash_cnt++;
+    if (slash_cnt >= 2) {
+      const char *msg = line + 1; /* bir slash düş */
+      if (msg[0] == '\0') { ui_print_error(state, "Boş mesaj — tek '/' için // kullan"); return; }
+      if (!ps || !ps->session || ps->fd < 0) {
+        ui_print_error(state, "bağlantı yok — // ile slash mesajı için önce /connect");
+        return;
+      }
+      nox_err_t err = send_segmented_message(state, msg);
+      if (err == NOX_OK) ui_print_outgoing(state, msg);
+      else ui_print_error(state, "Şifreleme/Gönderim hatası");
+      return;
+    }
+    /* 1b. Bilinen komutlar — tek tablo, session bağımsız */
     if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) {
       state->running = false;
       return;
     }
-
     if (strcmp(line, "/help") == 0) {
       ui_print_system(state,
           "Komutlar:\n"
@@ -460,387 +472,198 @@ void process_line(struct app_state *state, const char *line) {
           "  /switch <isim|onion>— aktif peer'ı değiştir\n"
           "  /msg <onion> <msj>  — mesaj gönder (çevrimdışıysa kuyruğa ekler)\n"
           "  /file <dosya_yolu>  — peer'a dosya gönder\n"
-          "  /status             — bağlantı durumunu göster\n"
-          "  /history            — mesaj geçmişini göster\n"
+          "  //mesaj             — '/' ile başlayan mesaj gönder (örn. //hello → /hello)\n"
           "  Ctrl+P              — çıkış\n\n"
           "Bağlantı kurulduktan sonra yazdığınız her şey mesaj olarak gönderilir.");
       return;
     }
-
     if (strcmp(line, "/addr") == 0) {
       ui_print_system(state, "%s", state->onion_addr);
       return;
     }
+    if (strncmp(line, "/add ", 5) == 0) {
+      if (state->ghost_mode) { ui_print_error(state, "ghost mod aktif — rehbere kişi eklenemez"); return; }
+      const char *p = line + 5; while (*p == ' ') p++;
+      const char *onion_start = p; while (*p && *p != ' ') p++;
+      size_t onion_len = (size_t)(p - onion_start);
+      if (onion_len != NOX_ONION_LEN || *p == '\0') { ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>"); return; }
+      if (!validate_onion_input(onion_start, onion_len)) { ui_print_error(state, "Geçersiz onion adresi formatı (56 base32 karakter + .onion)"); return; }
+      char onion[NOX_ONION_LEN + 1]; memcpy(onion, onion_start, NOX_ONION_LEN); onion[NOX_ONION_LEN] = '\0';
+      while (*p == ' ') p++;
+      const char *name_start = p;
+      if (*name_start == '\0') { ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>"); return; }
+      if (strlen(name_start) > NOX_CONTACT_NAME_LEN) { ui_print_error(state, "İsim çok uzun (max %u)", (unsigned)NOX_CONTACT_NAME_LEN); return; }
+      if (strpbrk(name_start, "\n\r\x1b") != NULL) { ui_print_error(state, "İsim kontrol karakteri içeremez"); return; }
+      char name[NOX_CONTACT_NAME_LEN + 1]; snprintf(name, sizeof(name), "%s", name_start);
+      uint8_t zero_key[NOX_KEY_LEN]; sodium_memzero(zero_key, sizeof(zero_key));
+      nox_err_t err = db_add_contact(onion, name, zero_key);
+      if (err == NOX_OK) ui_print_system(state, "[✓] Rehbere kaydedildi: %s (%s)", name, onion);
+      else ui_print_error(state, "Veritabanı hatası");
+      return;
+    }
+    if (strncmp(line, "/msg ", 5) == 0) {
+      const char *p = line + 5; while (*p == ' ') p++;
+      const char *onion_start = p; while (*p && *p != ' ') p++;
+      size_t onion_len = (size_t)(p - onion_start);
+      if (onion_len != NOX_ONION_LEN || *p == '\0') { ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>"); return; }
+      if (!validate_onion_input(onion_start, onion_len)) { ui_print_error(state, "Geçersiz onion adresi (56 base32 karakter + .onion)"); return; }
+      char onion[NOX_ONION_LEN + 1]; memcpy(onion, onion_start, NOX_ONION_LEN); onion[NOX_ONION_LEN] = '\0';
+      while (*p == ' ') p++;
+      const char *msg_start = p;
+      if (*msg_start == '\0') { ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>"); return; }
+      struct peer_session *target_ps = find_peer_by_name_or_onion(state, onion);
+      if (target_ps && target_ps->session && target_ps->fd >= 0) {
+        nox_err_t err = send_segmented_message_to(state, target_ps, msg_start);
+        if (err == NOX_OK) ui_print_outgoing(state, msg_start);
+        else ui_print_error(state, "Şifreleme/Gönderim hatası");
+      } else {
+        if (state->ghost_mode) { ui_print_error(state, "ghost mod aktif — çevrimdışı mesaj kuyruğa alınamaz"); return; }
+        nox_err_t err = queue_segmented_message(onion, msg_start);
+        if (err == NOX_OK) ui_print_system(state, "[*] Mesaj kuyruğa eklendi (akran çevrimdışı)");
+        else ui_print_error(state, "Kuyruğa ekleme başarısız");
+      }
+      return;
+    }
+    if (strncmp(line, "/connect ", 9) == 0) {
+      const char *target = line + 9; while (*target == ' ') target++;
+      /* K-3 FIX: aktif peer busy check kaldırıldı — çok-peer için boş slot + duplicate yeterli */
+      size_t target_len = strlen(target);
+      if (!validate_onion_input(target, target_len)) { ui_print_error(state, "Geçersiz onion adresi (sadece .onion adresleri desteklenir)"); return; }
+      if (target_len == NOX_ONION_LEN && memcmp(target, state->onion_addr, NOX_ONION_LEN) == 0) { ui_print_error(state, "kendi adresinize bağlanamazsınız"); return; }
+      struct peer_session *target_ps = NULL; unsigned target_idx = 0;
+      for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+        if (state->peers[i].fd == -1 && state->peers[i].state == ST_IDLE) { target_ps = &state->peers[i]; target_idx = i; break; }
+      }
+      if (!target_ps) { ui_print_error(state, "maksimum peer sayısına ulaşıldı"); return; }
+      for (unsigned j = 0; j < NOX_MAX_PEERS; j++) {
+        if (j != target_idx && state->peers[j].fd >= 0 && strcmp(state->peers[j].peer_onion, target) == 0) { ui_print_error(state, "Bu peer'a zaten bağlı"); return; }
+      }
+      /* Rate limit outbound */
+      {
+        struct timespec hs_ts; clock_gettime(CLOCK_MONOTONIC, &hs_ts);
+        time_t now = (time_t)hs_ts.tv_sec;
+        if (now - state->hs_window_start >= 60) { state->hs_attempt_count = 0; state->hs_window_start = now; }
+        if (state->hs_attempt_count >= 5) { NOX_WARN(LOG_MOD_NOISE, "Handshake rate limit aşıldı (5/60s) — outbound connect engellendi"); ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin."); return; }
+      }
+      NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
+      state->hs_attempt_count++;
+      int peer_fd = -1;
+      nox_err_t err = socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
+      if (err != NOX_OK) { ui_print_error(state, "bağlantı başarısız"); return; }
+      target_ps->fd = peer_fd;
+      snprintf(target_ps->peer_onion, sizeof(target_ps->peer_onion), "%s", target);
+      if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
+        NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı iptal");
+        close(peer_fd); target_ps->fd = -1; sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
+        ui_print_error(state, "bağlantı kayıt hatası"); return;
+      }
+      NOX_INFO(LOG_MOD_MAIN, "peer bağlandı");
+      target_ps->hs = sodium_malloc(sizeof(struct noise_handshake));
+      if (!target_ps->hs) { ui_print_error(state, "arena dolu"); close(peer_fd); target_ps->fd = -1; sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion)); return; }
+      handshake_init(target_ps->hs, true, state->my_static_priv, state->my_static_pub);
+      clock_gettime(CLOCK_MONOTONIC, &target_ps->handshake_start);
+      clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
+      if (sm_dispatch(target_ps, state, EV_CONNECT_CMD) != NOX_OK) {
+        NOX_WARN(LOG_MOD_MAIN, "EV_CONNECT_CMD reddedildi — state ayrışması önlendi");
+        close(peer_fd); target_ps->fd = -1; sodium_free(target_ps->hs); target_ps->hs = NULL;
+        sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
+        ui_print_error(state, "Bağlantı durumu uygun değil");
+        return;
+      }
+      uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN]; size_t hslen = sizeof(hsbuf);
+      nox_err_t hs_err = handshake_write(target_ps->hs, NULL, 0, hsbuf, &hslen);
+      if (hs_err != NOX_OK) {
+        NOX_ERROR(LOG_MOD_NOISE, "handshake_write hatası: %s", nox_strerror(hs_err));
+        ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
+        sm_dispatch(target_ps, state, EV_HANDSHAKE_ERROR);
+        return;
+      }
+      struct frame_header fh = { .magic = NOX_FRAME_MAGIC, .type = NOX_MSG_CTRL, .seq = target_ps->tx_seq, .len = (uint32_t)hslen, };
+      uint8_t wire[FRAME_HEADER_WIRE_SIZE]; frame_header_encode(&fh, wire);
+      struct iovec iov[2] = { { .iov_base = (void *)wire,  .iov_len = FRAME_HEADER_WIRE_SIZE }, { .iov_base = (void *)hsbuf, .iov_len = hslen }, };
+      ssize_t written = writev(peer_fd, iov, 2);
+      if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + hslen)) {
+        NOX_ERROR(LOG_MOD_NOISE, "handshake msg0 gönderilemedi: %s", written<0?strerror(errno):"kısmi");
+        ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
+        sm_dispatch(target_ps, state, EV_HANDSHAKE_ERROR);
+        return;
+      }
+      target_ps->tx_seq++;
+      clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
+      NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", target_ps->tx_seq);
+      ui_print_system(state, "[*] handshake başlatıldı");
+      state->active_peer_idx = (int)target_idx;
+      /* O-1 FIX: active_peer_onion atomik set (tek thread’de atomik, yorumla belgelendi) */
+      strncpy(state->active_peer_onion, target, NOX_ONION_LEN); state->active_peer_onion[NOX_ONION_LEN]='\0';
+      return;
+    }
+    if (strncmp(line, "/file ", 6) == 0) {
+      const char *filepath = line + 6; while (*filepath == ' ') filepath++;
+      if (!ps || !ps->session || ps->fd < 0) { ui_print_error(state, "Aktif bağlantı yok — /file için önce /connect"); return; }
+      file_transfer_start(state, filepath);
+      return;
+    }
+    if (strcmp(line, "/list") == 0) {
+      if (state->ghost_mode) { ui_print_error(state, "ghost mod — rehber kullanılamaz"); return; }
+      ui_print_system(state, "── Rehber ──");
+      db_list_contacts(list_visitor_cb, state);
+      ui_print_system(state, "── (%d bağlı) ──", active_peer_count(state));
+      return;
+    }
+    if (strncmp(line, "/switch ", 8) == 0) {
+      const char *arg = line + 8; while (*arg == ' ') arg++;
+      if (*arg == '\0') { ui_print_error(state, "Kullanım: /switch <isim|onion>"); return; }
+      struct peer_session *found = find_peer_by_name_or_onion(state, arg);
+      if (!found) { ui_print_error(state, "Peer bulunamadı: %s", arg); return; }
+      if (found->fd < 0 || !found->session || found->state != ST_ACTIVE) {
+        ui_print_error(state, "Peer aktif değil (handshake/TOFU devam ediyor olabilir): %s", arg);
+        return;
+      }
+      for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+        if (&state->peers[i] == found) {
+          state->active_peer_idx = (int)i;
+          strncpy(state->active_peer_onion, found->peer_onion, NOX_ONION_LEN);
+          state->active_peer_onion[NOX_ONION_LEN] = '\0';
+          ui_print_system(state, "Aktif peer: %s (%s)", found->name[0] ? found->name : found->peer_onion, sm_state_name(found->state));
+          return;
+        }
+      }
+      return;
+    }
+    if (strcmp(line, "/disconnect") == 0) {
+      struct peer_session *ps_dis = ACTIVE_PEER(state);
+      if (!ps_dis || ps_dis->fd < 0 || ps_dis->state == ST_IDLE) { ui_print_error(state, "Aktif peer yok"); return; }
+      char name_buf[NOX_CONTACT_NAME_LEN + 1];
+      strncpy(name_buf, ps_dis->name[0] ? ps_dis->name : (ps_dis->peer_onion[0]?ps_dis->peer_onion:"bilinmeyen"), sizeof(name_buf)-1); name_buf[sizeof(name_buf)-1]='\0';
+      sm_dispatch(ps_dis, state, EV_PEER_DISCONNECTED);
+      ui_print_system(state, "Bağlantı kesildi: %s", name_buf);
+      return;
+    }
+    if (strcmp(line, "/status") == 0) {
+      ui_print_system(state, "Aktif peer: %s (%s) — %d bağlı", state->active_peer_onion[0]?state->active_peer_onion:"yok", ps?sm_state_name(ps->state):"IDLE", active_peer_count(state));
+      return;
+    }
+    if (strcmp(line, "/history") == 0) {
+      ui_print_error(state, "Bilinmeyen komut: /history (henüz yok) — /help");
+      return;
+    }
+    /* Bilinmeyen slash → hata, asla mesaja düşme (format-string güvenli: %s) */
+    ui_print_error(state, "Bilinmeyen komut: %s — /help ile listeye bak", line);
+    return;
   }
 
-  /* ── Session aktifken: her satır mesaj ─── */
+  /* ── MESAJ YOLU — buraya yalnız '/' ile başlamayanlar düşer ─── */
   if (ps && ps->session && ps->fd >= 0) {
-    if (line[0] == '\0')
-      return; /* boş satır gönderme */
+    if (line[0] == '\0') return;
     nox_err_t err = send_segmented_message(state, line);
-    if (err == NOX_OK) {
-      ui_print_outgoing(state, line);
-    } else {
-      ui_print_error(state, "Şifreleme/Gönderim hatası");
-    }
+    if (err == NOX_OK) ui_print_outgoing(state, line);
+    else ui_print_error(state, "Şifreleme/Gönderim hatası");
     return;
   }
 
-  /* ── Session yokken: komut modu ─────── */
-  if ((!ps || ps->fd < 0) && line[0] != '/') {
-    if (state->ghost_mode) {
-      ui_print_error(state, "bağlantı yok — önce /connect kullan");
-    } else {
-      ui_print_error(state, "bağlantı yok — önce /connect kullan veya çevrimdışı "
-                            "mesaj için /msg kullan");
-    }
-    return;
-  }
-
-  if (strncmp(line, "/add ", 5) == 0) {
-    if (state->ghost_mode) {
-      ui_print_error(state, "ghost mod aktif — rehbere kişi eklenemez");
-      return;
-    }
-    const char *p = line + 5;
-    while (*p == ' ')
-      p++;
-
-    const char *onion_start = p;
-    while (*p && *p != ' ')
-      p++;
-    size_t onion_len = (size_t)(p - onion_start);
-
-    if (onion_len != NOX_ONION_LEN || *p == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>");
-      return;
-    }
-
-    /* Onion adres format doğrulaması */
-    if (!validate_onion_input(onion_start, onion_len)) {
-      ui_print_error(state,
-          "Geçersiz onion adresi formatı (56 base32 karakter + .onion)");
-      return;
-    }
-
-    char onion[NOX_ONION_LEN + 1];
-    memcpy(onion, onion_start, NOX_ONION_LEN);
-    onion[NOX_ONION_LEN] = '\0';
-
-    while (*p == ' ')
-      p++;
-    const char *name_start = p;
-    if (*name_start == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /add <onion> <isim>");
-      return;
-    }
-
-    char name[NOX_CONTACT_NAME_LEN + 1];
-    snprintf(name, sizeof(name), "%s", name_start);
-
-    uint8_t zero_key[NOX_KEY_LEN];
-    sodium_memzero(zero_key, sizeof(zero_key));
-
-    nox_err_t err = db_add_contact(onion, name, zero_key);
-    if (err == NOX_OK) {
-      ui_print_system(state, "[✓] Rehbere kaydedildi: %s (%s)", name, onion);
-    } else {
-      ui_print_error(state, "Veritabanı hatası");
-    }
-    return;
-  }
-
-  if (strncmp(line, "/msg ", 5) == 0) {
-    const char *p = line + 5;
-    while (*p == ' ')
-      p++;
-
-    const char *onion_start = p;
-    while (*p && *p != ' ')
-      p++;
-    size_t onion_len = (size_t)(p - onion_start);
-
-    if (onion_len != NOX_ONION_LEN || *p == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>");
-      return;
-    }
-
-    /* Onion adres format doğrulaması */
-    if (!validate_onion_input(onion_start, onion_len)) {
-      ui_print_error(state,
-          "Geçersiz onion adresi (56 base32 karakter + .onion)");
-      return;
-    }
-
-    char onion[NOX_ONION_LEN + 1];
-    memcpy(onion, onion_start, NOX_ONION_LEN);
-    onion[NOX_ONION_LEN] = '\0';
-
-    while (*p == ' ')
-      p++;
-    const char *msg_start = p;
-    if (*msg_start == '\0') {
-      ui_print_error(state, "Geçersiz kullanım. Örnek: /msg <onion> <mesaj>");
-      return;
-    }
-
-    /* Tüm bağlı peer'larda aktif oturum ara */
-    struct peer_session *target_ps = find_peer_by_name_or_onion(state, onion);
-    if (target_ps && target_ps->session && target_ps->fd >= 0) {
-      nox_err_t err = send_segmented_message_to(state, target_ps, msg_start);
-      if (err == NOX_OK) {
-        ui_print_outgoing(state, msg_start);
-      } else {
-        ui_print_error(state, "Şifreleme/Gönderim hatası");
-      }
-    } else {
-      if (state->ghost_mode) {
-        ui_print_error(state, "ghost mod aktif — çevrimdışı mesaj kuyruğa alınamaz");
-        return;
-      }
-      nox_err_t err = queue_segmented_message(onion, msg_start);
-      if (err == NOX_OK) {
-        ui_print_system(state, "[*] Mesaj kuyruğa eklendi (akran çevrimdışı)");
-      } else {
-        ui_print_error(state, "Kuyruğa ekleme başarısız");
-      }
-    }
-    return;
-  }
-
-  if (strncmp(line, "/connect ", 9) == 0) {
-    const char *target = line + 9;
-    while (*target == ' ')
-      target++;
-
-    if (ps && ps->state != ST_IDLE) {
-      ui_print_error(state, "zaten bağlı veya handshake devam ediyor");
-      return;
-    }
-
-    /* Onion adres doğrulaması */
-    size_t target_len = strlen(target);
-    if (!validate_onion_input(target, target_len)) {
-      ui_print_error(state,
-          "Geçersiz onion adresi (sadece .onion adresleri desteklenir)");
-      return;
-    }
-
-    /* Self-connection koruması */
-    if (target_len == NOX_ONION_LEN &&
-        memcmp(target, state->onion_addr, NOX_ONION_LEN) == 0) {
-      ui_print_error(state, "kendi adresinize bağlanamazsınız");
-      return;
-    }
-
-    /* Boş peer slotu bul */
-    struct peer_session *target_ps = NULL;
-    unsigned target_idx = 0;
-    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
-      if (state->peers[i].fd == -1 && state->peers[i].state == ST_IDLE) {
-        target_ps = &state->peers[i];
-        target_idx = i;
-        break;
-      }
-    }
-    if (!target_ps) {
-      ui_print_error(state, "maksimum peer sayısına ulaşıldı");
-      return;
-    }
-
-    /* Duplicate bağlantı kontrolü */
-    for (unsigned j = 0; j < NOX_MAX_PEERS; j++) {
-      if (j != target_idx && state->peers[j].fd >= 0 &&
-          strcmp(state->peers[j].peer_onion, target) == 0) {
-        ui_print_error(state, "Bu peer'a zaten bağlı");
-        return;
-      }
-    }
-
-    /* BUG-6 FIX: Rate limit kontrolü SOCKS5 öncesi */
-    /* M-12 FIX: duvar saati (time()) değil CLOCK_MONOTONIC —
-     * NTP/yerel saat oynatması pencereyi sıfırlayamaz. */
-    {
-      struct timespec hs_ts;
-      clock_gettime(CLOCK_MONOTONIC, &hs_ts);
-      time_t now = (time_t)hs_ts.tv_sec;
-      if (now - state->hs_window_start >= 60) {
-        state->hs_attempt_count = 0;
-        state->hs_window_start = now;
-      }
-      if (state->hs_attempt_count >= 5) {
-        NOX_WARN(LOG_MOD_NOISE,
-                 "Handshake rate limit aşıldı (5/60s) — outbound connect engellendi");
-        ui_print_error(state, "Çok fazla handshake denemesi — biraz bekleyin.");
-        return;
-      }
-    }
-
-    NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
-    /* M-12 FIX: sayaç connect BAŞARISINDAN önce artır —
-     * ölü onion'lara hızlı /connect fırtınası bütçeyi tüketebilsin. */
-    state->hs_attempt_count++;
-    int peer_fd = -1;
-    nox_err_t err =
-        socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
-    if (err != NOX_OK) {
-      ui_print_error(state, "bağlantı başarısız");
-      return;
-    }
-
-    target_ps->fd = peer_fd;
-    snprintf(target_ps->peer_onion, sizeof(target_ps->peer_onion),
-             "%s", target);
-
-    if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
-      NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı iptal");
-      close(peer_fd);
-      target_ps->fd = -1;
-      sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
-      ui_print_error(state, "bağlantı kayıt hatası");
-      return;
-    }
-    NOX_INFO(LOG_MOD_MAIN, "peer bağlandı");
-
-    /* Noise handshake — initiator */
-    target_ps->hs = sodium_malloc(sizeof(struct noise_handshake));
-    if (!target_ps->hs) {
-      ui_print_error(state, "arena dolu");
-      close(peer_fd);
-      target_ps->fd = -1;
-      sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
-      return;
-    }
-
-    handshake_init(target_ps->hs, true,
-               state->my_static_priv,
-               state->my_static_pub);
-    clock_gettime(CLOCK_MONOTONIC, &target_ps->handshake_start);
-    clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
-
-    /* State geçişi: IDLE → HANDSHAKE_INIT */
-    sm_dispatch(target_ps, state, EV_CONNECT_CMD);
-
-    uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
-    size_t hslen = sizeof(hsbuf);
-    nox_err_t hs_err = handshake_write(target_ps->hs, NULL, 0, hsbuf, &hslen);
-    if (hs_err != NOX_OK) {
-      NOX_ERROR(LOG_MOD_NOISE, "handshake_write hatası: %s",
-                nox_strerror(hs_err));
-      ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
-      sm_dispatch(target_ps, state, EV_HANDSHAKE_ERROR);
-      return;
-    }
-
-    struct frame_header fh = {
-        .magic = NOX_FRAME_MAGIC,
-        .type = NOX_MSG_CTRL,
-        .seq = target_ps->tx_seq,
-        .len = (uint32_t)hslen,
-    };
-    uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-    frame_header_encode(&fh, wire);
-    struct iovec iov[2] = {
-        { .iov_base = (void *)wire,  .iov_len = FRAME_HEADER_WIRE_SIZE },
-        { .iov_base = (void *)hsbuf, .iov_len = hslen },
-    };
-    ssize_t written = writev(peer_fd, iov, 2);
-    if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + hslen)) {
-      NOX_ERROR(LOG_MOD_NOISE, "handshake msg0 gönderilemedi");
-      ui_print_error(state, "Handshake başlatılamadı — bağlantı kesildi");
-      sm_dispatch(target_ps, state, EV_HANDSHAKE_ERROR);
-      return;
-    }
-    target_ps->tx_seq++;
-    clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
-
-    NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", target_ps->tx_seq);
-    ui_print_system(state, "[*] handshake başlatıldı");
-    state->active_peer_idx = (int)target_idx;
-    return;
-  }
-
-  /* ── /file <path> — Güvenli dosya gönderimi ── */
-  if (strncmp(line, "/file ", 6) == 0) {
-    const char *filepath = line + 6;
-    while (*filepath == ' ')
-      filepath++;
-
-    file_transfer_start(state, filepath);
-    return;
-  }
-
-  /* ── /list — Rehberdeki kişileri listele ── */
-  if (strcmp(line, "/list") == 0) {
-    if (state->ghost_mode) {
-      ui_print_error(state, "ghost mod — rehber kullanılamaz");
-      return;
-    }
-    ui_print_system(state, "── Rehber ──");
-    db_list_contacts(list_visitor_cb, state);
-    ui_print_system(state, "── (%d bağlı) ──",
-                    active_peer_count(state));
-    return;
-  }
-
-  /* ── /switch <isim|onion> — Aktif peer'ı değiştir ── */
-  if (strncmp(line, "/switch ", 8) == 0) {
-    const char *arg = line + 8;
-    while (*arg == ' ')
-      arg++;
-    if (*arg == '\0') {
-      ui_print_error(state, "Kullanım: /switch <isim|onion>");
-      return;
-    }
-
-    struct peer_session *found = find_peer_by_name_or_onion(state, arg);
-    if (!found) {
-      ui_print_error(state, "Peer bulunamadı: %s", arg);
-      return;
-    }
-
-    /* active_peer_idx'yi güncelle */
-    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
-      if (&state->peers[i] == found) {
-        state->active_peer_idx = (int)i;
-        strncpy(state->active_peer_onion, found->peer_onion, NOX_ONION_LEN);
-        state->active_peer_onion[NOX_ONION_LEN] = '\0';
-        ui_print_system(state, "Aktif peer: %s (%s)",
-                        found->name[0] ? found->name : found->peer_onion,
-                        sm_state_name(found->state));
-        return;
-      }
-    }
-    return;
-  }
-
-  /* ── /disconnect — Aktif peer'ın bağlantısını kes ── */
-  if (strcmp(line, "/disconnect") == 0) {
-    struct peer_session *ps_disconnect = ACTIVE_PEER(state);
-    if (!ps_disconnect) {
-      ui_print_error(state, "Aktif peer yok");
-      return;
-    }
-    char name_buf[NOX_CONTACT_NAME_LEN + 1];
-    strncpy(name_buf, ps_disconnect->name[0] ? ps_disconnect->name : "bilinmeyen",
-            sizeof(name_buf) - 1);
-    name_buf[sizeof(name_buf) - 1] = '\0';
-    sm_dispatch(ps_disconnect, state, EV_PEER_DISCONNECTED);
-    ui_print_system(state, "Bağlantı kesildi: %s", name_buf);
-    return;
-  }
-
-  ui_print_system(state, "  /addr               — .onion adresini göster");
-  ui_print_system(state, "  /connect <onion>    — peer'a bağlan");
-  ui_print_system(state, "  /add <onion> <isim> — rehbere kişi ekle");
-  ui_print_system(state, "  /msg <onion> <msj>  — kuyruklu mesaj gönder");
-  ui_print_system(state, "  /file <dosya_yolu>  — dosya gönder (aktif bağlantı)");
-  ui_print_system(state, "  /list               — rehberi listele");
-  ui_print_system(state, "  /switch <isim>      — aktif sohbeti değiştir");
-  ui_print_system(state, "  /disconnect         — bağlantıyı kes");
-  ui_print_system(state, "  Ctrl+P              — çıkış");
+  /* ── SESSION YOK → komut değilse hata ─── */
+  ui_print_error(state, "bağlantı yok — önce /connect kullan veya çevrimdışı mesaj için /msg kullan");
 }
-
 void ln_edit_init(struct app_state *state) {
   state->ln_active = 0;
   state->ln_buf = NULL;
@@ -929,10 +752,15 @@ if (res != NULL) {
       if (write(STDOUT_FILENO, "\r\n", 2) != 2) {}
       process_line(state, res);
       sodium_free(res); /* ENTER strdup kopyası — otomatik zeroize */
+    } else if (errno == ECANCELED) {
+      /* Ctrl+C / Ctrl+P — /quit ile aynı etki (TOFU'da bloklu, kullanıcı onayı).
+       * Sinyal yolu (SIGINT/SIGTERM) korunuyor — o yol g_shutdown ile aynı tek cleanup'a akar. */
+      if (write(STDOUT_FILENO, "\r\n", 2) != 2) {}
+      process_line(state, "/quit");
     }
-    /* CTRL-C (EAGAIN) / boş CTRL-D (ENOENT): satır iptal — sessiz reset.
-     * /quit (running=false) sonrası yeniden başlatma YOK — çıkışta
-     * gereksiz prompt kalıntısı çizilmesin (F-6). */
+    /* Boş Ctrl+D (ENOENT): sessiz reset — değişmesin (kullanıcı kararı).
+     * ECANCELED quit sonrası da aynı reset bloğu çalışır; TOFU'da bloklandıysa
+     * running hala true → prompt yeniden çizilir, değilse atlanır (F-6). */
     sodium_memzero(state->ln_buf, NOX_EDIT_CAP);
     if (state->running) {
       if (linenoiseEditStart(&state->ln_state, STDIN_FILENO, STDOUT_FILENO,
