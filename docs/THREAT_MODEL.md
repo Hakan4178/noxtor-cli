@@ -938,6 +938,7 @@ code and report vulnerabilities responsibly.
   question — whether TOFU yes/no confirmation binds to the specific
   originating peer session or to "whichever slot is active," given peer
   slots are recycled within the 2-minute TOFU window.
+- **2026-08-26 7.KRITIK-ish — File RX duplicate METADATA state bug (FIXED, TODO v2):** `src/file_transfer.c:548` `if (!active && pt_len==305 && "METADATA")` tek koşulda birleşik olduğundan `active==true` iken gelen ikinci `METADATA` frame'i `else if(active)` DATA yoluna düşüp plaintext `METADATA\0+filename+size+hash` (305B) dosyaya yazılıyordu. Minimal fix uygulandı: `bool is_metadata` önce bak, `if(is_metadata){ if(active) goto rx_abort; ...}` (`src/file_transfer.c:547`). **TODO v2 (wire breaking):** `NOX_MSG_FILE` tek tip (`include/types.h:48`) içinde METADATA vs DATA ayrımı sadece payload sniff (`305` + magic) ile yapılıyor — 305 byte'lık bir DATA chunk'ı tesadüfen `METADATA` ile başlarsa sahte METADATA sayılabilir. Doğru tasarım frame subtype'ının header'da olmasıdır (`frame_header` `type` genişlet veya `subtype` byte ekle, `include/network.h:122` `13→14` byte, `NOX_STATIC_ASSERT` kırılır) — her iki taraf aynı anda güncellenmeli, eski peer'larla uyumsuz. Track as **Known Issue / v2 breaking change**, şimdilik A fix'i yeterli.
 - **2026-08-23 sync (this edit — keeps old format, adds stubs):**
   - Refreshed stale parts against current codebase: `architecture.md` already
     synced (line counts, `NOX_SUBKEY_ONION_SEED=4`, `src/linenoise.c`); here

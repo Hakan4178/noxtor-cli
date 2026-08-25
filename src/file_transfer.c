@@ -256,7 +256,7 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   ps->tx_file.sent_bytes = 0;
   memcpy(ps->tx_file.hash, file_hash, 32);
   memcpy(ps->tx_file.filename, safe_name, bname_len + 1);
-  explicit_bzero(file_hash, sizeof(file_hash));
+  /* file_hash burada sıfırlanmaz — METADATA copy’si için gerekli (CRITICAL-1) */
 
   /* D-1 FIX: Pre-allocated plain buffer (stack yerine) */
   ps->tx_file.plain_buf = sodium_malloc(4096);
@@ -286,7 +286,8 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   meta[270] = (uint8_t)(net_size >> 16);
   meta[271] = (uint8_t)(net_size >> 8);
   meta[272] = (uint8_t)(net_size);
-  memcpy(meta + 273, file_hash, 32);
+  memcpy(meta + 273, ps->tx_file.hash, 32);
+  explicit_bzero(file_hash, sizeof(file_hash));
 
   /* Şifrele ve gönder */
   uint8_t meta_ct[305 + NOX_MAC_LEN];
@@ -384,8 +385,26 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
     }
   } else {
-    /* Yeni chunk oku ve şifrele */
-    ssize_t r = read(ps->tx_file.fd, ps->tx_file.plain_buf, 4096);
+    /* 3.KRITIK FIX: TX ilan edilen boyuttan fazla okumamalı.
+     * total_size - sent_bytes = remaining ile sınırla; dosya transfer
+     * sırasında büyürse read 4096 dönebilir, TX 4096 sayıp success ilan
+     * ederken RX min(remaining, pt_len) ile 1000 yazar — semantik mismatch.
+     * flock LOCK_SH başka yazarı engeller ama TOCTOU/growth'e karşı
+     * remaining cap şart. */
+    size_t remaining = 0;
+    if (ps->tx_file.total_size > ps->tx_file.sent_bytes)
+      remaining = (size_t)(ps->tx_file.total_size - ps->tx_file.sent_bytes);
+    if (remaining == 0) {
+      NOX_WARN(LOG_MOD_MAIN, "TX remaining 0 ama active — desync, abort");
+      close(ps->tx_file.fd);
+      sodium_free(ps->tx_file.plain_buf);
+      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      ps->tx_file.fd = -1;
+      epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
+      return;
+    }
+    size_t to_read = remaining < 4096 ? remaining : 4096;
+    ssize_t r = read(ps->tx_file.fd, ps->tx_file.plain_buf, to_read);
     if (r > 0) {
       ps->tx_file.current_chunk_size = (size_t)r;
 
@@ -539,13 +558,27 @@ bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
   }
 
   ssize_t pt_len = noise_decrypt(ps->session, payload, len, pt);
+  bool is_metadata = false;
   if (pt_len <= 0) {
-    sodium_free(pt);
-    return false;
+    if (ps->rx_file.active) {
+      NOX_WARN(LOG_MOD_NET, "FILE decrypt fail — transfer abort, seq=%u", ps->rx_seq);
+      ui_print_error(state, "Hata: Akran bağlantısında geçersiz sıra numarası algılandı (Replay Attack veya paket kaybı)!");
+      goto rx_abort;
+    } else {
+      NOX_WARN(LOG_MOD_NET, "FILE decrypt fail outside transfer — seq=%u len=%u", ps->rx_seq, len);
+      ui_print_error(state, "Hata: Akran bağlantısında geçersiz sıra numarası algılandı (Replay Attack veya paket kaybı)!");
+      sodium_free(pt);
+      return true;
+    }
   }
 
-  /* A-1 FIX: Gereksiz pt_len > 0 koşulu kaldırıldı */
-  if (!ps->rx_file.active && pt_len == 305 && sodium_memcmp(pt, "METADATA", 9) == 0) {
+  /* 7.KRITIK-ish FIX: duplicate METADATA active RX içinde data olarak yazılıyordu.
+   * Önce subtype'e bak, sonra state'e — active iken gelen METADATA abort olmalı.
+   * Wire'da subtype yok (payload sniff), v2'de header'a taşınmalı — TODO §7.1. */
+  is_metadata = (pt_len == 305 && sodium_memcmp(pt, "METADATA", 9) == 0);
+  if (is_metadata) {
+    if (ps->rx_file.active)
+      goto rx_abort;
     /* Yeni dosya transferi (Metadata) */
     char safe_name[256];
     size_t name_len = strnlen((const char *)pt + 9, 255);
@@ -579,6 +612,12 @@ bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
         } else {
           uint8_t file_hash[32];
           memcpy(file_hash, pt + 273, 32);
+          if (sodium_is_zero(file_hash, 32)) {
+            NOX_WARN(LOG_MOD_MAIN, "METADATA hash sıfır — sahte/bozuk frame reddedildi");
+            ui_print_error(state, "Gelen METADATA reddedildi (geçersiz hash)");
+            explicit_bzero(file_hash, sizeof(file_hash));
+            return true;
+          }
 
           int file_fd = -1;
           /* Bzero öncesi: open_recv_file local_name'i temiz struct'a yazar */

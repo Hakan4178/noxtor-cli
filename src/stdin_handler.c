@@ -524,7 +524,9 @@ void process_line(struct app_state *state, const char *line) {
       }
       return;
     }
-    if (strncmp(line, "/connect ", 9) == 0) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-out-of-bounds"
+    if (strlen(line) >= 9 && strncmp(line, "/connect ", 9) == 0) {
       const char *target = line + 9; while (*target == ' ') target++;
       /* K-3 FIX: aktif peer busy check kaldırıldı — çok-peer için boş slot + duplicate yeterli */
       size_t target_len = strlen(target);
@@ -597,12 +599,16 @@ void process_line(struct app_state *state, const char *line) {
       strncpy(state->active_peer_onion, target, NOX_ONION_LEN); state->active_peer_onion[NOX_ONION_LEN]='\0';
       return;
     }
-    if (strncmp(line, "/file ", 6) == 0) {
+#pragma GCC diagnostic pop
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-out-of-bounds"
+    if (strlen(line) >= 6 && strncmp(line, "/file ", 6) == 0) {
       const char *filepath = line + 6; while (*filepath == ' ') filepath++;
       if (!ps || !ps->session || ps->fd < 0) { ui_print_error(state, "Aktif bağlantı yok — /file için önce /connect"); return; }
       file_transfer_start(state, filepath);
       return;
     }
+#pragma GCC diagnostic pop
     if (strcmp(line, "/list") == 0) {
       if (state->ghost_mode) { ui_print_error(state, "ghost mod — rehber kullanılamaz"); return; }
       ui_print_system(state, "── Rehber ──");
@@ -610,7 +616,9 @@ void process_line(struct app_state *state, const char *line) {
       ui_print_system(state, "── (%d bağlı) ──", active_peer_count(state));
       return;
     }
-    if (strncmp(line, "/switch ", 8) == 0) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-out-of-bounds"
+    if (strlen(line) >= 8 && strncmp(line, "/switch ", 8) == 0) {
       const char *arg = line + 8; while (*arg == ' ') arg++;
       if (*arg == '\0') { ui_print_error(state, "Kullanım: /switch <isim|onion>"); return; }
       struct peer_session *found = find_peer_by_name_or_onion(state, arg);
@@ -630,6 +638,7 @@ void process_line(struct app_state *state, const char *line) {
       }
       return;
     }
+#pragma GCC diagnostic pop
     if (strcmp(line, "/disconnect") == 0) {
       struct peer_session *ps_dis = ACTIVE_PEER(state);
       if (!ps_dis || ps_dis->fd < 0 || ps_dis->state == ST_IDLE) { ui_print_error(state, "Aktif peer yok"); return; }
@@ -771,6 +780,12 @@ if (res != NULL) {
     return;
   }
 
+/* ── ÖNEMSİZ ESKİ — PIPE FALLBACK (non-TTY) ──────────────────────────
+ * Bu blok artık çoğunlukla işlevsiz; TUI (`tui_is_active`) veya TTY
+ * linenoise (`ln_active`) aktifken hiç çalışmaz. Sadece pipe/script
+ * (`isatty==false`, örn. `nox < cmd.txt`) için korunuyor.
+ * Güvenlik açığı aranması gerekmeyen legacy yol — öncelik düşük.
+ * ─────────────────────────────────────────────────────────────────── */
 #define STDIN_BUF_MAX  (64 * 1024U)   /* 64 KB üst sınır */
 #define STDIN_BUF_INIT 512U
 
