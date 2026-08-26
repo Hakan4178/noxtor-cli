@@ -599,16 +599,8 @@ requires roughly correct wall-clock for consensus; a skewed clock breaks Tor
 before it breaks Noxtor. Noxtor does not run its own NTP verification and
 treats time as an environment property.
 
-### 5.13 Swap and core-dump on non-STRICT builds
-`arena.c:225` `mlock` can fail in non-`STRICT` builds and the process
-continues with a logged warning — key material may then be swappable to
-disk. `MADV_DONTDUMP` (`arena.c:263`) and `PR_SET_DUMPABLE=0` are
-best-effort. Users needing swap/core-dump guarantees must run with
-`NOX_ARENA_STRICT_LOCK` (abort on `mlock` failure) and on a host with
-encrypted swap / `ulimit -c 0` / `sysctl kernel.core_pattern=|/bin/false`.
-Both are environment properties, not Noxtor code bugs, and are treated as
-out-of-scope for the default workstation model (see §5.2 for the partial
-vs. full distinction).
+### 5.13 Swap and core-dump on non-STRICT builds (MAP_LOCKED kaldırıldı — ideal mlock)
+`arena.c:214` `MAP_LOCKED` komple kaldırıldı — `man mmap MAP_LOCKED` prefault'te ENOMEM olsa da `mmap` başarıyla döner, major fault sonra olur, garantisi `mlock` kadar güçlü değil. Tek gerçek primary `mlock(usable)` `arena.c:225` (`mmap` sonra, `MAP_LOCKED` olmadan). `mlock` can fail in non-`STRICT` builds and the process continues with a logged warning — key material may then be swappable to disk. `MADV_DONTDUMP` (`arena.c:263`) and `PR_SET_DUMPABLE=0` are best-effort. Users needing swap/core-dump guarantees must run with `NOX_ARENA_STRICT_LOCK` (abort on `mlock` failure) and on a host with encrypted swap / `ulimit -c 0` / `sysctl kernel.core_pattern=|/bin/false`. Both are environment properties, not Noxtor code bugs, and are treated as out-of-scope for the default workstation model (see §5.2 for the partial vs. full distinction).
 
 ### 5.14 Speculative execution side channels (Spectre/Meltdown/L1TF/MDS)
 Transient-execution attacks can leak `arena.c` key material via CPU

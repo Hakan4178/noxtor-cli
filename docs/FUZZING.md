@@ -23,7 +23,7 @@ Bu belgede projedeki fuzzer altyapısı, aktif olarak fuzz edilen fonksiyonlar v
 *   **`arena_alloc` / `arena_restore` / `arena_check_canary` (Secure Memory Arena)**
     *   **Dosya:** `src/arena.c`
     *   **Harness:** `fuzz/fuzz_arena.c`
-    *   **Açıklama:** Kriptografik anahtarların saklandığı mmap + MAP_LOCKED tabanlı secure bellek yöneticisini test eder.
+    *   **Açıklama:** Kriptografik anahtarların saklandığı mmap + mlock (MAP_LOCKED kaldırıldı — tek gerçek mlock, prefault garantisi zayıf) tabanlı secure bellek yöneticisini test eder.
     *   **Amaç:** Ardışık bellek ayırma, geri yükleme ve canary doğrulaması sırasında oluşabilecek hizalama (alignment) hatalarını, integer overflow veya canary sızma açıklarını tespit etmek.
 
 *   **`process_line(struct app_state *state, const char *line)`**

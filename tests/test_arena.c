@@ -388,6 +388,145 @@ static int test_arena_alloc_canary_between_keys(void)
 }
 
 /* ================================================================
+ * TEST: arena_is_valid — yeni mapping invariant (2. bulgu fix)
+ * ================================================================ */
+static int test_arena_is_valid_ok(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+    TEST_ASSERT(arena_is_valid(&a) == true);
+    arena_destroy(&a);
+    return 0;
+}
+
+/* Saldırgan gözü: 1TB/2TB gibi tutarlı görünen sahte struct — eski zayıf
+ * 5 koşul bunu geçirirdi, yeni invariant yakalamalı (kritik). */
+static int test_arena_is_valid_rejects_1TB_trap(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+
+    struct secure_arena fake = a;
+    fake.page_size = 4096;
+    fake.usable_size = (size_t)(1ULL << 40); // 1 TB
+    fake.total_size  = (size_t)(2ULL << 40); // 2 TB
+    // base aynı kalır, ama mapping dışı — valid olmamalı
+    TEST_ASSERT(arena_is_valid(&fake) == false);
+
+    // Orijinal hala valid olmalı
+    TEST_ASSERT(arena_is_valid(&a) == true);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_is_valid_rejects_not_pow2(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+    struct secure_arena fake = a;
+    fake.page_size = 5000; // power-of-two değil
+    TEST_ASSERT(arena_is_valid(&fake) == false);
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_is_valid_rejects_unaligned_base(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+    struct secure_arena fake = a;
+    fake.base = (void *)((uintptr_t)a.base + 1); // page hizasız
+    TEST_ASSERT(arena_is_valid(&fake) == false);
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_is_valid_rejects_total_mismatch(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+    struct secure_arena fake = a;
+    fake.total_size += 4096; // bir guard fazla
+    TEST_ASSERT(arena_is_valid(&fake) == false);
+    arena_destroy(&a);
+    return 0;
+}
+
+static int test_arena_is_valid_rejects_unaligned_usable(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+    struct secure_arena fake = a;
+    fake.usable_size += 1; // usable+canary artık page hizalı değil
+    TEST_ASSERT(arena_is_valid(&fake) == false);
+    arena_destroy(&a);
+    return 0;
+}
+
+/* Saldırgan canary spoof: usable'yi mapping içindeki kendi doldurduğu
+ * bölgeye taşısa bile total mismatch yakalar — eski kod SIGSEGV yerine
+ * yanlış adresi memcmp ederdi. */
+static int test_arena_attacker_canary_spoof_blocked(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+
+    // Usable alanın ortasına canary'yi kopyala (saldırgan hazırlığı)
+    uint8_t *bptr = (uint8_t *)a.base;
+    uint8_t *mid = bptr + a.page_size + 128;
+    memcpy(mid, a.canary, NOX_CANARY_LEN);
+
+    struct secure_arena fake = a;
+    fake.usable_size = 128; // canary_pos = base+page+128 → mid'i gösterir
+    // total hala orijinal → total == page+ (128+16) + page değil → invalid
+    TEST_ASSERT(arena_is_valid(&fake) == false);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+#ifdef __linux__
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
+/* Fork ile abort testi: bozuk struct ile arena_check_canary abort etmeli */
+static int test_arena_check_canary_abort_on_corrupt(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0);
+    if (pid == 0) {
+        // child: struct'ı boz ve check çağır — abort bekleniyor
+        struct secure_arena fake = a;
+        fake.usable_size = (size_t)(1ULL << 40);
+        fake.total_size  = (size_t)(2ULL << 40);
+        arena_check_canary(&fake);
+        // abort etmezse fail
+        _exit(0);
+    } else {
+        int status = 0;
+        waitpid(pid, &status, 0);
+        // abort → SIGABRT ile ölmeli
+        TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+
+    arena_destroy(&a);
+    return 0;
+}
+#endif
+
+/* ================================================================
  * MAIN — Tüm testleri çalıştır
  * ================================================================ */
 int main(void)
@@ -413,6 +552,16 @@ int main(void)
     RUN_TEST(test_arena_alloc_canary_random);
     RUN_TEST(test_arena_alloc_canary_overflow);
     RUN_TEST(test_arena_alloc_canary_between_keys);
+    RUN_TEST(test_arena_is_valid_ok);
+    RUN_TEST(test_arena_is_valid_rejects_1TB_trap);
+    RUN_TEST(test_arena_is_valid_rejects_not_pow2);
+    RUN_TEST(test_arena_is_valid_rejects_unaligned_base);
+    RUN_TEST(test_arena_is_valid_rejects_total_mismatch);
+    RUN_TEST(test_arena_is_valid_rejects_unaligned_usable);
+    RUN_TEST(test_arena_attacker_canary_spoof_blocked);
+#ifdef __linux__
+    RUN_TEST(test_arena_check_canary_abort_on_corrupt);
+#endif
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n\n",
             tests_passed, tests_run);

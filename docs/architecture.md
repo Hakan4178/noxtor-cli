@@ -697,7 +697,7 @@ file_transfer_handle_rx()                [file_transfer.c:510]
 │  • Sabit zamanlı karşılaştırma (sodium_memcmp)          │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 5: Bellek Güvenliği                               │
-│  • Arena: mmap + MAP_LOCKED + guard pages (PROT_NONE)   │
+│  • Arena: mmap + mlock (MAP_LOCKED kaldırıldı) + guard  │
 │  • MADV_DONTFORK (fork'ta kopyalanma)                   │
 │  • MADV_DONTDUMP (core dump'ta gizleme)                 │
 │  • Canary: arena bütünlük kontrolü                      │
@@ -826,8 +826,8 @@ saldırgan hangi 32-byte bloğun gerçek key olduğunu tahmin edemez.
 
 Canary kontrolü: `arena_check_canary()` her allocation öncesi çalışır;
 `arena_restore()` canary ihlalini tespit eder (P4). Bellek: mmap +
-MAP_LOCKED (fallback: mlock), MADV_DONTFORK + MADV_DONTDUMP,
-destroy'da sodium_memzero ile temizleme.
+mlock (MAP_LOCKED kaldırıldı — tek gerçek mlock, prefault garantisi zayıf
+olduğu için ideal), MADV_DONTFORK + MADV_DONTDUMP, destroy'da sodium_memzero.
 
 ---
 

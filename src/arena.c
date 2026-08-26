@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * arena.c — Secure memory arena implementasyonu
  *
- * Key materyali için mmap + MAP_LOCKED tabanlı arena.
+ * Key materyali için mmap + mlock tabanlı arena (MAP_LOCKED kaldırıldı — tek gerçek mlock).
  *
  * Bellek topolojisi:
  *   [Lower Guard Page (PROT_NONE)] PAGE_SIZE
@@ -58,13 +58,16 @@
 /**
  * get_page_size() — Sistem sayfa boyutunu döner.
  *
- * sysconf() hata dönerse 4096 kullanılır (x86/ARM varsayılan).
- * Dönüş değeri her zaman 2'nin kuvvetidir (güvenli ~mask operasyonu için).
+ * sysconf() hata dönerse 0 döner — çağıran fail-closed davranmalı
+ * (4096 fallback guard page hizasını bozardı). Dönüş 0 hariç
+ * her zaman 2'nin kuvvetidir.
  */
 static size_t get_page_size(void)
 {
     long ps = sysconf(_SC_PAGESIZE);
-    return (ps > 0) ? (size_t)ps : 4096U;
+    if (ps <= 0)
+        return 0;
+    return (size_t)ps;
 }
 
 /**
@@ -86,11 +89,43 @@ static size_t page_align(size_t size, size_t page_size)
 }
 
 /* ================================================================
+ * YARDIMCI — Struct doğrulama (kritik tasarım fix)
+ *
+ * Zayıf 5 koşul yerine gerçek mapping invariant'ını doğrular:
+ *   usable = usable_size + NOX_CANARY_LEN  // page_align'lı
+ *   total  = page_size + usable + page_size
+ * Ayrıca base alignment ve power-of-two kontrolü yapar.
+ * 1TB/2TB gibi tutarlı görünen ama mapping dışı sahte değerleri yakalar.
+ * ================================================================ */
+ __attribute__((strub))
+ bool arena_is_valid(const struct secure_arena *a) {
+    if (!a || !a->base || a->page_size == 0)
+        return false;
+    if ((a->page_size & (a->page_size - 1U)) != 0)
+        return false; // power-of-two değil
+    if ((uintptr_t)a->base % a->page_size != 0)
+        return false;
+    if (a->usable_size == 0 || a->usable_size >= a->total_size)
+        return false;
+    if (a->total_size < 2U * a->page_size)
+        return false;
+    if (a->usable_size > SIZE_MAX - NOX_CANARY_LEN)
+        return false;
+    size_t usable = a->usable_size + NOX_CANARY_LEN;
+    if (usable % a->page_size != 0)
+        return false;
+    if (usable > SIZE_MAX - 2U * a->page_size)
+        return false;
+    if (a->total_size != a->page_size + usable + a->page_size)
+        return false;
+    return true;
+}
+
+/* ================================================================
  * YARDIMCI — Güvenli abort
  *
  * PR_SET_DUMPABLE=0 main'de seccomp ÖNCESİ ayarlandı (fork ile child'a
- * miras kalır). Bu fonksiyonda tekrar prctl çağırmıyoruz — seccomp
- * stage 1 prctl'i engeller, SIGSYS ile ölüm gereksiz.
+ * miras kalır).
  *
  * Bu fonksiyon wipe + abort gerçekleştirir.
  * ================================================================ */
@@ -102,15 +137,8 @@ static void secure_abort(const struct secure_arena *a, const char *msg) {
             msg ? msg : "(bilinmeyen hata)");
     fflush(stderr);
 
-    /*
-     * Struct bozuksa wipe tehlikeli olabilir.
-     * Sanity check: total > 2*page_size, usable < total.
-     */
-    if (a && a->base && a->page_size > 0 && a->usable_size > 0
-        && a->total_size > a->page_size
-        && a->total_size - a->page_size > a->page_size
-        && a->usable_size < a->total_size)
-    {
+    /* Struct bozuksa wipe tehlikeli — gerçek mapping invariant'ı ile doğrula */
+    if (arena_is_valid(a)) {
         size_t wipe = a->usable_size + NOX_CANARY_LEN;
 
         /* Savunmacı üst sınır: 256 MB'dan fazlasını silme */
@@ -151,6 +179,11 @@ __attribute__((strub))
     }
 
     size_t page_size = get_page_size();
+    if (page_size == 0) {
+        NOX_ERROR(LOG_MOD_ARENA,
+                  "sayfa boyutu alınamadı (sysconf _SC_PAGESIZE fail) — arena kurulamıyor");
+        return NOX_ERR_ALLOC;
+    }
 
     /* ----------------------------------------------------------------
      * P1 — Güvenli boyut hesabı (integer overflow koruması)
@@ -187,62 +220,46 @@ __attribute__((strub))
     size_t total = page_size + usable + page_size;
 
     /* ----------------------------------------------------------------
-     * 1. mmap — MAP_LOCKED ile dene
+     * 1. mmap — tek gerçek mlock (MAP_LOCKED komple kaldırıldı — ideal)
+     *    man mmap: MAP_LOCKED prefault'te ENOMEM olsa da mmap başarıyla
+     *    döner, major fault sonra olur — garantisi mlock kadar güçlü değil.
+     *    Tek gerçek garanti mlock()'tur. MAP_LOCKED hint'i silindi.
      * ---------------------------------------------------------------- */
     void *base = mmap(NULL, total,
                       PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED,
+                      MAP_PRIVATE | MAP_ANONYMOUS,
                       -1, 0);
 
-    bool locked = true;
-
     if (base == MAP_FAILED) {
-        /*
-         * MAP_LOCKED başarısız olabilir:
-         *   • RLIMIT_MEMLOCK aşıldı
-         *   • CAP_IPC_LOCK eksik
-         *
-         * Fallback: MAP_LOCKED olmadan tahsis, ardından mlock().
-         */
+        NOX_ERROR(LOG_MOD_ARENA,
+                  "mmap başarısız: %s", strerror(errno));
+        return NOX_ERR_ALLOC;
+    }
+
+    bool locked = false;
+    uint8_t *usable_start = (uint8_t *)base + page_size;
+    if (mlock(usable_start, usable) != 0) {
         NOX_WARN(LOG_MOD_ARENA,
-                 "MAP_LOCKED başarısız (errno=%d). "
-                 "Fallback: MAP_ANONYMOUS. CAP_IPC_LOCK gerekebilir.",
-                 errno);
-
-        base = mmap(NULL, total,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1, 0);
-
-        if (base == MAP_FAILED) {
-            NOX_ERROR(LOG_MOD_ARENA,
-                      "mmap başarısız: %s", strerror(errno));
-            return NOX_ERR_ALLOC;
-        }
-
-        /* Usable alanı kilitlemeyi dene (guard page'ler hariç) */
-        uint8_t *usable_start = (uint8_t *)base + page_size;
-        if (mlock(usable_start, usable) != 0) {
-            NOX_WARN(LOG_MOD_ARENA,
-                     "mlock başarısız: %s — swap riski mevcut.",
-                     strerror(errno));
+                 "mlock başarısız: %s — swap riski mevcut.",
+                 strerror(errno));
 
 #ifdef NOX_ARENA_STRICT_LOCK
-            /*
-             * P5 — STRICT mod: kilitleme başarısız → hata döner.
-             * Key materyalinin swap'a yazılması kabul edilemez.
-             */
-            NOX_ERROR(LOG_MOD_ARENA,
-                      "NOX_ARENA_STRICT_LOCK: mlock zorunlu, "
-                      "arena başlatma iptal edildi.");
-            munmap(base, total);
-            sodium_memzero(a, sizeof(*a));
-            return NOX_ERR_ALLOC;
+        /*
+         * P5 — STRICT mod: kilitleme başarısız → hata döner.
+         * Key materyalinin swap'a yazılması kabul edilemez.
+         */
+        NOX_ERROR(LOG_MOD_ARENA,
+                  "NOX_ARENA_STRICT_LOCK: mlock zorunlu, "
+                  "arena başlatma iptal edildi.");
+        munmap(base, total);
+        sodium_memzero(a, sizeof(*a));
+        return NOX_ERR_ALLOC;
 #else
-            locked = false;
-            /* Non-strict: devam et, swap riski loglandı */
+        locked = false;
+        /* Non-strict: devam et, swap riski loglandı */
 #endif
-        }
+    } else {
+        locked = true;
     }
 
     /* ----------------------------------------------------------------
@@ -327,7 +344,7 @@ __attribute__((strub))
              "arena başlatıldı: %zu KB kullanılabilir, "
              "guard page'ler aktif, %s",
              a->usable_size / 1024,
-             locked ? "MAP_LOCKED aktif" : "MAP_LOCKED KAPALI (swap riski)");
+             locked ? "mlock aktif" : "mlock KAPALI (swap riski)");
 
     return NOX_OK;
 }
@@ -348,8 +365,6 @@ __attribute__((strub))
     arena_check_canary(a);
 
     /* H-5: arena_alloc tek thread'lidir (bump allocator).
-     * Multi-peer (Phase 6.3+) veya multi-thread kullanımı için
-     * arena mutex veya thread-local arena gereklidir.
      * Şu an tüm arena erişimi main() ve main() çağrısı altındadır. */
     assert(a->offset <= a->usable_size && "arena offset bozulmuş");
 
@@ -408,14 +423,16 @@ __attribute__((strub))
  * arena_alloc_canary — Canary (honeypot) allocation
  *
  * Key'lerin arasına sahte key'ler yerleştirir.
- * Rastgele byte'lar ile doldurulur — gerçek key'den ayırt edilemez.
- *
- * RCE sonrası memory scanning'i zorlaştırır:
- *   - Saldırgan hangisinin gerçek hangisinin sahte olduğunu bilemez
- *   - Honeypot'lar gerçek anahtarlarla aynı bellek düzeninde yer alır
+ * Rastgele byte'lar ile doldurulur — basit signature-based memory
+ * scanning'i zorlaştırır. Ancak RCE sonrası memory scanner +
+ * pointer/reference tracing, register/stack/heap metadata veya Noise
+ * state incelemesi gibi tekniklerle gerçek key ayırt edilebileceğinden
+ * ayırt edilemezlik garantisi vermez. Honeypot'lar gerçek anahtarlarla
+ * aynı bellek düzeninde yer alsa da ek bir savunma katmanı olarak
+ * görülmeli, tek başına gizlilik garantisi olarak değil.
  *
  * Not: Honeypot'lar normal arena bloklarıdır — üzerlerine yazılabilir.
- * Korum mekanizması "kullanılamazlık" değil, "ayırt edilemezlik"tir.
+ * Koruma "kullanılamazlık" değil, sınırlı "ayırt edilebilirliği zorlaştırma"dır.
  *
  * @a:    Aktif arena
  * @size: Canary boyutu (genellikle NOX_KEY_LEN = 32)
@@ -443,19 +460,22 @@ __attribute__((strub))
     if (!a || !a->base)
         return;
 
-    /* Struct bütünlüğü ÖNCE — bozuksa pointer arithmetic SIGSEGV tetikler */
-    bool struct_ok = (a->page_size > 0 && a->usable_size > 0 &&
-                      a->total_size > a->page_size &&
-                      a->total_size - a->page_size > a->page_size &&
-                      a->usable_size < a->total_size);
-    if (!struct_ok) {
-        secure_abort(a, "Arena struct bozuk — canary okunamaz.");
+    /* Struct bütünlüğü ÖNCE — gerçek mapping invariant'ı */
+    if (!arena_is_valid(a)) {
+        secure_abort(a, "Arena struct bozuk — canary okunamaz (mapping invariant fail).");
         /* NOTREACHED */
     }
 
     size_t         page_size  = a->page_size;
     const uint8_t *bptr       = (const uint8_t *)a->base;
     const uint8_t *canary_pos = bptr + page_size + a->usable_size;
+
+    /* Canary gerçekten mapping içinde ve upper guard öncesi mi? */
+    if (canary_pos < bptr + page_size ||
+        canary_pos + NOX_CANARY_LEN > bptr + a->total_size - page_size) {
+        secure_abort(a, "Canary mapping dışında — struct bozuk.");
+        /* NOTREACHED */
+    }
 
     /*
      * sodium_memcmp() — sabit zamanlı karşılaştırma.
@@ -489,14 +509,8 @@ void arena_destroy(struct secure_arena *a)
     if (!a || !a->base)
         return;
 
-    /* 1. Yapısal bütünlük ÖNCE — bozuksa pointer arithmetic SIGSEGV tetikler */
-    bool struct_ok = (a->page_size > 0 && a->usable_size > 0 &&
-                      a->total_size > a->page_size &&
-                      a->total_size - a->page_size > a->page_size &&
-                      a->usable_size < a->total_size);
-
-    if (!struct_ok) {
-        fprintf(stderr, "[FATAL] Arena struct bozuk — güvenli kapanış!\n");
+    if (!arena_is_valid(a)) {
+        fprintf(stderr, "[FATAL] Arena struct bozuk — güvenli kapanış! (mapping invariant fail)\n");
         fflush(stderr);
         abort(); /* munmap ve wipe atlanır, OS process ölünce temizler */
     }
@@ -504,7 +518,16 @@ void arena_destroy(struct secure_arena *a)
     /* Artık struct'ın sağlam olduğunu biliyoruz, güvenle canary okuyabiliriz */
     uint8_t *bptr         = (uint8_t *)a->base;
     const uint8_t *canary_pos = bptr + a->page_size + a->usable_size;
-    bool canary_ok = (sodium_memcmp(canary_pos, a->canary, NOX_CANARY_LEN) == 0);
+    bool canary_ok = false;
+    if (canary_pos < bptr + a->page_size ||
+        canary_pos + NOX_CANARY_LEN > bptr + a->total_size - a->page_size) {
+        fprintf(stderr, "[FATAL] Canary mapping dışında — struct bozuk!\n");
+        fflush(stderr);
+        canary_ok = false;
+    } else {
+        canary_ok = (sodium_memcmp(canary_pos, a->canary, NOX_CANARY_LEN) == 0);
+    }
+    bool struct_ok = true; /* valid — wipe için compat */
 
     if (!canary_ok) {
         fprintf(stderr, "[FATAL] Arena canary bozulmuş!\n");
@@ -619,6 +642,7 @@ size_t arena_save(const struct secure_arena *a)
  * @param a             Arena pointer'ı
  * @param saved_offset  arena_save() ile alınan offset
  */
+ __attribute__((strub))
 void arena_restore(struct secure_arena *a, size_t saved_offset)
 {
     if (!a || !a->base)
@@ -626,6 +650,17 @@ void arena_restore(struct secure_arena *a, size_t saved_offset)
 
     /* P4 — Restore öncesi canary kontrolü */
     arena_check_canary(a);
+
+    /* OOB koruması: bozuk offset canary'lerden kaçabilir */
+    if (a->offset > a->usable_size)
+        secure_abort(a, "Arena offset bozuk");
+
+    if (saved_offset > a->usable_size) {
+        NOX_WARN(LOG_MOD_ARENA,
+                 "arena_restore: saved_offset (%zu) usable_size'ı (%zu) aşıyor!",
+                 saved_offset, a->usable_size);
+        return;
+    }
 
     /* Alignment kontrolü: 16 byte hizalı olmayan offset reddedilir */
     if (saved_offset % 16 != 0) {

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * arena.h — Secure arena public API
  *
- * Key materyali için mmap + MAP_LOCKED tabanlı arena.
+ * Key materyali için mmap + mlock tabanlı arena (MAP_LOCKED kaldırıldı).
  * Normal malloc kullanılmaz — swap'a gitmeyi engeller.
  * 16-byte aligned bump allocator (libsodium SIMD uyumu).
  * Guard page'ler buffer overflow'u SIGSEGV'ye çevirir.
@@ -22,15 +22,13 @@
  * @size: İstenen kullanılabilir alan (guard page'ler hariç)
  *
  * Yaptıkları:
- *   1. mmap(MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED)
- *   2. Alt guard page: mprotect(PROT_NONE)
- *   3. Üst guard page: mprotect(PROT_NONE)
- *   4. Rastgele canary üret
- *   5. Canary'yi usable alanın sonuna yaz
- *
- * MAP_LOCKED başarısız olursa (RLIMIT_MEMLOCK):
- *   - Uyarı verir, MAP_LOCKED olmadan tekrar dener
- *   - mlock() ile kısmi koruma dener
+ *   1. mmap(MAP_PRIVATE | MAP_ANONYMOUS) (MAP_LOCKED kaldırıldı)
+ *   2. mlock(usable) — tek gerçek garanti (man mmap: MAP_LOCKED prefault
+ *      zayıf, ENOMEM olsa da mmap başarıyla döner)
+ *   3. Alt guard page: mprotect(PROT_NONE)
+ *   4. Üst guard page: mprotect(PROT_NONE)
+ *   5. Rastgele canary üret
+ *   6. Canary'yi usable alanın sonuna yaz
  *
  * Return: NOX_OK veya NOX_ERR_ALLOC
  */
@@ -54,9 +52,11 @@ void *arena_alloc(struct secure_arena *a, size_t size);
  * arena_alloc_canary — Honeypot allocation
  *
  * Key'lerin arasına sahte key'ler yerleştirir.
- * Rastgele byte'lar ile doldurulur — gerçek key'den ayırt edilemez.
- * RCE sonrası memory scanning'i zorlaştırır: saldırgan hangisinin
- * gerçek olduğunu bilemez. Honeypot'lar normal arena bloklarıdır.
+ * Rastgele byte'larla doldurulur — basit signature-based memory
+ * scanning'i zorlaştırır. Ancak RCE sonrası pointer/reference takibi,
+ * Noise state/register/stack incelemesi gibi tekniklerle gerçek key
+ * ayırt edilebileceğinden ayırt edilemezlik garantisi vermez.
+ * Honeypot'lar normal arena bloklarıdır.
  *
  * Return: Rastgele byte'larla dolu pointer veya NULL
  */
@@ -71,6 +71,16 @@ void *arena_alloc_canary(struct secure_arena *a, size_t size);
  */
 __attribute__((strub))
 void arena_check_canary(const struct secure_arena *a);
+
+/*
+ * arena_is_valid — Mapping invariant doğrulaması (test için public)
+ *
+ * Eski zayıf 5 koşul yerine gerçek mmap invariant'ını doğrular:
+ *   total == page_size + page_align(usable_size+NOX_CANARY_LEN) + page_size
+ * Saldırganın 1TB/2TB gibi tutarlı görünen sahte struct'ını yakalar.
+ */
+__attribute__((strub))
+bool arena_is_valid(const struct secure_arena *a);
 
 /*
  * arena_destroy — Arena'yı güvenli şekilde yok et
@@ -100,6 +110,7 @@ size_t arena_bytes_free(const struct secure_arena *a);
  * Session bittiğinde hs/session belleğini geri kazanır.
  */
 size_t arena_save(const struct secure_arena *a);
+__attribute__((strub))
 void   arena_restore(struct secure_arena *a, size_t saved_offset);
 
 #endif /* PARANOID_ARENA_H */
