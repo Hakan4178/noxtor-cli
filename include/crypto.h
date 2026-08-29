@@ -105,30 +105,39 @@ nox_err_t derive_tor_expanded_key(uint8_t expanded_out[64],
  * Dosya formatı:
  *   [salt 16B][nonce 24B][encrypted_keypair 64B+MAC 16B]
  *   Toplam: 120 byte
+ *
+ * INVARIANT: Crypto dosya operasyonlarında config_dir string'i hiçbir zaman
+ * path çözümlemede kullanılmaz — YALNIZCA log/hata mesajı için saklanır;
+ * yalnızca config_dir_fd kullanılır. Tüm I/O openat/unlinkat/renameat
+ * (config_dir_fd, ...) + O_NOFOLLOW ile yapılır — string path → fd
+ * TOCTOU'su kapalı.
  * ================================================================ */
 
-/* Salt dosyasını oku veya oluştur */
-
+/* Salt dosyasını oku veya oluştur — fd-only (TOCTOU kapalı) */
 __attribute__((strub))
 nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
-                                     const char *config_dir);
+                                     int config_dir_fd);
 
 /*
  * İlk çalıştırma: yeni Ed25519 key pair üret ve disk'e yaz
  * identity_unlock_key ile secretbox şifreleme.
+ * config_dir_fd: main.c ensure_config_dir'de O_DIRECTORY|O_NOFOLLOW ile açılan fd,
+ *                crypto.c'ye geçiyor — tüm I/O openat(config_dir_fd, "identity.key") ile
+ *                TOCTOU'suz. fd<0 ise NOX_ERR_CONFIG.
  */
 __attribute__((strub))
-nox_err_t crypto_generate_identity(const char *identity_path,
+nox_err_t crypto_generate_identity(int config_dir_fd,
                                    const uint8_t unlock_key[NOX_KEY_LEN],
                                    uint8_t public_key_out[NOX_KEY_LEN]);
 
 /*
  * Sonraki çalıştırmalar: disk'ten oku ve çöz
  * Çözülen private key secure arena'da kalmalı.
+ * config_dir_fd: main.c'den gelen O_DIRECTORY|O_NOFOLLOW fd (yukarıdaki gibi).
  */
 
 __attribute__((strub))
-nox_err_t crypto_load_identity(const char *identity_path,
+nox_err_t crypto_load_identity(int config_dir_fd,
                                 const uint8_t unlock_key[NOX_KEY_LEN],
                                 uint8_t secret_key_out[crypto_sign_SECRETKEYBYTES],
                                 uint8_t public_key_out[NOX_KEY_LEN]);

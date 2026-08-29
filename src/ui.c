@@ -44,12 +44,12 @@
  * VARSAYILAN TEMA — Kullanıcı paleti (truecolor 24-bit)
  *
  * [Sen]     → yeşil    rgb(38, 162, 105)
- * [Peer]    → mor      rgb(133, 60, 153)
+ * [Peer]    → mor      rgb(112, 60, 153)
  * Sistem    → amber    rgb(202, 151, 15)
  * Hata      → kırmızı  rgb(210, 24, 38)
- * Prompt    → teal     rgb(34, 105, 121)
+ * Prompt    → teal     rgb(38, 105, 121)
  * Zaman     → koyu mavi rgb(31, 65, 117)
- * Progress  → teal     rgb(34, 105, 121)
+ * Progress  → teal     rgb(38, 105, 121)
  * ================================================================ */
 const struct nox_theme nox_theme_default = {
     .clr_self      = "\033[38;2;38;162;105m",

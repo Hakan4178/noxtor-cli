@@ -438,8 +438,9 @@ void event_loop(struct app_state *state) {
    * Sadece downloads dizini okunabilir/yazılabilir.
    * Kernel 5.13+ gerektirir, desteklemiyorsa hata döner.
    * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez. */
-  if (state->downloads_dir_fd >= 0) {
-    nox_err_t ll_err = landlock_sandbox_init(state->downloads_dir_fd);
+  if (state->config_dir_fd >= 0 && state->downloads_dir_fd >= 0) {
+    nox_err_t ll_err = landlock_sandbox_init(state->config_dir_fd,
+                                             state->downloads_dir_fd);
 
     if (ll_err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
       if (!state->allow_unsandboxed_fs) {

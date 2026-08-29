@@ -230,7 +230,8 @@ static nox_err_t resolve_config_paths(struct app_state *state) {
     home = pw->pw_dir;
   }
 
-  /* Config dizin yolu */
+  /* Config dizin yolu — YALNIZCA log/hata mesajı için saklanır;
+   * path çözümlemede ASLA kullanılmaz; tüm I/O config_dir_fd (openat) üzerinden */
   int ret = snprintf(state->config_dir, sizeof(state->config_dir), "%s/%s",
                      home, PARANOID_CONFIG_DIR);
   if (ret < 0 || (size_t)ret >= sizeof(state->config_dir)) {
@@ -312,6 +313,8 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
         NOX_ERROR(LOG_MOD_MAIN, "parent dizin yolu çok uzun veya hatalı");
         return NOX_ERR_CONFIG;
       }
+      /* Q3 Şık C: parent creation TOCTOU low-risk — ilk çalıştırmada bir kere,
+       * sonrası EEXIST; asıl pin open(O_NOFOLLOW) sonrası doğrulanır (328) */
       mkdir(parent, 0700); /* zaten varsa hata önemsiz */
 
       if (mkdir(state->config_dir, 0700) != 0) {
@@ -323,8 +326,18 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
     NOX_INFO(LOG_MOD_MAIN, "config dizini oluşturuldu: %s", state->config_dir);
   }
 
-  if (mkdir(state->downloads_dir, 0700) != 0 && errno != EEXIST) {
+  /* config_dir fd'yi önce pinle — downloads oluşturma dahil tüm alt I/O bu fd üzerinden */
+  state->config_dir_fd = open(state->config_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (state->config_dir_fd < 0) {
+    NOX_ERROR(LOG_MOD_MAIN, "config dizini fd açılamadı: %s", strerror(errno));
+    return NOX_ERR_CONFIG;
+  }
+
+  /* downloads — mkdirat + openat ile TOCTOU'suz (crypt pattern) */
+  if (mkdirat(state->config_dir_fd, "downloads", 0700) != 0 && errno != EEXIST) {
     NOX_ERROR(LOG_MOD_MAIN, "downloads dizini oluşturulamadı: %s", strerror(errno));
+    close(state->config_dir_fd);
+    state->config_dir_fd = -1;
     return NOX_ERR_CONFIG;
   }
   
@@ -332,16 +345,22 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
   assert(strncmp(state->downloads_dir, state->config_dir, strlen(state->config_dir)) == 0);
   if (strncmp(state->downloads_dir, state->config_dir, strlen(state->config_dir)) != 0) {
     NOX_ERROR(LOG_MOD_MAIN, "downloads_dir config_dir altında değil — yapılandırma hatası");
+    close(state->config_dir_fd);
+    state->config_dir_fd = -1;
     return NOX_ERR_CONFIG;
   }
-  state->downloads_dir_fd = open(state->downloads_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  state->downloads_dir_fd = openat(state->config_dir_fd, "downloads",
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
   if (state->downloads_dir_fd < 0) {
     NOX_ERROR(LOG_MOD_MAIN, "downloads dizini açılamadı: %s", strerror(errno));
+    close(state->config_dir_fd);
+    state->config_dir_fd = -1;
     return NOX_ERR_CONFIG;
   }
 
   /*
    * first_run: identity.key dosyasına bak, dizine DEĞİL.
+   * fd üzerinden fstatat — string stat TOCTOU'su kapalı (crypt pattern).
    *
    * Edge case'ler:
    *   - Dizin var ama identity.key yok (yarıda kesilmiş init)
@@ -351,7 +370,7 @@ static nox_err_t ensure_config_dir(struct app_state *state) {
    *   - salt var ama identity.key yok
    *     → salt yeniden üretilir (idempotent), identity de üretilir
    */
-  if (stat(state->identity_path, &st) == 0 && S_ISREG(st.st_mode)) {
+  if (fstatat(state->config_dir_fd, "identity.key", &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode)) {
     state->first_run = false;
     NOX_INFO(LOG_MOD_MAIN, "mevcut identity.key bulundu");
   } else {
@@ -596,6 +615,10 @@ static void cleanup(struct app_state *state) {
     close(state->downloads_dir_fd);
     state->downloads_dir_fd = -1;
   }
+  if (state->config_dir_fd >= 0) {
+    close(state->config_dir_fd);
+    state->config_dir_fd = -1;
+  }
 
   NOX_INFO(LOG_MOD_MAIN, "temizlik tamamlandı");
 }
@@ -722,6 +745,8 @@ int main(int argc, char *argv[]) {
     state.epoll_fd = -1;
     state.listen_fd = -1;
     state.peer_fd = -1;
+    state.config_dir_fd = -1;
+    state.downloads_dir_fd = -1;
     state.running = true;
     state.peer_state = ST_IDLE;
     state.active_peer_idx = -1;
@@ -759,54 +784,42 @@ int main(int argc, char *argv[]) {
         return 1;
       }
 
-      /* Güvenli silme: dosya içeriğini sıfırla, sonra unlink */
-      const char *files[] = {
-          state.identity_path, NULL /* sentinel */
-      };
-
-      /* Salt dosyası yolunu oluştur */
+      /* Güvenli silme — fd üzerinden (crypt pattern), string TOCTOU kapalı */
       size_t dir_len = strlen(state.config_dir);
       if (dir_len + 14 >= NOX_PATH_MAX) {
         fprintf(stderr, "[!] config yolu çok uzun\n");
         return 1;
       }
 
-      char salt_path[NOX_PATH_MAX];
-      memcpy(salt_path, state.config_dir, dir_len);
-      memcpy(salt_path + dir_len, "/salt", 6); /* 5 + NUL */
-
-      /* Onion key dosyası yolu */
-      char onion_key_path[NOX_PATH_MAX];
-      size_t okp_len = strlen(state.config_dir);
-      if (okp_len + 10 < NOX_PATH_MAX) {
-        memcpy(onion_key_path, state.config_dir, okp_len);
-        memcpy(onion_key_path + okp_len, "/onion.key", 11); /* 10 karakter + NUL */
-      } else {
-        onion_key_path[0] = '\0';
+      /* config_dir'i pinle */
+      int cfg_fd = open(state.config_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (cfg_fd < 0) {
+        NOX_WARN(LOG_MOD_MAIN, "config dizini açılamadı (pinleme yok): %s", strerror(errno));
       }
 
-      /* contacts.db */
-      char db_path[NOX_PATH_MAX];
-      memcpy(db_path, state.config_dir, dir_len);
-      memcpy(db_path + dir_len, "/contacts.db", 13); /* 12 + NUL */
-
-      const char *all_files[] = {state.identity_path, salt_path, db_path,
-                                 state.contacts_path, onion_key_path, NULL};
+      const char *basenames[] = {"identity.key", "salt", "contacts.db", "onion.key", NULL};
 
       int wiped = 0;
-      for (int i = 0; all_files[i] != NULL; i++) {
-        /* CodeQL #11 cpp/path-injection: tüm dosya yolları config_dir'den türetilmiştir */
-        assert(strncmp(all_files[i], state.config_dir, dir_len) == 0);
-        if (strncmp(all_files[i], state.config_dir, dir_len) != 0) {
-          NOX_WARN(LOG_MOD_MAIN, "dosya yolu config_dir altında değil — silme atlanıyor");
-          continue;
-        }
+      for (int i = 0; basenames[i] != NULL; i++) {
+        const char *bn = basenames[i];
         struct stat st;
-        if (stat(all_files[i], &st) != 0)
-          continue; /* dosya yok — sorun değil */
+        int sret = (cfg_fd >= 0)
+            ? fstatat(cfg_fd, bn, &st, AT_SYMLINK_NOFOLLOW)
+            : -1;
+        if (sret != 0) {
+          /* fd yoksa veya dosya yoksa fallback string check (log için) */
+          char tmp_path[NOX_PATH_MAX];
+          int tn = snprintf(tmp_path, sizeof(tmp_path), "%s/%s", state.config_dir, bn);
+          if (tn <= 0 || (size_t)tn >= sizeof(tmp_path)) continue;
+          if (stat(tmp_path, &st) != 0) continue;
+        } else {
+          if (!S_ISREG(st.st_mode)) continue;
+        }
 
-        /* Dosyayı sıfırlarla üzerine yaz */
-        int fd = open(all_files[i], O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+        /* Sıfırlarla üzerine yaz — openat ile TOCTOU'suz */
+        int fd = (cfg_fd >= 0)
+            ? openat(cfg_fd, bn, O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+            : -1;
         if (fd >= 0) {
           uint8_t zeros[256];
           explicit_bzero(zeros, sizeof(zeros));
@@ -822,12 +835,32 @@ int main(int argc, char *argv[]) {
           close(fd);
         }
 
-        /* Sil */
-        if (unlink(all_files[i]) == 0) {
-          fprintf(stderr, "[*] silindi: %s\n", all_files[i]);
+        /* Sil — unlinkat */
+        int uret = (cfg_fd >= 0) ? unlinkat(cfg_fd, bn, 0) : -1;
+        if (uret == 0) {
+          fprintf(stderr, "[*] silindi: %s/%s\n", state.config_dir, bn);
           wiped++;
+        } else if (cfg_fd < 0) {
+          char tmp_path[NOX_PATH_MAX];
+          size_t dlen = strlen(state.config_dir);
+          size_t blen = strlen(bn);
+          if (dlen + 1 + blen < sizeof(tmp_path)) {
+            memcpy(tmp_path, state.config_dir, dlen);
+            tmp_path[dlen] = '/';
+            memcpy(tmp_path + dlen + 1, bn, blen + 1);
+            if (unlink(tmp_path) == 0) {
+              fprintf(stderr, "[*] silindi: %s\n", tmp_path);
+              wiped++;
+            }
+          }
+        }
+        /* contacts.db WAL/SHM yan dosyaları da temizle */
+        if (strcmp(bn, "contacts.db") == 0 && cfg_fd >= 0) {
+          unlinkat(cfg_fd, "contacts.db-wal", 0);
+          unlinkat(cfg_fd, "contacts.db-shm", 0);
         }
       }
+      if (cfg_fd >= 0) close(cfg_fd);
 
       /* Dizini kaldır */
       if (rmdir(state.config_dir) == 0) {
@@ -838,8 +871,6 @@ int main(int argc, char *argv[]) {
               "\n[✓] %d dosya güvenli şekilde silindi.\n"
               "[!] Tüm key materyali yok edildi. Geri alınamaz.\n",
               wiped);
-
-      (void)files; /* unused warning suppress */
       return 0;
     }
 
@@ -1004,11 +1035,14 @@ int main(int argc, char *argv[]) {
     }
     /* READ == 0: zaten set dışında — bir şey yapma; -1: EINVAL (imkânsız) */
 
-    /* ── 9. Salt yükle veya oluştur ───────────────────── */
+    /* ── 9. Salt yükle veya oluştur ─────────────────────
+     * config_dir_fd → crypto.c'ye geçiyor (fd-only, TOCTOU kapalı):
+     * ensure_config_dir'de O_NOFOLLOW ile açılan fd, salt için
+     * openat(config_dir_fd, "salt") ile kullanılır. */
     uint8_t salt[NOX_SALT_LEN];
-    /* CodeQL #12 cpp/path-injection: config_dir realpath($HOME)'den türetilmiştir */
-    assert(state.config_dir[0] != '\0');
-    err = crypto_load_or_create_salt(salt, state.config_dir);
+    /* CodeQL #12 cpp/path-injection: config_dir_fd TOCTOU'suz, config_dir log için korunur */
+    assert(state.config_dir_fd >= 0);
+    err = crypto_load_or_create_salt(salt, state.config_dir_fd);
     if (err != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "salt hatası: %s", nox_strerror(err));
       sodium_free(pin_buf);
@@ -1106,8 +1140,9 @@ int main(int argc, char *argv[]) {
     memset(ed_sk, 0, 64);
 
     if (state.first_run) {
-      /* İlk çalıştırma: yeni key pair üret ve kaydet */
-      err = crypto_generate_identity(state.identity_path, identity_unlock,
+      /* İlk çalıştırma: yeni key pair üret ve kaydet
+       * config_dir_fd → crypto.c'ye geçiyor (fd-only) */
+      err = crypto_generate_identity(state.config_dir_fd, identity_unlock,
                                      ed_pub);
       if (err != NOX_OK) {
         NOX_FATAL(LOG_MOD_MAIN, "identity key üretimi başarısız: %s",
@@ -1120,14 +1155,13 @@ int main(int argc, char *argv[]) {
       NOX_INFO(LOG_MOD_MAIN, "yeni identity key oluşturuldu");
     }
 
-    /* Diskten şifreli anahtarı yükle */
-    /* CodeQL #13 cpp/path-injection: identity_path config_dir + "/identity.key" */
-    assert(strncmp(state.identity_path, state.config_dir, strlen(state.config_dir)) == 0);
-    if (strncmp(state.identity_path, state.config_dir, strlen(state.config_dir)) != 0) {
-      NOX_ERROR(LOG_MOD_MAIN, "identity_path config_dir altında değil — yapılandırma hatası");
+    /* Diskten şifreli anahtarı yükle — fd-only (TOCTOU kapalı) */
+    assert(state.config_dir_fd >= 0);
+    if (state.config_dir_fd < 0) {
+      NOX_ERROR(LOG_MOD_MAIN, "config_dir_fd geçersiz — TOCTOU koruması için fd gerekli");
       return NOX_ERR_CONFIG;
     }
-    err = crypto_load_identity(state.identity_path, identity_unlock, ed_sk,
+    err = crypto_load_identity(state.config_dir_fd, identity_unlock, ed_sk,
                                ed_pub);
     if (err == NOX_ERR_AUTH) {
       NOX_FATAL(LOG_MOD_MAIN, "yanlış PIN — identity key çözülemedi");
@@ -1182,9 +1216,10 @@ int main(int argc, char *argv[]) {
       return 0;
     }
 
-    /* SQLite veritabanını başlat */
+    /* SQLite veritabanını başlat — fd pinleme ile dizin hijack kapalı;
+     * dosya-inode TOCTOU penceresi için docs/THREAT_MODEL.md §4.9'a bak */
     if (!state.ghost_mode) {
-      err = db_init(state.config_dir, state.db_key);
+      err = db_init(state.config_dir, state.config_dir_fd, state.db_key);
       if (err != NOX_OK) {
         NOX_FATAL(LOG_MOD_MAIN, "veritabanı başlatılamadı: %s",
                   nox_strerror(err));

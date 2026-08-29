@@ -127,9 +127,11 @@ static void test_abi_conditional_rights(void) {
 static int run_integration(void) {
     char dl_tpl[] = "/tmp/ll_dl_XXXXXX";
     char out_tpl[] = "/tmp/ll_out_XXXXXX";
+    char cfg_tpl[] = "/tmp/ll_cfg_XXXXXX";
     char *dl_dir = mkdtemp(dl_tpl);
     char *out_dir = mkdtemp(out_tpl);
-    if (!dl_dir || !out_dir) {
+    char *cfg_dir = mkdtemp(cfg_tpl);
+    if (!dl_dir || !out_dir || !cfg_dir) {
         printf("  [FAIL] mkdtemp başarısız (errno=%d)\n", errno);
         return 1;
     }
@@ -137,7 +139,8 @@ static int run_integration(void) {
     /* fd'ler sandbox'tan ÖNCE açılmalı — sonrasında dış erişim yok */
     int dl_fd = open(dl_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int out_fd = open(out_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dl_fd < 0 || out_fd < 0) {
+    int cfg_fd = open(cfg_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dl_fd < 0 || out_fd < 0 || cfg_fd < 0) {
         printf("  [FAIL] dizin açılamadı (errno=%d)\n", errno);
         return 1;
     }
@@ -162,7 +165,7 @@ static int run_integration(void) {
             _exit(2);
         }
 
-        nox_err_t err = landlock_sandbox_init(dl_fd);
+        nox_err_t err = landlock_sandbox_init(cfg_fd, dl_fd);
         if (err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
             printf("  [SKIP] Landlock LSM bu kernel'de devre dışı (boot parametresi)\n");
             fflush(stdout);
@@ -230,8 +233,8 @@ static int run_integration(void) {
 
     /* child'ın çıkarmadığı olası kalıntı dosyayı temizle */
     (void)unlinkat(dl_fd, "probe.bin", 0);
-    close(dl_fd); close(out_fd);
-    (void)rmdir(dl_dir); (void)rmdir(out_dir);
+    close(dl_fd); close(out_fd); close(cfg_fd);
+    (void)rmdir(dl_dir); (void)rmdir(out_dir); (void)rmdir(cfg_dir);
 
     if (WIFEXITED(status) && WEXITSTATUS(status) == 2) return 2;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;

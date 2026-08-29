@@ -48,14 +48,16 @@ __u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled);
 /**
  * landlock_sandbox_init — Landlock sandbox'ı başlat.
  *
- * @downloads_dir_fd: downloads dizinin fd'si (O_PATH ile açılmış)
+ * @config_dir_fd:    config dizinin fd'si (O_DIRECTORY|O_NOFOLLOW, main:ensure_config_dir)
+ *                    — okuma izni için. <0 ise strict fail (Q2 Şık A).
+ * @downloads_dir_fd: downloads dizinin fd'si (O_DIRECTORY|O_NOFOLLOW)
  *
- * Sadece downloads dizinine okuma/yazma izni verir.
- * Diğer tüm dosya erişimleri engellenir (default deny).
+ * fd = anchor, path'e asla geri dönülmez (TOCTOU kapalı).
+ * Sadece downloads (RW) + config (RO) altında erişim verilir.
  *
  * Return: NOX_OK veya NOX_ERR_CONFIG / NOX_ERR_LANDLOCK_UNSUPPORTED
  */
-nox_err_t landlock_sandbox_init(int downloads_dir_fd);
+nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd);
 
 /**
  * landlock_is_available — Landlock mevcut mu?

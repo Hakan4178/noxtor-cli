@@ -15,9 +15,11 @@
 #include "crypto.h"
 #include "arena.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sodium.h>
 
 
@@ -65,6 +67,11 @@ static void cleanup_test_dir(void)
     unlink(path);
 
     rmdir(TEST_DIR);
+}
+
+static int open_test_dir_fd(void)
+{
+    return open(TEST_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 }
 
 /* ================================================================
@@ -154,7 +161,10 @@ static int test_salt_management(void)
     setup_test_dir();
 
     uint8_t salt1[NOX_SALT_LEN] = {0};
-    nox_err_t err = crypto_load_or_create_salt(salt1, TEST_DIR);
+    int fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    nox_err_t err = crypto_load_or_create_salt(salt1, fd);
+    close(fd);
     TEST_ASSERT(err == NOX_OK);
 
     /* Salt sıfır olmamalı */
@@ -163,7 +173,10 @@ static int test_salt_management(void)
 
     /* İkinci okuma — aynı salt dönmeli */
     uint8_t salt2[NOX_SALT_LEN] = {0};
-    err = crypto_load_or_create_salt(salt2, TEST_DIR);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    err = crypto_load_or_create_salt(salt2, fd);
+    close(fd);
     TEST_ASSERT(err == NOX_OK);
     TEST_ASSERT(sodium_memcmp(salt1, salt2, NOX_SALT_LEN) == 0);
 
@@ -180,12 +193,12 @@ static int test_identity_roundtrip(void)
     uint8_t unlock_key[NOX_KEY_LEN];
     randombytes_buf(unlock_key, NOX_KEY_LEN);
 
-    char id_path[256];
-    snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);
-
     /* Üret */
     uint8_t pub_gen[NOX_KEY_LEN] = {0};
-    nox_err_t err = crypto_generate_identity(id_path, unlock_key, pub_gen);
+    int fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    nox_err_t err = crypto_generate_identity(fd, unlock_key, pub_gen);
+    close(fd);
     TEST_ASSERT(err == NOX_OK);
 
     /* Public key sıfır olmamalı */
@@ -195,7 +208,10 @@ static int test_identity_roundtrip(void)
     /* Yükle — aynı key pair dönmeli */
     uint8_t sk_loaded[64] = {0};
     uint8_t pub_loaded[NOX_KEY_LEN] = {0};
-    err = crypto_load_identity(id_path, unlock_key, sk_loaded, pub_loaded);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    err = crypto_load_identity(fd, unlock_key, sk_loaded, pub_loaded);
+    close(fd);
     TEST_ASSERT(err == NOX_OK);
 
     /* Public key'ler eşleşmeli */
@@ -224,12 +240,12 @@ static int test_identity_wrong_pin(void)
     uint8_t correct_key[NOX_KEY_LEN];
     randombytes_buf(correct_key, NOX_KEY_LEN);
 
-    char id_path[256];
-    snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);
-
     /* Doğru key ile üret */
     uint8_t pub[NOX_KEY_LEN];
-    nox_err_t err = crypto_generate_identity(id_path, correct_key, pub);
+    int fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    nox_err_t err = crypto_generate_identity(fd, correct_key, pub);
+    close(fd);
     TEST_ASSERT(err == NOX_OK);
 
     /* Yanlış key ile yükle → AUTH hatası */
@@ -237,7 +253,10 @@ static int test_identity_wrong_pin(void)
     randombytes_buf(wrong_key, NOX_KEY_LEN);
 
     uint8_t sk[64], pk[NOX_KEY_LEN];
-    err = crypto_load_identity(id_path, wrong_key, sk, pk);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    err = crypto_load_identity(fd, wrong_key, sk, pk);
+    close(fd);
     TEST_ASSERT(err == NOX_ERR_AUTH);
 
     explicit_bzero(correct_key, sizeof(correct_key));
@@ -261,13 +280,15 @@ static int test_null_safety(void)
     TEST_ASSERT(crypto_derive_subkeys(NULL, key, key, key)
                 == NOX_ERR_CRYPTO);
 
-    TEST_ASSERT(crypto_load_or_create_salt(NULL, "/tmp")
+    TEST_ASSERT(crypto_load_or_create_salt(NULL, -1)
+                == NOX_ERR_CRYPTO);
+    TEST_ASSERT(crypto_load_or_create_salt(key, -1)
                 == NOX_ERR_CONFIG);
 
-    TEST_ASSERT(crypto_generate_identity(NULL, key, key)
+    TEST_ASSERT(crypto_generate_identity(-1, key, key)
                 == NOX_ERR_CRYPTO);
 
-    TEST_ASSERT(crypto_load_identity(NULL, key, (uint8_t[64]){0}, key)
+    TEST_ASSERT(crypto_load_identity(-1, key, (uint8_t[64]){0}, key)
                 == NOX_ERR_CRYPTO);
 
     return 0;
@@ -283,14 +304,16 @@ static int test_full_chain(void)
     setup_test_dir();
 
     char pin[] = "aktivist2024!";
-    char id_path[256];
-    snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);
+    int fd;
 
     /* ── İlk çalıştırma ────────────────────── */
 
     /* 1. Salt üret */
     uint8_t salt[NOX_SALT_LEN];
-    TEST_ASSERT(crypto_load_or_create_salt(salt, TEST_DIR) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt, fd) == NOX_OK);
+    close(fd);
 
     /* 2. PIN → master_key */
     uint8_t master[NOX_KEY_LEN];
@@ -302,13 +325,19 @@ static int test_full_chain(void)
 
     /* 4. Identity üret */
     uint8_t pub1[NOX_KEY_LEN];
-    TEST_ASSERT(crypto_generate_identity(id_path, unlock, pub1) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_generate_identity(fd, unlock, pub1) == NOX_OK);
+    close(fd);
 
     /* ── İkinci çalıştırma (aynı PIN) ──────── */
 
     /* 1. Salt oku (aynısı) */
     uint8_t salt2[NOX_SALT_LEN];
-    TEST_ASSERT(crypto_load_or_create_salt(salt2, TEST_DIR) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt2, fd) == NOX_OK);
+    close(fd);
     TEST_ASSERT(sodium_memcmp(salt, salt2, NOX_SALT_LEN) == 0);
 
     /* 2. Aynı PIN → aynı master_key */
@@ -324,7 +353,10 @@ static int test_full_chain(void)
 
     /* 4. Identity yükle → aynı public key */
     uint8_t sk[64], pub2[NOX_KEY_LEN];
-    TEST_ASSERT(crypto_load_identity(id_path, unlock2, sk, pub2) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_identity(fd, unlock2, sk, pub2) == NOX_OK);
+    close(fd);
     TEST_ASSERT(sodium_memcmp(pub1, pub2, NOX_KEY_LEN) == 0);
 
     explicit_bzero(master, sizeof(master));
@@ -347,11 +379,17 @@ static int test_salt_exists_no_identity(void)
 
     /* Salt üret */
     uint8_t salt1[NOX_SALT_LEN];
-    TEST_ASSERT(crypto_load_or_create_salt(salt1, TEST_DIR) == NOX_OK);
+    int fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt1, fd) == NOX_OK);
+    close(fd);
 
     /* identity.key dosyası yok — salt yine doğru okunmalı */
     uint8_t salt2[NOX_SALT_LEN];
-    TEST_ASSERT(crypto_load_or_create_salt(salt2, TEST_DIR) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt2, fd) == NOX_OK);
+    close(fd);
     TEST_ASSERT(sodium_memcmp(salt1, salt2, NOX_SALT_LEN) == 0);
 
     /* identity.key üretimi hâlâ çalışmalı */
@@ -362,15 +400,18 @@ static int test_salt_exists_no_identity(void)
     uint8_t db[NOX_KEY_LEN], unlock[NOX_KEY_LEN], session[NOX_KEY_LEN];
     TEST_ASSERT(crypto_derive_subkeys(master, db, unlock, session) == NOX_OK);
 
-    char id_path[256];
-    snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);
-
     uint8_t pub[NOX_KEY_LEN];
-    TEST_ASSERT(crypto_generate_identity(id_path, unlock, pub) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_generate_identity(fd, unlock, pub) == NOX_OK);
+    close(fd);
 
     /* Doğrulama — yükleme çalışmalı */
     uint8_t sk[64], pub2[NOX_KEY_LEN];
-    TEST_ASSERT(crypto_load_identity(id_path, unlock, sk, pub2) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_identity(fd, unlock, sk, pub2) == NOX_OK);
+    close(fd);
     TEST_ASSERT(sodium_memcmp(pub, pub2, NOX_KEY_LEN) == 0);
 
     explicit_bzero(master, sizeof(master));
@@ -404,11 +445,17 @@ static int test_corrupt_salt_recovery(void)
 
     /* Okuma — bozuk tespit edip abort etmeli (sessiz üretim yok) */
     uint8_t salt[NOX_SALT_LEN];
-    TEST_ASSERT(crypto_load_or_create_salt(salt, TEST_DIR) == NOX_ERR_IO);
+    int fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt, fd) == NOX_ERR_IO);
+    close(fd);
 
     /* Bozuk dosya müdahale sonrası silinirse yeni salt üretilmeli */
     unlink(salt_path);
-    TEST_ASSERT(crypto_load_or_create_salt(salt, TEST_DIR) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt, fd) == NOX_OK);
+    close(fd);
 
     /* Yeni salt sıfır olmamalı */
     uint8_t zero[NOX_SALT_LEN] = {0};
@@ -416,7 +463,10 @@ static int test_corrupt_salt_recovery(void)
 
     /* Tekrar okuma — aynı yeni salt dönmeli */
     uint8_t salt2[NOX_SALT_LEN];
-    TEST_ASSERT(crypto_load_or_create_salt(salt2, TEST_DIR) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt2, fd) == NOX_OK);
+    close(fd);
     TEST_ASSERT(sodium_memcmp(salt, salt2, NOX_SALT_LEN) == 0);
 
     return 0;
@@ -441,13 +491,13 @@ static int test_full_chain_wrong_pin(void)
         unlink(cleanup_path);
     }
 
-    char id_path[256];
-    snprintf(id_path, sizeof(id_path), "%s/identity.key", TEST_DIR);
-
     /* Doğru PIN ile tam zincir */
     char correct_pin[] = "correct_pin_2024";
     uint8_t salt[NOX_SALT_LEN];
-    TEST_ASSERT(crypto_load_or_create_salt(salt, TEST_DIR) == NOX_OK);
+    int fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_load_or_create_salt(salt, fd) == NOX_OK);
+    close(fd);
 
     uint8_t master_ok[NOX_KEY_LEN];
     TEST_ASSERT(crypto_derive_master_key(master_ok, correct_pin,
@@ -457,7 +507,10 @@ static int test_full_chain_wrong_pin(void)
     TEST_ASSERT(crypto_derive_subkeys(master_ok, db, unlock_ok, sess) == NOX_OK);
 
     uint8_t pub[NOX_KEY_LEN];
-    TEST_ASSERT(crypto_generate_identity(id_path, unlock_ok, pub) == NOX_OK);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(crypto_generate_identity(fd, unlock_ok, pub) == NOX_OK);
+    close(fd);
 
     /* Yanlış PIN ile tam zincir → AUTH hatası */
     char wrong_pin[] = "totally_wrong_99";
@@ -476,7 +529,10 @@ static int test_full_chain_wrong_pin(void)
 
     /* Identity yükleme → secretbox_open başarısız → NOX_ERR_AUTH */
     uint8_t sk[64], pk[NOX_KEY_LEN];
-    nox_err_t err = crypto_load_identity(id_path, unlock_bad, sk, pk);
+    fd = open_test_dir_fd();
+    TEST_ASSERT(fd >= 0);
+    nox_err_t err = crypto_load_identity(fd, unlock_bad, sk, pk);
+    close(fd);
     TEST_ASSERT(err == NOX_ERR_AUTH);
 
     explicit_bzero(master_ok, sizeof(master_ok));

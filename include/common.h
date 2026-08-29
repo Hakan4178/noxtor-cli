@@ -205,4 +205,17 @@ void nox_hexdump(log_module_t mod, const char *label,
                             _a > _b ? _a : _b; })
 #endif
 
+/* ================================================================
+ * HARDENED BOOLEAN — GCC hardbool (control-flow hardening)
+ *
+ * split_done / failed gibi kritik sentinel'lar fault injection ile
+ * 0/1 dışı değere çekilirse hardened check __builtin_trap ile yakalar.
+ * GCC >=14 destekler, altı fallback bool.
+ * ================================================================ */
+#if defined(__GNUC__) && __GNUC__ >= 14
+typedef unsigned char __attribute__((hardbool(0))) nox_hardbool_t;
+#else
+typedef bool nox_hardbool_t;
+#endif
+
 #endif /* PARANOID_COMMON_H */

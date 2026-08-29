@@ -8,8 +8,8 @@
  * Kernel desteklemiyorsa sessizce fallback.
  *
  * Kullanım:
- *   landlock_sandbox_init(downloads_dir_fd);
- *   // Bu noktadan sonra sadece downloads_dir içinde dosya okunabilir/yazılabilir
+ *   landlock_sandbox_init(config_dir_fd, downloads_dir_fd);
+ *   // Bu noktadan sonra sadece downloads_dir (RW) + config_dir (RO) altında erişim
  * ================================================================ */
 #include "common.h"
 #include "landlock_sandbox.h"
@@ -55,18 +55,20 @@ static int landlock_abi_version(void) {
 /* ================================================================
  * landlock_sandbox_init
  *
- * @downloads_dir_fd: downloads dizinin fd'si (O_PATH ile açılmış)
+ * @config_dir_fd:    config dizinin fd'si (O_DIRECTORY|O_NOFOLLOW) — RO
+ * @downloads_dir_fd: downloads dizinin fd'si (O_DIRECTORY|O_NOFOLLOW) — RW
  *
- * Sadece downloads dizinine okuma/yazma izni verir.
- * Diğer tüm dosya erişimleri engellenir (default deny).
+ * fd = anchor, path'e asla geri dönülmez (TOCTOU kapalı).
+ * Sadece downloads (RW) + config (RO) altında erişim verilir.
  *
  * Returns: NOX_OK veya NOX_ERR_CONFIG
  * ================================================================ */
 static bool s_landlock_active = false;
 
-nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
-    if (downloads_dir_fd < 0) {
-        NOX_ERROR(LOG_MOD_MAIN, "landlock: geçersiz downloads dir fd");
+nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
+    if (config_dir_fd < 0 || downloads_dir_fd < 0) {
+        NOX_ERROR(LOG_MOD_MAIN, "landlock: geçersiz dir fd (config=%d, downloads=%d)",
+                  config_dir_fd, downloads_dir_fd);
         return NOX_ERR_CONFIG;
     }
 
@@ -151,38 +153,25 @@ nox_err_t landlock_sandbox_init(int downloads_dir_fd) {
         return NOX_ERR_CONFIG;
     }
 
-    /* ── noxtor-cli config dizini için kural ekle ──
-     * Sadece okuma izni — config dosyaları okunabilir, yazılamaz. */
-    char config_dir[NOX_PATH_MAX];
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-
-    /* CodeQL: cpp/path-injection — HOME mutlak path olmalı */
-    assert(home != NULL && "HOME must be set");
-    if (home[0] == '/') {
-        snprintf(config_dir, sizeof(config_dir), "%s/.config/paranoidcli", home);
-
-        int config_fd = open(config_dir, O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (config_fd >= 0) {
-            struct landlock_path_beneath_attr config_rule = {
-                .allowed_access =
-                    LANDLOCK_ACCESS_FS_READ_FILE |
-                    LANDLOCK_ACCESS_FS_READ_DIR |
-                    LANDLOCK_ACCESS_FS_REMOVE_FILE, /* L-21 FIX: shutdown'da
-                    listen.sock unlink'i EPERM almadan çalışsın — yoksa bayat
-                    socket dosyası bir sonraki bind()'i engeller */
-                .parent_fd = config_fd,
-            };
-            rc = sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
-                                      &config_rule, 0);
-            if (rc < 0) {
-                NOX_ERROR(LOG_MOD_MAIN, "landlock: config kuralı eklenemedi (%s)",
-                          strerror(errno));
-                close(config_fd);
-                close(ruleset_fd);
-                return NOX_ERR_CONFIG;
-            }
-            close(config_fd);
+    /* ── config dizini için kural ekle — fd anchor, HOME parse yok (Q1 Şık A) ──
+     * Sadece okuma izni — TOCTOU kapalı, path'e asla geri dönülmez. */
+    {
+        struct landlock_path_beneath_attr config_rule = {
+            .allowed_access =
+                LANDLOCK_ACCESS_FS_READ_FILE |
+                LANDLOCK_ACCESS_FS_READ_DIR |
+                LANDLOCK_ACCESS_FS_REMOVE_FILE, /* L-21 FIX: shutdown'da
+                listen.sock unlink'i EPERM almadan çalışsın — yoksa bayat
+                socket dosyası bir sonraki bind()'i engeller */
+            .parent_fd = config_dir_fd,
+        };
+        rc = sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+                                  &config_rule, 0);
+        if (rc < 0) {
+            NOX_ERROR(LOG_MOD_MAIN, "landlock: config kuralı eklenemedi (%s)",
+                      strerror(errno));
+            close(ruleset_fd);
+            return NOX_ERR_CONFIG;
         }
     }
 

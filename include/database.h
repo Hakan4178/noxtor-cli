@@ -11,12 +11,25 @@
 /*
  * db_init — Veritabanını başlat ve tabloları oluştur
  *
- * @config_dir: Uygulamanın config dizin yolu (~/.config/paranoidcli)
- * @db_key:     Argon2id ile türetilmiş 32 byte veritabanı anahtarı
+ * @config_dir:    Uygulamanın config dizin yolu — YALNIZCA log/hata mesajı
+ *                 için saklanır; path çözümlemede kullanılmaz (fd pinleme var)
+ * @config_dir_fd: main.c:ensure_config_dir'de O_DIRECTORY|O_NOFOLLOW ile
+ *                 açılan fd; contacts.db ön-doğrulaması openat() ile bu fd
+ *                 üzerinden yapılır (dizin hijack kapalı). fd<0 ise ön-
+ *                 doğrulama atlanır (testler). SQLite path'i yeniden resolve
+ *                 ettiği için dosya-inode seviyesinde dar TOCTOU penceresi
+ *                 kalır — ileride ele alınacaktır.
+ * @db_key:        Argon2id ile türetilmiş 32 byte veritabanı anahtarı
  *
  * Return: NOX_OK veya NOX_ERR_DB / NOX_ERR_CONFIG
+ *
+ * Not: config_dir dizini fd üzerinden pinlenerek dizin değiştirme/hijack
+ * saldırıları engellenir; database dosyasının SQLite tarafından yeniden path
+ * üzerinden açılması nedeniyle dosya-inode seviyesinde kalan TOCTOU riski
+ * ileride ele alınacaktır.
  */
-nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]);
+nox_err_t db_init(const char *config_dir, int config_dir_fd,
+                  const uint8_t db_key[NOX_KEY_LEN]);
 
 /*
  * db_close — Veritabanı bağlantısını güvenle kapat

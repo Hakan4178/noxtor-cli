@@ -570,17 +570,32 @@ static nox_err_t generate_torrc(struct app_state *state) {
     return NOX_ERR_CONFIG;
   }
 
-  /* tor_data dizinini oluştur */
-  if (mkdir(state->tor_data_dir, 0700) != 0 && errno != EEXIST) {
-    NOX_ERROR(LOG_MOD_NET, "tor_data_dir oluşturulamadı: %s", strerror(errno));
-    return NOX_ERR_TOR;
+  /* tor_data dizinini oluştur — mkdirat ile TOCTOU'suz (crypt pattern) */
+  char tor_data_bn[64];
+  int bn_len = snprintf(tor_data_bn, sizeof(tor_data_bn), "tor_data_%d", (int)getpid());
+  if (bn_len <= 0 || (size_t)bn_len >= sizeof(tor_data_bn)) {
+    NOX_ERROR(LOG_MOD_NET, "tor_data basename çok uzun");
+    return NOX_ERR_CONFIG;
+  }
+  if (state->config_dir_fd >= 0) {
+    if (mkdirat(state->config_dir_fd, tor_data_bn, 0700) != 0 && errno != EEXIST) {
+      NOX_ERROR(LOG_MOD_NET, "tor_data_dir oluşturulamadı: %s", strerror(errno));
+      return NOX_ERR_TOR;
+    }
+  } else {
+    if (mkdir(state->tor_data_dir, 0700) != 0 && errno != EEXIST) {
+      NOX_ERROR(LOG_MOD_NET, "tor_data_dir oluşturulamadı: %s", strerror(errno));
+      return NOX_ERR_TOR;
+    }
   }
 
   /* C1 FIX: tor_data_dir açılışı fail-closed — 2. uzman.
    * dd < 0 → sessiz devam yok; symlink (O_NOFOLLOW ELOOP) dahil her
    * açma hatası başlatmayı iptal eder. Sahiplik ve tip doğrulaması:
    * dizin başkasına aitse veya dizin değilse kullanma. */
-  int dd = open(state->tor_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int dd = (state->config_dir_fd >= 0)
+      ? openat(state->config_dir_fd, tor_data_bn, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+      : open(state->tor_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (dd < 0) {
     NOX_ERROR(LOG_MOD_NET, "tor_data_dir açılamadı: %s", strerror(errno));
     return NOX_ERR_TOR;
@@ -609,9 +624,16 @@ static nox_err_t generate_torrc(struct app_state *state) {
   }
   close(dd);
 
-  /* torrc yaz — V6 FIX: O_NOFOLLOW symlink Engellemesi */
-  int fd =
-      open(state->torrc_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+  /* torrc yaz — V6 FIX: O_NOFOLLOW symlink Engellemesi, openat ile TOCTOU'suz */
+  char torrc_bn[64];
+  int rbn_len = snprintf(torrc_bn, sizeof(torrc_bn), "torrc_%d", (int)getpid());
+  if (rbn_len <= 0 || (size_t)rbn_len >= sizeof(torrc_bn)) {
+    NOX_ERROR(LOG_MOD_NET, "torrc basename çok uzun");
+    return NOX_ERR_CONFIG;
+  }
+  int fd = (state->config_dir_fd >= 0)
+      ? openat(state->config_dir_fd, torrc_bn, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600)
+      : open(state->torrc_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (fd < 0) {
     if (errno == ELOOP) {
       /* C2 FIX: symlink tespit edildiğinde fail-closed — silip yeniden
@@ -630,7 +652,8 @@ static nox_err_t generate_torrc(struct app_state *state) {
   if (fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) {
     NOX_ERROR(LOG_MOD_NET, "torrc regular file değil — saldırı tespit edildi");
     close(fd);
-    unlink(state->torrc_path);
+    if (state->config_dir_fd >= 0) unlinkat(state->config_dir_fd, torrc_bn, 0);
+    else unlink(state->torrc_path);
     return NOX_ERR_TOR;
   }
 
@@ -691,13 +714,14 @@ static nox_err_t generate_torrc(struct app_state *state) {
        * yapabilir. Tor config dosyasında her satır tek bir direktördür.
        * Yeni satır karakteri varsa bridge line reddedilir. */
       if (strchr(state->obfs4_bridge_line, '\n') != NULL ||
-          strchr(state->obfs4_bridge_line, '\r') != NULL) {
-        NOX_ERROR(LOG_MOD_NET, "obfs4 bridge line newline/carriage return karakteri içeriyor");
-        /* D5 FIX: kalıntı (yarım) torrc'yi diskte bırakma */
-        close(fd);
-        unlink(state->torrc_path);
-        return NOX_ERR_CONFIG;
-      }
+           strchr(state->obfs4_bridge_line, '\r') != NULL) {
+         NOX_ERROR(LOG_MOD_NET, "obfs4 bridge line newline/carriage return karakteri içeriyor");
+         /* D5 FIX: kalıntı (yarım) torrc'yi diskte bırakma */
+         close(fd);
+         if (state->config_dir_fd >= 0) unlinkat(state->config_dir_fd, torrc_bn, 0);
+         else unlink(state->torrc_path);
+         return NOX_ERR_CONFIG;
+       }
       /* Release: /dev/null, Debug: file */
 #ifdef NDEBUG
       clen =
@@ -785,7 +809,8 @@ static nox_err_t generate_torrc(struct app_state *state) {
     NOX_ERROR(LOG_MOD_NET, "torrc içeriği çok büyük");
     /* D5 FIX: kalıntı torrc'yi diskte bırakma */
     close(fd);
-    unlink(state->torrc_path);
+    if (state->config_dir_fd >= 0) unlinkat(state->config_dir_fd, torrc_bn, 0);
+    else unlink(state->torrc_path);
     return NOX_ERR_CONFIG;
   }
 
@@ -1463,7 +1488,7 @@ void tor_shutdown(struct app_state *state) {
     g_tor_pid = 0; /* K-2: stale PID eşleşmesini sıfırla */
   }
 
-  /* torrc dosyasını sil */
+  /* torrc dosyasını sil — unlinkat ile TOCTOU'suz (crypt pattern) */
   if (state->torrc_path[0] != '\0') {
     /* CodeQL #15 cpp/path-injection: torrc_path config_dir'den türetilmiştir.
      * A3: prefix + slash boundary — /a/.nox ve /a/.nox_evil karışmaz. */
@@ -1471,7 +1496,13 @@ void tor_shutdown(struct app_state *state) {
     if (!path_under_dir(state->torrc_path, state->config_dir)) {
       NOX_ERROR(LOG_MOD_MAIN, "torrc_path config_dir altında değil — silme engellendi");
     } else {
-      unlink(state->torrc_path);
+      if (state->config_dir_fd >= 0) {
+        const char *bn = strrchr(state->torrc_path, '/');
+        bn = bn ? bn + 1 : state->torrc_path;
+        unlinkat(state->config_dir_fd, bn, 0);
+      } else {
+        unlink(state->torrc_path);
+      }
     }
     state->torrc_path[0] = '\0';
   }

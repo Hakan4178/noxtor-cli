@@ -37,6 +37,8 @@ struct secure_arena {
     bool     locked;        /* MAP_LOCKED / mlock durumu               */
     uint8_t  canary[NOX_CANARY_LEN]; /* taşma tespiti için            */
 };
+NOX_STATIC_ASSERT(sizeof(struct secure_arena) % 16 == 0, "arena SIMD align");
+NOX_STATIC_ASSERT(NOX_CANARY_LEN == 16, "canary 16");
 
 /* ================================================================
  * MESAJ FRAMING
@@ -119,7 +121,11 @@ struct noise_handshake {
     uint8_t  re[NOX_KEY_LEN];      /* remote ephemeral public key */
     bool     initiator;
     int      msg_index;             /* 0, 1, 2 — hangi adımdayız  */
+    nox_hardbool_t split_done;       /* hardened: true → handshake_split yapıldı, tekrar yasak */
+    nox_hardbool_t failed;           /* hardened: true → önceki read/write fail, artık split yok */
 };
+NOX_STATIC_ASSERT(sizeof(struct noise_handshake) % 8 == 0, "handshake align 8");
+NOX_STATIC_ASSERT(offsetof(struct noise_handshake, split_done) < sizeof(struct noise_handshake), "split_done in bounds");
 
 /* ================================================================
  * NOISE XX — Session (handshake tamamlandıktan sonra)
@@ -306,9 +312,10 @@ struct app_state {
     size_t   prompt_display_len; /* prompt'un terminal karakter genişliği */
 
     /* Config yolları — NOX_PATH_MAX yeterli, PATH_MAX stack'i taşırır */
-    char     config_dir[NOX_PATH_MAX];
-    char     identity_path[NOX_PATH_MAX];
-    char     contacts_path[NOX_PATH_MAX];
+    char     config_dir[NOX_PATH_MAX]; /* YALNIZCA log/hata mesajı için — path çözümlemede ASLA kullanılmaz; I/O için config_dir_fd kullanılır */
+    int      config_dir_fd;      /* O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC, main:ensure_config_dir'de açılır — tüm crypto/db I/O bu fd üzerinden (openat) */
+    char     identity_path[NOX_PATH_MAX]; /* YALNIZCA log/hata mesajı için — I/O için config_dir_fd + "identity.key" openat */
+    char     contacts_path[NOX_PATH_MAX]; /* YALNIZCA log/hata mesajı için — I/O için config_dir_fd + "contacts.db" (db_init) */
 
     /* TOFU State */
     bool     tofu_pending;
@@ -335,8 +342,8 @@ struct app_state {
     char     obfs4_bridge_line[512];
 
     /* Asenkron Dosya İşlemleri */
-    int      downloads_dir_fd;
-    char     downloads_dir[NOX_PATH_MAX];
+    int      downloads_dir_fd; /* O_DIRECTORY|O_NOFOLLOW — tüm dosya I/O openat(downloads_dir_fd, ...) */
+    char     downloads_dir[NOX_PATH_MAX]; /* YALNIZCA log için — I/O için downloads_dir_fd */
 };
 
 /* Aktif peer'a便捷 erişim — NULL-safe */

@@ -26,6 +26,13 @@
  *         NULL kaynak kontrolü, ed25519_sk boyutu crypto_sign_SECRETKEYBYTES
  *   [F-1] crypto_load_or_create_salt — TOCTOU: stat+chmod→fstat+fchmod
  *   [F-2] crypto_load_or_create_salt — PID race: random suffix eklendi
+ *
+ * INVARIANT: Crypto dosya operasyonlarında config_dir string'i hiçbir zaman
+ * path çözümlemede kullanılmaz — YALNIZCA log/hata mesajı için saklanır;
+ * yalnızca config_dir_fd (openat/unlinkat/renameat + O_NOFOLLOW|O_CLOEXEC)
+ * kullanılır. Bu fd, main.c:ensure_config_dir içinde O_DIRECTORY|O_NOFOLLOW
+ * ile açılır ve tüm salt/identity I/O bu fd üzerinden yapılır — TOCTOU/
+ * symlink hijack kapalı.
  */
 
 #include "crypto.h"
@@ -78,6 +85,8 @@ enum nox_subkey_id {
 
 NOX_STATIC_ASSERT(sizeof(NOX_KDF_CTX) - 1 == crypto_kdf_CONTEXTBYTES,
                   "KDF context tam 8 byte olmali");
+NOX_STATIC_ASSERT(sizeof(NOX_KDF_CTX) > 1, "KDF ctx empty");
+NOX_STATIC_ASSERT(sizeof(NOX_KDF_CTX) == 9, "KDF ctx NUL incl");
 
 /* ================================================================
  * Identity dosya boyutu
@@ -347,184 +356,93 @@ nox_err_t derive_tor_expanded_key(uint8_t expanded_out[64],
  * ================================================================ */
 __attribute__((strub))
 nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
-                                      const char *config_dir)
+                                     int config_dir_fd)
 {
-    if (!salt || !config_dir)
+    if (!salt)
+        return NOX_ERR_CRYPTO;
+    if (config_dir_fd < 0)
         return NOX_ERR_CONFIG;
-
-    /* [F-1] + V2-M01 FIX: TOCTOU keep-alive fd — string'e düşme yok.
-     * dir_fd tüm fonksiyon boyunca açık tutulur; salt open/read/write/rename
-     * hep openat(dir_fd) ile yapılır. Böylece close→open pencerede
-     * config_dir symlink race'i kapanır. Fallback: dir_fd <0 ise path’e düş. */
-    int dir_fd = open(config_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (dir_fd >= 0) {
-        struct stat dir_st;
-        if (fstat(dir_fd, &dir_st) == 0) {
-            if ((dir_st.st_mode & 0777) != 0700) {
-                NOX_ERROR(LOG_MOD_CRYPTO,
-                          "config_dir izinleri güvensiz (%03o), "
-                          "fchmod deneniyor",
-                          dir_st.st_mode & 0777);
-                if (fchmod(dir_fd, 0700) != 0) {
-                    NOX_ERROR(LOG_MOD_CRYPTO,
-                              "config_dir izinleri düzeltilemiyor: %s — "
-                              "güvensiz dizinde kriptografik işlem yapılamaz",
-                              strerror(errno));
-                    close(dir_fd);
-                    return NOX_ERR_CONFIG;
-                }
-                NOX_INFO(LOG_MOD_CRYPTO, "config_dir izinleri 0700'e düzeltildi");
-            }
-        }
-        /* dir_fd kapatılmıyor — aşağıda openat için keep-alive */
-    }
-
-    char path[NOX_PATH_MAX];
-    int ret = snprintf(path, sizeof(path), "%s/salt", config_dir);
-    if (ret < 0 || (size_t)ret >= sizeof(path)) {
-        if (dir_fd >= 0) close(dir_fd);
-        return NOX_ERR_CONFIG;
-    }
-
-    /* Mevcut salt dosyasını oku
-     * H-4 FIX: yalnızca ENOENT → yeni salt üret; diğer tüm hatalar (EACCES,
-     * EIO, boyut uyumsuzluğu, fstat hatası) abort etmeli — aksi halde
-     * master_key = Argon2id(PIN, yeni_salt) tüm şifreli veriyi kalıcı
-     * erişilemez kılar ve "yanlış PIN" gibi görünür.
-     * V2-M01 FIX: openat(dir_fd,"salt") keep-alive ile TOCTOU kapalı. */
-    int fd;
-    if (dir_fd >= 0) {
-        fd = openat(dir_fd, "salt", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    } else {
-        fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    }
+    int fd = openat(config_dir_fd, "salt", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd >= 0) {
-        /* [P7] Dosya boyutu kontrolü — fstat hata ayrımı UB önler */
         struct stat st;
         if (fstat(fd, &st) != 0) {
             NOX_ERROR(LOG_MOD_CRYPTO,
                       "salt dosyası fstat başarısız — dosya dokunulmuyor");
             close(fd);
-            if (dir_fd >= 0) close(dir_fd);
             return NOX_ERR_IO;
         } else if (st.st_size != (off_t)NOX_SALT_LEN) {
             NOX_ERROR(LOG_MOD_CRYPTO,
                       "salt dosyası boyutu hatalı (%lld byte, beklenen %u) — yeniden üretilmiyor, müdahale gerekli",
                       (long long)st.st_size, NOX_SALT_LEN);
             close(fd);
-            if (dir_fd >= 0) close(dir_fd);
             return NOX_ERR_IO;
         } else {
             nox_err_t err = read_exact(fd, salt, NOX_SALT_LEN);
             close(fd);
             if (err == NOX_OK) {
                 NOX_INFO(LOG_MOD_CRYPTO, "salt dosyasından okundu");
-                if (dir_fd >= 0) close(dir_fd);
                 return NOX_OK;
             }
-            /* I/O hatası (disk dolu, NFS kopuk, EIO) — salt üretmeye çalışma!
-             * Eski salt ile türetilmiş master key hâlâ geçerli; yenisi tüm
-             * şifrelenmiş veriyi kalıcı olarak erişilmez kılar. */
             NOX_ERROR(LOG_MOD_CRYPTO,
                       "salt okunamadı (I/O hatası, dosya dokunulmuyor)");
-            if (dir_fd >= 0) close(dir_fd);
             return err;
         }
     } else {
-        /* open başarısız — yalnızca ENOENT yeni salt'ı hak eder */
         if (errno != ENOENT) {
             NOX_ERROR(LOG_MOD_CRYPTO,
                       "salt dosyası açılamadı (I/O hatası, dosya dokunulmuyor): %s",
                       strerror(errno));
-            if (dir_fd >= 0) close(dir_fd);
             return NOX_ERR_IO;
         }
         NOX_INFO(LOG_MOD_CRYPTO, "salt dosyası yok — yeni üretilecek");
     }
 
-    /* Yeni salt üret (yalnızca ENOENT yolu buraya düşer)
-     * V2-M01 FIX: openat/renameat keep-alive — string race yok
-     * V2-L06 FIX: rename sonrası dir fsync (crash’te direntry kaybı önlenir) */
     randombytes_buf(salt, NOX_SALT_LEN);
 
+    char tmp_name[64];
     uint8_t rnd[4];
     randombytes_buf(rnd, sizeof(rnd));
-
-    char tmp_name[64];
-    int tn_ret = snprintf(tmp_name, sizeof(tmp_name),
+    int tmp_ret = snprintf(tmp_name, sizeof(tmp_name),
                           "salt.tmp.%d.%02x%02x%02x%02x",
                           (int)getpid(), rnd[0], rnd[1], rnd[2], rnd[3]);
-    if (tn_ret < 0 || (size_t)tn_ret >= sizeof(tmp_name)) {
-        if (dir_fd >= 0) close(dir_fd);
+    if (tmp_ret < 0 || (size_t)tmp_ret >= sizeof(tmp_name)) {
         return NOX_ERR_CONFIG;
     }
 
-    /* dir_fd keep-alive varsa openat, yoksa fallback path */
-    char tmp_path[NOX_PATH_MAX];
-    int tpr = snprintf(tmp_path, sizeof(tmp_path), "%s/%s", config_dir, tmp_name);
-    if (tpr < 0 || (size_t)tpr >= sizeof(tmp_path)) {
-        if (dir_fd >= 0) close(dir_fd);
-        return NOX_ERR_CONFIG;
-    }
-
-    int tmp_fd;
-    if (dir_fd >= 0) {
-        tmp_fd = openat(dir_fd, tmp_name,
+    int tmp_fd = openat(config_dir_fd, tmp_name,
                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    } else {
-        tmp_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    }
     if (tmp_fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "salt tmp dosyası açılamadı: %s", strerror(errno));
-        if (dir_fd >= 0) close(dir_fd);
         return NOX_ERR_IO;
     }
 
     nox_err_t werr = write_exact(tmp_fd, salt, NOX_SALT_LEN);
 
-    /* [P3] fsync — diske garanti yaz */
     if (werr == NOX_OK) {
         if (fsync(tmp_fd) != 0) {
             NOX_ERROR(LOG_MOD_CRYPTO,
                      "salt fsync başarısız: %s", strerror(errno));
             close(tmp_fd);
-            if (dir_fd >= 0) unlinkat(dir_fd, tmp_name, 0);
-            else unlink(tmp_path);
-            if (dir_fd >= 0) close(dir_fd);
+            unlinkat(config_dir_fd, tmp_name, 0);
             return NOX_ERR_IO;
         }
     }
     close(tmp_fd);
 
     if (werr != NOX_OK) {
-        if (dir_fd >= 0) unlinkat(dir_fd, tmp_name, 0);
-        else unlink(tmp_path);
-        if (dir_fd >= 0) close(dir_fd);
+        unlinkat(config_dir_fd, tmp_name, 0);
         return NOX_ERR_IO;
     }
 
-    /* Atomic rename — keep-alive ise renameat + dir fsync (V2-L06) */
-    int ren_ok;
-    if (dir_fd >= 0) {
-        ren_ok = renameat(dir_fd, tmp_name, dir_fd, "salt");
-    } else {
-        ren_ok = rename(tmp_path, path);
-    }
-    if (ren_ok != 0) {
+    if (renameat(config_dir_fd, tmp_name, config_dir_fd, "salt") != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "salt rename başarısız: %s", strerror(errno));
-        if (dir_fd >= 0) unlinkat(dir_fd, tmp_name, 0);
-        else unlink(tmp_path);
-        if (dir_fd >= 0) close(dir_fd);
+        unlinkat(config_dir_fd, tmp_name, 0);
         return NOX_ERR_IO;
     }
-    /* V2-L06: dir fsync — power-loss’ta rename kalıcı */
-    if (dir_fd >= 0) {
-        if (fsync(dir_fd) != 0) {
-            NOX_WARN(LOG_MOD_CRYPTO, "salt dir fsync uyarı: %s", strerror(errno));
-        }
-        close(dir_fd);
+    if (fsync(config_dir_fd) != 0) {
+        NOX_WARN(LOG_MOD_CRYPTO, "salt dir fsync uyarı: %s", strerror(errno));
     }
 
     NOX_INFO(LOG_MOD_CRYPTO, "yeni salt üretildi ve kaydedildi (atomic)");
@@ -543,11 +461,11 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
  *   [nonce 24B][encrypted(sk) + MAC] = 24 + 64 + 16 = 104 byte
  * ================================================================ */
 __attribute__((strub))
-nox_err_t crypto_generate_identity(const char *identity_path,
+nox_err_t crypto_generate_identity(int config_dir_fd,
                                     const uint8_t unlock_key[NOX_KEY_LEN],
                                     uint8_t public_key_out[NOX_KEY_LEN])
 {
-    if (!identity_path || !unlock_key || !public_key_out)
+    if (config_dir_fd < 0 || !unlock_key || !public_key_out)
         return NOX_ERR_CRYPTO;
 
     nox_err_t ret = NOX_ERR_CRYPTO;
@@ -558,15 +476,14 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     uint8_t ciphertext[crypto_sign_SECRETKEYBYTES +
                         crypto_secretbox_MACBYTES]                  = {0};
 
-    /* [A-1] Atomic write — tmp yolu hazırla */
-    char tmp_path[NOX_PATH_MAX];
+    char tmp_name[64];
     uint8_t rnd[4];
     randombytes_buf(rnd, sizeof(rnd));
-    int tmp_ret = snprintf(tmp_path, sizeof(tmp_path),
-                           "%s.tmp.%d.%02x%02x%02x%02x",
-                           identity_path, (int)getpid(),
+    int tmp_ret = snprintf(tmp_name, sizeof(tmp_name),
+                           "identity.key.tmp.%d.%02x%02x%02x%02x",
+                           (int)getpid(),
                            rnd[0], rnd[1], rnd[2], rnd[3]);
-    if (tmp_ret < 0 || (size_t)tmp_ret >= sizeof(tmp_path)) {
+    if (tmp_ret < 0 || (size_t)tmp_ret >= sizeof(tmp_name)) {
         NOX_ERROR(LOG_MOD_CRYPTO, "identity tmp yolu çok uzun");
         return NOX_ERR_CONFIG;
     }
@@ -601,15 +518,7 @@ nox_err_t crypto_generate_identity(const char *identity_path,
     sodium_free(sk);
     sk = NULL;
 
-    /* [A-1] Dosyaya yaz: tmp + O_EXCL (atomic write) */
-    /* CodeQL #9 cpp/path-injection: tmp_path identity_path + ".tmp.PID.RND" */
-    assert(strncmp(tmp_path, identity_path, strlen(identity_path)) == 0);
-    if (strncmp(tmp_path, identity_path, strlen(identity_path)) != 0) {
-        NOX_ERROR(LOG_MOD_CRYPTO, "path sanitization hatası — tmp_path güvenli değil");
-        sodium_free(sk);
-        return NOX_ERR_CONFIG;
-    }
-    fd = open(tmp_path,
+    fd = openat(config_dir_fd, tmp_name,
               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
               0600);
     if (fd < 0) {
@@ -638,8 +547,7 @@ nox_err_t crypto_generate_identity(const char *identity_path,
 
     close(fd); fd = -1;
 
-    /* [A-1] Atomic rename */
-    if (rename(tmp_path, identity_path) != 0) {
+    if (renameat(config_dir_fd, tmp_name, config_dir_fd, "identity.key") != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity rename başarısız: %s", strerror(errno));
         ret = NOX_ERR_IO;
@@ -656,9 +564,9 @@ nox_err_t crypto_generate_identity(const char *identity_path,
 cleanup:
     if (fd >= 0) {
         close(fd);
-        unlink(tmp_path);   /* başarısız tmp'yi temizle */
+        unlinkat(config_dir_fd, tmp_name, 0);
     } else if (ret != NOX_OK) {
-        unlink(tmp_path);   /* fd kapatılmıştı ama rename başarısız */
+        unlinkat(config_dir_fd, tmp_name, 0);
     }
 
     /* [P6] Tek noktadan temizleme */
@@ -681,19 +589,19 @@ cleanup:
  * Çözülen private key çağıranın sağladığı alana yazılır (arena olmalı).
  * ================================================================ */
 __attribute__((strub))
-nox_err_t crypto_load_identity(const char *identity_path,
+nox_err_t crypto_load_identity(int config_dir_fd,
                                 const uint8_t unlock_key[NOX_KEY_LEN],
                                 uint8_t secret_key_out[crypto_sign_SECRETKEYBYTES],
                                 uint8_t public_key_out[NOX_KEY_LEN])
 {
-    if (!identity_path || !unlock_key ||
+    if (config_dir_fd < 0 || !unlock_key ||
         !secret_key_out || !public_key_out) {
         if (secret_key_out) sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
         if (public_key_out) sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 
-    int fd = open(identity_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = openat(config_dir_fd, "identity.key", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key açılamadı: %s", strerror(errno));

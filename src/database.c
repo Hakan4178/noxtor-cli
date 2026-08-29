@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <pthread.h>
 
 /* ================================================================
@@ -203,7 +205,8 @@ static nox_err_t db_decrypt_row(sqlite3_stmt *stmt, int nonce_col, int cipher_co
  * PUBLIC API IMPLEMENTASYONU
  * ================================================================ */
 
-nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
+nox_err_t db_init(const char *config_dir, int config_dir_fd,
+                  const uint8_t db_key[NOX_KEY_LEN]) {
   if (!config_dir || !db_key)
     return NOX_ERR_CONFIG;
 
@@ -223,6 +226,73 @@ nox_err_t db_init(const char *config_dir, const uint8_t db_key[NOX_KEY_LEN]) {
     g_state.db_key = NULL;
     DB_UNLOCK();
     return NOX_ERR_CONFIG;
+  }
+
+  /*
+   * Seçenek A — fd ile ön-doğrulama (dizin pinleme):
+   * config_dir dizini fd üzerinden pinlenerek dizin değiştirme/hijack
+   * saldırıları engellenir; database dosyasının SQLite tarafından yeniden
+   * path üzerinden açılması nedeniyle dosya-inode seviyesinde kalan TOCTOU
+   * riski ileride ele alınacaktır.
+   * config_dir_fd >=0 ise contacts.db openat ile bir kez açılıp sahiplik/
+   * izin doğrulanır, sonra kapatılıp SQLite path ile açar. fd<0 ise (test)
+   * doğrulama atlanır.
+   */
+  if (config_dir_fd >= 0) {
+    int vfd = openat(config_dir_fd, "contacts.db",
+                     O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (vfd >= 0) {
+      struct stat vst;
+      if (fstat(vfd, &vst) != 0) {
+        NOX_ERROR(LOG_MOD_DB, "contacts.db fstat başarısız: %s",
+                  strerror(errno));
+        close(vfd);
+        g_state.db_key = NULL;
+        DB_UNLOCK();
+        return NOX_ERR_DB;
+      }
+      if (!S_ISREG(vst.st_mode)) {
+        NOX_ERROR(LOG_MOD_DB, "contacts.db düzenli dosya değil");
+        close(vfd);
+        g_state.db_key = NULL;
+        DB_UNLOCK();
+        return NOX_ERR_DB;
+      }
+      if ((uid_t)vst.st_uid != getuid()) {
+        NOX_ERROR(LOG_MOD_DB, "contacts.db sahibi uid mismatch");
+        close(vfd);
+        g_state.db_key = NULL;
+        DB_UNLOCK();
+        return NOX_ERR_DB;
+      }
+      if ((vst.st_mode & 077) != 0) {
+        if (fchmod(vfd, 0600) != 0) {
+          NOX_WARN(LOG_MOD_DB, "contacts.db fchmod 0600 başarısız: %s",
+                   strerror(errno));
+        }
+      }
+      close(vfd);
+    } else if (errno != ENOENT) {
+      NOX_ERROR(LOG_MOD_DB, "contacts.db ön-doğrulama openat başarısız: %s",
+                strerror(errno));
+      g_state.db_key = NULL;
+      DB_UNLOCK();
+      return NOX_ERR_DB;
+    } else {
+      /* ENOENT — ilk çalıştırma, dosya yok; ön-doğrulama yok, SQLite oluşturacak */
+      int chk = openat(config_dir_fd, "contacts.db",
+                       O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+      if (chk >= 0) {
+        /* Atomik oluşturuldu — SQLite race'ini kapatmak için hemen kapat */
+        close(chk);
+      } else if (errno != EEXIST) {
+        NOX_ERROR(LOG_MOD_DB, "contacts.db atomik oluşturma başarısız: %s",
+                  strerror(errno));
+        g_state.db_key = NULL;
+        DB_UNLOCK();
+        return NOX_ERR_DB;
+      }
+    }
   }
 
   /* M-10 FIX: NOFOLLOW — db_path symlink ise ELOOP ile başarısız ol;

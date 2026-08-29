@@ -31,6 +31,9 @@
 #include <assert.h>
 #include <string.h>
 
+/* BLAKE2b hash boyutu — Noise spec: HASHLEN = 64 */
+#define NOISE_HASHLEN 64U
+
 /* ================================================================
  * DERLEME ZAMANI KONTROLLERİ
  * ================================================================ */
@@ -40,9 +43,14 @@ NOX_STATIC_ASSERT(crypto_aead_chacha20poly1305_ietf_ABYTES == NOX_MAC_LEN,
                   "ChaChaPoly MAC boyutu uyumsuz");
 NOX_STATIC_ASSERT(crypto_scalarmult_curve25519_BYTES == NOX_KEY_LEN,
                   "Curve25519 key boyutu uyumsuz");
-
-/* BLAKE2b hash boyutu — Noise spec: HASHLEN = 64 */
-#define NOISE_HASHLEN 64U
+NOX_STATIC_ASSERT(NOISE_HASHLEN == 64,
+                  "HASHLEN must be 64 for BLAKE2b");
+NOX_STATIC_ASSERT(NOISE_HASHLEN == crypto_generichash_BYTES_MAX, 
+                  "BLAKE2b max hash size mismatch");
+NOX_STATIC_ASSERT(NOISE_MAX_HANDSHAKE_LEN >= 256,
+                  "handshake buffer too small");
+NOX_STATIC_ASSERT(NOISE_MAX_PAYLOAD_LEN == NOX_MAX_MSG_LEN + NOX_MAC_LEN,
+                  "payload size mismatch");
 
 /* ================================================================
  * 1. CIPHER STATE — ChaChaPoly-1305 AEAD
@@ -122,10 +130,9 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
   if (ct_len < NOX_MAC_LEN)
     return -1;
 
-  /* atomic_fetch_add eski değeri döndürüp artırır — encrypt ile aynı mantık */
-  uint64_t current_n = atomic_fetch_add(&cs->n, 1);
+  /* Nonce spec: fail'de increment yok — önce yükle, decrypt başarılı olursa artır */
+  uint64_t current_n = atomic_load(&cs->n);
   if (current_n >= UINT64_MAX) {
-    atomic_store(&cs->n, UINT64_MAX);
     NOX_ERROR(LOG_MOD_NOISE, "nonce counter tükendi — session yenilenmeli");
     return -1;
   }
@@ -137,9 +144,10 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
   if (crypto_aead_chacha20poly1305_ietf_decrypt(out, &pt_len, NULL, ciphertext,
                                                 ct_len, ad, ad_len, nonce,
                                                 cs->k) != 0) {
-    return -1; /* MAC verification failed */
+    return -1; /* MAC verification failed — n artırılmadı */
   }
 
+  atomic_fetch_add(&cs->n, 1);
   return (ssize_t)pt_len;
 }
 
@@ -650,10 +658,13 @@ static nox_err_t write_msg2(struct noise_handshake *hs, const uint8_t *payload,
   return NOX_OK;
 }
 
+__attribute__((optimize("harden-control-flow-redundancy")))
 nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
                           size_t pl_len, uint8_t *out, size_t *out_len) {
   if (!hs || !out || !out_len)
     return NOX_ERR_PROTO;
+  if (hs->split_done || hs->failed)
+    return NOX_ERR_STATE;
   if (!payload)
     pl_len = 0;
 
@@ -686,8 +697,11 @@ nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
     }
   }
 
-  if (err == NOX_OK)
+  if (err == NOX_OK) {
     hs->msg_index++;
+  } else {
+    hs->failed = true;
+  }
   return err;
 }
 
@@ -806,6 +820,7 @@ static nox_err_t read_msg2(struct noise_handshake *hs, const uint8_t *msg,
   return NOX_OK;
 }
 
+__attribute__((optimize("harden-control-flow-redundancy")))
 nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
                          size_t msg_len, uint8_t *payload_out, size_t out_cap,
                          size_t *pl_len) {
@@ -813,6 +828,8 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
     return NOX_ERR_PROTO;
   if (!payload_out)
     return NOX_ERR_PROTO;
+  if (hs->split_done || hs->failed)
+    return NOX_ERR_STATE;
 
   nox_err_t err;
 
@@ -843,8 +860,11 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
     }
   }
 
-  if (err == NOX_OK)
+  if (err == NOX_OK) {
     hs->msg_index++;
+  } else {
+    hs->failed = true;
+  }
   return err;
 }
 
@@ -854,10 +874,13 @@ bool handshake_is_complete(const struct noise_handshake *hs) {
 
 
 __attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 nox_err_t handshake_split(struct noise_handshake *hs,
                           struct noise_session *session) {
   if (!hs || !session)
     return NOX_ERR_PROTO;
+  if (hs->split_done || hs->failed)
+    return NOX_ERR_STATE;
   if (!handshake_is_complete(hs))
     return NOX_ERR_STATE;
 
@@ -867,8 +890,10 @@ nox_err_t handshake_split(struct noise_handshake *hs,
   } else {
     err = symmetric_split(&hs->ss, &session->rx, &session->tx);
   }
-  if (err != NOX_OK)
+  if (err != NOX_OK) {
+    hs->failed = true;
     return err;
+  }
 
   memcpy(session->remote_static, hs->rs, NOX_KEY_LEN);
 
@@ -880,6 +905,8 @@ nox_err_t handshake_split(struct noise_handshake *hs,
   sodium_memzero(hs->re, NOX_KEY_LEN);
   sodium_memzero(hs->rs, NOX_KEY_LEN);
   atomic_thread_fence(memory_order_seq_cst);
+
+  hs->split_done = true;
 
   NOX_INFO(LOG_MOD_NOISE, "handshake tamamlandı — transport hazır");
   return NOX_OK;
@@ -914,6 +941,8 @@ nox_err_t handshake_inject_ephemeral(struct noise_handshake *hs,
                                      const uint8_t e_priv[NOX_KEY_LEN]) {
   if (!hs || !e_priv)
     return NOX_ERR_PROTO;
+  if (hs->split_done || hs->failed)
+    return NOX_ERR_STATE;
   memcpy(hs->e, e_priv, NOX_KEY_LEN);
   /* e_pub = scalar_mult(e_priv, basepoint) */
   crypto_scalarmult_base(hs->e_pub, hs->e);

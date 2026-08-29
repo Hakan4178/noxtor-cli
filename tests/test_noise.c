@@ -230,6 +230,124 @@ static int test_mac_tamper(void)
 }
 
 /* ================================================================
+ * TEST: Nonce fail'de artmamalı — Noise spec §5.1
+ * Sahte paket sonrası meşru paketin çözülebilmesi gerekir.
+ * ================================================================ */
+static int test_nonce_no_increment_on_fail(void)
+{
+    uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
+    uint8_t b_priv[NOX_KEY_LEN], b_pub[NOX_KEY_LEN];
+    gen_static_keypair(a_priv, a_pub);
+    gen_static_keypair(b_priv, b_pub);
+
+    struct noise_handshake hs_a, hs_b;
+    handshake_init(&hs_a, true, a_priv, a_pub);
+    handshake_init(&hs_b, false, b_priv, b_pub);
+
+    uint8_t buf[NOISE_MAX_HANDSHAKE_LEN];
+    uint8_t pl[64];
+    size_t len, pl_len;
+
+    len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
+    len = sizeof(buf); handshake_write(&hs_b, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hs_a, buf, len, pl, sizeof(pl), &pl_len);
+    len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
+
+    struct noise_session sa, sb;
+    handshake_split(&hs_a, &sa);
+    handshake_split(&hs_b, &sb);
+
+    const uint8_t msg1[] = "msg1";
+    const uint8_t msg2[] = "msg2";
+    uint8_t ct1[sizeof(msg1) + NOX_MAC_LEN];
+    uint8_t ct2[sizeof(msg2) + NOX_MAC_LEN];
+    ssize_t ct1_len = noise_encrypt(&sa, msg1, sizeof(msg1), ct1);
+    ssize_t ct2_len = noise_encrypt(&sa, msg2, sizeof(msg2), ct2);
+    TEST_ASSERT(ct1_len > 0 && ct2_len > 0);
+
+    /* Nonce snapshot before fail */
+    uint64_t n_before = atomic_load(&sb.rx.n);
+
+    /* Tamper ct1 */
+    uint8_t ct1_bad[sizeof(ct1)];
+    memcpy(ct1_bad, ct1, (size_t)ct1_len);
+    ct1_bad[0] ^= 0x01;
+
+    uint8_t pt[64];
+    ssize_t r1 = noise_decrypt(&sb, ct1_bad, (size_t)ct1_len, pt);
+    TEST_ASSERT(r1 == -1);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_before);
+
+    /* Aynı ct1 meşru hali tekrar gelmeli — başarılı olmalı (retransmit) */
+    ssize_t r2 = noise_decrypt(&sb, ct1, (size_t)ct1_len, pt);
+    TEST_ASSERT(r2 == (ssize_t)sizeof(msg1));
+    TEST_ASSERT(sodium_memcmp(pt, msg1, sizeof(msg1)) == 0);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_before + 1);
+
+    /* Sonraki meşru ct2 de başarılı olmalı (nonce 1) */
+    ssize_t r3 = noise_decrypt(&sb, ct2, (size_t)ct2_len, pt);
+    TEST_ASSERT(r3 == (ssize_t)sizeof(msg2));
+    TEST_ASSERT(sodium_memcmp(pt, msg2, sizeof(msg2)) == 0);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_before + 2);
+
+    /* ct2 tekrarı (replay) fail etmeli ve nonce artmamalı */
+    uint64_t n_after = atomic_load(&sb.rx.n);
+    ssize_t r4 = noise_decrypt(&sb, ct2, (size_t)ct2_len, pt);
+    TEST_ASSERT(r4 == -1);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_after);
+
+    return 0;
+}
+
+/* ================================================================
+ * TEST: Double split yasak — ikinci split fail etmeli
+ * ================================================================ */
+static int test_double_split(void)
+{
+    uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
+    uint8_t b_priv[NOX_KEY_LEN], b_pub[NOX_KEY_LEN];
+    gen_static_keypair(a_priv, a_pub);
+    gen_static_keypair(b_priv, b_pub);
+
+    struct noise_handshake ha, hb;
+    handshake_init(&ha, true, a_priv, a_pub);
+    handshake_init(&hb, false, b_priv, b_pub);
+
+    uint8_t buf[NOISE_MAX_HANDSHAKE_LEN];
+    uint8_t pl[64];
+    size_t len, pl_len;
+    len = sizeof(buf); handshake_write(&ha, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hb, buf, len, pl, sizeof(pl), &pl_len);
+    len = sizeof(buf); handshake_write(&hb, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&ha, buf, len, pl, sizeof(pl), &pl_len);
+    len = sizeof(buf); handshake_write(&ha, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hb, buf, len, pl, sizeof(pl), &pl_len);
+
+    struct noise_session sa1, sa2;
+    TEST_ASSERT(handshake_split(&ha, &sa1) == NOX_OK);
+    /* İkinci split aynı hs ile fail etmeli */
+    TEST_ASSERT(handshake_split(&ha, &sa2) == NOX_ERR_STATE);
+    /* read/write de split sonrası fail etmeli */
+    uint8_t dummy[64]; size_t dl = sizeof(dummy);
+    TEST_ASSERT(handshake_write(&ha, NULL, 0, dummy, &dl) == NOX_ERR_STATE);
+    uint8_t out[64]; size_t ol;
+    TEST_ASSERT(handshake_read(&ha, dummy, 32, out, sizeof(out), &ol) == NOX_ERR_STATE);
+
+    /* Failed handshake sonrası split de yasak */
+    struct noise_handshake hf;
+    handshake_init(&hf, true, a_priv, a_pub);
+    uint8_t bad[32] = {0};
+    /* Yanlış sıra: initiator read denemesi fail -> failed true */
+    TEST_ASSERT(handshake_read(&hf, bad, sizeof(bad), out, sizeof(out), &ol) == NOX_ERR_STATE);
+    struct noise_session sf;
+    TEST_ASSERT(handshake_split(&hf, &sf) == NOX_ERR_STATE);
+
+    return 0;
+}
+
+/* ================================================================
  * TEST: Remote static key doğrulama
  * ================================================================ */
 static int test_remote_static_key(void)
@@ -696,6 +814,8 @@ int main(void)
     RUN_TEST(test_loopback_handshake);
     RUN_TEST(test_transport_roundtrip);
     RUN_TEST(test_mac_tamper);
+    RUN_TEST(test_nonce_no_increment_on_fail);
+    RUN_TEST(test_double_split);
     RUN_TEST(test_remote_static_key);
     RUN_TEST(test_wrong_order);
     RUN_TEST(test_handshake_onion_payload);

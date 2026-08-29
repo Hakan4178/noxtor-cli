@@ -463,6 +463,98 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
   on this build; consider `DT_FLAGS_1 BIND_NOW` hardening already present via
   Makefile `HARDEN_COMMON`]`
 
+### 4.9 TOCTOU / Path-Injection Tutarlılık Kuralı (fd-only)
+
+**Kural (normatif):**
+
+> Kalıcı, paylaşılan veya tahmin edilebilir bir path'teki her dosya I/O
+> `*_at(config_dir_fd, ...)` / `*_at(downloads_dir_fd, ...)` + `O_NOFOLLOW |
+> O_CLOEXEC` (dizinler için `O_DIRECTORY`) ile yapılır. `config_dir` string'i
+> **YALNIZCA log/hata mesajı için** saklanır; path çözümlemede ASLA
+> kullanılmaz. Kod içi invariant: `src/crypto.c:30`, `include/crypto.h:109`,
+> `include/types.h:309`, `src/main.c:233`.
+
+Bu kural "her yerde fd kullan" demek değildir. Kriter tek: **dosya sistemi
+paylaşılan / tahmin edilebilir bir path'te mi?** TOCTOU, saldırganın
+`check (stat/open) → use (open/read/write)` arasına `symlink`/`rename`
+sokabildiği yerde patlar — tipik olarak `~/.config/paranoidcli` gibi home
+altı, uzun ömürlü, path'i önceden bilinen dizinler ile `/tmp`/`downloads`
+gibi multi-user alanlar. Process-private `memfd`/`pipe`/`socket`/`anon mmap`
+bu sınıfa girmez.
+
+**Kapsam — kesin:**
+
+| Alan | Örnek dosya | Durum | Not |
+|---|---|---|---|
+| `config_dir` (`~/.config/paranoidcli`, `types.h:309`) | `salt` (`crypto.c:356`), `identity.key` (`crypto.c:512,595`), `contacts.db` (dolaylı) | ✅ crypto fd-only kapalı; DB ara-çözüm bekliyor | `main.c:342` `open(O_DIRECTORY\|O_NOFOLLOW)` ile `config_dir_fd` pin'lenir |
+| `downloads_dir` (`config_dir/downloads`, `main.c:337`) | indirme hedefleri (`file_transfer.c:460 openat(O_EXCL\|O_NOFOLLOW)`) | ✅ `downloads_dir_fd` var; string kullanan cleanup dalları kaldı | `file_transfer.c:83 verify_downloads_dir_fd` 0700+UID kontrolü |
+| Ephemeral / private | `memfd`, `pipe`, `socketpair` | Kapsam dışı | TOCTOU sınıfı değil |
+
+Neden bu iki dizin? İkisi de **kullanıcı tarafından erişilebilir, uzun ömürlü,
+path önceden bilinen** dizinler — multi-user sistemde veya home'a yazabilen
+herhangi bir süreç için tam TOCTOU profiline girer.
+
+**Uygulama deseni (kanonik):**
+
+```c
+// Açılış — bir kez, program başında
+state.config_dir_fd = open(state.config_dir,
+                           O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+// invariant: başarısızsa ELOOP → symlink hijack → NOX_ERR_CONFIG
+
+// Tüm I/O — string path yok
+int fd = openat(config_dir_fd, "salt", O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+unlinkat(config_dir_fd, "identity.key.tmp.xxxx", 0);
+renameat(config_dir_fd, tmp, config_dir_fd, "salt");
+fsync(config_dir_fd); // dizin entry'sini diske flush
+```
+
+`openat` + `O_NOFOLLOW` tek başına "TOCTOU-free" demek değildir; **dizin
+fd'si açık tutulduğu sürece** dizin swap'i engellenir (fd aynı mount/dizin
+inode'unu pin'ler). `fstat(fd)` sonrası `st_uid/st_mode` kontrolü ek
+katmandır.
+
+**İstisna — `database.c:206 db_init` (gerekçeli):**
+
+`db_init(const char *config_dir, ...)` SQLite API'si `const char *path`
+ister — `sqlite3_open_v2`'yi `openat`'e çeviremeyiz (üçüncü taraf API
+sınırı). Bu yüzden kapsam dışı bırakmak doğru ayrımdır, ama gerekçe
+"path istiyor" demekle bitmez: `contacts.db` de `config_dir` içinde olduğu
+için **aynı TOCTOU sınıfına girer**.
+
+Ara-çözüm (tam fd-free değil ama dizin garantisini korur):
+1. `openat(config_dir_fd, "contacts.db", O_RDWR|O_CREAT, 0600)` ile bir kez
+   aç → `fstat(fd)` ile sahiplik/izin (`st_uid==getuid()`, `0600`,
+   `!S_ISLNK`) doğrula, gerekirse `fchmod(fd,0600)`.
+2. `close(fd)` → aynı path string'ini `sqlite3_open_v2(path,
+   SQLITE_OPEN_NOFOLLOW)`'ye ver. Pencere daralır: dizin fd'si eldeyken
+   dizin hijack'i `openat` korumasında; SQLite'ın `open`'u aynı inode'a gider.
+   Tam garanti değil (SQLite yine path resolve eder) ama pratikte TOCTOU'yu
+   "dizin hijack"ten "aynı dizin içinde dosya hijack"e indirger — ki
+   `O_NOFOLLOW|0600` onu da keser.
+3. Alternatif tam çözüm `/proc/self/fd/%d` üzerinden `sqlite3_open_v2`
+   (`openat` fd'sini procfs yoluyla açtırmak) — daha invaziv, lock/journal
+   davranışında ek test ister; bu fazda önerilmez.
+
+Bu ara-çözüm uygulandı (`database.c:206`): `config_dir` dizini fd üzerinden
+pinlenerek dizin değiştirme/hijack saldırıları engellenir; database dosyasının
+SQLite tarafından yeniden path üzerinden açılması nedeniyle dosya-inode
+seviyesinde kalan TOCTOU riski ileride ele alınacaktır.
+
+> **Not:** Dokümantasyonda "TOCTOU tamamen kapatıldı" denmez — dizin seviyesi
+> pinleme ile dizin hijack'i kapatılmıştır; DB dosyasının kendisi SQLite'ın
+> path-tabanlı `open()`'u nedeniyle inode seviyesinde dar bir pencere taşır
+> (yukarıdaki ara-çözüm).
+
+**Doğrulama:**
+
+* `grep -rn "openat\|unlinkat\|renameat" src/crypto.c` yalnızca fd API;
+  `grep -rn 'config_dir.*open\|fopen.*config_dir' src/crypto.c` boş olmalı.
+* Manuel hijack testi: `ln -s /tmp/pwn ~/.config/paranoidcli` →
+  `open(O_NOFOLLOW)` `ELOOP` / `NOX_ERR_CONFIG` vermeli.
+* `make debug` 0 uyarı + `make test` (`test_database` 5/5, `test_crypto`
+  10/10) yeşil.
+
 ## 5. Out of Scope
 
 These are explicitly **not** defended against. Listing them isn't an

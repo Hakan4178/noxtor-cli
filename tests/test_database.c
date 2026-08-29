@@ -6,6 +6,7 @@
 #include "types.h"
 #include "database.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -45,6 +46,11 @@ static void setup_test_dir(void)
     mkdir(TEST_DB_DIR, 0700);
 }
 
+static int open_test_db_dir_fd(void)
+{
+    return open(TEST_DB_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+}
+
 static void cleanup_test_dir(void)
 {
     char path[256];
@@ -59,13 +65,22 @@ static void cleanup_test_dir(void)
 
 static uint8_t g_dummy_key[NOX_KEY_LEN];
 
+static nox_err_t db_init_test(const uint8_t *key)
+{
+    int fd = open_test_db_dir_fd();
+    if (fd < 0) return NOX_ERR_CONFIG;
+    nox_err_t r = db_init(TEST_DB_DIR, fd, key);
+    close(fd);
+    return r;
+}
+
 /* ================================================================
  * TESTLER
  * ================================================================ */
 
 static int test_db_open_close(void)
 {
-    nox_err_t err = db_init(TEST_DB_DIR, g_dummy_key);
+    nox_err_t err = db_init_test(g_dummy_key);
     TEST_ASSERT(err == NOX_OK);
 
     db_close();
@@ -74,7 +89,7 @@ static int test_db_open_close(void)
 
 static int test_db_contacts(void)
 {
-    nox_err_t err = db_init(TEST_DB_DIR, g_dummy_key);
+    nox_err_t err = db_init_test(g_dummy_key);
     TEST_ASSERT(err == NOX_OK);
 
     const char *onion = "abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrst.onion";
@@ -119,7 +134,7 @@ static int test_db_contacts(void)
 static int test_db_wrong_key(void)
 {
     /* İlk olarak doğru anahtarla açıp yaz */
-    nox_err_t err = db_init(TEST_DB_DIR, g_dummy_key);
+    nox_err_t err = db_init_test(g_dummy_key);
     TEST_ASSERT(err == NOX_OK);
 
     const char *onion = "abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrst.onion";
@@ -135,7 +150,7 @@ static int test_db_wrong_key(void)
     uint8_t wrong_key[NOX_KEY_LEN];
     memset(wrong_key, 0x99, NOX_KEY_LEN);
 
-    err = db_init(TEST_DB_DIR, wrong_key);
+    err = db_init_test(wrong_key);
     TEST_ASSERT(err == NOX_OK);
 
     /* Kaydı okumaya çalış, deşifre edilememeli veya bulunamamalı (yani NOX_OK dönmemeli) */
@@ -159,7 +174,7 @@ static nox_err_t dummy_send_callback(const char *text, void *ctx)
 
 static int test_db_queue(void)
 {
-    nox_err_t err = db_init(TEST_DB_DIR, g_dummy_key);
+    nox_err_t err = db_init_test(g_dummy_key);
     TEST_ASSERT(err == NOX_OK);
 
     const char *onion = "abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrst.onion";
@@ -228,7 +243,7 @@ static void dummy_summary_visitor(
 
 static int test_db_history(void)
 {
-    nox_err_t err = db_init(TEST_DB_DIR, g_dummy_key);
+    nox_err_t err = db_init_test(g_dummy_key);
     TEST_ASSERT(err == NOX_OK);
 
     const char *onion = "abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrst.onion";
