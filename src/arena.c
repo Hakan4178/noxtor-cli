@@ -24,6 +24,7 @@
  *   P9  — destroy() içinde guard page'ler için mprotect() kaldırıldı,
  *          doğrudan munmap() kullanıldı
  *   P10 — munmap() dönüş değeri kontrol ediliyor
+ *   P11 — fork_safe/dump_safe default true → fail-closed false init (MADV tanımsızsa false) + invariant
  */
 
 #include "arena.h"
@@ -117,6 +118,15 @@ static size_t page_align(size_t size, size_t page_size)
     if (usable > SIZE_MAX - 2U * a->page_size)
         return false;
     if (a->total_size != a->page_size + usable + a->page_size)
+        return false;
+    if (a->offset > a->usable_size)
+        return false;
+    if ((a->offset & 15U) != 0)
+        return false;
+    /* P11 invariant — fork/dump flag'leri sadece bool 0/1 olmalı (corruption tespiti) */
+    if (a->fork_safe != false && a->fork_safe != true)
+        return false;
+    if (a->dump_safe != false && a->dump_safe != true)
         return false;
     return true;
 }
@@ -263,26 +273,35 @@ __attribute__((strub))
     }
 
     /* ----------------------------------------------------------------
-     * 2. Bellek önerileri — her iki branch için ortak
-     *    Fork sırasında ve core dump'ta hassas belleği gizle.
+     * 2. Bellek önerileri — her iki branch için ortak (fail-closed invariant)
+     *    Fork/dump koruması uygulanmadıysa fork_safe/dump_safe false kalır.
+     *    Sadece madvise başarılı olursa true yapılır — default true semantic bug'ı kapalı.
      * ---------------------------------------------------------------- */
-    a->fork_safe = true;
-    a->dump_safe = true;
+    a->fork_safe = false;
+    a->dump_safe = false;
 
 #ifdef MADV_DONTFORK
-    if (madvise(base, total, MADV_DONTFORK) != 0) {
+    if (madvise(base, total, MADV_DONTFORK) == 0) {
+        a->fork_safe = true;
+    } else {
         NOX_WARN(LOG_MOD_ARENA,
                  "MADV_DONTFORK başarısız: %s", strerror(errno));
-        a->fork_safe = false; /* caller karar versin */
+        a->fork_safe = false;
     }
+#else
+    NOX_WARN(LOG_MOD_ARENA, "MADV_DONTFORK tanımsız — fork koruması yok");
 #endif
 
 #ifdef MADV_DONTDUMP
-    if (madvise(base, total, MADV_DONTDUMP) != 0) {
+    if (madvise(base, total, MADV_DONTDUMP) == 0) {
+        a->dump_safe = true;
+    } else {
         NOX_WARN(LOG_MOD_ARENA,
                  "MADV_DONTDUMP başarısız: %s", strerror(errno));
-        a->dump_safe = false; /* caller karar versin */
+        a->dump_safe = false;
     }
+#else
+    NOX_WARN(LOG_MOD_ARENA, "MADV_DONTDUMP tanımsız koruma yok");
 #endif
 
     uint8_t *bptr = (uint8_t *)base;
