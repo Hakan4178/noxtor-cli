@@ -84,6 +84,30 @@ static void encode_nonce(uint8_t nonce_out[12], uint64_t n) {
     nonce_out[4 + i] = (uint8_t)(n >> (8 * i));
 }
 
+/*
+ * ASSUMPTION:
+ *   Noise transport nonce is a monotonically increasing 64-bit counter.
+ *
+ * INVARIANT:
+ *   UINT64_MAX is never used as an AEAD nonce.
+ *   A successful encryption consumes exactly one nonce value.
+ *
+ * FAILURE PROPERTY:
+ *   Once the counter reaches UINT64_MAX, encryption fails closed.
+ *   No ciphertext is produced with a reused or exhausted nonce.
+ *
+ * VERIFICATION:
+ *   Unit tests at counter boundary,
+ *   state-transition tests,
+ *   concurrency tests,
+ *   fuzzing of counter state.
+ *
+ * Current: atomic_fetch_add returns old value if current_n == UINT64_MAX
+ * the nonce is never used (fetch_add returns before increment),
+ * immediate fail-closed.
+ */
+ 
+__attribute__((strub))
 ssize_t cipher_encrypt(struct noise_cipher_state *cs, const uint8_t *ad,
                        size_t ad_len, const uint8_t *plaintext, size_t pt_len,
                        uint8_t *out) {
@@ -117,6 +141,7 @@ ssize_t cipher_encrypt(struct noise_cipher_state *cs, const uint8_t *ad,
   return (ssize_t)ct_len;
 }
 
+__attribute__((strub))
 ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
                        size_t ad_len, const uint8_t *ciphertext, size_t ct_len,
                        uint8_t *out) {
@@ -130,7 +155,21 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
   if (ct_len < NOX_MAC_LEN)
     return -1;
 
-  /* Nonce spec: fail'de increment yok — önce yükle, decrypt başarılı olursa artır */
+  /*
+   * SECURITY INVARIANT:
+   *   Failed AEAD authentication MUST NOT advance the receive nonce.
+   *
+   * POSTCONDITION:
+   *   On authentication failure, cs->n is unchanged.
+   *   On successful decryption, exactly one nonce is consumed.
+   *
+   * FAILURE PROPERTY:
+   *   Invalid ciphertexts cannot desynchronize the Noise nonce state.
+   *
+   * VERIFICATION:
+   *   Unit tests, malformed-ciphertext fuzzing,
+   *   state-transition tests, differential testing.
+   */
   uint64_t current_n = atomic_load(&cs->n);
   if (current_n >= UINT64_MAX) {
     NOX_ERROR(LOG_MOD_NOISE, "nonce counter tükendi — session yenilenmeli");
@@ -183,7 +222,7 @@ void symmetric_init(struct noise_symmetric_state *ss,
  * MixHash(data): h = HASH(h || data)
  */
 
-__attribute__((strub))
+__attribute__((strub))  // Ref: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html
 void symmetric_mix_hash(struct noise_symmetric_state *ss, const uint8_t *data,
                         size_t len) {
   crypto_generichash_blake2b_state state;
@@ -201,8 +240,16 @@ void symmetric_mix_hash(struct noise_symmetric_state *ss, const uint8_t *data,
  * HMAC(k, m) = BLAKE2b((k ⊕ opad) || BLAKE2b((k ⊕ ipad) || m))
  *
  * block_size = 128 byte (BLAKE2b için)
- * key > 128 byte ise önce hash'le, 64 byte'a indir
  */
+
+ /*
+ * ASSUMPTION: key_len ≤ 128 (Noise’ta key 32/64 ile sınırlı).
+ *
+ * INVARIANT: key_len > 128 desteklenmiyor. Fail-closed NOX_ERR_CRYPTO (RFC 2104’te HASH(key) yapılır, burada bilerek yapılmaz)
+ *
+ * VERIFICATION: unit boundary (129 → NOX_ERR_CRYPTO), caller static assert.
+ */
+
 __attribute__((strub)) static nox_err_t
 hmac_blake2b(const uint8_t *key, size_t key_len, const uint8_t *data,
              size_t data_len, uint8_t out[NOISE_HASHLEN]) {
@@ -376,6 +423,7 @@ ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
   return ct_len;
 }
 
+__attribute__((strub))
 ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *ciphertext, size_t ct_len,
                                    uint8_t *out, size_t out_cap) {
@@ -396,7 +444,21 @@ ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
   ssize_t result =
       cipher_decrypt(&ss->cs, ss->h, NOISE_HASHLEN, ciphertext, ct_len, out);
 
-  /* 2. MAC hatası → hata döndür, MixHash yapma, h sıfırlansın */
+  /*
+   * FAILURE POLICY:
+   *   Authentication failure permanently invalidates the transcript.
+   *
+   *   This is stronger than the Noise specification requirement:
+   *   failed decryption MUST NOT MixHash() unauthenticated ciphertext.
+   *
+   * SECURITY RATIONALE:
+   *   hs->failed prevents further protocol use, while clearing h prevents
+   *   accidental reuse or disclosure of the transcript after failure.
+   *
+   * INVARIANT:
+   *   Once authentication fails, the handshake transcript is no longer
+   *   considered valid or usable.
+   */
   if (result < 0) {
     sodium_memzero(ss->h, NOISE_HASHLEN);
     return -1;
@@ -412,6 +474,33 @@ ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
  *   temp_k1, temp_k2 = HKDF(ck, "")
  *   c1 = InitializeKey(temp_k1)
  *   c2 = InitializeKey(temp_k2)
+ *
+ * SECURITY INVARIANT:
+ *   After Split(), transport directions use independently derived
+ *   CipherState keys.
+ *
+ * KEY-SEPARATION PROPERTY:
+ *   Initiator:
+ *       tx = HKDF(ck, "")[0]
+ *       rx = HKDF(ck, "")[1]
+ *   Responder:
+ *       rx = HKDF(ck, "")[0]
+ *       tx = HKDF(ck, "")[1]
+ *
+ * FAILURE PROPERTY:
+ *   Split failure MUST NOT mark the handshake as successfully
+ *   transitioned to transport state.
+ *
+ * POSTCONDITION:
+ *   On NOX_OK, the handshake chaining state is destroyed and
+ *   transport keys are initialized.
+ *
+ * VERIFICATION:
+ *   Known Noise vectors, bidirectional loopback tests,
+ *   differential testing, key-direction tests:
+ *     initiator.tx == responder.rx
+ *     initiator.rx == responder.tx
+ *     initiator.tx != initiator.rx
  */
 __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *ss,
                           struct noise_cipher_state *c1,
@@ -459,6 +548,13 @@ __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *s
  * clamp (multiple of 8) tüm torsion noktalarında output=0 üretir.
  * libsodium ≥1.0.16 crypto_scalarmult zaten identity (0) noktasını
  * reddeder.
+ *
+ * ASSUMPTION: libsodium X25519 returns failure for rejected inputs
+ *   (crypto_scalarmult_curve25519 returns -1 on low-order/invalid points).
+ * INVARIANT: noise_dh() never returns NOX_OK with all-zero shared secret
+ *   (contributory check :484, RFC 7748 §6).
+ * VERIFICATION: unit tests (test_noise), differential fuzzing (noise-c ref),
+ *   reference implementation cross-check, formal checks where feasible (cbmc_noise).
  */
 
 __attribute__((strub))
@@ -490,6 +586,7 @@ static nox_err_t noise_dh(uint8_t out[NOX_KEY_LEN],
   return NOX_OK;
 }
 
+__attribute__((strub))
 nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
                          const uint8_t s_priv[NOX_KEY_LEN],
                          const uint8_t s_pub[NOX_KEY_LEN]) {
@@ -508,8 +605,7 @@ nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
   hs->initiator = initiator;
   hs->msg_index = 0;
 
-  /* XX pattern has no pre-messages — prologue is used */
-  /* MixHash("") — dolu prologue */
+  /* MixHash("Mustafa Kemal Atatürk") dolu prologue harcored informed choice */
   symmetric_mix_hash(&hs->ss, (const uint8_t *)"Mustafa Kemal Atatürk",
                      strlen("Mustafa Kemal Atatürk"));
 
@@ -658,7 +754,7 @@ static nox_err_t write_msg2(struct noise_handshake *hs, const uint8_t *payload,
   return NOX_OK;
 }
 
-__attribute__((optimize("harden-control-flow-redundancy")))
+__attribute__((optimize("harden-control-flow-redundancy"))) /* GCC security attributes: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html */ 
 nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
                           size_t pl_len, uint8_t *out, size_t *out_len) {
   if (!hs || !out || !out_len)
@@ -916,6 +1012,7 @@ nox_err_t handshake_split(struct noise_handshake *hs,
  * 4. TRANSPORT — Session-level encrypt/decrypt
  * ================================================================ */
 
+__attribute__((strub))
 ssize_t noise_encrypt(struct noise_session *session, const uint8_t *plaintext,
                       size_t pt_len, uint8_t *out) {
   if (!session || !out)

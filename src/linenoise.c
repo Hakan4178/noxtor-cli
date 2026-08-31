@@ -147,6 +147,7 @@ static struct termios orig_termios; /* In order to restore at exit.*/
 static int maskmode = 0; /* Show "***" instead of input. For passwords. */
 static int rawmode = 0; /* For atexit() function to check if restore is needed*/
 static int rawmode_output = STDOUT_FILENO; /* fd used for terminal escapes. */
+static int rawmode_input = -1; /* fd used for raw mode — atexit restore için. */
 static int mlmode = 0;  /* Multi line mode. Default is single line. */
 static int atexit_registered = 0; /* Register atexit just 1 time. */
 
@@ -617,7 +618,7 @@ static int enableRawMode(int fd) {
         return 0;
     }
 
-    if (!isatty(STDIN_FILENO)) goto fatal;
+    if (!isatty(fd)) goto fatal;
     if (!atexit_registered) {
         atexit(linenoiseAtExit);
         atexit_registered = 1;
@@ -643,6 +644,7 @@ static int enableRawMode(int fd) {
     /* put terminal in raw mode after flushing */
     if (tcsetattr(fd,TCSAFLUSH,&raw) < 0) goto fatal;
     rawmode = 1;
+    rawmode_input = fd;
     /* Ask the terminal to wrap paste input between ESC[200~ and ESC[201~. */
     if (write(rawmode_output, "\x1b[?2004h", 8) == -1) {}
     return 0;
@@ -656,6 +658,7 @@ static void disableRawMode(int fd) {
     /* Test mode: nothing to restore. */
     if (getenv("LINENOISE_ASSUME_TTY")) {
         rawmode = 0;
+        if (rawmode_input == fd) rawmode_input = -1;
         return;
     }
     /* Don't even check the return value as it's too late. */
@@ -663,6 +666,11 @@ static void disableRawMode(int fd) {
         /* Leave bracketed paste mode when leaving raw mode. */
         if (write(rawmode_output, "\x1b[?2004l", 8) == -1) {}
         rawmode = 0;
+        if (rawmode_input == fd) rawmode_input = -1;
+    } else if (rawmode && fd == rawmode_input) {
+        /* tcsetattr başarısız olsa da state'i temizle — atexit tekrar denemesin. */
+        rawmode = 0;
+        rawmode_input = -1;
     }
 }
 
@@ -2355,5 +2363,8 @@ void linenoiseFree(void *ptr) {
 
 /* At exit we'll try to fix the terminal to the initial conditions. */
 static void linenoiseAtExit(void) {
-    disableRawMode(STDIN_FILENO);
+    if (rawmode_input != -1)
+        disableRawMode(rawmode_input);
+    else
+        disableRawMode(STDIN_FILENO);
 }

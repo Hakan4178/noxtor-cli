@@ -55,6 +55,7 @@ void cipher_init_key(struct noise_cipher_state *cs,
  *
  * Return: Şifreli veri uzunluğu (pt_len + MAC) veya -1
  */
+__attribute__((strub))
 ssize_t cipher_encrypt(struct noise_cipher_state *cs,
                        const uint8_t *ad, size_t ad_len,
                        const uint8_t *plaintext, size_t pt_len,
@@ -65,6 +66,7 @@ ssize_t cipher_encrypt(struct noise_cipher_state *cs,
  *
  * Return: Plaintext uzunluğu veya -1 (MAC hatası)
  */
+__attribute__((strub))
 ssize_t cipher_decrypt(struct noise_cipher_state *cs,
                        const uint8_t *ad, size_t ad_len,
                        const uint8_t *ciphertext, size_t ct_len,
@@ -96,6 +98,7 @@ __attribute__((strub)) ssize_t symmetric_encrypt_and_hash(struct noise_symmetric
                                    uint8_t *out);
 
 /* DecryptAndHash — Çöz + hash'e karıştır */
+__attribute__((strub))
 ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *ciphertext, size_t ct_len,
                                    uint8_t *out, size_t out_cap);
@@ -107,6 +110,10 @@ __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *s
 
 /* ================================================================
  * HANDSHAKE API — XX pattern
+ *
+ * ASSUMPTION: libsodium X25519 rejects invalid points (see src/noise.c:464 noise_dh).
+ * INVARIANT: noise_dh never returns NOX_OK with all-zero shared secret.
+ * VERIFICATION: unit/differential fuzz (noise-c), ref impl, formal (cbmc) where feasible.
  * ================================================================ */
 
 /*
@@ -118,6 +125,7 @@ __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *s
  * @s_priv:     Static private key (32 byte, Curve25519)
  * @s_pub:      Static public key (32 byte)
  */
+__attribute__((strub))
 nox_err_t handshake_init(struct noise_handshake *hs,
                          bool initiator,
                          const uint8_t s_priv[NOX_KEY_LEN],
@@ -187,6 +195,7 @@ nox_err_t handshake_split(struct noise_handshake *hs,
  *
  * Return: Şifreli veri uzunluğu veya -1
  */
+__attribute__((strub))
 ssize_t noise_encrypt(struct noise_session *session,
                       const uint8_t *plaintext, size_t pt_len,
                       uint8_t *out);
@@ -232,12 +241,15 @@ nox_err_t handshake_init_with_prologue(struct noise_handshake *hs,
 
 /*
  * handshake_get_h — Handshake hash'i oku (test-only)
- * SPLIT/COMPLETE sonrası geçerli.
+ * COMPLETE sonrası, SPLIT öncesi geçerli; SPLIT sonrası ss.h
+ * symmetric_split() ile sıfırlanır (postcondition: h destroyed).
  */
 void handshake_get_h(const struct noise_handshake *hs, uint8_t out[64]);
 
 /*
  * handshake_get_ck — Chaining key'i oku (test-only)
+ * COMPLETE sonrası, SPLIT öncesi geçerli; SPLIT sonrası ss.ck
+ * symmetric_split() ile sıfırlanır.
  */
 void handshake_get_ck(const struct noise_handshake *hs, uint8_t out[64]);
 
