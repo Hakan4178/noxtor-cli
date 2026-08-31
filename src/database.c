@@ -101,18 +101,21 @@ static nox_err_t db_exec_sql(const char *sql, const char *desc) {
 /* Onion adresi için keyed BLAKE2b hash hesapla (metadata sızıntısını önler) */
 static nox_err_t hash_onion(const char *onion, uint8_t hash_out[32]) {
   if (!onion || !hash_out || !g_state.db_key) {
+    if (hash_out) sodium_memzero(hash_out, 32);
     NOX_ERROR(LOG_MOD_DB, "hash_onion: NULL parametre");
     return NOX_ERR_CRYPTO;
   }
 
   size_t onion_len = strnlen(onion, NOX_ONION_LEN + 1);
   if (onion_len != NOX_ONION_LEN) {
+    sodium_memzero(hash_out, 32);
     NOX_ERROR(LOG_MOD_DB, "hash_onion: geçersiz onion uzunluğu (%zu)", onion_len);
     return NOX_ERR_CRYPTO;
   }
 
   if (crypto_generichash(hash_out, 32, (const uint8_t *)onion, onion_len,
                          g_state.db_key, NOX_KEY_LEN) != 0) {
+    sodium_memzero(hash_out, 32);
     NOX_ERROR(LOG_MOD_DB, "Onion hashing başarısız");
     return NOX_ERR_CRYPTO;
   }
@@ -441,6 +444,7 @@ nox_err_t db_add_contact(const char *onion, const char *name, const uint8_t nois
   uint8_t hash[32];
   err = hash_onion(onion, hash);
   if (err != NOX_OK) {
+    sodium_memzero(hash, sizeof(hash));
     sodium_memzero(nonce, sizeof(nonce));
     sodium_memzero(cipher, sizeof(cipher));
     DB_UNLOCK();
@@ -910,15 +914,16 @@ nox_err_t db_get_history(const char *peer_onion, int limit,
   int rc = sqlite3_prepare_v2(g_state.db, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
     NOX_ERROR(LOG_MOD_DB, "Statement hazırlanamadı: %s", DB_ERRMSG());
+    sodium_memzero(hash, sizeof(hash));
     DB_UNLOCK(); return NOX_ERR_DB;
   }
 
   rc = sqlite3_bind_blob(stmt, 1, hash, sizeof(hash), SQLITE_TRANSIENT);
-  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); DB_UNLOCK(); return NOX_ERR_DB; }
+  if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   
   if (limit > 0) {
     rc = sqlite3_bind_int(stmt, 2, limit);
-    if (rc != SQLITE_OK) { sqlite3_finalize(stmt); DB_UNLOCK(); return NOX_ERR_DB; }
+    if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sodium_memzero(hash, sizeof(hash)); DB_UNLOCK(); return NOX_ERR_DB; }
   }
 
   while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -932,6 +937,7 @@ nox_err_t db_get_history(const char *peer_onion, int limit,
     char *plain = sodium_malloc(expected_plain + 1);
     if (!plain) {
       sqlite3_finalize(stmt);
+      sodium_memzero(hash, sizeof(hash));
       DB_UNLOCK(); return NOX_ERR_ALLOC;
     }
 
@@ -945,6 +951,7 @@ nox_err_t db_get_history(const char *peer_onion, int limit,
   }
 
   sqlite3_finalize(stmt);
+  sodium_memzero(hash, sizeof(hash));
   DB_UNLOCK();
   return NOX_OK;
 }
