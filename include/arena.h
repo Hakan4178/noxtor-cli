@@ -80,7 +80,7 @@ void arena_check_canary(const struct secure_arena *a);
  * Saldırganın 1TB/2TB gibi tutarlı görünen sahte struct'ını yakalar.
  */
 __attribute__((strub))
-bool arena_is_valid(const struct secure_arena *a);
+nox_hardbool_t arena_is_valid(const struct secure_arena *a);
 
 /*
  * arena_destroy — Arena'yı güvenli şekilde yok et

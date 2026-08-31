@@ -214,7 +214,11 @@ static const struct {
   { .num = SCMP_SYS(msgget),            .name = "msgget",            .stage = 3 },
   { .num = SCMP_SYS(msgsnd),            .name = "msgsnd",            .stage = 3 },
   { .num = SCMP_SYS(msgrcv),            .name = "msgrcv",            .stage = 3 },
-  { .num = SCMP_SYS(msgctl),            .name = "msgctl",            .stage = 3 },
+   { .num = SCMP_SYS(sendmsg),           .name = "sendmsg",           .stage = 3 },
+   { .num = SCMP_SYS(recvmsg),           .name = "recvmsg",           .stage = 3 },
+   { .num = SCMP_SYS(sendmmsg),          .name = "sendmmsg",          .stage = 3 },
+   { .num = SCMP_SYS(recvmmsg),          .name = "recvmmsg",          .stage = 3 },
+   { .num = SCMP_SYS(msgctl),            .name = "msgctl",            .stage = 3 },
   { .num = SCMP_SYS(memfd_create),      .name = "memfd_create",      .stage = 3 },
 #if defined(__NR_statmount)
   { .num = __NR_statmount,              .name = "statmount",         .stage = 3 },

@@ -97,8 +97,8 @@ static size_t page_align(size_t size, size_t page_size)
  * Ayrıca base alignment ve power-of-two kontrolü yapar.
  * 1TB/2TB gibi tutarlı görünen ama mapping dışı sahte değerleri yakalar.
  * ================================================================ */
- __attribute__((strub))
- bool arena_is_valid(const struct secure_arena *a) {
+  __attribute__((strub))
+  nox_hardbool_t arena_is_valid(const struct secure_arena *a) {
     if (!a || !a->base || a->page_size == 0)
         return false;
     if ((a->page_size & (a->page_size - 1U)) != 0)
@@ -107,16 +107,19 @@ static size_t page_align(size_t size, size_t page_size)
         return false;
     if (a->usable_size == 0 || a->usable_size >= a->total_size)
         return false;
-    if (a->total_size < 2U * a->page_size)
+    if (a->page_size > SIZE_MAX / 2U)
+        return false;
+    size_t guard_total = 2U * a->page_size;
+    if (a->total_size < guard_total)
         return false;
     if (a->usable_size > SIZE_MAX - NOX_CANARY_LEN)
         return false;
     size_t usable = a->usable_size + NOX_CANARY_LEN;
     if (usable % a->page_size != 0)
         return false;
-    if (usable > SIZE_MAX - 2U * a->page_size)
+    if (usable > SIZE_MAX - guard_total)
         return false;
-    if (a->total_size != a->page_size + usable + a->page_size)
+    if (a->total_size != usable + guard_total)
         return false;
     return true;
 }
@@ -537,22 +540,23 @@ void arena_destroy(struct secure_arena *a)
     size_t   page_size    = a->page_size;
     uint8_t *usable_start = bptr + page_size;
 
-    /*
-     * 2. Usable + canary alanını sıfırla
-     *
-     * P8: sodium_memzero() kullanılıyor.
-     *     • Derleyici optimizasyonuna karşı güçlüdür
-     *       (volatile yazım + memory barrier içerir).
-     *     • explicit_bzero() ile işlevsel olarak eşdeğer,
-     *       ancak libsodium bağımlılığıyla tutarlı.
-     *
-     * wipe_size: usable_size (bump alanı) + NOX_CANARY_LEN
-     * Sayfa hizası garantili, guard page'e taşmaz.
-     *
-     * Yapısal bütünlük kontrolü: struct bozuksa wipe → SIGSEGV
-     * → munmap atlanır → veri sızar. Bozuksa wipe'ı atla.
-     * (struct_ok başında hesaplandı — burada tekrar hesaplamaya gerek yok)
-     */
+     /*
+      * 2. Usable + canary alanını sıfırla
+      *
+      * P8: sodium_memzero() kullanılıyor.
+      *     • Derleyici optimizasyonuna karşı güçlüdür
+      *       (volatile yazım + memory barrier içerir).
+      *     • explicit_bzero() ile işlevsel olarak eşdeğer,
+      *       ancak libsodium bağımlılığıyla tutarlı.
+      *
+      * wipe_size: usable_size (bump alanı) + NOX_CANARY_LEN
+      * Sayfa hizası garantili, guard page'e taşmaz.
+      *
+      * Not: Yapısal bütünlük artık yukarıda arena_is_valid ile doğrulanır;
+      *      bozuksa abort ile çıkılır (eski struct_ok fallback'i yok).
+      *      struct_ok compat için korunur (her zaman true); burada sadece
+      *      canary durumuna göre wipe kararı verilir.
+      */
     if (struct_ok) {
         size_t wipe_size = a->usable_size + NOX_CANARY_LEN;
         /* Savunmacı üst sınır: 256 MB'dan fazlasını silme */

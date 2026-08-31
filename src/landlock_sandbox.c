@@ -63,7 +63,7 @@ static int landlock_abi_version(void) {
  *
  * Returns: NOX_OK veya NOX_ERR_CONFIG
  * ================================================================ */
-static bool s_landlock_active = false;
+static nox_hardbool_t s_landlock_active = 0;
 
 nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     if (config_dir_fd < 0 || downloads_dir_fd < 0) {
@@ -209,12 +209,12 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
  * Returns: true/false
  * ================================================================ */
 
-bool landlock_is_available(void) {
+nox_hardbool_t landlock_is_available(void) {
     int abi = landlock_abi_version();
     return abi >= 1;
 }
 
-bool landlock_is_active(void) {
+nox_hardbool_t landlock_is_active(void) {
     return s_landlock_active;
 }
 

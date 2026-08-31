@@ -32,9 +32,9 @@ struct secure_arena {
     size_t   usable_size;   /* kullanılabilir alan (guard page'siz)    */
     size_t   offset;        /* sonraki alloc pozisyonu (bump)          */
     size_t   page_size;     /* sistem sayfa boyutu (cache)             */
-    bool     fork_safe;     /* MADV_DONTFORK durumu                    */
-    bool     dump_safe;     /* MADV_DONTDUMP durumu                    */
-    bool     locked;        /* MAP_LOCKED / mlock durumu               */
+    nox_hardbool_t fork_safe;     /* hardened: MADV_DONTFORK durumu    */
+    nox_hardbool_t dump_safe;     /* hardened: MADV_DONTDUMP durumu    */
+    nox_hardbool_t locked;        /* hardened: MAP_LOCKED / mlock durumu */
     uint8_t  canary[NOX_CANARY_LEN]; /* taşma tespiti için            */
 };
 NOX_STATIC_ASSERT(sizeof(struct secure_arena) % 16 == 0, "arena SIMD align");
@@ -84,7 +84,7 @@ struct contact {
     char     name[NOX_CONTACT_NAME_LEN + 1]; /* kullanıcı verdiği isim (null-terminated) */
     char     onion[NOX_ONION_LEN];        /* .onion adresi           */
     uint8_t  noise_key[NOX_KEY_LEN];      /* static public key       */
-    bool     verified;                     /* fingerprint onaylandı mı*/
+    nox_hardbool_t verified;              /* hardened: fingerprint onaylandı mı */
 };
 
 /* ================================================================
@@ -93,7 +93,7 @@ struct contact {
 struct noise_cipher_state {
     uint8_t  k[NOX_KEY_LEN];   /* şifreleme anahtarı              */
     _Atomic uint64_t n;        /* nonce counter — monoton artan   */
-    bool     has_key;           /* key set edilmiş mi               */
+    nox_hardbool_t has_key;     /* hardened: key set edilmiş mi    */
 };
 
 /* ================================================================
@@ -119,7 +119,7 @@ struct noise_handshake {
     uint8_t  e_pub[NOX_KEY_LEN];   /* local ephemeral public key  */
     uint8_t  rs[NOX_KEY_LEN];      /* remote static public key    */
     uint8_t  re[NOX_KEY_LEN];      /* remote ephemeral public key */
-    bool     initiator;
+    nox_hardbool_t initiator;       /* hardened: XX role */
     int      msg_index;             /* 0, 1, 2 — hangi adımdayız  */
     nox_hardbool_t split_done;       /* hardened: true → handshake_split yapıldı, tekrar yasak */
     nox_hardbool_t failed;           /* hardened: true → önceki read/write fail, artık split yok */
@@ -156,7 +156,7 @@ NOX_STATIC_ASSERT(NOX_MAX_MSG_LEN + NOX_MAC_LEN <= 4096U + NOX_MAC_LEN,
                   "NOISE_MAX_PAYLOAD_LEN frame kapasitesini asamaz");
 
 struct file_rx_state {
-    bool     active;
+    nox_hardbool_t active;
     int      fd;                  /* hedef dosya tanımlayıcısı */
     char     filename[256];       /* dezenfekte edilmiş dosya adı */
     uint64_t expected_size;
@@ -170,7 +170,7 @@ struct file_rx_state {
 };
 
 struct file_tx_state {
-    bool     active;
+    nox_hardbool_t active;
     int      fd;                  /* kaynak dosya tanımlayıcısı */
     char     filename[256];       /* sadece dezenfekte dosya adı */
     uint64_t total_size;
@@ -211,23 +211,23 @@ struct peer_session {
     /* ── Sıra numaraları ── */
     uint32_t tx_seq;
     uint32_t rx_seq;
-    bool     queue_flushed;
+    nox_hardbool_t queue_flushed;
 
     /* ── Durum ── */
     peer_state_t state;
     char     connect_target[NOX_ONION_LEN + 1];
 
     /* ── TOFU ── */
-    bool     tofu_pending;
+    nox_hardbool_t tofu_pending;
     int      tofu_peer_fd;
     uint8_t  tofu_new_key[NOX_KEY_LEN];
     char     tofu_onion[NOX_ONION_LEN + 1];
     char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
     struct   timespec tofu_start;
-    bool     tofu_was_zero_key; /* H-1 FIX: ilk anahtar bağlaması mı? kuyruk sızıntısını önlemek için */
+    nox_hardbool_t tofu_was_zero_key; /* hardened: ilk anahtar bağlaması mı? */
 
     /* ── H-1/H-2: queue flush sadece doğrulanmış peer için ── */
-    bool     peer_verified; /* true = SESSION_READY ile kuruldu, false = TOFU ile */
+    nox_hardbool_t peer_verified; /* hardened: true = SESSION_READY */
 
     /* ── Recv buffer ── */
     uint8_t  recv_buf[RECV_BUF_CAPACITY];
@@ -304,11 +304,11 @@ struct app_state {
     char     connect_target[NOX_ONION_LEN + 1]; /* /connect hedef adresi */
 
     /* Durum */
-    bool     running;            /* false olunca event loop çıkar    */
-    bool     first_run;          /* ilk çalıştırma mı                */
-    bool     ghost_mode;         /* --ghost veya -ghost: SQLite yok  */
-    bool     allow_unsandboxed_fs; /* --allow-unsandboxed-fs: Landlock yoksa da devam */
-    bool     queue_flushed;      /* kuyruk ilk peer mesajında gönderildi */
+    bool     running;            /* false olunca event loop çıkar (non-hardened: UI) */
+    nox_hardbool_t first_run;    /* hardened: ilk çalıştırma mı      */
+    nox_hardbool_t ghost_mode;   /* hardened: --ghost SQLite yok     */
+    nox_hardbool_t allow_unsandboxed_fs; /* hardened: Landlock bypass */
+    nox_hardbool_t queue_flushed;/* hardened: kuyruk gönderildi      */
     size_t   prompt_display_len; /* prompt'un terminal karakter genişliği */
 
     /* Config yolları — NOX_PATH_MAX yeterli, PATH_MAX stack'i taşırır */
@@ -318,7 +318,7 @@ struct app_state {
     char     contacts_path[NOX_PATH_MAX]; /* YALNIZCA log/hata mesajı için — I/O için config_dir_fd + "contacts.db" (db_init) */
 
     /* TOFU State */
-    bool     tofu_pending;
+    nox_hardbool_t tofu_pending; /* hardened */
     int      tofu_peer_fd;
     char     tofu_onion[NOX_ONION_LEN + 1];
     char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
@@ -329,7 +329,7 @@ struct app_state {
     char    *stdin_buf;
     size_t   stdin_len;
     size_t   stdin_cap;
-    bool     stdin_closed;    /* K-4 FIX: EOF sonrası epoll busy-loop önleme */
+    nox_hardbool_t stdin_closed; /* hardened: K-4 EOF busy-loop */
 
     /* Linenoise editör (Faz E — TTY multiplexing, yalnızca ln_active iken) */
     struct linenoiseState ln_state;

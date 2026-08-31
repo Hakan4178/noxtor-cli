@@ -868,7 +868,7 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
   return err;
 }
 
-bool handshake_is_complete(const struct noise_handshake *hs) {
+nox_hardbool_t handshake_is_complete(const struct noise_handshake *hs) {
   return hs && hs->msg_index >= 3;
 }
 

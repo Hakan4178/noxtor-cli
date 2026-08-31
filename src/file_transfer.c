@@ -544,8 +544,8 @@ static nox_err_t open_recv_file(struct app_state *state,
     return NOX_OK;
 }
 
-bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
-                             const uint8_t *payload, uint32_t len) {
+nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
+                                         const uint8_t *payload, uint32_t len) {
   if (len < NOX_MAC_LEN || len > 4096 + NOX_MAC_LEN) {
     ui_print_error(state, "Gecersiz payload uzunlugu: %u", len);
     return false;
@@ -558,7 +558,7 @@ bool file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
   }
 
   ssize_t pt_len = noise_decrypt(ps->session, payload, len, pt);
-  bool is_metadata = false;
+  nox_hardbool_t is_metadata = 0;
   if (pt_len <= 0) {
     if (ps->rx_file.active) {
       NOX_WARN(LOG_MOD_NET, "FILE decrypt fail — transfer abort, seq=%u", ps->rx_seq);
