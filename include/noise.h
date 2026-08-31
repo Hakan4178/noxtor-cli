@@ -156,9 +156,9 @@ nox_err_t handshake_read(struct noise_handshake *hs,
                          size_t *pl_len);
 
 /*
- * handshake_is_complete — Handshake tamamlandı mı?
+ * handshake_is_complete — Handshake tamamlandı mı? (hardened)
  */
-bool handshake_is_complete(const struct noise_handshake *hs);
+nox_hardbool_t handshake_is_complete(const struct noise_handshake *hs);
 
 /*
  * handshake_split — Handshake bitince transport session oluştur

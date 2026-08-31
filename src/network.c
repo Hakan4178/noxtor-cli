@@ -60,7 +60,7 @@ static void safe_nanosleep(const struct timespec *req) {
  *   defense-in-depth'e değmez. Tor ADD_ONION yanıtı zaten
  *   geçerli v3 adres üretir (deterministik ED25519-V3).
  * ================================================================ */
-bool validate_onion_address(const char *addr) {
+nox_hardbool_t validate_onion_address(const char *addr) {
   if (!addr)
     return false;
   

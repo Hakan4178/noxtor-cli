@@ -60,21 +60,19 @@ __u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled);
 nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd);
 
 /**
- * landlock_is_available — Landlock mevcut mu?
+ * landlock_is_available — Landlock mevcut mu? (hardened)
  *
- * Return: true (ABI v1+) veya false
+ * Return: hardened true (ABI v1+) veya false
  */
-bool landlock_is_available(void);
+nox_hardbool_t landlock_is_available(void);
 
 /**
- * landlock_is_active — Landlock gerçekten uygulandı mı?
+ * landlock_is_active — Landlock gerçekten uygulandı mı? (hardened)
  *
  * landlock_sandbox_init() başarılı olduysa true döner.
- * landlock_is_available() sadece ABI versiyonuna bakar,
- * landlock_is_active() gerçekten uygulandığından emin olur.
  *
- * Return: true/false
+ * Return: hardened true/false
  */
-bool landlock_is_active(void);
+nox_hardbool_t landlock_is_active(void);
 
 #endif /* PARANOID_LANDLOCK_SANDBOX_H */

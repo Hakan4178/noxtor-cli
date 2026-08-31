@@ -24,7 +24,7 @@
 typedef struct {
     sqlite3           *db;
     const uint8_t     *db_key;
-    bool               ready;
+    nox_hardbool_t     ready;
     pthread_mutex_t    lock;
     uint64_t           key_generation;
 } nox_db_state_t;

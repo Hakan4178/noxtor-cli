@@ -63,8 +63,8 @@ __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *
 /* Onion v3 adres doğrulaması — base32 + ".onion" suffix.
  * 62 karakter tam v3 .onion adresi için true döner.
  * socks5_connect (peer) ve tor_create_new_hs (S3 — kendi HS)
- * tarafından çağrılır. */
-bool validate_onion_address(const char *addr);
+ * tarafından çağrılır. (hardened) */
+nox_hardbool_t validate_onion_address(const char *addr);
 
 /* Tor process'ini düzgün kapat */
 void tor_shutdown(struct app_state *state);
