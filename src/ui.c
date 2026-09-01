@@ -196,6 +196,7 @@ static void clear_below_cursor(void)
 }
 
 /* Prompt'u ve mevcut input'u state'ten yeniden çiz */
+// Real attack surface in practice: local stdin re-draw (pipe fallback)
 static void redraw_input(struct app_state *state)
 {
     if (tui_is_active())
@@ -209,16 +210,10 @@ static void redraw_input(struct app_state *state)
 
     ui_print_prompt(state);
 
-    /* Kullanıcının mevcut girdisini yeniden yaz — TOCTOU korumalı */
+    /* Kullanıcının mevcut girdisini yeniden yaz — doğrudan flush, 1023 cap kaldırıldı (A) */
     if (state->stdin_len > 0 && state->stdin_buf != NULL) {
-        char buf[1024];
-        size_t len = state->stdin_len;
-        if (len > sizeof(buf) - 1) len = sizeof(buf) - 1;
-        memcpy(buf, state->stdin_buf, len);
-        buf[len] = '\0';
-        fwrite(buf, 1, len, stderr);
-        /* [F7] Local buffer scrub */
-        sodium_memzero(buf, sizeof(buf));
+        size_t len = state->stdin_len; /* TOCTOU snap */
+        fwrite(state->stdin_buf, 1, len, stderr);
     }
     fflush(stderr);
 }
@@ -346,6 +341,7 @@ void ui_print_prompt(struct app_state *state)
 
 /* UI-1 FIX: Terminal ANSI injection koruması — tüm escape sequence türlerini temizle
  * CSI (ESC [), OSC (ESC ]), DCS (ESC P), ESC followed by non-[, tek ESC */
+// Real attack surface in practice: terminal injection (CSI/OSC/DCS)
 static void strip_ansi_escape(char *str) {
   if (!str) return;
   char *dst = str;
@@ -418,6 +414,7 @@ static void print_timestamp_short(void)
  * Sender değişince boşluk eklenir.
  */
 
+// Real attack surface in practice: attacker plaintext → terminal (strip_ansi)
 static void atomic_message(struct app_state *state, enum ui_label label,
                            const char *msg)
 {
@@ -474,6 +471,7 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     fflush(stderr);
 }
 
+// Real attack surface in practice: attacker-controlled plaintext → terminal
 void ui_print_incoming(struct app_state *state, const char *msg)
 {
     if (!msg || !*msg || strspn(msg, " \t") == strlen(msg))

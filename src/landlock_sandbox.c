@@ -154,7 +154,11 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     }
 
     /* ── config dizini için kural ekle — fd anchor, HOME parse yok (Q1 Şık A) ──
-     * Sadece okuma izni — TOCTOU kapalı, path'e asla geri dönülmez. */
+     * Sadece okuma izni — TOCTOU kapalı, path'e asla geri dönülmez.
+     * NOT: identity.key/salt event loop'ta RO okunabilir (şeffaf, bilerek):
+     *  dosyalar XSalsa20-Poly1305 şifreli, HS sonrası RAM'de arena+mlock'ta,
+     *  retry yok — erişilemez yapmak (READ_FILE çıkarmak) fail-closed olur
+     *  ama retry eklenirse kırar. Politika A: RO korunur, şifreli. */
     {
         struct landlock_path_beneath_attr config_rule = {
             .allowed_access =
@@ -205,7 +209,10 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
 /* ================================================================
  * landlock_is_available
  *
- * Landlock mevcut mu kontrol et.
+ * Landlock ABI detectable mi? Kernel VERSION sorgusu abi>=1 ise true.
+ * NOT: true "usable right now" demek değil — ruleset/add_rule/
+ * no_new_privs/restrict_self sonrası hata çıkabilir. Gerçek aktiflik
+ * için landlock_is_active() veya landlock_sandbox_init()==NOX_OK bak.
  * Returns: true/false
  * ================================================================ */
 

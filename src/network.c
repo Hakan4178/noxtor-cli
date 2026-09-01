@@ -1818,6 +1818,7 @@ void frame_header_encode(const struct frame_header *hdr, uint8_t *wire) {
   wire[12] = (uint8_t)(hdr->len);
 }
 
+// Real attack surface in practice: untrusted 13B wire (magic/type/len)
 nox_err_t frame_header_decode(const uint8_t *wire, struct frame_header *hdr) {
   hdr->magic = ((uint32_t)wire[0] << 24) | ((uint32_t)wire[1] << 16) |
                ((uint32_t)wire[2] << 8) | (uint32_t)wire[3];

@@ -26,6 +26,7 @@
  * ================================================================ */
 
 /* PATCH: HIGH‑2 — max_len sınırı ve null garantisi eklenmiş sanitize */
+// Real attack surface in practice: untrusted filename (path traversal)
 void sanitize_filename(char *name, size_t max_len) {
   if (!name || max_len == 0)
     return;
@@ -80,6 +81,7 @@ void sanitize_filename(char *name, size_t max_len) {
 
 /* PATCH: H-13 — downloads_dir_fd güvenlik doğrulaması */
 /* H-3: fd üzerinden doğrula — TOCTOU engeli (lstat(path) vs openat(fd) farkı) */
+// Real attack surface in practice: local FS dir (fstat/uid/0777)
 static nox_err_t verify_downloads_dir_fd(int dir_fd) {
     struct stat st;
     if (fstat(dir_fd, &st) != 0)
@@ -468,6 +470,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
  * ================================================================ */
 
 /* Partial write korumalı dosya yazma */
+// Real attack surface in practice: local FS write (EINTR loop)
 static nox_err_t write_to_file(int fd, const uint8_t *data, size_t len) {
   size_t written = 0;
   while (written < len) {
@@ -485,10 +488,11 @@ static nox_err_t write_to_file(int fd, const uint8_t *data, size_t len) {
 }
 
 
+// Real attack surface in practice: local FS (TOCTOU, O_EXCL|O_NOFOLLOW)
 static nox_err_t open_recv_file(struct app_state *state,
-                                struct peer_session *ps,
-                                const char *safe_name,
-                                int *fd_out)
+                                 struct peer_session *ps,
+                                 const char *safe_name,
+                                 int *fd_out)
 {
     /* safe_name "/" icermemeli */
     if (strchr(safe_name, '/') || strchr(safe_name, '\\')) {
@@ -544,6 +548,7 @@ static nox_err_t open_recv_file(struct app_state *state,
     return NOX_OK;
 }
 
+// Real attack surface in practice: untrusted FILE frame (METADATA+DATA, disk write)
 nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
                                          const uint8_t *payload, uint32_t len) {
   if (len < NOX_MAC_LEN || len > 4096 + NOX_MAC_LEN) {

@@ -157,12 +157,12 @@ network.c:1724    frame_header_decode()  ← 13-byte header decode
    d. Session henüz yoksa TEXT/FILE frame'leri tüketme — recv_buf'da
       bekletilir (TOFU_PENDING sırasında drop edilmez)
    e. payload = recv_buf + 13 (sodium_malloc kopya — swap koruması)
-   f. Frame tipine göre routing:
-      - CTRL (0x04): handshake_read() → msg_index < 3 ise
-        handshake_write() + writev() ile yanıt gönder
-      - TEXT (0x01): noise_decrypt() → ui_print_incoming()
-      - FILE (0x02): file_transfer_handle_rx()
-      - ACK (0x03): alındı onayı
+    f. Frame tipine göre routing:
+       - CTRL (0x04): handshake_read() → msg_index < 3 ise
+         handshake_write() + writev() ile yanıt gönder
+       - TEXT (0x01): noise_decrypt() → pt (sodium_malloc, mlock) → ui_print_incoming() → safe_msg (malloc, no mlock, anlık) — plain koruması §4.4
+       - FILE (0x02): file_transfer_handle_rx() → pt (sodium_malloc) → hash → write
+       - ACK (0x03): alındı onayı
    g. recv_pos -= (13 + payload_len) → kalan frame'leri işle
    h. goto a (döngü devam)
 ```
@@ -174,9 +174,9 @@ network.c:1724    frame_header_decode()  ← 13-byte header decode
 Kullanıcı girdisi → Tor'a veri gönderme. Tam yol:
 
 ```
-Kullanıcı (stdin veya TUI)
+Kullanıcı (stdin/TUI/linenoise: ln_buf sodium_malloc 4097 mlock — §4.4)
   ↓
-stdin_handler.c:875  process_stdin_events()
+stdin_handler.c:875  process_stdin_events() [ln_active→linenoiseEditFeed, pipe→stdin_buf sodium_malloc]
   ↓
 stdin_handler.c:383  process_line()         ← komut routing
   ↓
@@ -191,12 +191,9 @@ stdin_handler.c:383  process_line()         ← komut routing
   │
   ├─ /msg ─────→ stdin_handler.c:262 send_segmented_message()
   │                    ↓
-  │               stdin_handler.c:267 send_segmented_message_to()
+  │               chunk (sodium_malloc 4097, mlock) — plain koruması §4.4
   │                    ↓
-  │               stdin_handler.c:34 get_next_chunk_size()
-  │               (4000 byte UTF-8 güvenli chunk'lar)
-  │                    ↓
-  │               noise.c:892 noise_encrypt()
+  │               noise.c:892 noise_encrypt() (strub) → ct (sodium_malloc)
   │                    ↓
   │               network.c:1708 frame_header_encode()
   │                    ↓
@@ -257,6 +254,26 @@ iov[1].iov_base = ciphertext; // payload + MAC
 iov[1].iov_len  = payload_len + NOX_MAC_LEN;
 writev(peer_fd, iov, 2);     // kernel atomik garantisi (AF_UNIX)
 ```
+
+### 4.4 Plain Mesaj Yaşam Döngüsü ve Koruma (şeffaf)
+
+```
+ln_buf (sodium_malloc, mlock+guard, 4097) ─┐
+tui input_buf (.bss, 4096, no mlock) ──────┤
+stdin_buf (sodium_malloc, 64KB) ───────────┤→ chunk (sodium_malloc, 4097, mlock) → cipher_encrypt(k/n) → tx_buf (.bss, ciphertext) → noise_decrypt → pt (sodium_malloc, mlock) → safe_msg (malloc, no mlock, anlık) / tui chat_lines (strdup/malloc, no mlock, kalıcı)
+PIN (sodium_malloc, 130) → master/db/session/static (arena, tek mlock+outer guard+canary) → onion_seed/meta/dh_out (stack, no mlock, sodium_memzero)
+file plain_buf (sodium_malloc, 4096, mlock) → immediate sodium_memzero(4096) after encrypt
+```
+
+| Aşama | Yer (`file:line`) | Tip | mlock | Wipe | Ömür |
+|-------|-------------------|-----|-------|------|------|
+| PIN→subkey | `pin_buf:main.c:916` → `master_key:main.c:1055 arena` | sodium→arena | ✓ (tek mlock) | `sodium_memzero+free` / `arena_destroy` | sn → full |
+| Girdi | `ln_buf:stdin_handler.c:682` `chunk:283` `pt:event_loop.c:374` | sodium_malloc | ✓ per-alloc guard | `sodium_free` auto | satır |
+| Dosya | `plain_buf:file_transfer.c:262` | sodium_malloc | ✓ | `sodium_memzero(4096):426` | chunk |
+| Stack kopya | `salt:main.c:1042` `meta[305]:file_transfer.c:275` `dh_out:noise.c:658` | stack | ✗ | `sodium_memzero` manuel | µs |
+| UI kalıcı | `chat_lines:tui.c:429 strdup` `safe_msg:ui.c:423 malloc` | malloc/.bss | ✗ | `sodium_memzero+free` (anlık) / `free` wipe’suz (kalıcı) | kalıcı (scrollback 512) |
+
+Not: `tui chat_lines` ve `safe_msg` bilerek `malloc` — `mlock` yok, `sodium_malloc` değil; mitigasyon `PR_SET_DUMPABLE 0` + `MADV_DONTDUMP`, ispat değil.
 
 ---
 
@@ -704,6 +721,8 @@ file_transfer_handle_rx()                [file_transfer.c:510]
 ├─────────────────────────────────────────────────────────┤
 │ Layer 4: Dosya Güvenliği                                │
 │  • Landlock LSM:RW: erişilebilir dizinler beyaz liste   │
+│    (available=ABI detectable, active=restrict_self sonrası — is_available usable değil) │
+│  • config RO: identity.key/salt event loop’ta okunabilir (şeffaf, bilerek — şifreli, HS sonrası RAM-only) │
 │  • O_NOFOLLOW: symlink izleme engeli                    │
 │  • O_EXCL: yarış koşulu koruması                        │
 │  • TOCTOU: openat() + fd-based erişim                   │
@@ -987,6 +1006,43 @@ noxtor-cli/
 ├── Makefile
 ├── README.md
 └── noxtor-cli              # Binary
+```
+
+---
+
+## 13. RX Fonksiyon Ağacı (5 seviye, proje fonksiyonları — gerçek dış saldırı yüzeyi) Sep 1 2026
+
+```
+RX §3 — event_loop() → peer_fd EPOLLIN [event_loop.c:721]
+└─ process_peer_frames() [event_loop.c:55] (while recv_pos ≥13, payload kopya sodium_malloc)
+   ├─ frame_header_decode() [network.c:1821] → NOX_ERROR → nox_log_impl [log.c:119]
+   │  └─ be32 magic=0xDEADC0DE/type 1-4/len≤4112 — leaf
+   ├─ CTRL (0x04) [event_loop.c:105] → handshake_read() [noise.c:920] → (msg_index<3) handshake_write() [noise.c:753] → write_msg0/1/2 → frame_header_encode [network.c:1805] → writev()
+   │  │  └─ msg_index≥3 → peer_onion payload → validate_onion_address [network.c:63] → db_get_contact [database.c:491] → hash_onion [102] → sodium_memcmp (sabit zamanlı)
+   │  │     ├─ bilinen peer, key eşleşti → handshake_split [974] → symmetric_split [505] → sodium_malloc(session) → EV_SESSION_READY [state_machine.c:231] → ST_ACTIVE → peer_onion set [event_loop.c:237]
+   │  │     ├─ bilinen peer, key değişmiş → tofu_pending=true [254] → EV_HANDSHAKE_DONE → ST_TOFU_PENDING → action_tofu_prompt [349] (MITM uyarısı + fingerprint)
+   │  │     └─ bilinmeyen peer → tofu_pending=true [301] → EV_HANDSHAKE_DONE → ST_TOFU_PENDING → action_tofu_prompt
+   │  │        └─ TOFU kararı (stdin y/n) → EV_TOFU_ACCEPTED → action_tofu_accept [357] → db_add_contact [database.c:408] → sodium_malloc(session) → handshake_split → ST_ACTIVE
+   │  │                                └─ EV_TOFU_REJECTED → action_cleanup [240] → ST_IDLE
+   │  ├─ read_msg0 [805] → symmetric_mix_hash [226] → crypto_generichash_blake2b_* (sodium, leaf)
+   │  │                 └─ symmetric_decrypt_and_hash [427] → cipher_decrypt [144] → encode_nonce [80]
+   │  ├─ read_msg1 [829] → symmetric_mix_hash(re) → noise_dh(e,re) [561] → symmetric_mix_key(ee) [392] → hkdf_blake2b [336] → hmac_blake2b [253]
+   │  │                 → symmetric_decrypt_and_hash(s) → noise_dh(e,rs) → symmetric_mix_key(es) → symmetric_decrypt_and_hash(payload)
+   │  ├─ read_msg2 [882] → symmetric_decrypt_and_hash(s) → noise_dh(e,rs) → symmetric_mix_key(se) → symmetric_decrypt_and_hash(payload)
+   │  └─ handshake_split [974] → symmetric_split [505] → hkdf→hmac (sodium)
+   ├─ TEXT (0x01) [event_loop.c:371] → seq≠rx_seq → sm_dispatch[EV_SEQ_MISMATCH] [state_machine.c:196]
+   │                 └─ noise_decrypt() [noise.c:1023] → cipher_decrypt [144] → encode_nonce [80] → crypto_aead_chacha20poly1305_ietf_decrypt (sodium)
+   │                    └─ ui_print_incoming() [ui.c:471] → atomic_message [415] → strip_ansi_escape [343] (CSI/OSC/DCS leaf)
+   │                       ├─ TUI aktif → tui_chat_append [tui.c:380] → tui_chat_append_colored [385] → tui_refresh_all [586] → tui_draw_sidebar/chat/input
+   │                       └─ ANSI/linenoise → print_timestamp_short [389] → calc_current_input_lines [184] → redraw_input [199]
+   └─ FILE (0x02) [event_loop.c:414] → file_transfer_handle_rx() [file_transfer.c:547]
+      ├─ sanitize_filename [29] (strrchr/memmove/whitelist, leaf)
+      ├─ open_recv_file [488] → verify_downloads_dir_fd [83] (fstat/S_ISLNK/getuid/0777==0700 strict — dizin; dosya için db:077==0→fchmod 0600) → openat(O_EXCL|O_NOFOLLOW)
+      ├─ write_to_file [471] (write EINTR loop, leaf)
+      ├─ crypto_generichash_init/update/final (sodium, BLAKE2b) + fsync/fstatvfs
+      └─ sm_dispatch [state_machine.c:196] EV_FILE_RX_START/DONE + ui_print_error/system/progress [ui.c:513/565/647]
+
+Not: sodium/libc (malloc, poll, read, sodium_malloc, crypto_aead_*) leaf olarak filtrelendi; ağaç sadece proje tanımlı fonksiyonları gösterir. Derinlik 5 tam, dış saldırı yüzeyi peel → decode → decrypt → UI/file tek çizgi.
 ```
 
 ---

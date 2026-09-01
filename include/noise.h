@@ -205,6 +205,7 @@ ssize_t noise_encrypt(struct noise_session *session,
  *
  * Return: Plaintext uzunluğu veya -1
  */
+__attribute__((strub))
 ssize_t noise_decrypt(struct noise_session *session,
                       const uint8_t *ciphertext, size_t ct_len,
                       uint8_t *out);

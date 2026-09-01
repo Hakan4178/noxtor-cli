@@ -377,11 +377,13 @@ void tui_draw_sidebar(struct app_state *state)
 /* ================================================================
  * CHAT PANELİ
  * ================================================================ */
+// Real attack surface in practice: chat scrollback (persistent plain, no mlock)
 void tui_chat_append(const char *line)
 {
     tui_chat_append_colored(line, 0);
 }
 
+// Real attack surface in practice: word-wrap (malloc, no mlock)
 void tui_chat_append_colored(const char *line, uintattr_t fg)
 {
     if (!g_tui.active || !line || !*line)

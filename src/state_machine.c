@@ -193,6 +193,7 @@ static const state_transition_t transitions[] = {
  * DISPATCH MOTORU
  * ================================================================ */
 
+// Real attack surface in practice: untrusted state/event (peer-controlled)
 nox_err_t sm_dispatch(struct peer_session *ps, struct app_state *state,
                       peer_event_t event)
 {

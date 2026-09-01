@@ -60,9 +60,18 @@ __u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled);
 nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd);
 
 /**
- * landlock_is_available — Landlock mevcut mu? (hardened)
+ * landlock_is_available — Landlock ABI detectable mi? (hardened)
  *
- * Return: hardened true (ABI v1+) veya false
+ * Kernel Landlock `LANDLOCK_CREATE_RULESET_VERSION` sorgusuna
+ * `abi>=1` ile cevap veriyorsa true döner.
+ *
+ * NOT: true olması "usable right now" demek değildir.
+ * `landlock_sandbox_init()` sonrası `ruleset creation`, `add_rule`,
+ * `no_new_privs`, `restrict_self` adımlarında hata çıkabilir.
+ * Gerçek aktiflik için `landlock_is_active()` veya
+ * `landlock_sandbox_init()` dönüşü (`NOX_OK`) kontrol edilmeli.
+ *
+ * Return: hardened true (ABI detectable) veya false
  */
 nox_hardbool_t landlock_is_available(void);
 

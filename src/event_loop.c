@@ -52,6 +52,7 @@ static struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
  * çağrılır. Bu sayede TOFU_PENDING sonrası bekleyen frame'ler
  * session kurulduktan sonra işlenebilir.
  * ================================================================ */
+// Real attack surface in practice: untrusted network (AF_UNIX, attacker-controlled wire)
 static void process_peer_frames(struct peer_session *ps, struct app_state *state,
                                 int fd) {
   while (ps->recv_pos >= FRAME_HEADER_WIRE_SIZE) {
@@ -429,6 +430,7 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
 /* ================================================================
  * EVENT LOOP — epoll tabanlı async I/O
  * ================================================================ */
+// Real attack surface in practice: untrusted Tor peer, multiplexed epoll
 void event_loop(struct app_state *state) {
   /* 1 (stdin) + 2*NOX_MAX_PEERS (listener + data per peer) */
   struct epoll_event events[1 + 2 * NOX_MAX_PEERS];
