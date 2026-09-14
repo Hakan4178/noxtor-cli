@@ -74,6 +74,7 @@ NOX_STATIC_ASSERT(RECV_BUF_CAPACITY == 13U + NOISE_MAX_PAYLOAD_LEN,
  * ================================================================ */
 
 __attribute__((strub)) // Ref: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html
+__attribute__((optimize("harden-control-flow-redundancy"))) /* GCC security attributes: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html */
 void cipher_init(struct noise_cipher_state *cs) {
   sodium_memzero(cs, sizeof(*cs));
   cs->has_key = false;
@@ -93,6 +94,8 @@ void cipher_init_key(struct noise_cipher_state *cs,
  * ChaChaPoly IETF nonce is 12 bytes: [4 zero bytes][8-byte LE counter]
  */
 // Real attack surface in practice: nonce LE encode (12B, no surface)
+__attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 static void encode_nonce(uint8_t nonce_out[12], uint64_t n) {
   memset(nonce_out, 0, 4);
   /* Little-endian 8-byte counter */
@@ -124,7 +127,7 @@ static void encode_nonce(uint8_t nonce_out[12], uint64_t n) {
  */
  
 __attribute__((strub)) 
-__attribute__((optimize("harden-control-flow-redundancy"))) /* GCC security attributes: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html */
+__attribute__((optimize("harden-control-flow-redundancy"))) 
 ssize_t cipher_encrypt(struct noise_cipher_state *cs, const uint8_t *ad,
                        size_t ad_len, const uint8_t *plaintext, size_t pt_len,
                        uint8_t *out) {
@@ -353,6 +356,7 @@ noise_hmac_blake2b_64(const uint8_t *key, size_t key_len, const uint8_t *data,
   crypto_generichash_blake2b_final(&st, out, NOISE_HASHLEN);
 
   /* Temizlik */
+  sodium_memzero(&st, sizeof(st));
   sodium_free(k);
   k = NULL;
   sodium_free(ipad);
@@ -549,7 +553,9 @@ ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
  *     initiator.tx != initiator.rx
  */
 // Real attack surface in practice: key separation (tx!=rx, handshake destroy)
-__attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *ss,
+__attribute__((strub)) 
+__attribute__((optimize("harden-control-flow-redundancy")))
+nox_err_t symmetric_split(struct noise_symmetric_state *ss,
                           struct noise_cipher_state *c1,
                           struct noise_cipher_state *c2) {
   uint8_t temp_k1[NOISE_HASHLEN], temp_k2[NOISE_HASHLEN];
@@ -655,10 +661,14 @@ nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
   hs->initiator = initiator;
   hs->msg_index = 0;
 
-  /* MixHash("Mustafa Kemal Atatürk") dolu prologue harcored informed choice */
-  symmetric_mix_hash(&hs->ss, (const uint8_t *)"Mustafa Kemal Atatürk",
-                     strlen("Mustafa Kemal Atatürk"));
+/* MixHash("Mustafa Kemal Atatürk") dolu prologue harcored informed choice.
+ * PROLOGUE: sabit domain-separation değeri. İki taraf aynı değeri
+ * kullanmalı; bu sabit genel Noise implementasyonlarıyla interoperability'i
+ * bilinçli olarak kaldırır. Değiştirilirse mevcut session'lar bağlanamaz.
+ */
 
+   symmetric_mix_hash(&hs->ss, (const uint8_t *)"Mustafa Kemal Atatürk",
+                     strlen("Mustafa Kemal Atatürk"));
   NOX_DEBUG(LOG_MOD_NOISE, "handshake başlatıldı (%s)",
             initiator ? "initiator" : "responder");
 
@@ -865,6 +875,7 @@ nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
     sodium_memzero(hs->rs, NOX_KEY_LEN);
     sodium_memzero(hs->ss.ck, sizeof(hs->ss.ck));
     sodium_memzero(hs->ss.cs.k, sizeof(hs->ss.cs.k));
+    sodium_memzero(hs->ss.h, sizeof(hs->ss.h));    
   }
   return err;
 }
@@ -1045,6 +1056,7 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
     sodium_memzero(hs->rs, NOX_KEY_LEN);
     sodium_memzero(hs->ss.ck, sizeof(hs->ss.ck));  
     sodium_memzero(hs->ss.cs.k, sizeof(hs->ss.cs.k));
+    sodium_memzero(hs->ss.h, sizeof(hs->ss.h));
   }
   return err;
 }
@@ -1081,6 +1093,7 @@ nox_err_t handshake_split(struct noise_handshake *hs,
     sodium_memzero(hs->rs, NOX_KEY_LEN);
     sodium_memzero(hs->ss.ck, sizeof(hs->ss.ck));
     sodium_memzero(hs->ss.cs.k, sizeof(hs->ss.cs.k));
+    sodium_memzero(hs->ss.h, sizeof(hs->ss.h));
     return err;
   }
 
