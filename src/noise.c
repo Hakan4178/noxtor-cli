@@ -20,8 +20,10 @@
  *       ile differential fuzzing
  *   tests/cbmc_noise_easy.c — ESBMC formal verification (12 kolay fonksiyon,
  *       overflow/memory-leak check)
+ *
+ * NOTE:ONLY SINGLE THREAD. THIS CODE IS NOT THREAD-SAFE. NOISE STATE MUST BE USED BY A SINGLE THREAD.
  * 
- * FREEZE FOR FİX AND FEATURES Sep 1 2026
+ * FREEZE FOR FIX AND FEATURES Sep 13 2026
  *
  */
 
@@ -53,7 +55,15 @@ NOX_STATIC_ASSERT(NOISE_HASHLEN == crypto_generichash_BYTES_MAX,
 NOX_STATIC_ASSERT(NOISE_MAX_HANDSHAKE_LEN >= 256,
                   "handshake buffer too small");
 NOX_STATIC_ASSERT(NOISE_MAX_PAYLOAD_LEN == NOX_MAX_MSG_LEN + NOX_MAC_LEN,
-                  "payload size mismatch");
+                   "payload size mismatch");
+NOX_STATIC_ASSERT(NOISE_MAX_PAYLOAD_LEN <= 4096U + NOX_MAC_LEN,
+                   "payload exceeds wire limit");
+NOX_STATIC_ASSERT(NOISE_MAX_PAYLOAD_LEN > NOX_MAC_LEN,
+                   "payload must be larger than MAC");
+NOX_STATIC_ASSERT(TX_BUF_CAPACITY == 13U + NOISE_MAX_PAYLOAD_LEN,
+                   "TX_BUF must equal header + max payload");
+NOX_STATIC_ASSERT(RECV_BUF_CAPACITY == 13U + NOISE_MAX_PAYLOAD_LEN,
+                   "RECV_BUF must equal header + max payload");
 
 /* ================================================================
  * 1. CIPHER STATE — ChaChaPoly-1305 AEAD
@@ -63,12 +73,14 @@ NOX_STATIC_ASSERT(NOISE_MAX_PAYLOAD_LEN == NOX_MAX_MSG_LEN + NOX_MAC_LEN,
  *   n: 64-bit nonce counter
  * ================================================================ */
 
+__attribute__((strub)) // Ref: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html
 void cipher_init(struct noise_cipher_state *cs) {
   sodium_memzero(cs, sizeof(*cs));
   cs->has_key = false;
   cs->n = 0;
 }
 
+__attribute__((strub))
 void cipher_init_key(struct noise_cipher_state *cs,
                      const uint8_t key[NOX_KEY_LEN]) {
   memcpy(cs->k, key, NOX_KEY_LEN);
@@ -111,10 +123,18 @@ static void encode_nonce(uint8_t nonce_out[12], uint64_t n) {
  * immediate fail-closed.
  */
  
-__attribute__((strub)) // Ref: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html
+__attribute__((strub)) 
+__attribute__((optimize("harden-control-flow-redundancy"))) /* GCC security attributes: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html */
 ssize_t cipher_encrypt(struct noise_cipher_state *cs, const uint8_t *ad,
                        size_t ad_len, const uint8_t *plaintext, size_t pt_len,
                        uint8_t *out) {
+  /* Transport plaintext hard limit  */
+  if (pt_len > NOX_MAX_MSG_LEN)
+    return -1;
+  if (pt_len > 0 && !plaintext)
+    return -1;
+  if (!out)
+    return -1;
   if (!cs->has_key) {
     /* No key → pass through (handshake initial messages) */
     if (plaintext && pt_len > 0)
@@ -147,9 +167,17 @@ ssize_t cipher_encrypt(struct noise_cipher_state *cs, const uint8_t *ad,
 
 // Real attack surface in practice: untrusted AEAD (nonce invariant)
 __attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
                        size_t ad_len, const uint8_t *ciphertext, size_t ct_len,
                        uint8_t *out) {
+  if (!out)
+    return -1;
+  if (ct_len > 0 && !ciphertext)
+    return -1;
+  /* Wire limit */
+  if (ct_len > NOISE_MAX_PAYLOAD_LEN)
+    return -1;
   if (!cs->has_key) {
     /* No key → pass through */
     if (ciphertext && ct_len > 0)
@@ -204,6 +232,8 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
  *   cs: embedded CipherState
  * ================================================================ */
 
+__attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 void symmetric_init(struct noise_symmetric_state *ss,
                     const char *protocol_name) {
   size_t name_len = strlen(protocol_name);
@@ -228,6 +258,7 @@ void symmetric_init(struct noise_symmetric_state *ss,
  */
 
 __attribute__((strub))  
+__attribute__((optimize("harden-control-flow-redundancy")))
 void symmetric_mix_hash(struct noise_symmetric_state *ss, const uint8_t *data,
                         size_t len) {
   crypto_generichash_blake2b_state state;
@@ -240,10 +271,13 @@ void symmetric_mix_hash(struct noise_symmetric_state *ss, const uint8_t *data,
 #define BLAKE2B_BLOCK_SIZE 128U
 
 /*
- * HMAC-BLAKE2b
+ * Noise-specific HMAC-BLAKE2b-64
+ *
+ * Daraltılmış primitive: sadece Noise HKDF için, sabit 64-byte digest,
+ * key ≤128. Generic RFC2104 değil. Key>128 fail-closed.
+ * İsim noise_hmac_blake2b_64 bilerek daraltıldı.
  *
  * HMAC(k, m) = BLAKE2b((k ⊕ opad) || BLAKE2b((k ⊕ ipad) || m))
- *
  * block_size = 128 byte (BLAKE2b için)
  */
 
@@ -257,7 +291,7 @@ void symmetric_mix_hash(struct noise_symmetric_state *ss, const uint8_t *data,
 
 // Real attack surface in practice: HMAC-BLAKE2b (key>128 fail-closed)
 __attribute__((strub)) static nox_err_t
-hmac_blake2b(const uint8_t *key, size_t key_len, const uint8_t *data,
+noise_hmac_blake2b_64(const uint8_t *key, size_t key_len, const uint8_t *data,
              size_t data_len, uint8_t out[NOISE_HASHLEN]) {
   uint8_t *k = sodium_malloc(BLAKE2B_BLOCK_SIZE);
   uint8_t *ipad = sodium_malloc(BLAKE2B_BLOCK_SIZE);
@@ -288,9 +322,9 @@ hmac_blake2b(const uint8_t *key, size_t key_len, const uint8_t *data,
   /* 1. key normalize */
   memset(k, 0, BLAKE2B_BLOCK_SIZE);
   if (key_len > BLAKE2B_BLOCK_SIZE) {
-    assert(0 && "hmac_blake2b: key > BLAKE2B_BLOCK_SIZE");
+    assert(0 && "noise_hmac_blake2b_64: key > BLAKE2B_BLOCK_SIZE");
     NOX_ERROR(LOG_MOD_NOISE,
-              "hmac_blake2b: beklenmeyen büyük key (%zu byte)", key_len);
+              "noise_hmac_blake2b_64: beklenmeyen büyük key (%zu byte)", key_len);
     sodium_memzero(k, BLAKE2B_BLOCK_SIZE);
     sodium_free(k); sodium_free(ipad); sodium_free(opad); sodium_free(inner);
     sodium_memzero(out, NOISE_HASHLEN);
@@ -340,6 +374,7 @@ hmac_blake2b(const uint8_t *key, size_t key_len, const uint8_t *data,
 
 // Real attack surface in practice: key derivation (HMAC, temp_key)
 __attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 static nox_err_t hkdf_blake2b(const uint8_t ck[NOISE_HASHLEN],
                               const uint8_t *ikm, size_t ikm_len,
                               uint8_t out1[NOISE_HASHLEN],
@@ -364,19 +399,19 @@ static nox_err_t hkdf_blake2b(const uint8_t ck[NOISE_HASHLEN],
   }
 
   /* temp_key = HMAC-BLAKE2b(ck, ikm) */
-  err = hmac_blake2b(ck, NOISE_HASHLEN, ikm, ikm_len, temp_key);
+  err = noise_hmac_blake2b_64(ck, NOISE_HASHLEN, ikm, ikm_len, temp_key);
   if (err != NOX_OK)
     goto cleanup;
 
   /* output1 = HMAC-BLAKE2b(temp_key, 0x01) */
-  err = hmac_blake2b(temp_key, NOISE_HASHLEN, &byte_01, 1, out1);
+  err = noise_hmac_blake2b_64(temp_key, NOISE_HASHLEN, &byte_01, 1, out1);
   if (err != NOX_OK)
     goto cleanup;
 
   /* output2 = HMAC-BLAKE2b(temp_key, output1 || 0x02) */
   memcpy(buf, out1, NOISE_HASHLEN);
   buf[NOISE_HASHLEN] = 0x02;
-  err = hmac_blake2b(temp_key, NOISE_HASHLEN, buf, NOISE_HASHLEN + 1, out2);
+  err = noise_hmac_blake2b_64(temp_key, NOISE_HASHLEN, buf, NOISE_HASHLEN + 1, out2);
 
 cleanup:
   sodium_free(temp_key);
@@ -419,6 +454,7 @@ __attribute__((strub)) nox_err_t symmetric_mix_key(struct noise_symmetric_state 
  *   return ciphertext
  */
  __attribute__((strub)) 
+ __attribute__((optimize("harden-control-flow-redundancy")))
 ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *plaintext, size_t pt_len,
                                    uint8_t *out) {
@@ -433,6 +469,7 @@ ssize_t symmetric_encrypt_and_hash(struct noise_symmetric_state *ss,
 
 // Real attack surface in practice: untrusted ciphertext → h wipe on fail
 __attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
                                    const uint8_t *ciphertext, size_t ct_len,
                                    uint8_t *out, size_t out_cap) {
@@ -569,6 +606,7 @@ __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *s
 
 // Real attack surface in practice: small-subgroup/weak key (contributory)
 __attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 static nox_err_t noise_dh(uint8_t out[NOX_KEY_LEN],
                           const uint8_t priv[NOX_KEY_LEN],
                           const uint8_t pub[NOX_KEY_LEN]) {
@@ -598,6 +636,7 @@ static nox_err_t noise_dh(uint8_t out[NOX_KEY_LEN],
 }
 
 __attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
                          const uint8_t s_priv[NOX_KEY_LEN],
                          const uint8_t s_pub[NOX_KEY_LEN]) {
@@ -627,12 +666,14 @@ nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
 }
 
 /* --- msg0: → e --- */
+__attribute__((strub))
 static nox_err_t write_msg0(struct noise_handshake *hs, const uint8_t *payload,
                             size_t pl_len, uint8_t *out, size_t *out_len) {
   size_t offset = 0;
 
-  /* H-5 FIX: msg0 = 32 (e) + pl_len + 16 (MAC) — *out_len kapasitedir */
-  if (NOX_KEY_LEN + pl_len + 16U > *out_len)
+  /* H-5 FIX: msg0 = 32 (e) + pl_len — MAC yok: bu noktada has_key=false,
+   * cipher_encrypt pass-through yapar (Noise XX: ilk payload plaintext). */
+  if (NOX_KEY_LEN + pl_len > *out_len)
     return NOX_ERR_PROTO;
 
   /* Generate ephemeral key pair */
@@ -663,6 +704,7 @@ static nox_err_t write_msg0(struct noise_handshake *hs, const uint8_t *payload,
 }
 
 /* --- msg1: ← e, ee, s, es --- */
+__attribute__((strub))
 static nox_err_t write_msg1(struct noise_handshake *hs, const uint8_t *payload,
                             size_t pl_len, uint8_t *out, size_t *out_len) {
   size_t offset = 0;
@@ -670,7 +712,7 @@ static nox_err_t write_msg1(struct noise_handshake *hs, const uint8_t *payload,
   nox_err_t err;
 
   /* H-5 FIX: msg1 → 32 (e) + 48 (s_pub+MAC) + pl_len + 16 (MAC) = 96 + pl_len */
-  if (NOX_KEY_LEN + NOX_KEY_LEN + 16U + pl_len + 16U > *out_len)
+  if (NOX_KEY_LEN + NOX_KEY_LEN + NOX_MAC_LEN + pl_len + NOX_MAC_LEN > *out_len)
     return NOX_ERR_PROTO;
 
   /* Generate ephemeral key pair */
@@ -724,10 +766,13 @@ static nox_err_t write_msg1(struct noise_handshake *hs, const uint8_t *payload,
   offset += (size_t)ct;
 
   *out_len = offset;
+  /* Responder static private son kullanımı es DH idi — RAM yaşam süresini kısalt */
+  sodium_memzero(hs->s, NOX_KEY_LEN);
   return NOX_OK;
 }
 
 /* --- msg2: → s, se --- */
+__attribute__((strub))
 static nox_err_t write_msg2(struct noise_handshake *hs, const uint8_t *payload,
                             size_t pl_len, uint8_t *out, size_t *out_len) {
   size_t offset = 0;
@@ -735,7 +780,7 @@ static nox_err_t write_msg2(struct noise_handshake *hs, const uint8_t *payload,
   nox_err_t err;
 
   /* H-5 FIX: msg2 → 48 (s_pub+MAC) + pl_len + 16 (MAC) = 64 + pl_len */
-  if (NOX_KEY_LEN + 16U + pl_len + 16U > *out_len)
+  if (NOX_KEY_LEN + NOX_MAC_LEN + pl_len + NOX_MAC_LEN > *out_len)
     return NOX_ERR_PROTO;
 
   /* s: EncryptAndHash(s_pub) */
@@ -762,11 +807,14 @@ static nox_err_t write_msg2(struct noise_handshake *hs, const uint8_t *payload,
   offset += (size_t)ct;
 
   *out_len = offset;
+  /* Initiator static private son kullanımı se DH idi — RAM yaşam süresini kısalt */
+  sodium_memzero(hs->s, NOX_KEY_LEN);
   return NOX_OK;
 }
 
 // Real attack surface in practice: handshake response (local priv, peer re)
-__attribute__((optimize("harden-control-flow-redundancy"))) /* GCC security attributes: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html */ 
+__attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))  
 nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
                           size_t pl_len, uint8_t *out, size_t *out_len) {
   if (!hs || !out || !out_len)
@@ -809,11 +857,20 @@ nox_err_t handshake_write(struct noise_handshake *hs, const uint8_t *payload,
     hs->msg_index++;
   } else {
     hs->failed = true;
+    sodium_memzero(hs->e, NOX_KEY_LEN);
+    sodium_memzero(hs->e_pub, NOX_KEY_LEN);
+    sodium_memzero(hs->s, NOX_KEY_LEN);
+    sodium_memzero(hs->s_pub, NOX_KEY_LEN);
+    sodium_memzero(hs->re, NOX_KEY_LEN);
+    sodium_memzero(hs->rs, NOX_KEY_LEN);
+    sodium_memzero(hs->ss.ck, sizeof(hs->ss.ck));
+    sodium_memzero(hs->ss.cs.k, sizeof(hs->ss.cs.k));
   }
   return err;
 }
 
 /* --- read msg0: → e --- */
+__attribute__((strub))
 // Real attack surface in practice: untrusted →e (MixHash, no key)
 static nox_err_t read_msg0(struct noise_handshake *hs, const uint8_t *msg,
                            size_t msg_len, uint8_t *payload_out,
@@ -839,6 +896,8 @@ static nox_err_t read_msg0(struct noise_handshake *hs, const uint8_t *msg,
 }
 
 /* --- read msg1: ← e, ee, s, es --- */
+__attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 // Real attack surface in practice: untrusted ←e,ee,s,es (DH, MixKey)
 static nox_err_t read_msg1(struct noise_handshake *hs, const uint8_t *msg,
                            size_t msg_len, uint8_t *payload_out,
@@ -893,6 +952,7 @@ static nox_err_t read_msg1(struct noise_handshake *hs, const uint8_t *msg,
 }
 
 /* --- read msg2: → s, se --- */
+__attribute__((strub))
 // Real attack surface in practice: untrusted →s,se (DH, MixKey)
 static nox_err_t read_msg2(struct noise_handshake *hs, const uint8_t *msg,
                            size_t msg_len, uint8_t *payload_out,
@@ -932,6 +992,7 @@ static nox_err_t read_msg2(struct noise_handshake *hs, const uint8_t *msg,
 }
 
 // Real attack surface in practice: untrusted handshake payload (msg_index<3)
+__attribute__((strub))
 __attribute__((optimize("harden-control-flow-redundancy")))
 nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
                          size_t msg_len, uint8_t *payload_out, size_t out_cap,
@@ -976,6 +1037,14 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
     hs->msg_index++;
   } else {
     hs->failed = true;
+    sodium_memzero(hs->e, NOX_KEY_LEN);
+    sodium_memzero(hs->e_pub, NOX_KEY_LEN);
+    sodium_memzero(hs->s, NOX_KEY_LEN);
+    sodium_memzero(hs->s_pub, NOX_KEY_LEN);
+    sodium_memzero(hs->re, NOX_KEY_LEN);
+    sodium_memzero(hs->rs, NOX_KEY_LEN);
+    sodium_memzero(hs->ss.ck, sizeof(hs->ss.ck));  
+    sodium_memzero(hs->ss.cs.k, sizeof(hs->ss.cs.k));
   }
   return err;
 }
@@ -1004,6 +1073,11 @@ nox_err_t handshake_split(struct noise_handshake *hs,
   }
   if (err != NOX_OK) {
     hs->failed = true;
+    sodium_memzero(hs->e, NOX_KEY_LEN);
+    sodium_memzero(hs->e_pub, NOX_KEY_LEN);
+    sodium_memzero(hs->s, NOX_KEY_LEN);
+    sodium_memzero(hs->ss.ck, sizeof(hs->ss.ck));
+    sodium_memzero(hs->ss.cs.k, sizeof(hs->ss.cs.k));
     return err;
   }
 
@@ -1030,9 +1104,14 @@ nox_err_t handshake_split(struct noise_handshake *hs,
 
 // Real attack surface in practice: local plaintext (transport, strub)
 __attribute__((strub))
+__attribute__((optimize("harden-control-flow-redundancy")))
 ssize_t noise_encrypt(struct noise_session *session, const uint8_t *plaintext,
                       size_t pt_len, uint8_t *out) {
   if (!session || !out)
+    return -1;
+  if (pt_len > NOX_MAX_MSG_LEN)
+    return -1;
+  if (pt_len > 0 && !plaintext)
     return -1;
   return cipher_encrypt(&session->tx, NULL, 0, plaintext, pt_len, out);
 }
@@ -1042,6 +1121,12 @@ __attribute__((strub))
 ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ciphertext,
                       size_t ct_len, uint8_t *out) {
   if (!session || !out)
+    return -1;
+  if (ct_len > NOISE_MAX_PAYLOAD_LEN)
+    return -1;
+  if (ct_len < NOX_MAC_LEN)
+    return -1;
+  if (ct_len > 0 && !ciphertext)
     return -1;
   return cipher_decrypt(&session->rx, NULL, 0, ciphertext, ct_len, out);
 }

@@ -621,6 +621,7 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             NOX_WARN(LOG_MOD_MAIN, "METADATA hash sıfır — sahte/bozuk frame reddedildi");
             ui_print_error(state, "Gelen METADATA reddedildi (geçersiz hash)");
             explicit_bzero(file_hash, sizeof(file_hash));
+            sodium_free(pt);
             return true;
           }
 

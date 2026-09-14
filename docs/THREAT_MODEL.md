@@ -905,12 +905,12 @@ Noxtor-verifiable property.
     noise_handshake))` followed by `sodium_free(ps->hs)` whenever `ps->hs`
     is non-NULL — covering the whole handshake struct (not just `e`),
     belt-and-suspenders on top of libsodium's own zero-on-free. No gap.
-  - `hmac_blake2b` doesn't implement the RFC 2104 "hash the key down if
+  - `noise_hmac_blake2b_64` (ex-`hmac_blake2b`) doesn't implement the RFC 2104 "hash the key down if
     it's longer than the block size" step — it rejects such keys outright.
     Harmless today since every call site passes a fixed 64-byte key
     (well under the 128-byte block size), but this makes the helper
     unsafe to repurpose as a general HMAC primitive without revisiting
-    that path first.
+    that path first. Renamed to `noise_hmac_blake2b_64` to signal non-generic, fixed-64 digest.
   - **Cross-cutting pattern worth naming explicitly:** `ui.c` (`g_theme`),
     `database.c` (`pthread_mutex_t` + unused `key_generation`), and now
     `noise.c` (`_Atomic` nonce counters) all show the same shape —

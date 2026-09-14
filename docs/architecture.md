@@ -1026,7 +1026,7 @@ RX §3 — event_loop() → peer_fd EPOLLIN [event_loop.c:721]
    │  │                                └─ EV_TOFU_REJECTED → action_cleanup [240] → ST_IDLE
    │  ├─ read_msg0 [805] → symmetric_mix_hash [226] → crypto_generichash_blake2b_* (sodium, leaf)
    │  │                 └─ symmetric_decrypt_and_hash [427] → cipher_decrypt [144] → encode_nonce [80]
-   │  ├─ read_msg1 [829] → symmetric_mix_hash(re) → noise_dh(e,re) [561] → symmetric_mix_key(ee) [392] → hkdf_blake2b [336] → hmac_blake2b [253]
+    │  ├─ read_msg1 [829] → symmetric_mix_hash(re) → noise_dh(e,re) [561] → symmetric_mix_key(ee) [392] → hkdf_blake2b [336] → noise_hmac_blake2b_64 [253]
    │  │                 → symmetric_decrypt_and_hash(s) → noise_dh(e,rs) → symmetric_mix_key(es) → symmetric_decrypt_and_hash(payload)
    │  ├─ read_msg2 [882] → symmetric_decrypt_and_hash(s) → noise_dh(e,rs) → symmetric_mix_key(se) → symmetric_decrypt_and_hash(payload)
    │  └─ handshake_split [974] → symmetric_split [505] → hkdf→hmac (sodium)

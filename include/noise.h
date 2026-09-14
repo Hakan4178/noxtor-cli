@@ -39,7 +39,9 @@
  * cipher_init — CipherState sıfırla
  * cipher_init_key — Key ile başlat (handshake sonunda çağrılır)
  */
+__attribute__((strub))
 void cipher_init(struct noise_cipher_state *cs);
+__attribute__((strub))
 void cipher_init_key(struct noise_cipher_state *cs,
                      const uint8_t key[NOX_KEY_LEN]);
 
@@ -81,6 +83,7 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs,
  *
  * Protocol name hash → h, ck
  */
+__attribute__((strub))
 void symmetric_init(struct noise_symmetric_state *ss,
                     const char *protocol_name);
 
@@ -142,6 +145,7 @@ nox_err_t handshake_init(struct noise_handshake *hs,
  *
  * Return: NOX_OK, NOX_ERR_PROTO (yanlış sıra), NOX_ERR_OVERFLOW
  */
+__attribute__((strub))
 nox_err_t handshake_write(struct noise_handshake *hs,
                           const uint8_t *payload, size_t pl_len,
                           uint8_t *out, size_t *out_len);
@@ -158,6 +162,7 @@ nox_err_t handshake_write(struct noise_handshake *hs,
  *
  * Return: NOX_OK, NOX_ERR_AUTH (MAC hatası), NOX_ERR_PROTO
  */
+__attribute__((strub))
 nox_err_t handshake_read(struct noise_handshake *hs,
                          const uint8_t *msg, size_t msg_len,
                          uint8_t *payload_out, size_t out_cap,
