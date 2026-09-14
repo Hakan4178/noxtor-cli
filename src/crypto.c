@@ -572,9 +572,9 @@ cleanup:
     /* [P6] Tek noktadan temizleme */
     if (sk)
         sodium_free(sk);                              /* sk — sodium heap */
-    explicit_bzero(ciphertext, sizeof(ciphertext));
-    explicit_bzero(nonce,      sizeof(nonce));
-    explicit_bzero(pk,         sizeof(pk));
+    sodium_memzero(ciphertext, sizeof(ciphertext));
+    sodium_memzero(nonce,      sizeof(nonce));
+    sodium_memzero(pk,         sizeof(pk));
     memory_barrier();
 
     return ret;

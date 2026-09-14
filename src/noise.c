@@ -1076,6 +1076,9 @@ nox_err_t handshake_split(struct noise_handshake *hs,
     sodium_memzero(hs->e, NOX_KEY_LEN);
     sodium_memzero(hs->e_pub, NOX_KEY_LEN);
     sodium_memzero(hs->s, NOX_KEY_LEN);
+    sodium_memzero(hs->s_pub, NOX_KEY_LEN);
+    sodium_memzero(hs->re, NOX_KEY_LEN);
+    sodium_memzero(hs->rs, NOX_KEY_LEN);
     sodium_memzero(hs->ss.ck, sizeof(hs->ss.ck));
     sodium_memzero(hs->ss.cs.k, sizeof(hs->ss.cs.k));
     return err;

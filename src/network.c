@@ -1185,7 +1185,7 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
   close(fd);
   if (err != NOX_OK) {
     NOX_ERROR(LOG_MOD_NET, "cookie okuma hatası");
-    explicit_bzero(cookie, sizeof(cookie));
+    sodium_memzero(cookie, sizeof(cookie));
     return NOX_ERR_TOR;
   }
 
@@ -1211,10 +1211,10 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir) {
   cmd[pos++] = '\n';
   cmd[pos] = '\0';
 
-  explicit_bzero(cookie, sizeof(cookie));
+  sodium_memzero(cookie, sizeof(cookie));
 
   err = ctrl_send_command(ctrl_fd, cmd);
-  explicit_bzero(cmd, sizeof(cmd));
+  sodium_memzero(cmd, sizeof(cmd));
   if (err != NOX_OK)
     return err;
 
@@ -1376,8 +1376,8 @@ __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *list
   NOX_INFO(LOG_MOD_NET, "Hidden Service (ghost): %s", onion_out);
 
 cleanup:
-  explicit_bzero(cmd, sizeof(cmd));
-  explicit_bzero(resp, sizeof(resp));
+  sodium_memzero(cmd, sizeof(cmd));
+  sodium_memzero(resp, sizeof(resp));
   return err;
 }
 
@@ -1458,8 +1458,8 @@ cleanup:
   sodium_memzero(pub, sizeof(pub));          /* Q3: pub da sıfırlanır */
   sodium_memzero(expanded_sk, sizeof(expanded_sk));
   sodium_memzero(b64_key, sizeof(b64_key));
-  explicit_bzero(cmd, sizeof(cmd));
-  explicit_bzero(resp, sizeof(resp));
+  sodium_memzero(cmd, sizeof(cmd));
+  sodium_memzero(resp, sizeof(resp));
   NOX_DEBUG(LOG_MOD_NET,
             "onion materyali bellekten silindi (seed, pub, expanded, b64)");
   return err;

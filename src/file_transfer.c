@@ -187,7 +187,7 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
     bname_len = sizeof(safe_name) - 1;
   memcpy(safe_name, bname, bname_len);
   safe_name[bname_len] = '\0';
-  explicit_bzero(path_copy, sizeof(path_copy));
+  sodium_memzero(path_copy, sizeof(path_copy));
 
   /* Streaming BLAKE2b hash — dosyayı 4KB parçalarla hash'le
    * C-6 FIX: Hash'e file_size'ı dahil et — boyut yalan söylenirse hash uyuşmaz */
@@ -206,11 +206,11 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   size_buf[6] = (uint8_t)(fsize >> 8);  size_buf[7] = (uint8_t)(fsize);
   if (crypto_generichash_update(&hash_st, size_buf, 8) != 0) {
     ui_print_error(state, "Hash güncellenemedi");
-    explicit_bzero(size_buf, sizeof(size_buf));
+    sodium_memzero(size_buf, sizeof(size_buf));
     close(file_fd);
     return;
   }
-  explicit_bzero(size_buf, sizeof(size_buf));
+  sodium_memzero(size_buf, sizeof(size_buf));
 
   uint8_t hash_buf[4096];
   for (;;) {
@@ -219,7 +219,7 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
       if (errno == EINTR)
         continue;
       ui_print_error(state, "Dosya okuma hatası: %s", strerror(errno));
-      explicit_bzero(hash_buf, sizeof(hash_buf));
+      sodium_memzero(hash_buf, sizeof(hash_buf));
       close(file_fd);
       return;
     }
@@ -227,17 +227,17 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
       break;
     if (crypto_generichash_update(&hash_st, hash_buf, (size_t)r) != 0) {
       ui_print_error(state, "Hash güncellenemedi");
-      explicit_bzero(hash_buf, sizeof(hash_buf));
+      sodium_memzero(hash_buf, sizeof(hash_buf));
       close(file_fd);
       return;
     }
   }
-  explicit_bzero(hash_buf, sizeof(hash_buf));
+  sodium_memzero(hash_buf, sizeof(hash_buf));
 
   uint8_t file_hash[32];
   if (crypto_generichash_final(&hash_st, file_hash, 32) != 0) {
     ui_print_error(state, "Hash tamamlanamadı");
-    explicit_bzero(file_hash, sizeof(file_hash));
+    sodium_memzero(file_hash, sizeof(file_hash));
     close(file_fd);
     return;
   }
@@ -245,13 +245,13 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   /* Dosya başına geri sar */
   if (lseek(file_fd, 0, SEEK_SET) == (off_t)-1) {
     ui_print_error(state, "Dosya işaretçisi sıfırlanamadı: %s", strerror(errno));
-    explicit_bzero(file_hash, sizeof(file_hash));
+    sodium_memzero(file_hash, sizeof(file_hash));
     close(file_fd);
     return;
   }
 
   /* tx_file state'ini kur */
-  explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+  sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
   ps->tx_file.active = true;
   ps->tx_file.fd = file_fd;
   ps->tx_file.total_size = (uint64_t)st.st_size;
@@ -265,7 +265,7 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   if (!ps->tx_file.plain_buf) {
     ui_print_error(state, "Bellek tahsisi başarısız");
     close(file_fd);
-    explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+    sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
     ps->tx_file.fd = -1;
     return;
   }
@@ -289,19 +289,19 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   meta[271] = (uint8_t)(net_size >> 8);
   meta[272] = (uint8_t)(net_size);
   memcpy(meta + 273, ps->tx_file.hash, 32);
-  explicit_bzero(file_hash, sizeof(file_hash));
+  sodium_memzero(file_hash, sizeof(file_hash));
 
   /* Şifrele ve gönder */
   uint8_t meta_ct[305 + NOX_MAC_LEN];
   ssize_t meta_ct_len =
       noise_encrypt(ps->session, meta, sizeof(meta), meta_ct);
-  explicit_bzero(meta, sizeof(meta));
+  sodium_memzero(meta, sizeof(meta));
   if (meta_ct_len < 0) {
     ui_print_error(state, "Metadata şifreleme hatası.");
-    explicit_bzero(meta_ct, sizeof(meta_ct));
+    sodium_memzero(meta_ct, sizeof(meta_ct));
     close(file_fd);
     sodium_free(ps->tx_file.plain_buf);
-    explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+    sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
     ps->tx_file.fd = -1;
     return;
   }
@@ -322,15 +322,15 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   ssize_t written = writev(ps->fd, iov, 2);
   if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)meta_ct_len)) {
     ui_print_error(state, "Metadata gönderim hatası.");
-    explicit_bzero(meta_ct, sizeof(meta_ct));
+    sodium_memzero(meta_ct, sizeof(meta_ct));
     close(file_fd);
     sodium_free(ps->tx_file.plain_buf);
-    explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+    sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
     ps->tx_file.fd = -1;
     return;
   }
   ps->tx_seq++;
-  explicit_bzero(meta_ct, sizeof(meta_ct));
+  sodium_memzero(meta_ct, sizeof(meta_ct));
 
   /* peer_fd'yi EPOLLIN | EPOLLOUT olarak değiştir */
   epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN | EPOLLOUT);
@@ -369,7 +369,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
                           (unsigned long)ps->tx_file.total_size);
           close(ps->tx_file.fd);
           sodium_free(ps->tx_file.plain_buf);
-          explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+          sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
           ps->tx_file.fd = -1;
           epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
         } else {
@@ -382,7 +382,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
       ui_print_error(state, "Dosya gönderimi koptu (%s)", w == 0 ? "write returned 0" : strerror(errno));
       close(ps->tx_file.fd);
       sodium_free(ps->tx_file.plain_buf);
-      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
       ps->tx_file.fd = -1;
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
     }
@@ -400,7 +400,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
       NOX_WARN(LOG_MOD_MAIN, "TX remaining 0 ama active — desync, abort");
       close(ps->tx_file.fd);
       sodium_free(ps->tx_file.plain_buf);
-      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
       ps->tx_file.fd = -1;
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
       return;
@@ -415,7 +415,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
         ui_print_error(state, "Chunk boyutu tx_buf kapasitesini aşıyor");
       close(ps->tx_file.fd);
       sodium_free(ps->tx_file.plain_buf);
-      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
       ps->tx_file.fd = -1;
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
       return;
@@ -441,7 +441,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
         ui_print_error(state, "Chunk şifreleme başarısız");
         close(ps->tx_file.fd);
         sodium_free(ps->tx_file.plain_buf);
-        explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+        sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
         ps->tx_file.fd = -1;
         epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
       }
@@ -451,14 +451,14 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
       ui_print_error(state, "Dosya gönderim sırasında kısaldı — transfer iptal");
       close(ps->tx_file.fd);
       sodium_free(ps->tx_file.plain_buf);
-      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
       ps->tx_file.fd = -1;
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
     } else if (r < 0 && errno != EINTR) {
       ui_print_error(state, "Yerel dosya okuma başarısız");
       close(ps->tx_file.fd);
       sodium_free(ps->tx_file.plain_buf);
-      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
       ps->tx_file.fd = -1;
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
     }
@@ -620,14 +620,14 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
           if (sodium_is_zero(file_hash, 32)) {
             NOX_WARN(LOG_MOD_MAIN, "METADATA hash sıfır — sahte/bozuk frame reddedildi");
             ui_print_error(state, "Gelen METADATA reddedildi (geçersiz hash)");
-            explicit_bzero(file_hash, sizeof(file_hash));
+            sodium_memzero(file_hash, sizeof(file_hash));
             sodium_free(pt);
             return true;
           }
 
           int file_fd = -1;
-          /* Bzero öncesi: open_recv_file local_name'i temiz struct'a yazar */
-          explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+          /* Memzero öncesi: open_recv_file local_name'i temiz struct'a yazar */
+          sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
           nox_err_t err = open_recv_file(state, ps, safe_name, &file_fd);
           if (err == NOX_OK && file_fd >= 0) {
             ps->rx_file.active = true;
@@ -644,7 +644,7 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             if (crypto_generichash_init(&ps->rx_file.hash_state, NULL, 0, 32) != 0) {
               ui_print_error(state, "Hash state başlatılamadı");
               close(file_fd);
-              explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+              sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
               ps->rx_file.fd = -1;
               sm_dispatch(ps, state, EV_FILE_DONE);
               sodium_free(pt);
@@ -659,15 +659,15 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             size_hdr[6] = (uint8_t)(net_size >> 8);  size_hdr[7] = (uint8_t)(net_size);
             if (crypto_generichash_update(&ps->rx_file.hash_state, size_hdr, 8) != 0) {
               ui_print_error(state, "Hash güncellenemedi");
-              explicit_bzero(size_hdr, sizeof(size_hdr));
+              sodium_memzero(size_hdr, sizeof(size_hdr));
               close(file_fd);
-              explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+              sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
               ps->rx_file.fd = -1;
               sm_dispatch(ps, state, EV_FILE_DONE);
               sodium_free(pt);
               return true;
             }
-            explicit_bzero(size_hdr, sizeof(size_hdr));
+            sodium_memzero(size_hdr, sizeof(size_hdr));
 
             ui_print_system(state, "[⬇] Gelen dosya: %s (%lu byte)", safe_name,
                             (unsigned long)net_size);
@@ -718,7 +718,7 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
         sodium_free(pt);
         unlinkat(state->downloads_dir_fd, ps->rx_file.local_name, 0);
         if (ps->rx_file.fd >= 0) { close(ps->rx_file.fd); ps->rx_file.fd = -1; }
-        explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+        sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
         ps->rx_file.fd = -1;
         sm_dispatch(ps, state, EV_FILE_DONE);
         return true;
@@ -747,8 +747,8 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
         ui_print_error(state, "HATA: Alinan dosyanin (%s) hash'i uyusmuyor!", ps->rx_file.filename);
       }
 
-      explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
-      /* A-1 FIX: fd'yi -1 yap (explicit_bzero sonrası 0 olur) */
+      sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
+      /* A-1 FIX: fd'yi -1 yap (sodium_memzero sonrası 0 olur) */
       ps->rx_file.fd = -1;
       sm_dispatch(ps, state, EV_FILE_DONE);
     } else {
@@ -772,7 +772,7 @@ rx_abort:
     unlinkat(state->downloads_dir_fd, ps->rx_file.local_name, 0);
   }
   ui_print_error(state, "Transfer iptal edildi ve yarım kalan dosya silindi.");
-  explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+  sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
   ps->rx_file.fd = -1;
   sm_dispatch(ps, state, EV_FILE_DONE);
   sodium_free(pt);
@@ -795,7 +795,7 @@ void file_transfer_cleanup(struct app_state *state) {
       if (ps->tx_file.plain_buf) {
         sodium_free(ps->tx_file.plain_buf);
       }
-      explicit_bzero(&ps->tx_file, sizeof(ps->tx_file));
+      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
       ps->tx_file.fd = -1;
       ui_print_error(state, "Bağlantı koptuğu için dosya gönderimi iptal edildi.");
     }
@@ -808,7 +808,7 @@ void file_transfer_cleanup(struct app_state *state) {
       if (state->downloads_dir_fd >= 0 && ps->rx_file.local_name[0] != '\0') {
         unlinkat(state->downloads_dir_fd, ps->rx_file.local_name, 0);
       }
-      explicit_bzero(&ps->rx_file, sizeof(ps->rx_file));
+      sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
       ps->rx_file.fd = -1;
       ui_print_error(state, "Bağlantı koptuğu için dosya alımı iptal edildi ve yarım kalan dosya silindi.");
     }

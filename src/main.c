@@ -822,7 +822,7 @@ int main(int argc, char *argv[]) {
             : -1;
         if (fd >= 0) {
           uint8_t zeros[256];
-          explicit_bzero(zeros, sizeof(zeros));
+          sodium_memzero(zeros, sizeof(zeros));
           off_t remaining = st.st_size;
           while (remaining > 0) {
             size_t chunk = (size_t)remaining < sizeof(zeros) ? (size_t)remaining
