@@ -127,6 +127,15 @@ Please report vulnerabilities responsibly.
 - 0 errors under ASan / UBSan / -fanalyzer ✅
 - All parsers handling external input have been fuzz-tested ✅
 - Sensitive memory is actively wiped after use ✅
+- Handshake claim is signed with the onion Ed25519 key and the
+  public key is recovered from the v3 address (checksum enforced);
+  outbound connections additionally require the claim to equal the
+  dialed target, peer identity is no longer self-asserted ✅
+
+> **⚠️ Breaking (protocol):** the handshake claim payload is now
+> `[0x01 | onion(62) | sig(64)] = 127 bytes`. Older builds sending the
+> legacy 63-byte payload are **not** interoperable and are disconnected
+> cleanly at handshake (hard cut — beta decision, no legacy code path).
 
 **What hasn't been done yet:**
 - Independent third-party audit

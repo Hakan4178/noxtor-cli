@@ -550,6 +550,13 @@ static void cleanup(struct app_state *state) {
   state->db_key = NULL;
   state->session_key = NULL;
 
+  /* H-1/H-2: onion seed — arena DIŞI sodium_malloc (mlock+guard page).
+   * sodium_free wipe + munlock + guard page iadesi yapar. */
+  if (state->my_onion_seed) {
+    sodium_free(state->my_onion_seed);
+    state->my_onion_seed = NULL;
+  }
+
   /* Dosya transferi temizliği — peers CANLIYKEN yapılmalı:
    * tx_file.active/rx_file.active state'leri okunur; sonraki peer
    * loop'u state'leri sıfırlar (memzero). Bu sıra bozulursa yarım
@@ -1107,7 +1114,8 @@ int main(int argc, char *argv[]) {
 
     if (state.ghost_mode) {
       /* Ghost: master_key bundan sonra hiçbir yerde kullanılmıyor (HS
-       * NEW:ED25519-V3 — deterministik türetme yok) — en erken sil. */
+       * artık app-üretim RASTGELE seed kullanır — H-1/H-2, deterministik
+       * master_key türetmesi yok) — en erken sil. */
       sodium_memzero(state.master_key, NOX_KEY_LEN);
       memory_barrier();
       state.master_key = NULL;
@@ -1371,13 +1379,26 @@ int main(int argc, char *argv[]) {
         NOX_EXIT(1);
       }
 
-      /* HS — ghost: NEW + DiscardPK (her açılışta farklı adres, key hiçbir
-       * yerde — ne diskte ne client'ta). Normal: master_key'den deterministik
+      /* H-1/H-2: onion seed — handshake claim imzasının Ed25519 tohumu.
+       * sodium_malloc (mlock + guard page), ARENA DIŞI: arena Tor ölümünde
+       * yıkılır ama seed onion kimliğinin özüdür — cleanup'a kadar yaşar
+       * (Tor-death yolunda event_loop ayrıca sodium_free eder). */
+      state.my_onion_seed = sodium_malloc(32);
+      if (!state.my_onion_seed) {
+        NOX_FATAL(LOG_MOD_MAIN, "bellek tahsisi başarısız (onion seed)");
+        cleanup(&state);
+        NOX_EXIT(1);
+      }
+      sodium_memzero(state.my_onion_seed, 32);
+
+      /* HS — ghost: app-üretim RASTGELE seed (her açılışta farklı adres,
+       * seed sadece bellekte). Normal: master_key'den deterministik
        * türetme (her açılışta AYNI adres, onion.key dosyası YOK). */
       if (state.ghost_mode) {
         NOX_DEBUG(LOG_MOD_MAIN,
-                  "onion seed türetilmedi (ghost mod — key Tor'da, DiscardPK)");
+                  "ghost mod — rastgele onion seed app'de üretildi (H-1/H-2)");
         err = tor_create_new_hs(state.tor_ctrl_fd, state.listen_path,
+                                state.my_onion_seed,
                                 state.onion_addr, sizeof(state.onion_addr));
         if (err != NOX_OK) {
           if (g_shutdown) goto shutdown_clean;
@@ -1388,6 +1409,17 @@ int main(int argc, char *argv[]) {
         }
         NOX_INFO(LOG_MOD_MAIN, "adresiniz (geçici): %s", state.onion_addr);
       } else {
+        /* H-1/H-2: seed'i ÖNCE türet — master_key bundan sonra silinecek
+         * (aşağıda), crypto_derive_onion_seed KDF-only'dir (Argon2 değil). */
+        err = crypto_derive_onion_seed(state.my_onion_seed, state.master_key);
+        if (err != NOX_OK) {
+          if (g_shutdown) goto shutdown_clean;
+          NOX_FATAL(LOG_MOD_MAIN, "onion seed türetme başarısız: %s",
+                    nox_strerror(err));
+          cleanup(&state);
+          NOX_EXIT(1);
+        }
+
         err = tor_create_derived_hs(state.tor_ctrl_fd, state.listen_path,
                                     state.master_key,
                                     state.onion_addr, sizeof(state.onion_addr));
@@ -1406,6 +1438,30 @@ int main(int argc, char *argv[]) {
           NOX_EXIT(1);
         }
         NOX_INFO(LOG_MOD_MAIN, "adresiniz (kalıcı): %s", state.onion_addr);
+      }
+
+      /* H-1/H-2 STARTUP TUTARLILIK KONTROLÜ: seed ↔ onion_addr birebir
+       * aynı olmalı (Tor ServiceID = base32(pub(seed) || checksum || 03)).
+       * Değilse claim imzası asla doğrulanamaz — başlangıçta reddet
+       * (fail-closed), bağlantı kurulmadan önce. */
+      {
+        uint8_t exp_chk[64], seed_pub[32], addr_pub[32];
+        nox_err_t c_err =
+            derive_tor_expanded_key(exp_chk, seed_pub, state.my_onion_seed);
+        sodium_memzero(exp_chk, sizeof(exp_chk));
+        if (c_err == NOX_OK)
+          c_err = crypto_onion_pubkey(addr_pub, state.onion_addr);
+        bool match = (c_err == NOX_OK) &&
+                     (sodium_memcmp(seed_pub, addr_pub, NOX_KEY_LEN) == 0);
+        sodium_memzero(seed_pub, sizeof(seed_pub));
+        sodium_memzero(addr_pub, sizeof(addr_pub));
+        if (!match) {
+          NOX_FATAL(LOG_MOD_MAIN,
+                    "onion seed ↔ adres tutarsızlığı (H-1/H-2) — reddedildi");
+          cleanup(&state);
+          NOX_EXIT(1);
+        }
+        NOX_INFO(LOG_MOD_MAIN, "onion seed ↔ adres tutarlılığı doğrulandı");
       }
     }
 

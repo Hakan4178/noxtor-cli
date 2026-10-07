@@ -5,6 +5,7 @@
 #include "event_loop.h"
 #include "arena.h"
 #include "common.h"
+#include "crypto.h"
 #include "landlock_sandbox.h"
 #include "seccomp_policy.h"
 #include "ui.h"
@@ -43,6 +44,55 @@ static struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
             return ps;
     }
     return NULL;
+}
+
+/* ================================================================
+ * H-1/H-2: HANDSHAKE CLAIM PAYLOAD v1 — [ver | onion | sig]
+ *
+ * Her iki rol de msg2/msg3 payload'ına kendi claim'ini koyar:
+ * responder msg2'de (initiator bunu okuyup verify eder),
+ * initiator msg3'te (responder bunu okuyup verify eder).
+ *
+ * sig = Ed25519_Sign(onion_seed, "noxtor-bind-v1" || onion || my_static_pub)
+ * Verify eden taraf pubkey'i onion ADRESİNDEN çıkarır — self-asserted
+ * claim kriptografik olarak onion kimliğine bağlanır (H-1) ve adres
+ * checksum'ı zorunlu olur (H-2).
+ *
+ * Kapasite: 127B payload msg2'yi 223B'ye, msg3'ü 191B'ye çıkarır —
+ * NOISE_MAX_HANDSHAKE_LEN (256) içine derleme zamanında sığmalı.
+ * ================================================================ */
+NOX_STATIC_ASSERT(32 + 48 + NOX_HS_PAYLOAD_V1_LEN + NOX_MAC_LEN <=
+                      NOISE_MAX_HANDSHAKE_LEN,
+                  "msg2 (e||enc(s)||enc(payload)) 256B'ye sığmalı");
+NOX_STATIC_ASSERT(48 + NOX_HS_PAYLOAD_V1_LEN + NOX_MAC_LEN <=
+                      NOISE_MAX_HANDSHAKE_LEN,
+                  "msg3 (enc(s)||enc(payload)) 256B'ye sığmalı");
+
+static nox_err_t hs_build_claim_payload(uint8_t pl[NOX_HS_PAYLOAD_V1_LEN],
+                                        const struct app_state *state)
+{
+    if (!pl || !state)
+        return NOX_ERR_CRYPTO;
+    /* seed veya static pub yoksa imzalanamaz — fail-closed
+     * (örn. Tor-death sonrası; handshake_init return kontrolü de
+     * bu yolu kapatır) */
+    if (!state->my_onion_seed || !state->my_static_pub)
+        return NOX_ERR_STATE;
+
+    uint8_t sig[crypto_sign_BYTES];
+    nox_err_t err = crypto_onion_sign(sig, state->onion_addr,
+                                      state->my_static_pub,
+                                      state->my_onion_seed);
+    if (err != NOX_OK) {
+        sodium_memzero(sig, sizeof(sig));
+        return err;
+    }
+
+    pl[0] = NOX_HS_PAYLOAD_V1_VER;
+    memcpy(pl + 1, state->onion_addr, NOX_ONION_LEN);
+    memcpy(pl + 1 + NOX_ONION_LEN, sig, sizeof(sig));
+    sodium_memzero(sig, sizeof(sig));
+    return NOX_OK;
 }
 
 /* ================================================================
@@ -104,7 +154,10 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
      * → TOFU-PENDING bekleyen slot ölür. CTRL yalnızca handshake aktifken
      * (msg_index < 3) handshake'e verilir; fazlası sessizce düşürülür. */
     if (fh.type == NOX_MSG_CTRL && ps->hs && ps->hs->msg_index < 3) {
-      uint8_t pl[64];
+      /* H-1/H-2: claim payload v1 = 127 byte (eski 64'TEN BÜYÜK —
+       * handshake_read out_cap buradan gelir, küçük kalırsa decrypt
+       * başarısız olurdu). */
+      uint8_t pl[NOX_HS_PAYLOAD_V1_LEN];
       size_t pl_len = sizeof(pl);
       nox_err_t hs_err =
           handshake_read(ps->hs, payload, fh.len, pl, sizeof(pl), &pl_len);
@@ -123,9 +176,21 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
       if (ps->hs->msg_index < 3) {
         uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
         size_t hslen = sizeof(hsbuf);
+        /* H-1/H-2: claim payload v1 [ver|onion|sig] — imza başarısızsa
+         * handshake'i bitir (fail-closed, peer'a bilgi gitmez). */
+        uint8_t hs_pl[NOX_HS_PAYLOAD_V1_LEN];
+        nox_err_t claim_err = hs_build_claim_payload(hs_pl, state);
+        if (claim_err != NOX_OK) {
+          NOX_ERROR(LOG_MOD_NOISE,
+                    "claim payload imzalanamadı: %s", nox_strerror(claim_err));
+          ui_print_error(state, "Kimlik imzası oluşturulamadı");
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
+          sodium_free(payload);
+          break;
+        }
         nox_err_t hs_write_err = handshake_write(ps->hs,
-                            (const uint8_t *)state->onion_addr,
-                            NOX_ONION_LEN + 1, hsbuf, &hslen);
+                            hs_pl, NOX_HS_PAYLOAD_V1_LEN, hsbuf, &hslen);
+        sodium_memzero(hs_pl, sizeof(hs_pl));
         if (hs_write_err != NOX_OK) {
           NOX_ERROR(LOG_MOD_NOISE, "handshake_write hatası: %s",
                     nox_strerror(hs_write_err));
@@ -164,12 +229,18 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
         char peer_onion[NOX_ONION_LEN + 1];
         sodium_memzero(peer_onion, sizeof(peer_onion));
 
-        if (pl_len == NOX_ONION_LEN + 1 && pl[NOX_ONION_LEN] == '\0') {
-          memcpy(peer_onion, pl, NOX_ONION_LEN + 1);
+        /* H-1/H-2 HARD CUT: yalnızca v1 [ver|onion(62)|sig(64)] = 127B.
+         * Legacy (56+NUL / 63B) payload'ın HİÇBİR kod yolu yok — beta
+         * kararı: eski peer temiz disconnect alır. */
+        if (pl_len == NOX_HS_PAYLOAD_V1_LEN &&
+            pl[0] == NOX_HS_PAYLOAD_V1_VER) {
+          memcpy(peer_onion, pl + 1, NOX_ONION_LEN);
+          peer_onion[NOX_ONION_LEN] = '\0';
         } else {
           NOX_ERROR(LOG_MOD_NOISE,
-                    "Handshake payload geçersiz veya eksik");
-          ui_print_error(state, "Akran geçerli bir adres iletmedi");
+                    "Handshake payload geçersiz veya desteklenmeyen sürüm "
+                    "(len=%zu, beklenen %u)", pl_len, NOX_HS_PAYLOAD_V1_LEN);
+          ui_print_error(state, "Akran geçerli bir adres iletmedi (sürüm uyuşmuyor)");
           sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
           sodium_free(payload);
           continue;
@@ -178,6 +249,37 @@ static void process_peer_frames(struct peer_session *ps, struct app_state *state
         /* Terminal injection koruması — base32 charset dışı karakter engeli */
         if (!validate_onion_address(peer_onion)) {
           NOX_ERROR(LOG_MOD_NOISE, "Geçersiz onion adresi formatı (injection?)");
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
+          sodium_free(payload);
+          continue;
+        }
+
+        /* H-1: claim ↔ onion ↔ static key imza doğrulaması.
+         * pubkey onion ADRESİNDEN çıkarılır (checksum dahil, H-2);
+         * imza peer'ın hs->rs statik anahtarı üzerinden verify edilir.
+         * Başarısız → impersonation/MITM reddi, peer'a sıfır bilgi. */
+        if (crypto_onion_verify(pl + 1 + NOX_ONION_LEN, peer_onion,
+                                ps->hs->rs) != NOX_OK) {
+          NOX_ERROR(LOG_MOD_NOISE,
+                    "H-1: claim imzası doğrulanamadı — reddedildi (%.63s)",
+                    peer_onion);
+          ui_print_error(state, "Peer kimlik doğrulaması başarısız — bağlantı reddedildi");
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
+          sodium_free(payload);
+          continue;
+        }
+
+        /* H-1: OUTBOUND — dial hedefi ile claim birebir aynı OLMALI.
+         * Tor zaten dial edilen onion'un key'ini transport'ta doğruladı;
+         * burada sadece claim'in o hedefle tutarlılığını garantiliyoruz.
+         * Inbound'da connect_target boş → atlanır (imza yeterli). */
+        if (ps->connect_target[0] != '\0' &&
+            strcmp(peer_onion, ps->connect_target) != 0) {
+          NOX_ERROR(LOG_MOD_NOISE,
+                    "H-1: ONION MISMATCH (MITM) — dial=%.63s claim=%.63s",
+                    ps->connect_target, peer_onion);
+          ui_print_error(state,
+              "BAĞLANTI REDDEDİLDİ: onion adresi uyuşmuyor (MITM riski)");
           sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
           sodium_free(payload);
           continue;
@@ -691,6 +793,14 @@ void event_loop(struct app_state *state) {
         state->session_key = NULL;
         state->my_static_priv = NULL;
         state->my_static_pub = NULL;
+        /* H-1/H-2: onion seed de gitti — onion kimliği artık imzalanamaz,
+         * yeni handshake'ler fail-closed (hs_build_claim_payload
+         * NOX_ERR_STATE döner). cleanup()'ta sodium_free tekrar NULL
+         * görür (double-free yok). */
+        if (state->my_onion_seed) {
+          sodium_free(state->my_onion_seed);
+          state->my_onion_seed = NULL;
+        }
 
         ui_print_error(state,
           "Tor bağlantısı koptu — tüm anahtarlar silindi. "
@@ -801,9 +911,23 @@ void event_loop(struct app_state *state) {
             continue;
           }
 
-          handshake_init(listener_ps->hs, false,
-                 state->my_static_priv,
-                 state->my_static_pub);
+          /* H-1/H-2 (M-5): return kontrolü — Tor-death sonrası static
+           * key'ler NULL ise init başarısız; hs GARBAGE kalırdı ve
+           * msg1 msg_index'siz write'a giderdi. Fail-closed: slot'a
+           * hiç dokunmadan reddet (state hâlâ ST_IDLE). */
+          nox_err_t hi_err = handshake_init(listener_ps->hs, false,
+                 state->my_static_priv, state->my_static_pub);
+          if (hi_err != NOX_OK) {
+            NOX_ERROR(LOG_MOD_NOISE, "handshake_init başarısız: %s",
+                      nox_strerror(hi_err));
+            sodium_memzero(listener_ps->hs, sizeof(struct noise_handshake));
+            sodium_free(listener_ps->hs);
+            listener_ps->hs = NULL;
+            close(peer_fd);
+            listener_ps->fd = -1;
+            ui_line_resume(state);
+            continue;
+          }
           clock_gettime(CLOCK_MONOTONIC, &listener_ps->handshake_start);
           clock_gettime(CLOCK_MONOTONIC, &listener_ps->last_active);
           state->hs_inbound_count++;

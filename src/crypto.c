@@ -344,6 +344,185 @@ nox_err_t derive_tor_expanded_key(uint8_t expanded_out[64],
     return NOX_OK;
 }
 
+/* ================================================================
+ * H-1/H-2: ONION ↔ OTURUM BAĞI — Proof-of-Possession
+ *
+ * Handshake claim'i onion seed'inden türetilen Ed25519 key'iyle
+ * imzalanır; verify eden taraf pubkey'i onion ADRESİNDEN çıkarır
+ * (v3 adres gömülü pubkey içerir). threat model ve mesaj formatı
+ * crypto.h bölümünde belgelendi.
+ *
+ * Not: network.c'deki eski "libsodium SHA3-256 sunmaz" yorumu
+ * yanlıştır — libsodium 1.0.14+ crypto_hash_sha3256 sunar (1.0.22
+ * ile doğrulandı). v3 checksum artık zorunludur.
+ * ================================================================ */
+
+/* Domain separation — protokol sabiti, DEĞİŞTİRİLEMEZ */
+#define NOX_ONION_BIND_CTX   "noxtor-bind-v1"
+#define NOX_ONION_CKSUM_CTX  ".onion checksum"
+
+NOX_STATIC_ASSERT(sizeof(NOX_ONION_BIND_CTX) - 1 == 14, "bind ctx 14 byte");
+NOX_STATIC_ASSERT(sizeof(NOX_ONION_CKSUM_CTX) - 1 == 15, "cksum ctx 15 byte");
+/* Payload v1 yerleşimi derleme zamanında kilitli: [ver | onion | sig] */
+NOX_STATIC_ASSERT(NOX_HS_PAYLOAD_V1_LEN ==
+                      1 + NOX_ONION_LEN + crypto_sign_BYTES,
+                  "payload v1 layout: ver+onion+sig");
+
+/* İmzalanan/verify edilen mesaj: ctx || onion(62) || static_pub(32) */
+#define NOX_ONION_BIND_MSG_LEN \
+    (sizeof(NOX_ONION_BIND_CTX) - 1 + NOX_ONION_LEN + NOX_KEY_LEN)
+
+/* base32 decode: 56 char (a-z2-7) → 35 byte. Charset kontrolü çağıranda. */
+static nox_err_t onion_b32_decode(const char *in,
+                                  uint8_t out[NOX_ONION_BODY_LEN])
+{
+    uint32_t acc  = 0;
+    unsigned bits = 0;
+    size_t   o    = 0;
+
+    for (size_t i = 0; i < NOX_ONION_B32_LEN; i++) {
+        char c = in[i];
+        unsigned v;
+        if (c >= 'a' && c <= 'z')
+            v = (unsigned)(c - 'a');
+        else if (c >= '2' && c <= '7')
+            v = 26u + (unsigned)(c - '2');
+        else
+            return NOX_ERR_CRYPTO;
+
+        acc = (acc << 5) | v;
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (uint8_t)((acc >> bits) & 0xFF);
+        }
+    }
+    /* 56×5 = 280 bit = 35 byte tam — artan bit olmamalı */
+    if (bits != 0 || o != NOX_ONION_BODY_LEN)
+        return NOX_ERR_CRYPTO;
+    return NOX_OK;
+}
+
+/* Bind mesajını kur: "noxtor-bind-v1" || onion || static_pub */
+static void onion_bind_msg(uint8_t msg[NOX_ONION_BIND_MSG_LEN],
+                           const char *addr,
+                           const uint8_t static_pub[NOX_KEY_LEN])
+{
+    memcpy(msg, NOX_ONION_BIND_CTX, sizeof(NOX_ONION_BIND_CTX) - 1);
+    memcpy(msg + (sizeof(NOX_ONION_BIND_CTX) - 1), addr, NOX_ONION_LEN);
+    memcpy(msg + (sizeof(NOX_ONION_BIND_CTX) - 1) + NOX_ONION_LEN,
+           static_pub, NOX_KEY_LEN);
+}
+
+nox_err_t crypto_onion_pubkey(uint8_t pub_out[NOX_KEY_LEN],
+                              const char *addr)
+{
+    if (!pub_out || !addr)
+        return NOX_ERR_CRYPTO;
+
+    /* 1-2. uzunluk + suffix + charset */
+    if (strlen(addr) != NOX_ONION_LEN)
+        return NOX_ERR_PROTO;
+    if (strcmp(addr + NOX_ONION_B32_LEN, ".onion") != 0)
+        return NOX_ERR_PROTO;
+    for (size_t i = 0; i < NOX_ONION_B32_LEN; i++) {
+        char c = addr[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7')))
+            return NOX_ERR_PROTO;
+    }
+
+    /* 3. decode → 35B body = pub(32) || checksum(2) || version(1) */
+    uint8_t body[NOX_ONION_BODY_LEN];
+    nox_err_t err = onion_b32_decode(addr, body);
+    if (err != NOX_OK) {
+        sodium_memzero(body, sizeof(body));
+        return NOX_ERR_CRYPTO;
+    }
+
+    /* 4. version == 0x03 (v3) */
+    if (body[NOX_ONION_BODY_LEN - 1] != 0x03) {
+        sodium_memzero(body, sizeof(body));
+        return NOX_ERR_PROTO;
+    }
+
+    /* 5. checksum = SHA3-256(".onion checksum" || pub || version)[:2] */
+    uint8_t ck_in[15 + NOX_KEY_LEN + 1];
+    memcpy(ck_in, NOX_ONION_CKSUM_CTX, 15);
+    memcpy(ck_in + 15, body, NOX_KEY_LEN);
+    ck_in[15 + NOX_KEY_LEN] = 0x03;
+
+    uint8_t digest[crypto_hash_sha3256_BYTES];
+    if (crypto_hash_sha3256(digest, ck_in, sizeof(ck_in)) != 0) {
+        sodium_memzero(body, sizeof(body));
+        sodium_memzero(ck_in, sizeof(ck_in));
+        sodium_memzero(digest, sizeof(digest));
+        return NOX_ERR_CRYPTO;
+    }
+    sodium_memzero(ck_in, sizeof(ck_in));
+
+    if (sodium_memcmp(digest, body + NOX_KEY_LEN, 2) != 0) {
+        sodium_memzero(body, sizeof(body));
+        sodium_memzero(digest, sizeof(digest));
+        return NOX_ERR_PROTO; /* checksum ihlali — reddet */
+    }
+    sodium_memzero(digest, sizeof(digest));
+
+    memcpy(pub_out, body, NOX_KEY_LEN);
+    sodium_memzero(body, sizeof(body));
+    return NOX_OK;
+}
+
+nox_err_t crypto_onion_sign(uint8_t sig[crypto_sign_BYTES],
+                            const char *addr,
+                            const uint8_t static_pub[NOX_KEY_LEN],
+                            const uint8_t onion_seed[32])
+{
+    if (!sig || !addr || !static_pub || !onion_seed)
+        return NOX_ERR_CRYPTO;
+    if (strlen(addr) != NOX_ONION_LEN)
+        return NOX_ERR_PROTO;
+
+    /* onion_seed → Ed25519 keypair (libsodium format seed||pub) */
+    uint8_t pk[crypto_sign_PUBLICKEYBYTES];
+    uint8_t sk[crypto_sign_SECRETKEYBYTES];
+    if (crypto_sign_seed_keypair(pk, sk, onion_seed) != 0) {
+        sodium_memzero(pk, sizeof(pk));
+        sodium_memzero(sk, sizeof(sk));
+        return NOX_ERR_CRYPTO;
+    }
+
+    uint8_t msg[NOX_ONION_BIND_MSG_LEN];
+    onion_bind_msg(msg, addr, static_pub);
+
+    int rc = crypto_sign_detached(sig, NULL, msg, sizeof(msg), sk);
+    sodium_memzero(msg, sizeof(msg));
+    sodium_memzero(pk, sizeof(pk));
+    sodium_memzero(sk, sizeof(sk));
+    return rc == 0 ? NOX_OK : NOX_ERR_CRYPTO;
+}
+
+nox_err_t crypto_onion_verify(const uint8_t sig[crypto_sign_BYTES],
+                              const char *addr,
+                              const uint8_t static_pub[NOX_KEY_LEN])
+{
+    if (!sig || !addr || !static_pub)
+        return NOX_ERR_CRYPTO;
+
+    /* pubkey'i ADRESDEN çıkar — tüm format/checksum zinciri burada */
+    uint8_t pub[NOX_KEY_LEN];
+    nox_err_t err = crypto_onion_pubkey(pub, addr);
+    if (err != NOX_OK)
+        return err; /* NOX_ERR_PROTO — biçim/checksum */
+
+    uint8_t msg[NOX_ONION_BIND_MSG_LEN];
+    onion_bind_msg(msg, addr, static_pub);
+
+    int bad = crypto_sign_verify_detached(sig, msg, sizeof(msg), pub);
+    sodium_memzero(msg, sizeof(msg));
+    sodium_memzero(pub, sizeof(pub));
+    return bad == 0 ? NOX_OK : NOX_ERR_AUTH;
+}
+
 
 /* ================================================================
  * 2.2: SALT YÖNETİMİ

@@ -265,6 +265,12 @@ struct app_state {
     uint8_t *my_static_priv;     /* arena'da, 32 byte (Curve25519)  */
     uint8_t *my_static_pub;      /* arena'da, 32 byte (Curve25519)  */
 
+    /* H-1/H-2: onion seed — claim imzası için Ed25519 tohumu.
+     * sodium_malloc'da (mlock+guard page) — ARENA'DA DEĞİL:
+     * arena Tor ölümünde yıkılır, imza anahtarı onion kimliğinin
+     * özüdür ve cleanup'a kadar yaşamalıdır. 32 byte. */
+    uint8_t *my_onion_seed;
+
     /* Eski tek-peer alanları — ghost mode fallback (Faz 6.3'te kaldırılacak) */
     struct noise_session *session; /* arena'da veya NULL              */
     struct noise_handshake *hs;  /* aktif handshake veya NULL         */

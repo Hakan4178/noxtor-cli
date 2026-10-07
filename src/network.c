@@ -55,31 +55,22 @@ static void safe_nanosleep(const struct timespec *req) {
  * Public: tor_create_new_hs / tor_create_persistent_hs (S3 — kendi HS)
  *         ve socks5_connect (peer adresi) tarafından çağrılır.
  *
- * S3 notu: v3 checksum (SHA3-256 truncated) doğrulaması YAPILMAZ.
- *   libsodium SHA3-256 sunmaz, ek kütüphane ekleme maliyeti
- *   defense-in-depth'e değmez. Tor ADD_ONION yanıtı zaten
- *   geçerli v3 adres üretir (deterministik ED25519-V3).
+ * H-2 FIX: v3 checksum (SHA3-256 truncated) artık ZORUNLU.
+ *   Eski yorum "libsodium SHA3-256 sunmaz" yanlıştı —
+ *   crypto_hash_sha3256 libsodium 1.0.14+'ta vardır (1.0.22 ile
+ *   doğrulandı). Doğrulama zinciri crypto_onion_pubkey'e taşındı:
+ *   uzunluk + suffix + charset + base32 decode + version 0x03 +
+ *   checksum. Eski salt-charset yorumu (S3) geçersizdir.
  * ================================================================ */
 nox_hardbool_t validate_onion_address(const char *addr) {
   if (!addr)
     return false;
-  
-  size_t len = strlen(addr);
-  if (len != NOX_ONION_LEN)
-    return false;
-  
-  /* ".onion" suffix kontrolü */
-  if (strcmp(addr + 56, ".onion") != 0)
-    return false;
-  
-  /* İlk 56 karakter base32 olmalı: a-z, 2-7 */
-  for (size_t i = 0; i < 56; i++) {
-    char c = addr[i];
-    if (!((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7')))
-      return false;
-  }
-  
-  return true;
+
+  /* Tek doğrulama zinciri — kopya kod yok (crypto_onion_pubkey) */
+  uint8_t pub[NOX_KEY_LEN];
+  nox_err_t err = crypto_onion_pubkey(pub, addr);
+  sodium_memzero(pub, sizeof(pub));
+  return err == NOX_OK;
 }
 
 /* ================================================================
@@ -1335,13 +1326,17 @@ static nox_err_t parse_service_id(const char *resp,
   return NOX_OK;
 }
 
-/* Ghost mod: ADD_ONION NEW:ED25519-V3 Flags=DiscardPK
- * - Key'i TOR üretir (deterministik türetim YOK — her açılışta farklı adres)
- * - DiscardPK: PrivateKey yanıtı GELMEZ — key sadece Tor process belleğinde
- *   yaşar, ne diskte ne client'ta kopya (D6)
- * - Detach YOK: control connection kapanınca hizmet otomatik silinir (D5)
- * - key_out parametresi KALKMIŞTIR (D8) — key parse/saklama kodu tamamen ölü */
+/* Ghost mod: ADD_ONION ED25519-V3:<app-üretim rastgele seed>
+ * - H-1/H-2 DÜZELTMESİ (eski: NEW:ED25519-V3 Flags=DiscardPK): claim
+ *   imzası için onion private key client'ta bulunmalı — Tor'da DiscardPK
+ *   ile yaşadığı sürece imza atılamazdı. Artık seed app'de randombytes_buf
+ *   ile üretilir, sadece bellekte saklanır (disk'e YOK — D3 aynen geçerli).
+ * - Her açılışta FARKLI adres (eski ghost UX korunur, D6'nın amacı).
+ * - Detach YOK: control connection kapanınca hizmet otomatik silinir (D5).
+ * - seed_out: çağrıyanın sodium_malloc buffer'ı — SADECE BAŞARIDA yazılır.
+ * - D8 eski notu (key parse/saklama kodu ölüydü) bu değişiklikle geçersiz. */
 __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
+                             uint8_t seed_out[32],
                              char *onion_out, size_t onion_len) {
   /* NET-4 FIX: CRLF injection koruması */
   if (strchr(listen_path, '\r') || strchr(listen_path, '\n')) {
@@ -1349,12 +1344,52 @@ __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *list
     return NOX_ERR_CONFIG;
   }
 
-  char cmd[160];
+  uint8_t onion_seed[32];
+  uint8_t pub[32];
+  uint8_t expanded_sk[64];
+  char b64_key[NOX_ONION_KEY_B64_MAX + 1];
+  char cmd[256];
   char resp[512];
-  nox_err_t err;
-  int n = snprintf(cmd, sizeof(cmd),
-                   "ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port=%u,unix:%s\r\n",
-                   NOX_VIRTUAL_PORT, listen_path);
+  int n;
+  nox_err_t err = NOX_ERR_TOR;
+
+  sodium_memzero(onion_seed, sizeof(onion_seed));
+  sodium_memzero(pub, sizeof(pub));
+  sodium_memzero(expanded_sk, sizeof(expanded_sk));
+  b64_key[0] = '\0';
+
+  /* 1. Rastgele seed — her açılışta farklı onion (ghost UX, eski D6 amacı) */
+  randombytes_buf(onion_seed, 32);
+
+  /* 2. Seed → Tor formatında expanded key + pub (aynı KRİTİK tur:
+   *    Tor [clamped_scalar||prefix] bekler, seed_keypair sk'si DEĞİL) */
+  if (derive_tor_expanded_key(expanded_sk, pub, onion_seed) != NOX_OK) {
+    err = NOX_ERR_CRYPTO;
+    goto cleanup;
+  }
+
+  /* 3. 64B expanded → base64 (88 char + NUL) */
+  if (sodium_bin2base64(b64_key, sizeof(b64_key),
+                        expanded_sk, sizeof(expanded_sk),
+                        sodium_base64_VARIANT_ORIGINAL) == NULL) {
+    err = NOX_ERR_CRYPTO;
+    goto cleanup;
+  }
+
+  /* 4. Charset doğrulaması — Tor'a gitmeden ÖNCE */
+  if (strspn(b64_key,
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != NOX_ONION_KEY_B64_MAX) {
+    NOX_ERROR(LOG_MOD_NET, "ghost b64 charset dışı — üretim hatası");
+    err = NOX_ERR_CRYPTO;
+    goto cleanup;
+  }
+
+  /* 5. ADD_ONION — NEW yerine app-üretim key (H-1/H-2: claim imzalanabilir).
+   *    CRLF injection: listen_path kontrolü fonksiyon başında (NET-4),
+   *    snprintf'den ÖNCE — Tor komutuna tek satır garantisi. */
+  n = snprintf(cmd, sizeof(cmd),
+               "ADD_ONION ED25519-V3:%s Port=%u,unix:%s\r\n",
+               b64_key, NOX_VIRTUAL_PORT, listen_path);
   if (n <= 0 || (size_t)n >= sizeof(cmd)) {
     err = NOX_ERR_OVERFLOW;
     goto cleanup;
@@ -1368,14 +1403,22 @@ __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *list
   if (err != NOX_OK)
     goto cleanup;
 
-  /* ServiceID parse (DiscardPK ile PrivateKey parse YOK — D6/D8) */
+  /* ServiceID parse */
   err = parse_service_id(resp, onion_out, onion_len);
   if (err != NOX_OK)
     goto cleanup;
 
+  /* BAŞARILI — seed'i caller'a ver (H-1/H-2 claim imzası için) */
+  memcpy(seed_out, onion_seed, 32);
+
   NOX_INFO(LOG_MOD_NET, "Hidden Service (ghost): %s", onion_out);
 
 cleanup:
+  /* D4 — TEK noktadan temizlik, başarı veya hata fark etmez */
+  sodium_memzero(onion_seed, sizeof(onion_seed));
+  sodium_memzero(pub, sizeof(pub));
+  sodium_memzero(expanded_sk, sizeof(expanded_sk));
+  sodium_memzero(b64_key, sizeof(b64_key));
   sodium_memzero(cmd, sizeof(cmd));
   sodium_memzero(resp, sizeof(resp));
   return err;

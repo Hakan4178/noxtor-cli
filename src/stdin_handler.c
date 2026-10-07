@@ -554,21 +554,46 @@ void process_line(struct app_state *state, const char *line) {
       if (err != NOX_OK) { ui_print_error(state, "bağlantı başarısız"); return; }
       target_ps->fd = peer_fd;
       snprintf(target_ps->peer_onion, sizeof(target_ps->peer_onion), "%s", target);
+      /* H-1 FIX: dial hedefini AYRI alanda sakla — peer_onion handshake
+       * claim'iyle ezilebilir (event_loop :238), connect_target ezilmez.
+       * Parse'de strcmp(claim, dial) karşılaştırması bunu kullanır. */
+      snprintf(target_ps->connect_target, sizeof(target_ps->connect_target), "%s", target);
       if (epoll_add_fd(state->epoll_fd, peer_fd) != NOX_OK) {
         NOX_ERROR(LOG_MOD_MAIN, "epoll_ctl ADD başarısız — bağlantı iptal");
         close(peer_fd); target_ps->fd = -1; sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
+        sodium_memzero(target_ps->connect_target, sizeof(target_ps->connect_target));
         ui_print_error(state, "bağlantı kayıt hatası"); return;
       }
       NOX_INFO(LOG_MOD_MAIN, "peer bağlandı");
       target_ps->hs = sodium_malloc(sizeof(struct noise_handshake));
-      if (!target_ps->hs) { ui_print_error(state, "arena dolu"); close(peer_fd); target_ps->fd = -1; sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion)); return; }
-      handshake_init(target_ps->hs, true, state->my_static_priv, state->my_static_pub);
+      if (!target_ps->hs) { ui_print_error(state, "arena dolu"); close(peer_fd); target_ps->fd = -1; sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion)); sodium_memzero(target_ps->connect_target, sizeof(target_ps->connect_target)); return; }
+      /* H-1/H-2 (M-5): return kontrolü — başarısızsa hs garbage kalır,
+       * msg1 buna dayanır. Fail-closed: her şeyi geri al. */
+      {
+        nox_err_t hi_err = handshake_init(target_ps->hs, true,
+                                          state->my_static_priv,
+                                          state->my_static_pub);
+        if (hi_err != NOX_OK) {
+          NOX_ERROR(LOG_MOD_NOISE, "handshake_init başarısız: %s",
+                    nox_strerror(hi_err));
+          sodium_memzero(target_ps->hs, sizeof(struct noise_handshake));
+          sodium_free(target_ps->hs);
+          target_ps->hs = NULL;
+          close(peer_fd);
+          target_ps->fd = -1;
+          sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
+          sodium_memzero(target_ps->connect_target, sizeof(target_ps->connect_target));
+          ui_print_error(state, "Handshake başlatılamadı");
+          return;
+        }
+      }
       clock_gettime(CLOCK_MONOTONIC, &target_ps->handshake_start);
       clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
       if (sm_dispatch(target_ps, state, EV_CONNECT_CMD) != NOX_OK) {
         NOX_WARN(LOG_MOD_MAIN, "EV_CONNECT_CMD reddedildi — state ayrışması önlendi");
         close(peer_fd); target_ps->fd = -1; sodium_free(target_ps->hs); target_ps->hs = NULL;
         sodium_memzero(target_ps->peer_onion, sizeof(target_ps->peer_onion));
+        sodium_memzero(target_ps->connect_target, sizeof(target_ps->connect_target));
         ui_print_error(state, "Bağlantı durumu uygun değil");
         return;
       }

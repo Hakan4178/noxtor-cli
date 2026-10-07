@@ -151,4 +151,70 @@ nox_err_t crypto_ed25519_to_curve25519(uint8_t curve25519_pk[NOX_KEY_LEN],
                                        const uint8_t ed25519_pk[NOX_KEY_LEN],
                                        const uint8_t ed25519_sk[crypto_sign_SECRETKEYBYTES]);
 
+/* ================================================================
+ * H-1/H-2: ONION ↔ OTURUM BAĞI — Proof-of-Possession
+ *
+ * Threat: handshake payload'ındaki onion claim'i self-asserted.
+ * Tor hidden service anahtarını yalnızca BAĞLANILAN hedef için
+ * uçtan uca doğrular; payload'daki "ben X.onion'ım" iddiası
+ * transport katmanında HİÇ doğrulanmaz — saldırgan herhangi bir
+ * kurban onion'ını kendi key'iyle claim edip TOFU'yu kazanabilir.
+ *
+ * Çözüm: claim, onion seed'inden türetilen Ed25519 key'iyle
+ * imzalanır; verify eden taraf pubkey'i onion ADRESİNDEN çıkarır
+ * (v3 adres base32(pub||checksum||version) — pubkey ad gömülüdür).
+ * Böylece claim ↔ onion ↔ static key üçlüsü kriptografik bağlanır.
+ *
+ * İmzalanan mesaj (domain separation dahil):
+ *   "noxtor-bind-v1" || onion_adres(62, NUL hariç) || static_pub(32)
+ *
+ * Tazelik: claim msg2/msg3'ün AEAD şifreli payload'ının içindedir —
+ * replay edilen handshake mesajı yeni transcript'te çözülemez;
+ * imza rs'e (static key) bağlandığı için saldırgan kendi oturumuna
+ * kurban imzasını taşıyamaz.
+ * ================================================================ */
+
+/*
+ * crypto_onion_pubkey — v3 onion adresinden Ed25519 pubkey çıkar.
+ *
+ * Doğrulama zinciri (hepsi ZORUNLU):
+ *   1. uzunluk 62 + ".onion" suffix
+ *   2. 56 char base32 charset (a-z, 2-7)
+ *   3. base32 decode → 35 byte body
+ *   4. version byte == 0x03
+ *   5. v3 checksum: SHA3-256(".onion checksum" || pub || 0x03)[:2]
+ *
+ * @pub_out: 32 byte Ed25519 public key
+ * @addr:    62 char + NUL (.onion dahil)
+ * Hata: NOX_ERR_PROTO (format/checksum), NOX_ERR_CRYPTO (decode)
+ */
+nox_err_t crypto_onion_pubkey(uint8_t pub_out[NOX_KEY_LEN],
+                              const char *addr);
+
+/*
+ * crypto_onion_sign — claim'i onion seed'iyle imzala.
+ *
+ * onion_seed → crypto_sign_seed_keypair → Ed25519 detached signature.
+ * @sig:          Çıktı, 64 byte
+ * @addr:         Kendi onion adresimiz (62 + NUL)
+ * @static_pub:   Kendi Noise static public key'imiz (X25519, 32B)
+ * @onion_seed:   Onion seed (32B) — sodium_malloc'da, ASLA arena'da değil
+ */
+nox_err_t crypto_onion_sign(uint8_t sig[crypto_sign_BYTES],
+                            const char *addr,
+                            const uint8_t static_pub[NOX_KEY_LEN],
+                            const uint8_t onion_seed[32]);
+
+/*
+ * crypto_onion_verify — peer claim'inin imzasını doğrula.
+ *
+ * pubkey onion adresinden çıkarılır (crypto_onion_pubkey zinciri),
+ * imza (addr || static_pub) üzerinden verify edilir.
+ * @static_pub: peer'ın Noise static public key'i (hs->rs, 32B)
+ * @return: NOX_OK | NOX_ERR_PROTO (adres biçimsiz) | NOX_ERR_AUTH (imza geçersiz)
+ */
+nox_err_t crypto_onion_verify(const uint8_t sig[crypto_sign_BYTES],
+                              const char *addr,
+                              const uint8_t static_pub[NOX_KEY_LEN]);
+
 #endif /* PARANOID_CRYPTO_H */

@@ -51,8 +51,18 @@
 
 /* Onion adresi */
 #define NOX_ONION_LEN          62U       /* 56 + ".onion" */
+#define NOX_ONION_B32_LEN      56U       /* base32 kısım (suffix hariç) */
+#define NOX_ONION_BODY_LEN     35U       /* v3 body: pub(32)+checksum(2)+version(1) */
 #define NOX_VIRTUAL_PORT       9876U     /* HS virtual port (sabit) */
 #define NOX_ONION_KEY_B64_MAX 88U  /* ED25519-V3 private key base64 (buffer sınırı) */
+
+/* H-1/H-2: Handshake claim payload v1 — onion ↔ static key binding.
+ * [ver(1) | onion(62) | ed25519_sig(64)] = 127 byte.
+ * sig = Ed25519_Sign(onion_seed, "noxtor-bind-v1" || onion || my_static_pub).
+ * Yalnızca v1 formatı kabul edilir — legacy (56+NUL/63B) payload'ın
+ * hiçbir kod yolu yoktur (hard cut, beta kararı). */
+#define NOX_HS_PAYLOAD_V1_VER  0x01U
+#define NOX_HS_PAYLOAD_V1_LEN  127U
 
 /* Contact */
 #define NOX_CONTACT_NAME_LEN   64U

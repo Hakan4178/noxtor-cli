@@ -409,8 +409,14 @@ $(FUZZ_DIR)/fuzz_handshake: $(FUZZ_DIR)/fuzz_handshake.c $(FUZZ_OBJS)
 	$(Q)AFL_PATH=/tmp/aflpp-build $(FUZZ_CC) $(FUZZ_CFLAGS) $^ -o $@ $(FUZZ_LDFLAGS)
 	@echo "[*] Fuzzer binary hazır: $@"
 
-fuzz: $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5 $(FUZZ_DIR)/fuzz_handshake
-	@echo "[*] Fuzzerlar derlendi. Çalıştırmak için: make fuzz-run, make fuzz-run-sanitize, make fuzz-run-arena, make fuzz-run-stdin, make fuzz-run-file_transfer, make fuzz-run-stdin_events, make fuzz-run-ctrl, make fuzz-run-socks5 veya make fuzz-run-handshake"
+# H-1/H-2 onion claim parse (crypto_onion_pubkey/verify) fuzzer hedefi
+$(FUZZ_DIR)/fuzz_onion_bind: $(FUZZ_DIR)/fuzz_onion_bind.c $(FUZZ_OBJS)
+	$(MSG) 'FUZZ' '$@'
+	$(Q)AFL_PATH=/tmp/aflpp-build $(FUZZ_CC) $(FUZZ_CFLAGS) $^ -o $@ $(FUZZ_LDFLAGS)
+	@echo "[*] Fuzzer binary hazır: $@"
+
+fuzz: $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5 $(FUZZ_DIR)/fuzz_handshake $(FUZZ_DIR)/fuzz_onion_bind
+	@echo "[*] Fuzzerlar derlendi. Çalıştırmak için: make fuzz-run, make fuzz-run-sanitize, make fuzz-run-arena, make fuzz-run-stdin, make fuzz-run-file_transfer, make fuzz-run-stdin_events, make fuzz-run-ctrl, make fuzz-run-socks5, make fuzz-run-handshake veya make fuzz-run-onion_bind"
 
 fuzz-run: fuzz
 	@echo "[*] AFL++ başlatılıyor (frame_decode)... Durdurmak için Ctrl+C"
@@ -483,6 +489,14 @@ fuzz-run-handshake: fuzz
 	/tmp/aflpp-build/afl-fuzz -i $(FUZZ_DIR)/corpus/handshake \
 	         -o $(FUZZ_DIR)/findings_handshake \
 	         -- ./$(FUZZ_DIR)/fuzz_handshake
+
+fuzz-run-onion_bind: fuzz
+	@echo "[*] AFL++ başlatılıyor (onion claim parse H-1/H-2)... Durdurmak için Ctrl+C"
+	AFL_SKIP_CPUFREQ=1 \
+	AFL_PATH=/tmp/aflpp-build \
+	/tmp/aflpp-build/afl-fuzz -i $(FUZZ_DIR)/corpus/onion_bind \
+	         -o $(FUZZ_DIR)/findings_onion_bind \
+	         -- ./$(FUZZ_DIR)/fuzz_onion_bind
 
 # ----------------------------------------------------------------
 # DIFFERENTIAL FUZZING — noise-c referans ile karşılaştırma (hedefli + kapsamlı)

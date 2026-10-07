@@ -28,8 +28,8 @@
  *
  * tor_authenticate: Cookie dosyasını okur, hex olarak gönderir + siler.
  * tor_wait_bootstrap: timeout ile %100 bootstrap bekler.
- * tor_create_new_hs: ADD_ONION NEW:ED25519-V3 Flags=DiscardPK — ghost mod
- *                    (ephemeral, key Tor'da kalır, client'a dönmez).
+ * tor_create_new_hs: ADD_ONION ED25519-V3:<app-üretim rastgele seed> — ghost mod
+ *                    (ephemeral, seed yalnızca bellekte — claim imzası için).
  * tor_create_derived_hs: ADD_ONION ED25519-V3:<derived key> — normal mod
  *                    (master_key'den deterministik türetme, dosya YOK).
  * tor_shutdown: SIGNAL SHUTDOWN + waitpid + dizin temizliği.
@@ -44,12 +44,17 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir);
 /* Bootstrap %100 olana kadar bekle */
 nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec);
 
-/* Ghost mod Hidden Service — ADD_ONION NEW:ED25519-V3 Flags=DiscardPK (D6).
- * Key'i TOR üretir, PrivateKey yanıtı GELMEZ, her açılışta farklı adres.
+/* Ghost mod Hidden Service — ADD_ONION ED25519-V3:<app-üretim rastgele seed>.
+ * (H-1/H-2: eski NEW:ED25519-V3 Flags=DiscardPK kaldırıldı — claim imzası
+ * için onion private key client'ta bulunmalı. Her açılışta farklı rastgele
+ * seed → farklı adres, eski ghost UX korunur.)
  * Detach YOK: control connection kapanınca hizmet otomatik silinir (D5).
  * listen_path: AF_UNIX socket yolu (ADD_ONION unix: prefix ile)
+ * seed_out: 32 byte, SADECE BAŞARIDA yazılır (çağrıyan sodium_free ile
+ *           temizler; hata yolunda içeriği yazılmamış olur)
  * onion_out: 63 byte (56 base32 + ".onion\0") */
 __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
+                             uint8_t seed_out[32],
                              char *onion_out, size_t onion_len);
 
 /* Normal mod Hidden Service — master_key'den deterministik türetme (D3/D10).
@@ -60,10 +65,11 @@ __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *
                                   const uint8_t master_key[NOX_KEY_LEN],
                                   char *onion_out, size_t onion_len);
 
-/* Onion v3 adres doğrulaması — base32 + ".onion" suffix.
+/* Onion v3 adres doğrulaması — base32 + ".onion" suffix + v3 checksum
+ * (H-2 FIX: SHA3-256 checksum zorunlu — zincir crypto_onion_pubkey'te).
  * 62 karakter tam v3 .onion adresi için true döner.
- * socks5_connect (peer) ve tor_create_new_hs (S3 — kendi HS)
- * tarafından çağrılır. (hardened) */
+ * socks5_connect (peer), parse_service_id (kendi HS) ve event_loop
+ * (handshake claim) tarafından çağrılır. (hardened) */
 nox_hardbool_t validate_onion_address(const char *addr);
 
 /* Tor process'ini düzgün kapat */
