@@ -5,27 +5,7 @@
  * Adım 2.2: PIN → Argon2id → master_key → subkeys + identity key yönetimi
  *
  * Tüm key materyali secure arena'da yaşar.
- * Geçici hassas veriler fonksiyon dönüşünde explicit_bzero ile silinir.
- *
- * Audit patch'leri (tümü uygulandı):
- *   [P1] read_exact/write_exact — EINTR retry + EOF ayrımı
- *   [P2] Salt dosyası — atomic write (tmp + rename + O_EXCL)
- *   [P3] fsync — identity ve salt yazımı sonrası garanti flush
- *   [P4] crypto_sign_keypair — dönüş değeri kontrol edildi
- *   [P5] sk buffer — sodium_malloc ile stack'ten kaldırıldı
- *   [P6] goto cleanup — DRY, tek noktadan temizleme
- *   [P7] fstat — salt dosyası boyut kontrolü
- *   [P8] config_dir izin kontrolü — 0700 zorunlu
- *   [P9] PIN min/max uzunluk kontrolü
- *   [P10] Subkey ID enum — magic number yok
- *   [P11] NOX_KDF_CTX değişmezlik uyarısı
- *   [B-1] crypto_load_identity — file_buf sodium_malloc'a taşındı,
- *         fstat hata ayrımı (UB önleme), sodium_free otomatik sıfırlama
- *   [A-1] crypto_generate_identity — O_TRUNC→atomic write (tmp+rename)
- *   [A-2] crypto_ed25519_to_curve25519 — kısmi dönüşüm koruması,
- *         NULL kaynak kontrolü, ed25519_sk boyutu crypto_sign_SECRETKEYBYTES
- *   [F-1] crypto_load_or_create_salt — TOCTOU: stat+chmod→fstat+fchmod
- *   [F-2] crypto_load_or_create_salt — PID race: random suffix eklendi
+ * Geçici hassas veriler fonksiyon dönüşünde sodium_memzero ile silinir.
  *
  * INVARIANT: Crypto dosya operasyonlarında config_dir string'i hiçbir zaman
  * path çözümlemede kullanılmaz — YALNIZCA log/hata mesajı için saklanır;
@@ -143,6 +123,37 @@ static nox_err_t write_exact(int fd, const void *buf, size_t len)
         remaining -= (size_t)n;
     }
     return NOX_OK;
+}
+
+/*
+ * Dosya fsync — EINTR retry
+ * INVARIANT: kalıcılık iddiası taşıyan yazım (salt, identity)
+ * başarısızlığı FATAL kabul eder — WARN değil.
+ */
+static nox_err_t fsync_exact(int fd)
+{
+    int r;
+    do {
+        r = fsync(fd);
+    } while (r != 0 && errno == EINTR);
+    return r == 0 ? NOX_OK : NOX_ERR_IO;
+}
+
+static nox_err_t fsync_dir(int dirfd)
+{
+    int r;
+    do {
+        r = fsync(dirfd);
+    } while (r != 0 && errno == EINTR);
+
+    if (r == 0)
+        return NOX_OK;
+    if (errno == EINVAL || errno == ENOTSUP) {
+        NOX_WARN(LOG_MOD_CRYPTO, "dir fsync bu FS'te desteklenmiyor: %s",
+                 strerror(errno));
+        return NOX_OK;
+    }
+    return NOX_ERR_IO;
 }
 
 /* ================================================================
@@ -353,8 +364,8 @@ nox_err_t derive_tor_expanded_key(uint8_t expanded_out[64],
  * crypto.h bölümünde belgelendi.
  *
  * Not: network.c'deki eski "libsodium SHA3-256 sunmaz" yorumu
- * yanlıştır — libsodium 1.0.14+ crypto_hash_sha3256 sunar (1.0.22
- * ile doğrulandı). v3 checksum artık zorunludur.
+ * yanlıştır — libsodium 1.0.22+ crypto_hash_sha3256 sunar. Ref: https://doc.libsodium.org/doc/advanced/sha-3_hash_function
+ * v3 checksum artık zorunludur.
  * ================================================================ */
 
 /* Domain separation — protokol sabiti, DEĞİŞTİRİLEMEZ */
@@ -526,12 +537,6 @@ nox_err_t crypto_onion_verify(const uint8_t sig[crypto_sign_BYTES],
 
 /* ================================================================
  * 2.2: SALT YÖNETİMİ
- *
- * [P1] EINTR retry read_exact/write_exact içinde
- * [P2] Atomic write — tmp dosya + rename
- * [P3] fsync — diske garanti flush
- * [P7] fstat — dosya boyutu kontrolü
- * [P8] config_dir izin kontrolü
  * ================================================================ */
 __attribute__((strub))
 nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
@@ -599,7 +604,8 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
     nox_err_t werr = write_exact(tmp_fd, salt, NOX_SALT_LEN);
 
     if (werr == NOX_OK) {
-        if (fsync(tmp_fd) != 0) {
+        /* [P3] dosya fsync — FATAL (EINTR retry fsync_exact içinde) */
+        if (fsync_exact(tmp_fd) != NOX_OK) {
             NOX_ERROR(LOG_MOD_CRYPTO,
                      "salt fsync başarısız: %s", strerror(errno));
             close(tmp_fd);
@@ -620,8 +626,11 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
         unlinkat(config_dir_fd, tmp_name, 0);
         return NOX_ERR_IO;
     }
-    if (fsync(config_dir_fd) != 0) {
-        NOX_WARN(LOG_MOD_CRYPTO, "salt dir fsync uyarı: %s", strerror(errno));
+    /* [P3] parent dir fsync — rename kalıcılığı (fsync_dir) */
+    if (fsync_dir(config_dir_fd) != NOX_OK) {
+        NOX_ERROR(LOG_MOD_CRYPTO, "salt dir fsync başarısız: %s",
+                  strerror(errno));
+        return NOX_ERR_IO;
     }
 
     NOX_INFO(LOG_MOD_CRYPTO, "yeni salt üretildi ve kaydedildi (atomic)");
@@ -633,7 +642,9 @@ nox_err_t crypto_load_or_create_salt(uint8_t salt[NOX_SALT_LEN],
  *
  * [P4] crypto_sign_keypair dönüş değeri kontrol ediliyor
  * [P5] sk → sodium_malloc (stack'ten kaldırıldı)
- * [P3] fsync — diske garanti flush
+ * [P3] fsync — dosya fsync FATAL (fsync_exact) + rename sonrası
+ *      parent dir fsync (fsync_dir) — EINVAL/ENOTSUP WARN,
+ *      diğer hata (EIO vb.) FATAL
  * [P6] goto cleanup — tek noktadan temizleme (DRY)
  *
  * Dosya formatı:
@@ -719,16 +730,29 @@ nox_err_t crypto_generate_identity(int config_dir_fd,
         goto cleanup;
     }
 
-    /* [P3] fsync — diske garanti flush */
-    if (fsync(fd) != 0)
-        NOX_WARN(LOG_MOD_CRYPTO,
-                 "identity fsync başarısız: %s", strerror(errno));
+    /*
+     * INVARIANT: identity.key yalnızca dosya fsync'ten sonra rename
+     * edilir (EINTR retry: fsync_exact).
+     * Hata yolu: cleanup → close + unlinkat(tmp).
+     */
+    if (fsync_exact(fd) != NOX_OK) {
+        NOX_ERROR(LOG_MOD_CRYPTO,
+                  "identity fsync başarısız: %s", strerror(errno));
+        ret = NOX_ERR_IO;
+        goto cleanup;
+    }
 
     close(fd); fd = -1;
 
     if (renameat(config_dir_fd, tmp_name, config_dir_fd, "identity.key") != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity rename başarısız: %s", strerror(errno));
+        ret = NOX_ERR_IO;
+        goto cleanup;
+    }
+
+    /* [P3] parent dir fsync — rename kalıcılığı (fsync_dir) */
+    if (fsync_dir(config_dir_fd) != NOX_OK) {
         ret = NOX_ERR_IO;
         goto cleanup;
     }

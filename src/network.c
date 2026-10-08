@@ -57,8 +57,8 @@ static void safe_nanosleep(const struct timespec *req) {
  *
  * H-2 FIX: v3 checksum (SHA3-256 truncated) artık ZORUNLU.
  *   Eski yorum "libsodium SHA3-256 sunmaz" yanlıştı —
- *   crypto_hash_sha3256 libsodium 1.0.14+'ta vardır (1.0.22 ile
- *   doğrulandı). Doğrulama zinciri crypto_onion_pubkey'e taşındı:
+ *   crypto_hash_sha3256 libsodium 1.0.22+'da eklendi. Doğrulama
+ *   zinciri crypto_onion_pubkey'e taşındı:
  *   uzunluk + suffix + charset + base32 decode + version 0x03 +
  *   checksum. Eski salt-charset yorumu (S3) geçersizdir.
  * ================================================================ */

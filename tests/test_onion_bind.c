@@ -82,7 +82,7 @@ static void b32_encode_35(const uint8_t in[NOX_ONION_BODY_LEN],
 }
 
 /* pub → v3 onion adresi (checksum + version dahil) üret */
-static void make_onion_addr(char out[NOX_ONION_LEN + 1],
+static int make_onion_addr(char out[NOX_ONION_LEN + 1],
                             const uint8_t pub[NOX_KEY_LEN])
 {
     uint8_t body[NOX_ONION_BODY_LEN];
@@ -95,11 +95,12 @@ static void make_onion_addr(char out[NOX_ONION_LEN + 1],
     ck_in[15 + NOX_KEY_LEN] = 0x03;
 
     uint8_t digest[crypto_hash_sha3256_BYTES];
-    crypto_hash_sha3256(digest, ck_in, sizeof(ck_in));
+    TEST_ASSERT(crypto_hash_sha3256(digest, ck_in, sizeof(ck_in)) == 0);
     memcpy(body + NOX_KEY_LEN, digest, 2); /* checksum = SHA3(...)[:2] */
 
     b32_encode_35(body, out);
     memcpy(out + NOX_ONION_B32_LEN, ".onion", 7); /* ".onion" + NUL */
+    return 0;
 }
 
 /* ================================================================
@@ -145,7 +146,7 @@ static int test_address_roundtrip(void)
 
     randombytes_buf(seed, sizeof(seed));
     TEST_ASSERT(derive_tor_expanded_key(exp, pub, seed) == NOX_OK);
-    make_onion_addr(addr, pub);
+    TEST_ASSERT(make_onion_addr(addr, pub) == 0);
 
     TEST_ASSERT(crypto_onion_pubkey(back, addr) == NOX_OK);
     TEST_ASSERT(sodium_memcmp(pub, back, NOX_KEY_LEN) == 0);
@@ -167,7 +168,7 @@ static int test_sign_verify_roundtrip(void)
 
     randombytes_buf(seed, sizeof(seed));
     TEST_ASSERT(derive_tor_expanded_key(exp, pub, seed) == NOX_OK);
-    make_onion_addr(addr, pub);
+    TEST_ASSERT(make_onion_addr(addr, pub) == 0);
     crypto_box_keypair(static_pub, static_priv); /* X25519 static */
 
     TEST_ASSERT(crypto_onion_sign(sig, addr, static_pub, seed) == NOX_OK);
@@ -191,7 +192,7 @@ static int test_tampered_signature(void)
 
     randombytes_buf(seed, sizeof(seed));
     TEST_ASSERT(derive_tor_expanded_key(exp, pub, seed) == NOX_OK);
-    make_onion_addr(addr, pub);
+    TEST_ASSERT(make_onion_addr(addr, pub) == 0);
     crypto_box_keypair(spub, spriv);
     TEST_ASSERT(crypto_onion_sign(sig, addr, spub, seed) == NOX_OK);
 
@@ -219,7 +220,7 @@ static int test_wrong_static_key(void)
 
     randombytes_buf(seed, sizeof(seed));
     TEST_ASSERT(derive_tor_expanded_key(exp, pub, seed) == NOX_OK);
-    make_onion_addr(addr, pub);
+    TEST_ASSERT(make_onion_addr(addr, pub) == 0);
     crypto_box_keypair(victim_static, victim_priv);
     crypto_box_keypair(attacker_static, attacker_priv);
 
@@ -247,7 +248,7 @@ static int test_bitflipped_onion_rejected(void)
 
     randombytes_buf(seed, sizeof(seed));
     TEST_ASSERT(derive_tor_expanded_key(exp, pub, seed) == NOX_OK);
-    make_onion_addr(addr, pub);
+    TEST_ASSERT(make_onion_addr(addr, pub) == 0);
     crypto_box_keypair(spub, spriv);
     TEST_ASSERT(crypto_onion_sign(sig, addr, spub, seed) == NOX_OK);
 
@@ -277,7 +278,7 @@ static int test_legacy_lengths_rejected(void)
 
     randombytes_buf(seed, sizeof(seed));
     TEST_ASSERT(derive_tor_expanded_key(exp, pub, seed) == NOX_OK);
-    make_onion_addr(addr, pub);
+    TEST_ASSERT(make_onion_addr(addr, pub) == 0);
     crypto_box_keypair(spub, spriv);
     TEST_ASSERT(crypto_onion_sign(sig, addr, spub, seed) == NOX_OK);
 

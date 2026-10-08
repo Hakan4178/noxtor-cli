@@ -288,7 +288,7 @@ static void base32_encode(const uint8_t *in, size_t inlen, char *out)
     out[o] = '\0';
 }
 
-static void derive_v3_address(const uint8_t pub[32], char *addr_out)
+static int derive_v3_address(const uint8_t pub[32], char *addr_out)
 {
     uint8_t checksum[32];
     uint8_t salted[15 + 32 + 1];   /* ".onion checksum" (15) || pub (32) || version (1) */
@@ -311,7 +311,7 @@ static void derive_v3_address(const uint8_t pub[32], char *addr_out)
 
     memcpy(salted + 15, pub, 32);
     salted[47] = 0x03;
-    crypto_hash_sha3256(checksum, salted, 48);
+    TEST_ASSERT(crypto_hash_sha3256(checksum, salted, 48) == 0);
 
     uint8_t blob[35];
     memcpy(blob, pub, 32);
@@ -320,6 +320,7 @@ static void derive_v3_address(const uint8_t pub[32], char *addr_out)
 
     base32_encode(blob, 35, addr_out);
     /* addr_out 56 char base32 + NUL — çağıran buffer ≥ 57 sağlamalı */
+    return 0;
 }
 
 /* ================================================================
@@ -347,7 +348,7 @@ static int emit_addr(const uint8_t mk[32])
     if (crypto_derive_onion_seed(seed, mk) != NOX_OK) return 1;
     if (derive_tor_expanded_key(exp, pub, seed) != NOX_OK) return 1;
 
-    derive_v3_address(pub, addr);
+    TEST_ASSERT(derive_v3_address(pub, addr) == 0);
     printf("%s.onion\n", addr);
     return 0;
 }
