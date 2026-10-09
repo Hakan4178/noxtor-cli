@@ -28,11 +28,11 @@
  *   1.  Log sistemi
  *   2.  Signal + terminal
  *   3.  libsodium init
- *   4.  CPU (CET-SZ) kontrolü
+ *   4.  CPU (CET-SZ) kontrolü · 4b. CET-SS kilidi + self-test
  *   5.  Config dizin bootstrap
  *   6.  PIN oku (echo kapalı)
  *   7.  RLIMIT_MEMLOCK
- *   8.  Arena init · 8b. dumpable · 8c. CET-SS · 8d. CAP_NET_RAW
+ *   8.  Arena init · 8b. dumpable · 8d. CAP_NET_RAW
  *   9.  Salt yükle/oluştur · 9b. key derivation
  *   10. Subkey türetimi
  *   11. Identity key + Curve25519 · 11b. seccomp stage 1 (constructor)
@@ -49,6 +49,7 @@
 
 #include "arena.h"
 #include "asm_utils.h"
+#include "cet_shstk.h"
 #include "common.h"
 #include "crypto.h"
 #include "database.h"
@@ -71,13 +72,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <sys/syscall.h> /* SYS_arch_prctl */
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h> /* nanosleep, struct timespec */
 #include <unistd.h>
 
-#include <asm/prctl.h> /* ARCH_SHSTK_LOCK (x86_64 CET-SS) */
 #include <errno.h>
 #include <libgen.h> /* basename */
 #include <sodium.h>
@@ -903,6 +902,37 @@ int main(int argc, char *argv[]) {
     NOX_INFO(LOG_MOD_HARD, "IBT (CET-IBT): %s",
              cpu_has_ibt() ? "destekleniyor" : "desteklenmiyor");
 
+#ifdef NDEBUG
+    /* ── 4b. CET-SS kilidi + self-test ──────────────────────
+     * Adım 4'ün raporundan hemen sonra, PIN'den ÖNCE (5/6):
+     * self-test fork() yapar — key materyali henüz yok.
+     * Mantık, Referans/ASSUMPTION/INVARIANT ve exit protokolü:
+     * bkz. src/cet_shstk.c */
+    {
+      cet_ss_state cet = cet_ss_lock_and_verify();
+
+      if (cet == CET_SS_BROKEN) {
+        NOX_FATAL(LOG_MOD_HARD,
+                  "CET-SS self-test: destek varsayılıyor ama doğrulanamadı "
+                  "(aktiflik/kilit/enforcement tutarsız — strace/gdb ile "
+                  "cet_ss_lock_and_verify)");
+        return 1;
+      }
+      if (cet == CET_SS_UNSUPPORTED)
+        NOX_WARN(LOG_MOD_HARD,
+                 "CET-SS: shadow stack desteklenmiyor — self-test atlandı");
+      else if (cet == CET_SS_NOT_ENFORCED)
+        NOX_WARN(LOG_MOD_HARD,
+                 "CET-SS: shadow stack pasif — self-test temiz döndü "
+                 "(enforcement yok; GLIBC_TUNABLES=glibc.cpu.hwcaps=SHSTK "
+                 "ile açılır)");
+      else
+        NOX_INFO(LOG_MOD_HARD,
+                 "CET-SS: shadow stack aktif, kilitli — self-test PASS "
+                 "(#CP ile engellendi)");
+    }
+#endif
+
     /* ── 5. Config dizin ───────────────────────────────── */
     err = resolve_config_paths(&state);
     if (err != NOX_OK) {
@@ -982,47 +1012,9 @@ int main(int argc, char *argv[]) {
     /* (8b kaldırıldı — PR_SET_DUMPABLE + RLIMIT_CORE artık main'den ÖNCE
      * early_hardening_init() constructor'ında set ediliyor; K-7/Y-1 fix.) */
 
-    /* ── 8c. CET-SS kilidi + self-test (release-only) ──────────
-     * Kernel/glibc, ELF shstk notuna göre (-Wl,-z,shstk) main thread'i
-     * shadow stack'li başlatır — ARCH_SHSTK_ENABLE gerekmez. Burada
-     * mevcut durum dondurulur: ARCH_SHSTK_LOCK sonrası ENABLE/DISABLE
-     * imkânsız (geri dönüşümsüz). WRSS da kilitlenir — açılırsa shadow
-     * stack'e yazılabildiği için korumayı etkisiz kılardı.
-     * Kilitlenmemiş shadow stack, RCE sonrası tek syscall ile
-     * kapatılabilen kozmetik savunma olurdu (THREAT_MODEL.md madde).
-     * CPU desteklemiyorsa (cpu_has_shstk) sessizce atlanır. */
-#ifdef NDEBUG
-    if (cpu_has_shstk()) {
-#ifdef ARCH_SHSTK_LOCK
-      long rc_lock = syscall(SYS_arch_prctl, ARCH_SHSTK_LOCK,
-                             ARCH_SHSTK_SHSTK | ARCH_SHSTK_WRSS);
-      if (rc_lock != 0)
-        NOX_WARN(LOG_MOD_HARD,
-                 "CET-SS kilitlenemedi (errno=%d) — shadow stack koruması kapatılabilir",
-                 errno);
-#endif
-      /* Self-test: /proc/self/status doğrulaması — "derlendi" ile
-       * "runtime'da kilitli" arasındaki fark asla varsayılmaz. */
-      int fd_st = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
-      if (fd_st >= 0) {
-        /* static: 16KB stack'i şişirmemek için .bss'e alınır (tek seferlik) */
-        static char stbuf[16384];
-        ssize_t n_st = read(fd_st, stbuf, sizeof(stbuf) - 1);
-        close(fd_st);
-        if (n_st > 0) {
-          stbuf[n_st] = '\0';
-          const char *feat = strstr(stbuf, "x86_Thread_features_locked:");
-          if (feat != NULL && strstr(feat, "shstk") != NULL)
-            NOX_INFO(LOG_MOD_HARD, "CET-SS: shadow stack AKTİF ve KİLİTLİ");
-          else
-            NOX_WARN(LOG_MOD_HARD,
-                     "CET-SS self-test: kilitli shadow stack doğrulanamadı — koruma kapalı olabilir");
-          /* sodium_init'e bağımlı değil — glibc explicit_bzero */
-          explicit_bzero(stbuf, sizeof(stbuf));
-        }
-      }
-    }
-#endif
+    /* (8c kaldırıldı — CET-SS kilidi + self-test artık 4b'de, PIN'den
+     * önce çalışıyor: bkz. src/cet_shstk.c. Eski blok, shstk KAPALıyken
+     * bile "AKTİF ve KİLİTLİ" raporlayabiliyordu — yanlış-PASS düzeltildi.) */
 
     /* ── 8d. CAP_NET_RAW ──────────────────────────────────────
      * K-6 FIX: eski kod olmayan PR_CAPBSET_QUERY sabitini #ifdef'liyordu —

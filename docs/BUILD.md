@@ -31,7 +31,10 @@
 ```
 
 - **Full optimization** + tüm hardening flag'leri
-- **CET** (Shadow Stack + IBT) aktif
+- **CET-ready** — binary `-fcf-protection=full` + `-Wl,-z,shstk` (GNU
+  property) ile derlenir; shstk'yi kernel exec'te kapatır, glibc default
+  OFF — init 4b self-test'i runtime'da dürüstçe doğrular (destek yoksa veya
+  pasifse WARN, BROKEN ise fatal; asla sahte PASS)
 - **RELRO + NOW** → GOT/PLT tamamen read-only
 - `strip --strip-debug` → küçük binary
 - `LOG_DEBUG` derlenmeden çıkar, `NDEBUG` tanımlı

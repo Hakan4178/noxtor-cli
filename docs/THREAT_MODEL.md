@@ -671,6 +671,20 @@ flags section). **Reference build (TODO: fill with actual `gcc --version` /
 | Kernel | e.g. 6.8 — Landlock ABI v1 (5.13+) / v3 (6.2+) feature-gated |
 | Binutils/linker | CET `shstk` needs `ld` with `z shstk` support |
 
+CET-SS is the one hardening claim that is additionally verified **at
+runtime on every start** (init 4b, `cet_shstk.c`): the kernel disables
+shadow stack on exec and the loader (glibc) re-enables it only
+conditionally, so Noxtor never assumes it from build flags alone. If the
+loader left shadow stack inactive, the self-test takes the CET-OFF path
+and Noxtor logs a WARN instead of claiming protection; if support is
+claimed (STATUS active) but the lock, the `/proc` two-line check, or the
+#CP self-test fails to hold, startup aborts fail-closed (`CET_SS_BROKEN`
+→ `NOX_FATAL`). The converse contradiction (STATUS inactive yet the live
+test faults with #CP) aborts the same way: the reported state cannot be
+reconciled with observed behavior, and no "enforced" claim is made
+without lock evidence. Locking is never attempted while shadow stack is
+inactive — locking freezes the *current* (off) status irreversibly.
+
 Until reproducible-build attestation exists, rebuilds on other toolchains
 should be treated as unverified for hardening.
 
