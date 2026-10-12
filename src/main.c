@@ -56,7 +56,7 @@
 #include "network.h"
 #include "noise.h"
 #include "types.h"
-#include "ui.h"
+#include "frontend.h"
 #include "stdin_handler.h"
 #include "file_transfer.h"
 #include "tui.h"
@@ -923,9 +923,7 @@ int main(int argc, char *argv[]) {
                  "CET-SS: shadow stack desteklenmiyor — self-test atlandı");
       else if (cet == CET_SS_NOT_ENFORCED)
         NOX_WARN(LOG_MOD_HARD,
-                 "CET-SS: shadow stack pasif — self-test temiz döndü "
-                 "(enforcement yok; GLIBC_TUNABLES=glibc.cpu.hwcaps=SHSTK "
-                 "ile açılır)");
+                 "CET-SS: shadow stack pasif ama self-test temiz döndü ");
       else
         NOX_INFO(LOG_MOD_HARD,
                  "CET-SS: shadow stack aktif, kilitli — self-test PASS "

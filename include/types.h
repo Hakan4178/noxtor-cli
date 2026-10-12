@@ -225,6 +225,7 @@ struct peer_session {
     char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
     struct   timespec tofu_start;
     nox_hardbool_t tofu_was_zero_key; /* hardened: ilk anahtar bağlaması mı? */
+    uint64_t tofu_epoch; /* C2: bu TOFU örneğinin epoch'u (prompt'ta atanır) */
 
     /* ── H-1/H-2: queue flush sadece doğrulanmış peer için ── */
     nox_hardbool_t peer_verified; /* hardened: true = SESSION_READY */
@@ -329,6 +330,11 @@ struct app_state {
     char     tofu_onion[NOX_ONION_LEN + 1];
     char     tofu_name[NOX_CONTACT_NAME_LEN + 1];
     uint8_t  tofu_new_key[NOX_KEY_LEN];
+    /* C2 FIX: TOFU slot-recycling token'ı — y/n onayı prompt anındaki
+     * örneğe (epoch + fp) bağlanır; slot yenilendiyse uyuşmazlık → ret. */
+    uint64_t tofu_epoch;                  /* monotonic sayaç (her prompt ++) */
+    uint64_t tofu_prompt_epoch;           /* cevaplanabilir prompt epoch'u (0 = yok) */
+    uint8_t  tofu_prompt_fp[NOX_KEY_LEN]; /* ekrandaki fp'nin snapshot'ı */
     char     active_peer_onion[NOX_ONION_LEN + 1];
 
     /* Async stdin buffering */
@@ -352,7 +358,13 @@ struct app_state {
     char     downloads_dir[NOX_PATH_MAX]; /* YALNIZCA log için — I/O için downloads_dir_fd */
 };
 
-/* Aktif peer'a便捷 erişim — NULL-safe */
+/* C2: TOFU token sabit boyut eşitlikleri — sodium_memcmp(..., NOX_KEY_LEN)
+ * çağrılarının iki tarafı aynı boyutta kalmalı (regresyon koruması). */
+NOX_STATIC_ASSERT(sizeof(((struct peer_session *)0)->tofu_new_key) ==
+                  sizeof(((struct app_state *)0)->tofu_prompt_fp),
+                  "C2: tofu_prompt_fp tofu_new_key ile aynı boyutta olmalı");
+
+/* Aktif peer'a hızlı erişim — NULL-safe */
 #define ACTIVE_PEER(state) \
     ((state)->active_peer_idx >= 0 ? &(state)->peers[(state)->active_peer_idx] : NULL)
 

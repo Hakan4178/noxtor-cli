@@ -9,7 +9,7 @@
 #include "database.h"
 #include "network.h"
 #include "noise.h"
-#include "ui.h"
+#include "frontend.h"
 #include "tui.h"
 #include "state_machine.h"
 
@@ -411,10 +411,34 @@ void process_line(struct app_state *state, const char *line) {
         return;
       }
       if (is_yes) {
-        if (sm_dispatch(tofu_ps, state, EV_TOFU_ACCEPTED) != NOX_OK) {
+        /* C2 FIX: bayat onay — "y", prompt anındaki örnek (epoch + fp)
+         * bağlanır. Slot recycle'ı (drop → aynı slota yeni anahtar) burada
+         * yakalanır: kullanıcı, güncel fp tekrar ekrandayken karar vermeden
+         * onaylanmaz. Uyuşmazlıkta snapshot yenilenir (re-arm) + hata. */
+        if (tofu_ps->tofu_epoch != state->tofu_prompt_epoch ||
+            sodium_memcmp(tofu_ps->tofu_new_key, state->tofu_prompt_fp,
+                          NOX_KEY_LEN) != 0) {
+          char fp_now[NOX_KEY_LEN * 2 + 1];
+          for (size_t fk = 0; fk < NOX_KEY_LEN; fk++)
+            snprintf(&fp_now[fk * 2], sizeof(fp_now) - fk * 2, "%02x",
+                     tofu_ps->tofu_new_key[fk]);
+          state->tofu_prompt_epoch = tofu_ps->tofu_epoch; /* yeniden arm */
+          memcpy(state->tofu_prompt_fp, tofu_ps->tofu_new_key, NOX_KEY_LEN);
+          ui_print_error(state,
+              "[!] TOFU onay PENCERESİ DEĞİŞTİ — bağlantı yenilenmiş olabilir "
+              "(slot %zu).\n      Doğrulanacak fingerprint: %s\n"
+              "      fp ekrandakiyle eşleşiyorsa onaylamak için tekrar 'y' yazın.",
+              (size_t)(tofu_ps - state->peers), fp_now);
+          sodium_memzero(fp_now, sizeof(fp_now));
+          return;
+        }
+        nox_err_t acc_rc = sm_dispatch(tofu_ps, state, EV_TOFU_ACCEPTED);
+        state->tofu_prompt_epoch = 0; /* onay tüketildi (başarılı ya da ölü örnek) */
+        if (acc_rc != NOX_OK) {
           sm_dispatch(tofu_ps, state, EV_PEER_DISCONNECTED);
         }
       } else {
+        state->tofu_prompt_epoch = 0; /* reddedildi — pencere kapandı */
         ui_print_system(state, "[*] Bağlantı reddedildi.");
         sm_dispatch(tofu_ps, state, EV_TOFU_REJECTED);
       }

@@ -39,7 +39,7 @@ extern char __VERIFIER_nondet_char(void);
 #endif
 
 /* ================================================================
- * P1 + P2: nox_strerror穷举 — tüm enum değerleri
+ * P1 + P2: nox_strerror exhaustive — tüm enum değerleri
  * Geçerli enum sınırları: NOX_OK..NOX_ERR_LANDLOCK_UNSUPPORTED (16 değer)
  * ================================================================ */
 static void test_nox_strerror(void) {

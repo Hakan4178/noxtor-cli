@@ -71,6 +71,19 @@
 #define NOX_PATH_MAX           512U
 
 /* ================================================================
+ * PER-PEER TIMEOUT'LAR — event_loop.c süpürme döngüsü
+ *
+ * Kod içinde magic number yok; hepsi buradan yönetilir.
+ * Handshake/TOFU/idle CLOCK_MONOTONIC, dosya RX chunk time(NULL)
+ * ile sayılır.
+ * ================================================================ */
+#define NOX_HANDSHAKE_TIMEOUT_SEC  30     /* HS tamamlanmazsa kopar */
+#define NOX_TOFU_TIMEOUT_SEC       120    /* TOFU prompt'u cevapsız kalırsa (2 dk) */
+#define NOX_FILE_CHUNK_TIMEOUT_SEC 60     /* RX chunk gelmezse sender sessiz */
+#define NOX_PEER_IDLE_TIMEOUT_SEC  3600   /* ST_ACTIVE/FILE idle (1 saat) */
+#define NOX_HALFFRAME_TIMEOUT_SEC  60     /* Yarım frame beklemesi (M-2) */
+
+/* ================================================================
  * HATA KODLARI — nox_err_t
  *
  * Negatif errno tarzı. NOX_ERR_AUTH ayrı çünkü Noise MAC hatası

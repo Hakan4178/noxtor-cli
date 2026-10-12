@@ -20,7 +20,7 @@
  *   [F7] Plain text scrub — local buffer'lar sodium_memzero ile temizleniyor
  */
 
-#include "ui.h"
+#include "frontend.h"
 #include "common.h"
 #include "types.h"
 #include "tui.h"

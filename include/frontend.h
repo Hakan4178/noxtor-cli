@@ -6,8 +6,8 @@
  * güncellemek — tüm çıktılar otomatik olarak yeni paleti kullanır.
  */
 
-#ifndef PARANOID_UI_H
-#define PARANOID_UI_H
+#ifndef PARANOID_FRONTEND_H
+#define PARANOID_FRONTEND_H
 
 #include "common.h"
 #include <stdarg.h>
@@ -89,4 +89,4 @@ void ui_print_progress(struct app_state *state,
                        uint64_t done, uint64_t total,
                        bool is_upload);
 
-#endif /* PARANOID_UI_H */
+#endif /* PARANOID_FRONTEND_H */

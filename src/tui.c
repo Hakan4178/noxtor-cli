@@ -22,7 +22,7 @@
 #include "common.h"
 #include "types.h"
 #include "database.h"
-#include "ui.h"
+#include "frontend.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "termbox2.h"

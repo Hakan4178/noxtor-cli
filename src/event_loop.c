@@ -8,7 +8,7 @@
 #include "crypto.h"
 #include "landlock_sandbox.h"
 #include "seccomp_policy.h"
-#include "ui.h"
+#include "frontend.h"
 #include "tui.h"
 #include "state_machine.h"
 #include "stdin_handler.h"
@@ -675,33 +675,33 @@ void event_loop(struct app_state *state) {
       if (ps->fd == -1 && ps->state == ST_IDLE)
         continue;
 
-      /* Handshake timeout — 30 saniye */
+      /* Handshake timeout — NOX_HANDSHAKE_TIMEOUT_SEC */
       if (ps->state == ST_HANDSHAKE_INIT ||
           ps->state == ST_HANDSHAKE_RESP) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - ps->handshake_start.tv_sec > 30) {
+        if (now.tv_sec - ps->handshake_start.tv_sec > NOX_HANDSHAKE_TIMEOUT_SEC) {
           NOX_WARN(LOG_MOD_NOISE, "Handshake zaman aşımına uğradı");
           ui_print_error(state, "Akran ile handshake zaman aşımına uğradı.");
           sm_dispatch(ps, state, EV_HANDSHAKE_TIMEOUT);
         }
       }
 
-      /* TOFU timeout — 2 dakika */
+      /* TOFU timeout — NOX_TOFU_TIMEOUT_SEC */
       if (ps->state == ST_TOFU_PENDING) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - ps->tofu_start.tv_sec > 120) {
-          NOX_WARN(LOG_MOD_NET, "TOFU timeout — 2 dakikada onaylanmadı");
+        if (now.tv_sec - ps->tofu_start.tv_sec > NOX_TOFU_TIMEOUT_SEC) {
+          NOX_WARN(LOG_MOD_NET, "TOFU timeout — süresinde onaylanmadı");
           ui_print_error(state, "TOFU onay zaman aşımı — bağlantı temizlendi.");
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         }
       }
 
-      /* Dosya transferi timeout — 60 saniye */
+      /* Dosya transferi timeout — NOX_FILE_CHUNK_TIMEOUT_SEC */
       if (ps->rx_file.active) {
         time_t now = time(NULL);
-        if (now - ps->rx_file.last_chunk_time > 60) {
+        if (now - ps->rx_file.last_chunk_time > NOX_FILE_CHUNK_TIMEOUT_SEC) {
           NOX_WARN(LOG_MOD_MAIN, "Dosya transferi zaman aşımı: %s", ps->rx_file.filename);
           ui_print_error(state, "Dosya transferi zaman aşımı — sender sessiz.");
           if (state->downloads_dir_fd >= 0 && ps->rx_file.local_name[0] != '\0') {
@@ -717,17 +717,19 @@ void event_loop(struct app_state *state) {
 
       /* M-2 FIX: ST_ACTIVE / ST_FILE idle timeout — 16 slot tükenmesini önler
        * Yarım frame gönderen veya sessizleşen peer slot'u sonsuza dek işgal
-       * edemez. ACTIVE için 120s, FILE için 60s (dosya RX zaten yukarıda). */
+       * edemez. Idle: NOX_PEER_IDLE_TIMEOUT_SEC; yarım frame:
+       * NOX_HALFFRAME_TIMEOUT_SEC (dosya RX chunk ayrıca yukarıda). */
       if (ps->state == ST_ACTIVE || ps->state == ST_FILE_TX || ps->state == ST_FILE_RX) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         long idle = (long)(now.tv_sec - ps->last_active.tv_sec);
-        if (idle > 3600) {
+        if (idle > NOX_PEER_IDLE_TIMEOUT_SEC) {
           NOX_WARN(LOG_MOD_NET, "Peer idle timeout (%lds) — slot %u disconnect", idle, pi);
           ui_print_error(state, "Bağlantı zaman aşımı — peer sessiz (idle).");
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
-        } else if (ps->recv_pos > 0 && idle > 60 && ps->recv_pos < RECV_BUF_CAPACITY) {
-          /* Yarım frame 60s bekliyorsa da kopar — M-2 ikinci yarısı */
+        } else if (ps->recv_pos > 0 && idle > NOX_HALFFRAME_TIMEOUT_SEC &&
+                   ps->recv_pos < RECV_BUF_CAPACITY) {
+          /* Yarım frame beklemesi — M-2 ikinci yarısı */
           NOX_WARN(LOG_MOD_NET, "Yarım frame timeout (%lds, recv_pos=%zu) — disconnect", idle, ps->recv_pos);
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         }

@@ -7,7 +7,7 @@
 #include "network.h"
 #include "noise.h"
 #include "state_machine.h"
-#include "ui.h"
+#include "frontend.h"
 
 #include <assert.h>
 #include <errno.h>

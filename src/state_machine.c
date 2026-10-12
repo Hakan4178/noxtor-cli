@@ -19,11 +19,17 @@
 #include "noise.h"
 #include "stdin_handler.h"
 #include "types.h"
-#include "ui.h"
+#include "frontend.h"
 
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* C2: TOFU epoch token sabit boyutu — peer_session örnek token'ı ↔
+ * app_state snapshot aynı genişlikte kalmalı (daraltma = sessiz kayıp). */
+NOX_STATIC_ASSERT(sizeof(((struct peer_session *)0)->tofu_epoch) ==
+                  sizeof(((struct app_state *)0)->tofu_prompt_epoch),
+                  "C2: tofu_epoch ↔ tofu_prompt_epoch boyut eşitliği");
 
 /* ================================================================
  * DEBUG YARDIMCILARI — state/event → string
@@ -350,8 +356,18 @@ static nox_err_t action_hs_process(struct peer_session *ps, struct app_state *st
 static nox_err_t action_tofu_prompt(struct peer_session *ps, struct app_state *state,
                                     peer_event_t ev)
 {
-    (void)ps; (void)state; (void)ev;
-    /* Adım 4'te main.c TOFU UI kodundan taşınacak */
+    (void)ev;
+    /* C2 FIX: Her TOFU örneğine monotonic epoch. Prompt UI event_loop.c'de
+     * basılır (ps->tofu_new_key o an ekrandaki fp'dir); snapshot yalnız
+     * cevaplanmamış bir prompt yokken yazılır: slot recycle'ında (drop →
+     * aynı slot → yeni prompt) EZİLMEZ, "y" uyuşmazlıkta reddedilir.
+     * INVARIANT: snapshot, kullanıcı y/n ile çözmeden başka prompt
+     * tarafından üzerine yazılmaz. */
+    ps->tofu_epoch = ++state->tofu_epoch;
+    if (state->tofu_prompt_epoch == 0) {
+        state->tofu_prompt_epoch = ps->tofu_epoch;
+        memcpy(state->tofu_prompt_fp, ps->tofu_new_key, NOX_KEY_LEN);
+    }
     return NOX_OK;
 }
 
@@ -359,6 +375,18 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
                                     peer_event_t ev)
 {
     (void)ev;
+
+    /* C2 FIX (defense-in-depth): onay token doğrulaması — y/n yolundaki
+     * kontrolün (stdin_handler) tekrarı; oradan kaçan yol burada
+     * fail-closed: slot recycle'ı (drop → yeni anahtar → aynı slot)
+     * durumunda epoch/fp uyuşmaz. */
+    if (ps->tofu_epoch != state->tofu_prompt_epoch ||
+        sodium_memcmp(ps->tofu_new_key, state->tofu_prompt_fp, NOX_KEY_LEN) != 0) {
+        ui_print_error(state,
+            "TOFU onay token'ı tutarsız — bağlantı reddedildi "
+            "(slot yenilenmiş olabilir; fp tekrar kontrol edin)");
+        return NOX_ERR_PROTO;
+    }
 
     /* hs geçerlilik kontrolü — peer TOFU bekleme sırasında ayrılmış olabilir */
     if (!ps->hs) {
