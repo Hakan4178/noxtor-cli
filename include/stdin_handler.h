@@ -7,8 +7,17 @@
 
 #include "types.h"
 
+#include <stdbool.h>
+
 /* Terminalden gelen her satırı (komut veya mesaj) işler */
 void process_line(struct app_state *state, const char *line);
+
+/* TOFU kullanıcı yanıtı — tek karar noktası. process_line 'y'/'n'
+ * yolundan çağrılır; GTK geçişinde frontend callback'i (tofu_accept_request)
+ * da AYNI fonksiyonu çağırır. C2 epoch+fp token kontrolü burada (ret +
+ * re-arm); çoklu bekleyen varsa hiçbirine karar verilmez; pencere
+ * kapanmışsa (async gecikme) no-op. */
+void tofu_user_response(struct app_state *state, bool accept);
 
 /* Non-blocking girdi okuma, tamponlama ve satır bölme işlemlerini yürütür */
 void process_stdin_events(struct app_state *state);
@@ -31,6 +40,11 @@ nox_err_t send_segmented_message_to(struct app_state *state,
 
 /* Çevrimdışı mesajları parçalara ayırıp kuyruğa alır */
 nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg);
+
+/* D FIX: Sıradaki parça boyutunu UTF-8 sınırına göre hesaplar — kodpoint
+ * bölünmez; offset >= total_len → 0; geçersiz UTF-8 garbage → 1 (progress).
+ * Korpus: tests/test_chunk_size.c */
+size_t nox_next_chunk_size(const char *msg, size_t offset, size_t total_len);
 
 /* Veritabanı kuyruğundan mesaj gönderme callback fonksiyonu */
 nox_err_t send_queued_callback(const char *text, void *ctx);

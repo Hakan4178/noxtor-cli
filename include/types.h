@@ -163,7 +163,9 @@ struct file_rx_state {
     uint64_t received_bytes;
     uint8_t  expected_hash[32];   /* 256-bit BLAKE2b */
     crypto_generichash_state hash_state;
-    time_t   last_chunk_time;     /* son chunk zamanı — timeout kontrolü */
+    struct timespec last_chunk_ts; /* son chunk — CLOCK_MONOTONIC (A FIX:
+                                    * duvar saati değil; suspend/resume veya
+                                    * NTP adımı aktif transferi öldürmemeli) */
 
     /* B-1 FIX: unlinkat için gerçek dosya adı */
     char     local_name[300];
@@ -364,9 +366,13 @@ NOX_STATIC_ASSERT(sizeof(((struct peer_session *)0)->tofu_new_key) ==
                   sizeof(((struct app_state *)0)->tofu_prompt_fp),
                   "C2: tofu_prompt_fp tofu_new_key ile aynı boyutta olmalı");
 
-/* Aktif peer'a hızlı erişim — NULL-safe */
+/* Aktif peer'a hızlı erişim — NULL-safe. C4: çift uç bound — idx < 0 (yok)
+ * VE idx >= NOX_MAX_PEERS (dışı) → NULL (fail-closed). state_machine.c reset
+ * yolunda aynı bound'u uygular (regresyon çifti). */
 #define ACTIVE_PEER(state) \
-    ((state)->active_peer_idx >= 0 ? &(state)->peers[(state)->active_peer_idx] : NULL)
+    ((state)->active_peer_idx >= 0 && \
+         (unsigned)(state)->active_peer_idx < NOX_MAX_PEERS \
+         ? &(state)->peers[(state)->active_peer_idx] : NULL)
 
 extern volatile sig_atomic_t g_shutdown;
 extern volatile sig_atomic_t g_tor_died;

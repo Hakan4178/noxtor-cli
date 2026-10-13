@@ -30,4 +30,12 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
 /* Bağlantı koptuğunda yarım kalan transferlerin kaynaklarını temizler ve dosyaları siler */
 void file_transfer_cleanup(struct app_state *state);
 
+/* Chunk timeout predikati — saf ve saat enjekte edilebilir (A FIX):
+ * now - last > timeout_sec. Caller CLOCK_MONOTONIC ile besler (M-12
+ * kalıbı); duvar saati karşılaştırması YOK. NULL girdi → false
+ * (fail-safe: sahipsiz veri aktif transferi öldürmesin). */
+bool file_transfer_chunk_expired(const struct timespec *last,
+                                 const struct timespec *now,
+                                 long timeout_sec);
+
 #endif /* PARANOID_FILE_TRANSFER_H */

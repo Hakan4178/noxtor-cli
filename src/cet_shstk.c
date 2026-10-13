@@ -1,46 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * cet_shstk.c — CET-SS kilidi + fork-CP self-test (init 4b)
  *
- * Referans:
- *   kernel Documentation/arch/x86/shstk.rst:
- *     "On exec, shadow stack features are disabled by the kernel. At
- *      which point, userspace can choose to re-enable, or lock them."
- *      — shstk'yi loader (glibc ld.so) açar; ELF notu (-Wl,-z,shstk)
- *      tek başına yetmez. glibc 2.44 default: kapalı (dl-cet.c USABLE
- *      kapısı); hwcaps tunable ile açılır.
- *   arch_prctl(ARCH_SHSTK_LOCK, mask):
- *     "Lock in features at their current enabled or disabled status...
- *      The mask is ORed with the existing value." — LOCK mevcut DURUMU
- *     dondurur: shstk kapalıyken atılırsa korumayı OFF'a kilitler ve
- *     geri alınamaz. Bu yüzden LOCK yalnızca STATUS=aktifken atılır.
- *     Empirik (lock_states, glibc 2.44 / kernel 7.2.9): pasif, aktif-
- *     kilitsiz, aktif-kilitli — üç durumda da LOCK rc=0 (idempotent).
- *   /proc/self/status (shstk.rst "Proc Status"):
- *     x86_Thread_features:        → gerçekten ENABLE edilenler = AKTİFLİK
- *     x86_Thread_features_locked: → durumu DONDURAN kilit mask'ı
- *     locked satırındaki shstk, özelliğin AÇIK olduğu anlamına GELMEZ;
- *     eski 8c bu iki satırı karıştırdığı için shstk kapalıyken bile
- *     "AKTİF ve KİLİTLİ" raporluyordu (yanlış-PASS).
- *   SEGV_CPERR (asm-generic/siginfo.h, = 10): sayfa-dışı olmayan #CP'nin
- *     si_code'u; si_addr=NULL. "Plain SIGSEGV ≠ PASS" ayrımı bununla
- *     yapılır.
- *
- * ASSUMPTION:
- *   - shstk ancak process başından itibaren aktifse anlamlıdır.
- *     Runtime'da ARCH_SHSTK_ENABLE ile açmak mevcut çağrı zincirini
- *     bozar: ilk ret, shadow stack altında SEGV_ACCERR ile ölür
- *     (gözlemlendi: syscall+37, shstk VMA tabanı). Bu yüzden enable
- *     edilmez, sadece STATUS ile okunur.
- *   - Pasif durumda LOCK asla çağrılmaz (yukarıdaki OFF kilidi tuzağı).
- *
- * INVARIANT:
- *   - Self-test, main init sırasının 4b adımıdır: PIN'den ÖNCE fork()
- *     edilir; child key materyali göremez.
- *   - Test penceresinde SIGCHLD blokludur: adım 2'deki sigchld_handler
- *     waitpid(-1, WNOHANG) ile child'ı ezip ECHILD yarışı yaratmasın.
- *   - Child yalnız async-signal-safe çağrı kullanır (_exit); atexit
- *     handler'ları (terminal restore vb.) çağırmaz.
- *
  * Child exit protokolü (parent WIFEXITED üzerinden okur):
  *   100 = enforcement yok — trigger temiz döndü (CET-OFF yolu)
  *   101 = #CP → SIGSEGV, si_code == SEGV_CPERR  → PASS

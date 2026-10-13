@@ -634,7 +634,7 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             ps->rx_file.fd = file_fd;
             ps->rx_file.expected_size = net_size;
             ps->rx_file.received_bytes = 0;
-            ps->rx_file.last_chunk_time = time(NULL);
+            clock_gettime(CLOCK_MONOTONIC, &ps->rx_file.last_chunk_ts);
             memcpy(ps->rx_file.expected_hash, file_hash, 32);
             strncpy(ps->rx_file.filename, safe_name, 255);
             ps->rx_file.filename[255] = '\0';
@@ -642,13 +642,11 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             sm_dispatch(ps, state, EV_FILE_RX_START);
 
             if (crypto_generichash_init(&ps->rx_file.hash_state, NULL, 0, 32) != 0) {
+              /* M-F3 FIX: inline temizlik unlinkat'i atliyordu — hash_init
+               * OOM'unda yarim dosya kalici orphan oluyordu. rx_abort ortak
+               * temizlik: close + unlinkat + EV_FILE_DONE + pt free. */
               ui_print_error(state, "Hash state başlatılamadı");
-              close(file_fd);
-              sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
-              ps->rx_file.fd = -1;
-              sm_dispatch(ps, state, EV_FILE_DONE);
-              sodium_free(pt);
-              return true;
+              goto rx_abort;
             }
 
             /* C-6 FIX: Hash'e file_size dahil et — sender boyut yalan söylerse hash uyuşmaz */
@@ -658,14 +656,10 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             size_hdr[4] = (uint8_t)(net_size >> 24); size_hdr[5] = (uint8_t)(net_size >> 16);
             size_hdr[6] = (uint8_t)(net_size >> 8);  size_hdr[7] = (uint8_t)(net_size);
             if (crypto_generichash_update(&ps->rx_file.hash_state, size_hdr, 8) != 0) {
+              /* M-F3 FIX: yukarıdaki gerekçeyle rx_abort (unlinkat dahil) */
               ui_print_error(state, "Hash güncellenemedi");
               sodium_memzero(size_hdr, sizeof(size_hdr));
-              close(file_fd);
-              sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
-              ps->rx_file.fd = -1;
-              sm_dispatch(ps, state, EV_FILE_DONE);
-              sodium_free(pt);
-              return true;
+              goto rx_abort;
             }
             sodium_memzero(size_hdr, sizeof(size_hdr));
 
@@ -701,7 +695,7 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
       goto rx_abort;
     }
     ps->rx_file.received_bytes += write_len;
-    ps->rx_file.last_chunk_time = time(NULL);
+    clock_gettime(CLOCK_MONOTONIC, &ps->rx_file.last_chunk_ts);
 
     if (ps->rx_file.received_bytes >= ps->rx_file.expected_size) {
       /* C-6 FIX: Defense-in-depth — boyut tutarlılığı kontrolü */
@@ -777,6 +771,16 @@ rx_abort:
   sm_dispatch(ps, state, EV_FILE_DONE);
   sodium_free(pt);
   return true;
+}
+
+/* A FIX: chunk timeout predikati — saf, saat enjekte edilebilir.
+ * Caller CLOCK_MONOTONIC timespec ile besler (M-12 kalıbı). NULL → false. */
+bool file_transfer_chunk_expired(const struct timespec *last,
+                                 const struct timespec *now,
+                                 long timeout_sec) {
+  if (!last || !now)
+    return false;
+  return (now->tv_sec - last->tv_sec) > timeout_sec;
 }
 
 /* ================================================================

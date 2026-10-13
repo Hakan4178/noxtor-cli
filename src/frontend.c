@@ -1,29 +1,27 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * ui.c — noxtor-cli merkezi terminal UI katmanı
+ * frontend.c — noxtor-cli ortak frontend katmanı (eski adıyla ui.c)
+ *
+ * Bu dosya ORTAK KATMAN'dır: ui_print_* public sarmalayıcılar, sanitizasyon,
+ * timestamp hesabı ve dispatch bulunur. Asıl çizim (render) fe_ansi.c /
+ * fe_tui.c gibi backend'lere aittir — bkz. struct frontend_ops.
  *
  * Tüm kullanıcıya görünen çıktılar bu dosyadan geçer.
  * Tema renkleri tek bir struct'ta tanımlı, ileride config'den okunabilir.
  *
- * Tasarım: Atomic ANSI Terminal Output
+ * Tasarım: Atomic ANSI Terminal Output (mevcut) + Structured Event (faz 1)
  *   - Her ui_print_* kendi kendine yeterli atomik çıkış üretir
  *   - Save/restore statefulness yok — her fonksiyon state'ten hesaplar
  *   - RAM'de plain text depolanmaz — fprintf + fflush + scrub
  *   - Cursor hide/show ile flicker engellenir
  *   - Prompt her zaman state'ten yeniden çizilir
  *
- * Audit fix'leri:
- *   [F1] g_theme global — thread-unsafe, şu an single-thread (nota eklendi)
- *   [F2] ui_print_progress — save/restore kaldırıldı, progress bar karışıyordu
- *   [F3] ui_print_outgoing — wrap kırılganlığı düzeltildi (TIOCGWINSZ + multi-line clear)
- *   [F4] format_size — uint64_t → PRIu64, 32-bit taşma giderildi
- *   [F6] Atomic ANSI — save/restore kaldırıldı, her mesaj atomik
- *   [F7] Plain text scrub — local buffer'lar sodium_memzero ile temizleniyor
  */
 
 #include "frontend.h"
 #include "common.h"
 #include "types.h"
 #include "tui.h"
+#include "fe_tui.h"     /* TUI çizim gövdeleri (commit 3 split) */
 
 #include <assert.h>
 #include <inttypes.h>  /* PRIu64 — [F4] */
@@ -342,7 +340,11 @@ void ui_print_prompt(struct app_state *state)
 /* UI-1 FIX: Terminal ANSI injection koruması — tüm escape sequence türlerini temizle
  * CSI (ESC [), OSC (ESC ]), DCS (ESC P), ESC followed by non-[, tek ESC */
 // Real attack surface in practice: terminal injection (CSI/OSC/DCS)
-static void strip_ansi_escape(char *str) {
+/* UI-1/B FIX: Tek doğruluk kaynağı — ESC kaçış temizliği. Daha önce İKİ
+ * static kopya vardı (frontend.c + stdin_handler.c) ve drift başlamıştı:
+ * stdin kopyasında OSC/DCS tarama limiti (256) vardı, frontend'de yok.
+ * Kanonik = limitli versiyon; korpus: tests/test_ansi_strip.c. */
+void ui_strip_ansi(char *str) {
   if (!str) return;
   char *dst = str;
   const char *src = str;
@@ -356,17 +358,19 @@ static void strip_ansi_escape(char *str) {
           src++;
         if (*src) src++;
       } else if (src[1] == ']') {
-        /* OSC: ESC ] <cmd> ; <data> BEL or ESC \ */
+        /* OSC: ESC ] <cmd> ; <data> BEL or ESC \ — max 256 byte tara */
         src += 2;
-        while (*src && (unsigned char)*src != 0x07 &&
+        int osc_limit = 256;
+        while (*src && osc_limit-- > 0 && (unsigned char)*src != 0x07 &&
                !(src[0] == 0x1b && src[1] == '\\'))
           src++;
         if ((unsigned char)*src == 0x07) src++;
         else if (src[0] == 0x1b && src[1] == '\\') src += 2;
       } else if (src[1] == 'P') {
-        /* DCS: ESC P <data> ESC \ */
+        /* DCS: ESC P <data> ESC \ — max 256 byte tara */
         src += 2;
-        while (*src && !(src[0] == 0x1b && src[1] == '\\'))
+        int dcs_limit = 256;
+        while (*src && dcs_limit-- > 0 && !(src[0] == 0x1b && src[1] == '\\'))
           src++;
         if (src[0] == 0x1b && src[1] == '\\') src += 2;
       } else {
@@ -388,15 +392,35 @@ static void strip_ansi_escape(char *str) {
   *dst = '\0';
 }
 
-static void print_timestamp_short(void)
+/* ================================================================
+ * ORTAK ZAMAN DAMGASI — tek clock_gettime + localtime_r (commit 2)
+ *
+ * Eski kod: print_timestamp_short() + 4 TUI bloğu bağımsız olarak aynı
+ * hesaplıyordu (5 kopya). Artık tek yardımcı — backend'ler ve TUI blokları
+ * bunu çağırır; faz 2'de fe_event.tm alanına da buradan yazılacak.
+ *
+ * Hata davranışı korundu: clock_gettime başarısızsa epoch'a (ts=0)
+ * düşülür, localtime_r'ın dönüşü kontrol edilir ama hata yutulur
+ * (mevcut davranışın aynısı).
+ *
+ * commit 3: non-static — fe_tui.c backend'i de tek kaynaktan okur
+ * (frontend.h'de bildirimi var).
+ * ================================================================ */
+void fe_now_tm(struct tm *tm_out)
 {
     struct timespec ts;
     memset(&ts, 0, sizeof(ts));
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
-        ts.tv_sec = 0;
+        ts.tv_sec = 0;   /* korunmuş davranış: hata → epoch */
+    memset(tm_out, 0, sizeof(*tm_out));
+    if (!localtime_r(&ts.tv_sec, tm_out))
+        memset(tm_out, 0, sizeof(*tm_out)); /* hata → sıfır tm (00:00:00) */
+}
+
+static void print_timestamp_short(void)
+{
     struct tm tm_buf;
-    memset(&tm_buf, 0, sizeof(tm_buf));
-    localtime_r(&ts.tv_sec, &tm_buf);
+    fe_now_tm(&tm_buf);
     fprintf(stderr, "%s[%02d:%02d:%02d]%s ",
             g_theme->clr_timestamp,
             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
@@ -426,7 +450,7 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     char *safe_msg = malloc(msg_len + 1);
     if (!safe_msg) return;
     memcpy(safe_msg, msg, msg_len + 1);
-    strip_ansi_escape(safe_msg);
+    ui_strip_ansi(safe_msg);
 
     if (state->ln_active) {
         /* Linenoise modu (Faz G-1): terminal satırının sahibi linenoise'dır
@@ -477,16 +501,7 @@ void ui_print_incoming(struct app_state *state, const char *msg)
     if (!msg || !*msg || strspn(msg, " \t") == strlen(msg))
         return;
     if (tui_is_active()) {
-        struct timespec ts;
-        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
-        struct tm tm_buf;
-        localtime_r(&ts.tv_sec, &tm_buf);
-        char tbuf[8192];
-        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Peer: %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
-        tui_chat_append(tbuf);
-        tui_refresh_all(state);
-        sodium_memzero(tbuf, sizeof(tbuf));
+        fe_tui_msg_in(state, msg);   /* gövde fe_tui.c'de (commit 3) */
         return;
     }
     atomic_message(state, UI_LABEL_PEER, msg);
@@ -495,16 +510,7 @@ void ui_print_incoming(struct app_state *state, const char *msg)
 void ui_print_outgoing(struct app_state *state, const char *msg)
 {
     if (tui_is_active()) {
-        struct timespec ts;
-        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
-        struct tm tm_buf;
-        localtime_r(&ts.tv_sec, &tm_buf);
-        char tbuf[8192];
-        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] Sen: %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
-        tui_chat_append(tbuf);
-        tui_refresh_all(state);
-        sodium_memzero(tbuf, sizeof(tbuf));
+        fe_tui_msg_out(state, msg);  /* gövde fe_tui.c'de (commit 3) */
         return;
     }
     atomic_message(state, UI_LABEL_SELF, msg);
@@ -516,32 +522,20 @@ void ui_print_outgoing(struct app_state *state, const char *msg)
 
 void ui_print_system(struct app_state *state, const char *fmt, ...)
 {
-    if (tui_is_active()) {
-        char msg[4096];
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(msg, sizeof(msg), fmt, ap);
-        va_end(ap);
-
-        struct timespec ts;
-        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
-        struct tm tm_buf;
-        localtime_r(&ts.tv_sec, &tm_buf);
-        char tbuf[8192];
-        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
-        tui_chat_append(tbuf);
-        tui_refresh_all(state);
-        sodium_memzero(tbuf, sizeof(tbuf));
-        sodium_memzero(msg, sizeof(msg));
-        return;
-    }
-
+    /* vsnprintf ortak başlangıca — her iki kol da aynı msg[] kullanır
+     * (commit 3: TUI/ANSI dalları önceki vsnprintf kopyaları birleştirildi;
+     * çıktı aynı, commit 4 dispatch'ine hazırlık) */
     char msg[4096];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+
+    if (tui_is_active()) {
+        fe_tui_msg_system(state, msg);  /* gövde fe_tui.c'de (commit 3) */
+        sodium_memzero(msg, sizeof(msg));
+        return;
+    }
 
     if (state->ln_active) {
         /* Linenoise modu (Faz G-1): yalnız içerik — satır yönetimi
@@ -568,32 +562,18 @@ void ui_print_system(struct app_state *state, const char *fmt, ...)
 
 void ui_print_error(struct app_state *state, const char *fmt, ...)
 {
-    if (tui_is_active()) {
-        char msg[4096];
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(msg, sizeof(msg), fmt, ap);
-        va_end(ap);
-
-        struct timespec ts;
-        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) ts.tv_sec = 0;
-        struct tm tm_buf;
-        localtime_r(&ts.tv_sec, &tm_buf);
-        char tbuf[8192];
-        snprintf(tbuf, sizeof(tbuf), "[%02d:%02d:%02d] [!] %s",
-                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
-        tui_chat_append(tbuf);
-        tui_refresh_all(state);
-        sodium_memzero(tbuf, sizeof(tbuf));
-        sodium_memzero(msg, sizeof(msg));
-        return;
-    }
-
+    /* vsnprintf ortak başlangıca (commit 3 — bkz. ui_print_system notu) */
     char msg[4096];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+
+    if (tui_is_active()) {
+        fe_tui_msg_error(state, msg);  /* gövde fe_tui.c'de (commit 3) */
+        sodium_memzero(msg, sizeof(msg));
+        return;
+    }
 
     if (state->ln_active) {
         /* Linenoise modu (Faz G-1): yalnız içerik — satır yönetimi
@@ -652,7 +632,7 @@ void ui_print_progress(struct app_state *state, const char *filename,
                        uint64_t done, uint64_t total, bool is_upload)
 {
     if (tui_is_active()) {
-        tui_refresh_all(state);
+        fe_tui_progress(state);  /* gövde fe_tui.c'de (commit 3) */
         return;
     }
     if (total == 0)
@@ -672,7 +652,7 @@ void ui_print_progress(struct app_state *state, const char *filename,
     char *safe_fn = malloc(fn_len + 1);
     if (!safe_fn) return;
     memcpy(safe_fn, filename, fn_len + 1);
-    strip_ansi_escape(safe_fn);
+    ui_strip_ansi(safe_fn);
 
     unsigned pct = (unsigned)((done * 100ULL) / total);
     if (pct > 100) pct = 100;
@@ -700,4 +680,37 @@ void ui_print_progress(struct app_state *state, const char *filename,
     /* H-2: dosya adı kopyası heap'te iz bırakmasın */
     sodium_memzero(safe_fn, fn_len + 1);
     free(safe_fn);
+}
+
+/* ================================================================
+ * STRUCTURED EVENT + OPS — Faz 1 iskeleti (commit 1)
+ *
+ * Bu noktada HİÇBİR mevcut ui_print_* bu sisteme bağlı değildir; iskelet
+ * önce kurulur, dönüşüm sonraki commit'lerde yapılır. Bu sayede commit
+ * 1'in davranış etkisi sıfır — derleme/test garantisi kolay.
+ *
+ * Backend henüz kayıtlı değilse emit no-op kalır (fuzz hedefleri
+ * registration yapmaz; stderr'deki mevcut davranış bu sayede korunur).
+ * ================================================================ */
+
+static const struct frontend_ops *g_fe_ops = NULL;
+static void *g_fe_ctx = NULL;
+
+void frontend_register(const struct frontend_ops *ops, void *ctx)
+{
+    /* Son çağran kazanır — TUI devreye girerse ANSI'ın yerini alır.
+     * NULL ile unregister da mümkün (temizlik/kapanış). */
+    g_fe_ops = ops;
+    g_fe_ctx = ctx;
+}
+
+void frontend_emit(const struct fe_event *ev)
+{
+    if (!ev || !g_fe_ops || !g_fe_ops->emit)
+        return;   /* kayıtlı backend yok → no-op (davranış-değiştirmez) */
+
+    /* SENKRON: backend, event'teki pointer'ları emit dönüşünde
+     * kullanamaz. Kuyruk/copy YOK — plaintext beklemez (tehdit modeli).
+     * Recursion yasağı: backend bu fonksiyonu geri çağırmaz. */
+    g_fe_ops->emit(g_fe_ctx, ev);
 }

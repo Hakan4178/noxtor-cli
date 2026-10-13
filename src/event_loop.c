@@ -698,10 +698,15 @@ void event_loop(struct app_state *state) {
         }
       }
 
-      /* Dosya transferi timeout — NOX_FILE_CHUNK_TIMEOUT_SEC */
+      /* Dosya transferi timeout — NOX_FILE_CHUNK_TIMEOUT_SEC
+       * A FIX: CLOCK_MONOTONIC (M-12 kalıbı) — duvar saati atlaması
+       * (suspend/resume, NTP) aktif transferi haksız yere öldürmemeli;
+       * ayrıca timeout predikati saf ve test edilebilir (test_time_expiry). */
       if (ps->rx_file.active) {
-        time_t now = time(NULL);
-        if (now - ps->rx_file.last_chunk_time > NOX_FILE_CHUNK_TIMEOUT_SEC) {
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        if (file_transfer_chunk_expired(&ps->rx_file.last_chunk_ts, &now_ts,
+                                        NOX_FILE_CHUNK_TIMEOUT_SEC)) {
           NOX_WARN(LOG_MOD_MAIN, "Dosya transferi zaman aşımı: %s", ps->rx_file.filename);
           ui_print_error(state, "Dosya transferi zaman aşımı — sender sessiz.");
           if (state->downloads_dir_fd >= 0 && ps->rx_file.local_name[0] != '\0') {

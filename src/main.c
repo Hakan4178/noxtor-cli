@@ -884,6 +884,15 @@ int main(int argc, char *argv[]) {
     NOX_INFO(LOG_MOD_MAIN, "%s v%s başlatılıyor", PARANOID_APP_NAME,
              PARANOID_VERSION);
 
+     /* ── tzset() — en başta, sandbox'tan ÖNCE ──────────────────
+     * localtime_r() ilk çağrısında /etc/localtime'i açabilir. Bu, Landlock
+     * veya seccomp stage 3 yüklendikten SONRA yapılırsa sessizce UTC'ye
+     * düşebilir veya EACCES alabilir. tzset() erken çağrılırsa zaman dilimi
+     * önceden çözümlenir ve sonraki sandbox kısıtlamalarından etkilenmez.
+     * İlk localtime_r çağrısı step 1'deki log sistemi — bu yüzden ondan
+     * önce gelmeli. (Faz 1, commit 2) */
+    tzset();
+
     /* ── 2. Signal handler'lar ─────────────────────────── */
     setup_signal_handlers();
     setup_terminal();

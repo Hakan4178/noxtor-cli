@@ -31,7 +31,10 @@
  * ================================================================ */
 
 /* UTF-8 multi-byte karakter sınırına göre bir sonraki güvenli bölme boyutunu bulur */
-static size_t get_next_chunk_size(const char *msg, size_t offset, size_t total_len) {
+/* D FIX: UTF-8 kodpoint bölünmezliği sözleşmesi — 4000 sınırı kodpoint
+ * ortasına düşerse LEAD byte'ın ÖNÜNE çekilir; tamamen continuation
+ * garbage'te 1 döner (progress garantisi). Korpus: tests/test_chunk_size.c */
+size_t nox_next_chunk_size(const char *msg, size_t offset, size_t total_len) {
   /* Underflow koruması */
   if (offset >= total_len) return 0;
 
@@ -136,55 +139,9 @@ static struct peer_session *find_peer_by_name_or_onion(struct app_state *state,
   return NULL;
 }
 
-/* Ham terminal modunda ANSI kaçış dizilerini temizle — tüm türler:
- * CSI (ESC [), OSC (ESC ]), DCS (ESC P), tek ESC */
-static void strip_ansi_escape(char *str) {
-  if (!str) return;
-  char *dst = str;
-  const char *src = str;
-  while (*src) {
-    if ((unsigned char)*src == 0x1b) {
-      if (src[1] == '[') {
-        /* CSI: ESC [ <params> <final> */
-        src += 2;
-        while (*src && ((*src >= '0' && *src <= '?') ||
-                        (*src >= ' ' && *src <= '/')))
-          src++;
-        if (*src) src++;
-      } else if (src[1] == ']') {
-        /* OSC: ESC ] <cmd> ; <data> BEL or ESC \ — max 256 byte tara */
-        src += 2;
-        int osc_limit = 256;
-        while (*src && osc_limit-- > 0 && (unsigned char)*src != 0x07 &&
-               !(src[0] == 0x1b && src[1] == '\\'))
-          src++;
-        if ((unsigned char)*src == 0x07) src++;
-        else if (src[0] == 0x1b && src[1] == '\\') src += 2;
-      } else if (src[1] == 'P') {
-        /* DCS: ESC P <data> ESC \ — max 256 byte tara */
-        src += 2;
-        int dcs_limit = 256;
-        while (*src && dcs_limit-- > 0 && !(src[0] == 0x1b && src[1] == '\\'))
-          src++;
-        if (src[0] == 0x1b && src[1] == '\\') src += 2;
-      } else {
-        /* Diğer tüm ESC sequence'leri — atla */
-        if (src[1] != '\0')
-          src += 2;
-        else
-          src++;  /* bare ESC — NUL'a kadar atla */
-      }
-    } else if ((unsigned char)*src < 32 && *src != '\t' && *src != '\n' && *src != '\r') {
-      /* LN-1: C0 control (except TAB/LF/CR) — drop, UTF-8 continuation korunur */
-      src++;
-    } else if ((unsigned char)*src == 0x7F) {
-      src++;
-    } else {
-      *dst++ = *src++;
-    }
-  }
-  *dst = '\0';
-}
+/* B FIX: ANSI kaçış temizliği artık frontend.c'de tek kaynak
+ * (ui_strip_ansi, test_ansi_strip korpusuyla kilitli) — buradaki
+ * static kopya silindi, drift'e kapalı. */
 
 /* ================================================================
  * MESAJ GÖNDERME VE KUYRUK YARDIMCILARI
@@ -288,7 +245,7 @@ nox_err_t send_segmented_message_to(struct app_state *state,
   }
 
   while (offset < total_len) {
-    size_t chunk_len = get_next_chunk_size(msg, offset, total_len);
+    size_t chunk_len = nox_next_chunk_size(msg, offset, total_len);
     memcpy(chunk, msg + offset, chunk_len);
     chunk[chunk_len] = '\0';
 
@@ -355,7 +312,7 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
   int queued = 0;
 
   while (offset < total_len) {
-    size_t chunk_len = get_next_chunk_size(msg, offset, total_len);
+    size_t chunk_len = nox_next_chunk_size(msg, offset, total_len);
     memcpy(chunk, msg + offset, chunk_len);
     chunk[chunk_len] = '\0';
 
@@ -380,10 +337,15 @@ nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg) 
   sodium_free(chunk);
   return first_err;
 }
-void process_line(struct app_state *state, const char *line) {
-  struct peer_session *ps = ACTIVE_PEER(state);
-
-  /* ── TOFU Onay Modu (H-2 paranoid + K-1 ile entegre) ─────────────── */
+/* ================================================================
+ * TOFU KULLANICI YANITI — tek karar noktası
+ *
+ * process_line 'y'/'n' yolundan ve GTK geçişinde frontend callback'inden
+ * (tofu_accept_request) çağrılır. C2 token kontrolü burada: prompt
+ * anındaki örnek (epoch + fp snapshot) ile güncel örnek eşleşmezse ret +
+ * re-arm. Çoklu bekleyen bağlantı varsa hiçbirine karar verilmez.
+ * ================================================================ */
+void tofu_user_response(struct app_state *state, bool accept) {
   struct peer_session *tofu_ps = NULL;
   unsigned tofu_cnt = 0;
   for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
@@ -392,56 +354,73 @@ void process_line(struct app_state *state, const char *line) {
       tofu_cnt++;
     }
   }
-  if (tofu_cnt > 0) {
+  if (tofu_cnt == 0)
+    return; /* pencere çoktan kapandı — no-op (GTK async gecikmesi) */
+  if (tofu_cnt > 1) {
+    ui_print_error(state,
+      "Birden fazla TOFU bekleyen bağlantı var (%u). Lütfen önce "
+      "/disconnect ile birini kapatın veya tek TOFU kalana dek bekleyin.",
+      tofu_cnt);
+    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+      if (state->peers[i].state == ST_TOFU_PENDING) {
+        ui_print_system(state, "  - slot %u: %s (%s)", i,
+          state->peers[i].tofu_onion[0] ? state->peers[i].tofu_onion : "?",
+          state->peers[i].tofu_name[0]  ? state->peers[i].tofu_name  : "?");
+      }
+    }
+    return;
+  }
+  if (accept) {
+    /* C2 FIX: bayat onay — "y", prompt anındaki örnek (epoch + fp)
+     * bağlanır. Slot recycle'ı (drop → aynı slota yeni anahtar) burada
+     * yakalanır: kullanıcı, güncel fp tekrar ekrandayken karar vermeden
+     * onaylanmaz. Uyuşmazlıkta snapshot yenilenir (re-arm) + hata. */
+    if (tofu_ps->tofu_epoch != state->tofu_prompt_epoch ||
+        sodium_memcmp(tofu_ps->tofu_new_key, state->tofu_prompt_fp,
+                      NOX_KEY_LEN) != 0) {
+      char fp_now[NOX_KEY_LEN * 2 + 1];
+      for (size_t fk = 0; fk < NOX_KEY_LEN; fk++)
+        snprintf(&fp_now[fk * 2], sizeof(fp_now) - fk * 2, "%02x",
+                 tofu_ps->tofu_new_key[fk]);
+      state->tofu_prompt_epoch = tofu_ps->tofu_epoch; /* yeniden arm */
+      memcpy(state->tofu_prompt_fp, tofu_ps->tofu_new_key, NOX_KEY_LEN);
+      ui_print_error(state,
+          "[!] TOFU onay PENCERESİ DEĞİŞTİ — bağlantı yenilenmiş olabilir "
+          "(slot %zu).\n      Doğrulanacak fingerprint: %s\n"
+          "      fp ekrandakiyle eşleşiyorsa onaylamak için tekrar 'y' yazın.",
+          (size_t)(tofu_ps - state->peers), fp_now);
+      sodium_memzero(fp_now, sizeof(fp_now));
+      return;
+    }
+    nox_err_t acc_rc = sm_dispatch(tofu_ps, state, EV_TOFU_ACCEPTED);
+    state->tofu_prompt_epoch = 0; /* onay tüketildi (başarılı ya da ölü örnek) */
+    if (acc_rc != NOX_OK) {
+      sm_dispatch(tofu_ps, state, EV_PEER_DISCONNECTED);
+    }
+  } else {
+    state->tofu_prompt_epoch = 0; /* reddedildi — pencere kapandı */
+    ui_print_system(state, "[*] Bağlantı reddedildi.");
+    sm_dispatch(tofu_ps, state, EV_TOFU_REJECTED);
+  }
+}
+
+void process_line(struct app_state *state, const char *line) {
+  struct peer_session *ps = ACTIVE_PEER(state);
+
+  /* ── TOFU Onay Modu (H-2 paranoid + K-1 ile entegre) ─────────────── */
+  bool tofu_pending = false;
+  for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+    if (state->peers[i].state == ST_TOFU_PENDING) {
+      tofu_pending = true;
+      break;
+    }
+  }
+  if (tofu_pending) {
     bool is_yes = (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0);
     bool is_no  = (strcasecmp(line, "n") == 0 || strcasecmp(line, "no") == 0);
     if (is_yes || is_no) {
-      if (tofu_cnt > 1) {
-        ui_print_error(state,
-          "Birden fazla TOFU bekleyen bağlantı var (%u). Lütfen önce "
-          "/disconnect ile birini kapatın veya tek TOFU kalana dek bekleyin.",
-          tofu_cnt);
-        for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
-          if (state->peers[i].state == ST_TOFU_PENDING) {
-            ui_print_system(state, "  - slot %u: %s (%s)", i,
-              state->peers[i].tofu_onion[0] ? state->peers[i].tofu_onion : "?",
-              state->peers[i].tofu_name[0]  ? state->peers[i].tofu_name  : "?");
-          }
-        }
-        return;
-      }
-      if (is_yes) {
-        /* C2 FIX: bayat onay — "y", prompt anındaki örnek (epoch + fp)
-         * bağlanır. Slot recycle'ı (drop → aynı slota yeni anahtar) burada
-         * yakalanır: kullanıcı, güncel fp tekrar ekrandayken karar vermeden
-         * onaylanmaz. Uyuşmazlıkta snapshot yenilenir (re-arm) + hata. */
-        if (tofu_ps->tofu_epoch != state->tofu_prompt_epoch ||
-            sodium_memcmp(tofu_ps->tofu_new_key, state->tofu_prompt_fp,
-                          NOX_KEY_LEN) != 0) {
-          char fp_now[NOX_KEY_LEN * 2 + 1];
-          for (size_t fk = 0; fk < NOX_KEY_LEN; fk++)
-            snprintf(&fp_now[fk * 2], sizeof(fp_now) - fk * 2, "%02x",
-                     tofu_ps->tofu_new_key[fk]);
-          state->tofu_prompt_epoch = tofu_ps->tofu_epoch; /* yeniden arm */
-          memcpy(state->tofu_prompt_fp, tofu_ps->tofu_new_key, NOX_KEY_LEN);
-          ui_print_error(state,
-              "[!] TOFU onay PENCERESİ DEĞİŞTİ — bağlantı yenilenmiş olabilir "
-              "(slot %zu).\n      Doğrulanacak fingerprint: %s\n"
-              "      fp ekrandakiyle eşleşiyorsa onaylamak için tekrar 'y' yazın.",
-              (size_t)(tofu_ps - state->peers), fp_now);
-          sodium_memzero(fp_now, sizeof(fp_now));
-          return;
-        }
-        nox_err_t acc_rc = sm_dispatch(tofu_ps, state, EV_TOFU_ACCEPTED);
-        state->tofu_prompt_epoch = 0; /* onay tüketildi (başarılı ya da ölü örnek) */
-        if (acc_rc != NOX_OK) {
-          sm_dispatch(tofu_ps, state, EV_PEER_DISCONNECTED);
-        }
-      } else {
-        state->tofu_prompt_epoch = 0; /* reddedildi — pencere kapandı */
-        ui_print_system(state, "[*] Bağlantı reddedildi.");
-        sm_dispatch(tofu_ps, state, EV_TOFU_REJECTED);
-      }
+      /* Tek karar noktası — GTK (tofu_accept_request) da buradan çağırır */
+      tofu_user_response(state, is_yes);
       return;
     }
     /* y/n değil ve TOFU bekliyor — // dahil hiçbir slash-mesaj gönderme */
@@ -917,12 +896,12 @@ if (res != NULL) {
 
     /* Echo: terminal raw mode'da echo kapalı, program kendi yazacak
      * Sadece son okunan byte'ları echo et (önceki döngüde zaten yazıldı)
-     * NOT: strip_ansi_escape'dan ÖNCE hesapla — escape temizlenince
+     * NOT: ui_strip_ansi'dan ÖNCE hesapla — escape temizlenince
      * echo_start underflow olmasın */
     size_t old_len = state->stdin_len - (size_t)r;
     {
-      /* Escape sequence temizle — ok tuşları, vb. */
-      strip_ansi_escape(state->stdin_buf);
+      /* Escape sequence temizle — ok tuşları, vb. (B FIX: tek kaynak) */
+      ui_strip_ansi(state->stdin_buf);
       state->stdin_len = strlen(state->stdin_buf);
 
       size_t echo_start = (state->stdin_len > old_len) ? old_len : state->stdin_len;
