@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <seccomp.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>

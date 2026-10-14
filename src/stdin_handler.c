@@ -19,6 +19,7 @@
 
 #include <errno.h>
 #include <time.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>

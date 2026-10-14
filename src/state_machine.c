@@ -23,6 +23,7 @@
 
 #include <string.h>
 #include <time.h>
+#include <stdio.h>
 #include <unistd.h>
 
 /* C2: TOFU epoch token sabit boyutu — peer_session örnek token'ı ↔
