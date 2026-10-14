@@ -19,6 +19,7 @@
 
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
