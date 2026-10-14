@@ -64,6 +64,22 @@ jobs:
     # - name: Setup runtime (example)
     #   uses: actions/setup-example@v1
 
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-14 g++-14 make curl libsqlite3-dev libseccomp-dev tor obfs4proxy
+
+    - name: Build libsodium 1.0.20
+      run: |
+        curl -fsSLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz
+        echo "<SHA256>  libsodium-1.0.20-stable.tar.gz" | sha256sum -c -
+        tar xzf libsodium-1.0.20-stable.tar.gz
+        cd libsodium-stable
+        ./configure --prefix=/usr/local
+        make -j"$(nproc)"
+        sudo make install
+        sudo ldconfig
+
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v4
