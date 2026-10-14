@@ -4,8 +4,9 @@
  * Bu header İKİ katmanı tanımlar:
  *   1. Public UI API (ui_print_*, tema, CLI-only satır sahipliği) — 206
  *      çağrı sitesi bu imzaları kullanır; fazlarda imzalar DEĞİŞMEZ.
- *   2. Structured event + ops (faz 1 iskeleti) — backend'lerin
- *      (fe_ansi/fe_tui/fe_socket) takılacağı dispatch noktası.
+ *   2. Structured event + ops — dispatch noktası (commit 4'te canlı:
+ *      ui_print_* → frontend_emit → kayıtlı backend fe_ansi/fe_tui).
+ *      CLI-only API implementasyonları fe_ansi.c'dedir.
  *
  * Tema değiştirmek için tek yapılması gereken nox_theme struct'ını
  * güncellemek — tüm çıktılar otomatik olarak yeni paleti kullanır.
@@ -82,8 +83,8 @@ void clear_prompt_area(struct app_state *state);
 /* Belirli satır sayısını temizle (saved prompt wrap için) */
 void clear_prompt_area_lines(int lines);
 
-/* Bağlam duyarlı prompt bas (bağlantı durumu + onion kısaltma) */
-void ui_print_prompt(struct app_state *state);
+/* ui_print_prompt: header'dan DÜŞTÜ (commit 4, §1.3) — dış çağrı 0;
+ * yalnız fe_ansi.c'deki redraw_input çağırır (static). */
 
 /* G-2: Terminal satır sahipliği — YALNIZCA event_loop.c top-level
  * handler'larından çağrılır. ui_print_* veya log.c gibi yardımcılar içine

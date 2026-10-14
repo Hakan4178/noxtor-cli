@@ -45,7 +45,7 @@ jobs:
         make -j"$(nproc)"
         sudo make install
         sudo ldconfig
-        grep -q crypto_hash_sha3256 /usr/local/include/sodium/crypto_hash_sha3256.h
+        grep -q crypto_hash_sha3256 /usr/local/include/sodium/crypto_hash_sha3.h
 
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v4
