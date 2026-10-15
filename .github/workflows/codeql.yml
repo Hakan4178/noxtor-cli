@@ -38,7 +38,7 @@ jobs:
     - name: Build libsodium 1.0.22
       run: |
         curl -fsSLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.22-stable.tar.gz
-        echo "eb9873cc5ccd7b26ef058394264663c99e9c047b423be1ffd484071774198f26  libsodium-1.0.22-stable.tar.gz" | sha256sum -c -
+        echo "d862511f0ef382b5a6fab6909b511053d4ff62ea11cfd820ac6269d0a0993e9d  libsodium-1.0.22-stable.tar.gz" | sha256sum -c -
         tar xzf libsodium-1.0.22-stable.tar.gz
         cd libsodium-stable
         ./configure --prefix=/usr/local
