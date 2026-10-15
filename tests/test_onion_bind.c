@@ -26,31 +26,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sodium.h>
+#include "test_common.h"
 
-/* ================================================================
- * TEST MAKROLARI
- * ================================================================ */
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define TEST_ASSERT(cond) do {                                      \
-    if (!(cond)) {                                                  \
-        fprintf(stderr, "FAIL %s:%d: %s\n",                        \
-                __FILE__, __LINE__, #cond);                         \
-        return 1;                                                   \
-    }                                                               \
-} while (0)
-
-#define RUN_TEST(test_fn) do {                                      \
-    tests_run++;                                                    \
-    fprintf(stderr, "  [%d] %-45s ", tests_run, #test_fn);          \
-    if (test_fn() == 0) {                                           \
-        tests_passed++;                                             \
-        fprintf(stderr, "\033[32mOK\033[0m\n");                     \
-    } else {                                                        \
-        fprintf(stderr, "\033[31mFAIL\033[0m\n");                   \
-    }                                                               \
-} while (0)
 
 /* Canlı Tor ADD_ONION ile bu makinede üretilen gerçek v3 adres
  * (test_onion_derive.sh, canlı Tor). Checksum formülünü Tor'un
@@ -59,27 +36,9 @@ static int tests_passed = 0;
     "je63abepbqzrn7tvqfrdi5g7tp76uq3fv5dh7jwmala7yqwgkrfdlxad.onion"
 
 /* ================================================================
- * YARDIMCILAR — base32 encode + v3 adres kurulumu (test için)
+ * YARDIMCILAR — v3 adres kurulumu (test için)
+ * (base32 encode: test_common.h → nox_test_base32_encode)
  * ================================================================ */
-static const char B32_ALPHABET[] = "abcdefghijklmnopqrstuvwxyz234567";
-
-/* 35 byte body → 56 char base32 (RFC4648, padding yok, lowercase) */
-static void b32_encode_35(const uint8_t in[NOX_ONION_BODY_LEN],
-                          char out[NOX_ONION_B32_LEN])
-{
-    uint32_t acc  = 0;
-    unsigned bits = 0;
-    size_t   o    = 0;
-    for (size_t i = 0; i < NOX_ONION_BODY_LEN; i++) {
-        acc = (acc << 8) | in[i];
-        bits += 8;
-        while (bits >= 5) {
-            bits -= 5;
-            out[o++] = B32_ALPHABET[(acc >> bits) & 31u];
-        }
-    }
-    /* 35×8 = 280 = 56×5 — artan bit kalmaz */
-}
 
 /* pub → v3 onion adresi (checksum + version dahil) üret */
 static int make_onion_addr(char out[NOX_ONION_LEN + 1],
@@ -98,7 +57,7 @@ static int make_onion_addr(char out[NOX_ONION_LEN + 1],
     TEST_ASSERT(crypto_hash_sha3256(digest, ck_in, sizeof(ck_in)) == 0);
     memcpy(body + NOX_KEY_LEN, digest, 2); /* checksum = SHA3(...)[:2] */
 
-    b32_encode_35(body, out);
+    nox_test_base32_encode(body, NOX_ONION_BODY_LEN, out);
     memcpy(out + NOX_ONION_B32_LEN, ".onion", 7); /* ".onion" + NUL */
     return 0;
 }

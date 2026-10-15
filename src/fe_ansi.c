@@ -1,33 +1,19 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * fe_ansi.c — Atomic ANSI Terminal Output backend (Faz 1, commit 4)
+ * fe_ansi.c — Atomic ANSI backend (eski: ui.c'nin bir kısmı)
  *
- * frontend.c'den taşındı (eski: ui.c içindeydi). Bu dosya sahip olduğu:
- *   - Tema (nox_theme_default, g_theme, ui_init)
- *   - Prompt çizimi (ui_print_prompt — static), redraw_input,
- *     clear_prompt_area(_lines), ui_line_* (G-2), ui_reset_sender
- *   - Atomic ANSI mesaj çıkışı (atomic_message + strip)
- *   - Sistem/hata bloğu (block_message), progress bar (render_progress)
- *   - Label state (g_last_label — commit 5'te ctx'e taşınacak)
+ * Varsayılan dispatch backend'i: tema, prompt/redraw, atomic mesaj,
+ * sistem/hata bloğu, progress bar. CLI-only fonksiyonlar (dispatch
+ * dışı — tui_is_active guard'ı kalır): clear_prompt_area*, ui_line_*,
+ * ui_reset_sender; ui_print_prompt static (header'dan düştü).
  *
- * Tasarım: Atomic ANSI Terminal Output
- *   - Her çizim fonksiyonu kendi kendine yeterli atomik çıkış üretir
- *   - Save/restore statefulness yok — her fonksiyon state'ten hesaplar
- *   - RAM'de plain text depolanmaz — fprintf + fflush + scrub
- *   - Cursor hide/show ile flicker engellenir
- *   - Prompt her zaman state'ten yeniden çizilir
+ * Tasarım: her çizim kendi kendine yeterli atomik çıktı üretir;
+ * save/restore yok; plaintext RAM'de beklemez (fprintf + scrub);
+ * prompt state'ten yeniden çizilir; flicker cursor hide/show ile
+ * engellenir.
  *
- * DISPATCH (commit 4): bu backend fe_ansi_ops.emit ile kayıtlıdır;
- * tui_is_active() dallanması çizim yollarından KALKTI — backend seçimi
- * registration ile. CLI-only fonksiyonlarda (clear_prompt_area*,
- * redraw_input, ui_print_prompt) guard KALIR — onlar dispatch dışı.
- *
- * Audit fix'leri:
- *   [F1] g_theme global — thread-unsafe, şu an single-thread (nota eklendi)
- *   [F2] ui_print_progress — save/restore kaldırıldı, progress bar karışıyordu
- *   [F3] ui_print_outgoing — wrap kırılganlığı düzeltildi (TIOCGWINSZ + multi-line clear)
- *   [F4] format_size — uint64_t → PRIu64, 32-bit taşma giderildi
- *   [F6] Atomic ANSI — save/restore kaldırıldı, her mesaj atomik
- *   [F7] Plain text scrub — local buffer'lar sodium_memzero ile temizleniyor
+ * Audit: [F1] g_ansi tek-instance (single-thread) [F2] progress
+ * save/restore kaldırıldı [F3] outgoing wrap düzeltmesi [F4]
+ * format_size PRIu64 [F6] atomic ANSI [F7] local buffer scrub
  */
 
 #include "fe_ansi.h"
@@ -37,33 +23,23 @@
 #include "tui.h"
 
 #include <assert.h>
-#include <inttypes.h>  /* PRIu64 — [F4] */
-
-/* İleri bildirim — ui_print_prompt tanımı (satır ~279) çağrıdan (redraw_input)
- * sonra geliyor; derleyici implicit-declaration veriyordu (WIP build fix) */
-static void ui_print_prompt(struct app_state *state);
-#include <sodium.h>    /* [F7] sodium_memzero — plain text scrub */
+#include <inttypes.h>  /* PRIu64 [F4] */
+#include <sodium.h>    /* sodium_memzero [F7] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-/* ── Magic number sabitleri ───────────────────── */
+/* Öne bildirim — tanım redraw_input'tan sonra geliyor */
+static void ui_print_prompt(struct app_state *state);
+
+/* Magic number sabitleri */
 #define SHORT_ID_SIZE       12
 #define PROGRESS_BAR_WIDTH  16
 
-/* ================================================================
- * VARSAYILAN TEMA — Kullanıcı paleti (truecolor 24-bit)
- *
- * [Sen]     → yeşil    rgb(38, 162, 105)
- * [Peer]    → mor      rgb(112, 60, 153)
- * Sistem    → amber    rgb(202, 151, 15)
- * Hata      → kırmızı  rgb(210, 24, 38)
- * Prompt    → teal     rgb(38, 105, 121)
- * Zaman     → koyu mavi rgb(31, 65, 117)
- * Progress  → teal     rgb(38, 105, 121)
- * ================================================================ */
+/* VARSAYILAN TEMA — truecolor 24-bit
+ * Sen yeşil | Peer mor | Sistem amber | Hata kırmızı | Prompt teal | Zaman koyu mavi */
 const struct nox_theme nox_theme_default = {
     .clr_self      = "\033[38;2;38;162;105m",
     .clr_peer      = "\033[38;2;133;60;153m",
@@ -75,27 +51,35 @@ const struct nox_theme nox_theme_default = {
     .clr_reset     = "\033[0m",
 };
 
-/*
- * [F1] g_theme — global pointer, şu an single-thread olduğu için güvenli.
- *
- * ⚠️  GELECEK UYARI: Multi-peer (Phase 6.3+) veya GTK UI thread'i
- *     eklendiğinde bu pointer'a eşzamanlı erişim race condition yaratır.
- *     O zaman ya app_state içine taşı ya da _Atomic/_Thread_local kullan.
- *     (commit 5: ansi_ctx'e taşınacak — fe_ansi_emit ctx parametresi hazır)
- */
-static const struct nox_theme *g_theme = &nox_theme_default;
+/* Mesaj label'ı */
+enum ui_label {
+    UI_LABEL_NONE,
+    UI_LABEL_SELF,
+    UI_LABEL_PEER,
+    UI_LABEL_ERROR,
+};
 
-/* ================================================================
- * TEMA BAŞLATMA
- * ================================================================ */
+/* ANSI backend durumu — default yolda ctx NULL → g_ansi (fallback);
+ * ctx override test/fuzz içindir, tam ctx-erisim Faz 4 (GTK).
+ * [F1] tek-instance: single-thread; GTK thread'inde race olur →
+ * o zaman app_state'e taşı ya da _Atomic/_Thread_local kullan. */
+struct ansi_ctx {
+    const struct nox_theme *theme;
+    enum ui_label last_label;
+};
+
+static struct ansi_ctx g_ansi = {
+    .theme       = &nox_theme_default,
+    .last_label  = UI_LABEL_NONE,
+};
+
+/* TEMA BAŞLATMA */
 void ui_init(const struct nox_theme *theme)
 {
-    g_theme = theme ? theme : &nox_theme_default;
+    g_ansi.theme = theme ? theme : &nox_theme_default;
 }
 
-/* ================================================================
- * YARDIMCI: Terminal genişliği ve wrap satır hesabı
- * ================================================================ */
+/* YARDIMCI: Terminal genişliği ve wrap satır hesabı */
 static int get_terminal_cols(void)
 {
     struct winsize ws;
@@ -144,8 +128,9 @@ static int calc_input_lines(struct app_state *state)
 
 /* Wrap edilmiş tüm satırları temizle (cursor yukarı + sil)
  *
- * CLI-only (dispatch dışı): TUI aktifken no-op — guard KALIR (commit 4:
- * çizim yollarındaki tui_is_active dalları kalktı, bunlar kalmaz). */
+ * CLI-only (dispatch dışı): TUI aktifken no-op — guard BURADA KALIR
+ * (commit 4: çizim yollarındaki tui_is_active dalları kalktı; bunların
+ * CLI-only olduğu için kalması kararı korundu). */
 void clear_prompt_area(struct app_state *state)
 {
     if (tui_is_active())
@@ -212,8 +197,7 @@ static void clear_below_cursor(void)
     fprintf(stderr, "\033[J");
 }
 
-/* Prompt'u ve mevcut input'u state'ten yeniden çiz */
-// Real attack surface in practice: local stdin re-draw (pipe fallback)
+/* Prompt'u ve mevcut input'u state'ten yeniden çiz (pipe fallback yolu) */
 static void redraw_input(struct app_state *state)
 {
     if (tui_is_active())
@@ -235,28 +219,17 @@ static void redraw_input(struct app_state *state)
     fflush(stderr);
 }
 
-/* Mesaj label'ı yaz */
-enum ui_label {
-    UI_LABEL_NONE,
-    UI_LABEL_SELF,
-    UI_LABEL_PEER,
-    UI_LABEL_ERROR,
-};
-
-/* commit 5: ctx'e taşınacak (fe_ansi_emit ctx parametresi hazır) */
-static enum ui_label g_last_label = UI_LABEL_NONE;
-
 static void print_label(enum ui_label label)
 {
     switch (label) {
     case UI_LABEL_SELF:
-        fprintf(stderr, "%sSen:%s", g_theme->clr_self, g_theme->clr_reset);
+        fprintf(stderr, "%sSen:%s", g_ansi.theme->clr_self, g_ansi.theme->clr_reset);
         break;
     case UI_LABEL_PEER:
-        fprintf(stderr, "%sPeer:%s", g_theme->clr_peer, g_theme->clr_reset);
+        fprintf(stderr, "%sPeer:%s", g_ansi.theme->clr_peer, g_ansi.theme->clr_reset);
         break;
     case UI_LABEL_ERROR:
-        fprintf(stderr, "%s!:%s", g_theme->clr_error, g_theme->clr_reset);
+        fprintf(stderr, "%s!:%s", g_ansi.theme->clr_error, g_ansi.theme->clr_reset);
         break;
     case UI_LABEL_NONE:
         break;
@@ -268,18 +241,11 @@ static void print_label(enum ui_label label)
 /* Sender durumunu sıfırla (yeni bağlantıda) */
 void ui_reset_sender(void)
 {
-    g_last_label = UI_LABEL_NONE;
+    g_ansi.last_label = UI_LABEL_NONE;
 }
 
-/* ================================================================
- * BAĞLAM DUYARLI PROMPT
- *
- * Bağlantı yok:          nox>
- * Bağlı:                 [peer:abcd..wxyz] >
- * Dosya gönderiliyor:    [peer:abcd..wxyz ⬆45%] >
- *
- * header'dan düştü (§1.3): dış çağrı 0 — yalnız redraw_input çağırır.
- * ================================================================ */
+/* Bağlam duyarlı prompt (static — dış çağrı 0, yalnız redraw_input):
+ * nox> | [peer:abcd..wxyz] > | [peer:abcd..wxyz ⬆45%] > */
 static void ui_print_prompt(struct app_state *state)
 {
     if (tui_is_active())
@@ -288,7 +254,7 @@ static void ui_print_prompt(struct app_state *state)
     /* Display uzunluğunu hesapla ve kaydet (wrap hesabı için gerekli) */
     state->prompt_display_len = calc_prompt_display_len(state);
 
-    fprintf(stderr, "%s", g_theme->clr_prompt);
+    fprintf(stderr, "%s", g_ansi.theme->clr_prompt);
 
     struct peer_session *ps = ACTIVE_PEER(state);
 
@@ -336,53 +302,29 @@ static void ui_print_prompt(struct app_state *state)
             fprintf(stderr, "[%s]", short_id);
         }
 
-        fprintf(stderr, " > %s", g_theme->clr_reset);
+        fprintf(stderr, " > %s", g_ansi.theme->clr_reset);
 
     } else {
-        fprintf(stderr, "nox> %s", g_theme->clr_reset);
+        fprintf(stderr, "nox> %s", g_ansi.theme->clr_reset);
     }
 
     fflush(stderr);
 }
 
-/* ================================================================
- * MESAJ ÇIKTILARI — İki Satır Formatı
- *
- *   [21:14:39] Sen:
- *     pejfoooooooooooooooooooooooooooooooooooo
- *     ooooooooooooooooooooooooooooooooooooooo
- *
- *   [21:14:39] Peer:
- *     r3nhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
- *     hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
- *
- * [F8] Dinamik satır hesabı — peer mesajı gelirken input bozulmaz
- * ================================================================ */
+/* Mesaj çıkışı — [HH:MM:SS] label tek satır; uzun mesaj wrap
+ * ([F8] dinamik satır hesabı — peer mesajı gelirken input bozulmaz) */
 
 /* Timestamp bas — tm event'ten gelir (commit 4: tek clock frontend.c'de) */
 static void print_timestamp_short(const struct tm *tm)
 {
     fprintf(stderr, "%s[%02d:%02d:%02d]%s ",
-            g_theme->clr_timestamp,
+            g_ansi.theme->clr_timestamp,
             tm->tm_hour, tm->tm_min, tm->tm_sec,
-            g_theme->clr_reset);
+            g_ansi.theme->clr_reset);
 }
 
-/* Atomik mesaj çıkışı — tek satır format
- *
- *   [22:29:17] Sen: jeyyheyyo
- *   [22:29:22] Peer: heyo
- *   [22:29:33] Sen: uhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
- *               hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
- *
- * Uzun mesajlar terminal genişliğine göre otomatik sarılır.
- * Sender değişince boşluk eklenir.
- *
- * commit 4: tui_is_active guard KALKTI (dispatch registration ile korur),
- * tm event'ten parametre olarak gelir.
- */
-
-// Real attack surface in practice: attacker plaintext → terminal (strip_ansi)
+/* Atomik mesaj çıkışı — strip + scrub; uzun mesaj wrap, sender
+ * değişince boşluk; tm event'ten (tek clock — frontend.c). */
 static void atomic_message(struct app_state *state, enum ui_label label,
                            const char *msg, const struct tm *tm)
 {
@@ -398,7 +340,7 @@ static void atomic_message(struct app_state *state, enum ui_label label,
          * (Hide/Show/EditStart). Eski input-satır mekanizması burada
          * prompt'u silip kendi prompt'unu bastığı için atlanır — yalnız
          * içerik yazılır. */
-        if (g_last_label != UI_LABEL_NONE && g_last_label != label)
+        if (g_ansi.last_label != UI_LABEL_NONE && g_ansi.last_label != label)
             fprintf(stderr, "\n");
         print_timestamp_short(tm);
         print_label(label);
@@ -408,7 +350,7 @@ static void atomic_message(struct app_state *state, enum ui_label label,
         sodium_memzero(safe_msg, msg_len + 1);
         free(safe_msg);
         fflush(stderr);
-        g_last_label = label;
+        g_ansi.last_label = label;
         return;
     }
 
@@ -418,7 +360,7 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     clear_prompt_area_lines(clear_lines);
 
     /* Sender değişince boşluk ekle */
-    if (g_last_label != UI_LABEL_NONE && g_last_label != label)
+    if (g_ansi.last_label != UI_LABEL_NONE && g_ansi.last_label != label)
         fprintf(stderr, "\n");
 
     print_timestamp_short(tm);
@@ -429,24 +371,15 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     free(safe_msg);
     fflush(stderr);
 
-    g_last_label = label;
+    g_ansi.last_label = label;
 
     redraw_input(state);
     fprintf(stderr, "\033[?25h");
     fflush(stderr);
 }
 
-/* Sistem/hata bloğu — eski ui_print_system/ui_print_error ANSI yolu
- *
- *   [22:29:17]   sistem mesajı
- *   [22:29:18]   [!] hata mesajı
- *
- * tag: "" (system) veya "[!] " (error) — çıktı byte-identical
- * (eski formatlar: "  %s%s%s\n" / "  %s[!] %s%s\n").
- *
- * scrub YOK: msg sahipliği caller'da (frontend.c emit dönüşünde
- * sodium_memzero). H-2 sahiplik kuralı: backend text'i sahiplenmez.
- */
+/* Sistem/hata bloğu — "  <color><tag><text>" (byte-identical);
+ * scrub yok: text sahipliği caller'da (H-2 kuralı) */
 static void block_message(struct app_state *state, const struct tm *tm,
                           const char *color, const char *tag,
                           const char *text)
@@ -455,7 +388,7 @@ static void block_message(struct app_state *state, const struct tm *tm,
         /* Linenoise modu (Faz G-1): yalnız içerik — satır yönetimi
          * linenoise'da (bkz. atomic_message notu). */
         print_timestamp_short(tm);
-        fprintf(stderr, "  %s%s%s%s\n", color, tag, text, g_theme->clr_reset);
+        fprintf(stderr, "  %s%s%s%s\n", color, tag, text, g_ansi.theme->clr_reset);
         fflush(stderr);
         return;
     }
@@ -465,27 +398,17 @@ static void block_message(struct app_state *state, const struct tm *tm,
     fprintf(stderr, "\033[?25l");
     clear_prompt_area_lines(clear_lines);
     print_timestamp_short(tm);
-    fprintf(stderr, "  %s%s%s%s\n", color, tag, text, g_theme->clr_reset);
+    fprintf(stderr, "  %s%s%s%s\n", color, tag, text, g_ansi.theme->clr_reset);
     fflush(stderr);
     redraw_input(state);
     fprintf(stderr, "\033[?25h");
     fflush(stderr);
 }
 
-/* ================================================================
- * DOSYA TRANSFERİ PROGRESS BAR
- *
- * ASCII stili: [========--------] 45% 1.2/2.6 MB
- * Aynı satırı günceller (\r\033[K ile).
- *
- * [F2] save/restore KALDIRILDI:
- *   Progress bar sürekli aynı satırı \r ile günceller.
- *   Önceki sürümde her güncellemede ui_restore_input çağrılıyor,
- *   prompt yeniden basılıyordu → progress bar + prompt iç içe geçiyordu.
- *   Çözüm: progress bar kendi satırını yönetir, prompt basmaz.
- *   Transfer bitince caller ui_print_system ile sonucu bildirir,
- *   o da save/restore ile prompt'u düzgün geri getirir.
- * ================================================================ */
+/* DOSYA TRANSFERİ PROGRESS BAR — [========--------] 45% 1.2/2.6 MB;
+ * \r\033[K ile aynı satırı günceller. [F2] save/restore YOK: eski
+ * sürüm her güncellemede prompt'u yeniden basıyordu → bar + prompt
+ * iç içe geçiyordu; transfer sonunu caller ui_print_system bildirir. */
 
 /* [F4] format_size — PRIu64 ile 32-bit taşma giderildi */
 static void format_size(uint64_t bytes, char *buf, size_t buf_sz)
@@ -502,25 +425,16 @@ static void format_size(uint64_t bytes, char *buf, size_t buf_sz)
     }
 }
 
-/* Progress bar çiz — commit 4: dispatch hedefi (eski ui_print_progress gövdesi).
- *
- * total==0 erken dönüşü BURADA (ANSI kolunda) — TUI'da bugün total==0'da
- * bile refresh var, o yüzden kontrol ortak katmana alınmadı (davranış
- * birebir korunur). */
+/* Progress bar çiz — FE_PROGRESS hedefi; total==0 → erken dönüş
+ * (ANSI kolunda; TUI'da total==0'da bile refresh var). */
 static void render_progress(struct app_state *state, const char *filename,
-                            uint64_t done, uint64_t total, bool is_upload)
+                            uint64_t done, uint64_t total, bool is_upload,
+                            const char *clr)
 {
     if (total == 0)
         return;
 
-    /*
-     * [F2] save/restore YOK — kasıtlı.
-     * Bu fonksiyon \r ile aynı satırı günceller, prompt basmaz.
-     * ui_save_input/ui_restore_input çağrılırsa prompt iç içe geçer.
-     * Transfer tamamlanınca caller ui_print_system çağırır,
-     * o da save/restore ile prompt'u düzgün geri getirir.
-     */
-    (void)state;  /* şu an kullanılmıyor — ileride tema için gerekebilir */
+    (void)state;  /* bugün kullanılmıyor — wrap/redraw bu çizimde yok */
 
     /* M-24 FIX: ANSI injection koruması — filename strip */
     size_t fn_len = strlen(filename);
@@ -547,28 +461,27 @@ static void render_progress(struct app_state *state, const char *filename,
     const char *arrow = is_upload ? "\xe2\xac\x86" : "\xe2\xac\x87";
 
     fprintf(stderr, "\r\033[K  %s%s %s [%s] %u%% %s/%s%s",
-            g_theme->clr_progress,
+            clr,
             arrow, safe_fn, bar, pct,
             done_str, total_str,
-            g_theme->clr_reset);
+            g_ansi.theme->clr_reset);
     fflush(stderr);
     /* H-2: dosya adı kopyası heap'te iz bırakmasın */
     sodium_memzero(safe_fn, fn_len + 1);
     free(safe_fn);
 }
 
-/* ================================================================
- * DISPATCH HEDEFİ — fe_ansi_ops
- *
- * Senkron: ev dönüşünde geçersiz; text sahiplenilmez (scrup caller yapar).
- * Recursion yasağı: frontend_emit'e geri çağrılmaz.
- *
- * label mapping: FE_MSG_IN→Peer, FE_MSG_OUT→Sen, FE_ERROR→blok "[!] ",
- * FE_SYSTEM→blok tag "" — eski çağrı ağaçlarıyla birebir aynı çıktı.
- * ================================================================ */
+/* DISPATCH HEDEFİ — fe_ansi_ops.emit: senkron, kopyasız; text
+ * sahiplenilmez (scrub caller'da); recursion yok.
+ * IN→Peer, OUT→Sen, ERROR→"[!] " blok, SYSTEM→tag "" blok. */
 static void fe_ansi_emit(void *ctx, const struct fe_event *ev)
 {
-    (void)ctx;   /* commit 5: g_theme/g_last_label ansi_ctx'e taşınacak */
+    /* ctx bir ansi_ctx ise theme oradan; default yolda ctx NULL →
+     * g_ansi (üretimde bu yol hep aktif). label-state ve alt
+     * yardımcılar tek-instance — tam ctx-erisim Faz 4. */
+    const struct ansi_ctx *ac = ctx ? (const struct ansi_ctx *)ctx : &g_ansi;
+    const struct nox_theme *theme =
+        ac->theme ? ac->theme : &nox_theme_default;
 
     struct app_state *state = ev->state;
 
@@ -580,14 +493,14 @@ static void fe_ansi_emit(void *ctx, const struct fe_event *ev)
         atomic_message(state, UI_LABEL_SELF, ev->text, &ev->tm);
         break;
     case FE_SYSTEM:
-        block_message(state, &ev->tm, g_theme->clr_system, "", ev->text);
+        block_message(state, &ev->tm, theme->clr_system, "", ev->text);
         break;
     case FE_ERROR:
-        block_message(state, &ev->tm, g_theme->clr_error, "[!] ", ev->text);
+        block_message(state, &ev->tm, theme->clr_error, "[!] ", ev->text);
         break;
     case FE_PROGRESS:
         render_progress(state, ev->filename, ev->done,
-                        ev->total, ev->is_upload);
+                        ev->total, ev->is_upload, theme->clr_progress);
         break;
     default:
         break;   /* bilinmeli tip → sessiz (strict koruma socket fazında) */

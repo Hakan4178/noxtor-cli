@@ -10,7 +10,7 @@
  *   9-11.  /connect doğrulamaları: self, geçersiz onion, duplicate
  *          (socks5_connect'e hiç düşmez — hs_attempt_count==0 kanıtı)
  *   12.    /msg geçersiz onion — db'ye dokunmadan ret
- *   13.    /msg ghost çevrimdışı — kuyruk yok (ghost mod)
+ *   13.    /msg ghost çevrimdışı — kuyruk yok (ghost mod, db kanıtı)
  *   14.    queue_segmented_message success + M-14 rollback (db ile)
  *   15.    /add success (db round-trip) + kontrol-karakterli isim ret
  *   16.    /switch|/disconnect|/status hata yolları
@@ -32,31 +32,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sodium.h>
+#include "test_common.h"
 
-/* ================================================================
- * TEST MAKROLARI (şablon: test_tofu_epoch.c)
- * ================================================================ */
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define TEST_ASSERT(cond) do {                                      \
-    if (!(cond)) {                                                  \
-        fprintf(stderr, "FAIL %s:%d: %s\n",                        \
-                __FILE__, __LINE__, #cond);                         \
-        return 1;                                                   \
-    }                                                               \
-} while (0)
-
-#define RUN_TEST(test_fn) do {                                      \
-    tests_run++;                                                    \
-    fprintf(stderr, "  [%d] %-45s ", tests_run, #test_fn);          \
-    if (test_fn() == 0) {                                           \
-        tests_passed++;                                             \
-        fprintf(stderr, "\033[32mOK\033[0m\n");                     \
-    } else {                                                        \
-        fprintf(stderr, "\033[31mFAIL\033[0m\n");                   \
-    }                                                               \
-} while (0)
 
 /* ================================================================
  * FIXTURE
@@ -284,17 +261,39 @@ static int test_msg_invalid_onion(void)
     return 0;
 }
 
-/* 13) /msg ghost + çevrimdışı → kuyruk reddedilir (ghost mod) */
+/* 13) /msg ghost + çevrimdışı → kuyruğa alınmaz (ghost mod, db kanıtı) */
+static nox_err_t queue_count_cb(const char *text, void *ctx)
+{
+    (void)text;
+    (*(int *)ctx)++;
+    return NOX_OK;
+}
+
 static int test_msg_ghost_offline_blocked(void)
 {
     fixture_reset();
     st.ghost_mode = true;
+    mkdir(TEST_DB_DIR, 0700);
+    TEST_ASSERT(db_init_test() == NOX_OK);
 
     char cmd[160];
     snprintf(cmd, sizeof(cmd), "/msg %s merhaba", VALID_ONION);
     process_line(&st, cmd);
 
-    TEST_ASSERT(st.ghost_mode == true);         /* davranış: kuyruk yok */
+    /* Gerçek kanıt: kuyrukta işlenecek mesaj YOK */
+    int queued = 0;
+    TEST_ASSERT(db_process_queue(VALID_ONION, queue_count_cb, &queued) == NOX_OK);
+    TEST_ASSERT(queued == 0);
+
+    /* Pozitif kontrol: ghost kapanınca aynı komut kuyruğa yazılır —
+     * böylece "boş kuyruk" assert'i bozuk bir yolda da geçemez */
+    st.ghost_mode = false;
+    process_line(&st, cmd);
+    TEST_ASSERT(db_process_queue(VALID_ONION, queue_count_cb, &queued) == NOX_OK);
+    TEST_ASSERT(queued == 1);
+
+    db_close();
+    cleanup_db_dir();
     return 0;
 }
 
@@ -351,11 +350,13 @@ static int test_add_contact_success_and_reject(void)
 }
 
 /* 16) Hata yolları: /switch bulunamadı (ghost: db'sız), /disconnect peer'sız,
- *     /status ve /history smoke */
+ *     /status ve /history — hiçbiri uygulamayı kapatmaz, aktif peer'ı
+ *     değiştirmez (sadece crash değil, davranış da kilitlenir) */
 static int test_switch_disconnect_status_errors(void)
 {
     fixture_reset();
     st.ghost_mode = true;   /* find_peer db'ye düşmesin */
+    st.running = true;      /* quit OLMAYAN komutlar running'e dokunmaz */
 
     process_line(&st, "/switch yokki");
     TEST_ASSERT(st.active_peer_idx == -1);
@@ -363,9 +364,10 @@ static int test_switch_disconnect_status_errors(void)
     process_line(&st, "/disconnect");
     TEST_ASSERT(st.active_peer_idx == -1);
 
-    process_line(&st, "/status");    /* smoke — crash yok */
+    process_line(&st, "/status");
     process_line(&st, "/history");   /* bilinen "henüz yok" hatası */
-    TEST_ASSERT(st.running == false || st.running == true); /* no-crash */
+    TEST_ASSERT(st.running == true);      /* hiçbiri quit değil */
+    TEST_ASSERT(st.active_peer_idx == -1);
     return 0;
 }
 

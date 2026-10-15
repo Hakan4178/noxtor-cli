@@ -25,27 +25,8 @@
 #include <string.h>
 #include <time.h>
 
-static int tests_run    = 0;
-static int tests_passed = 0;
+#include "test_common.h"
 
-#define TEST_ASSERT(cond) do {                                      \
-    if (!(cond)) {                                                  \
-        fprintf(stderr, "FAIL %s:%d: %s\n",                        \
-                __FILE__, __LINE__, #cond);                         \
-        return 1;                                                   \
-    }                                                               \
-} while (0)
-
-#define RUN_TEST(test_fn) do {                                      \
-    tests_run++;                                                    \
-    fprintf(stderr, "  [%d] %-45s ", tests_run, #test_fn);          \
-    if (test_fn() == 0) {                                           \
-        tests_passed++;                                             \
-        fprintf(stderr, "\033[32mOK\033[0m\n");                     \
-    } else {                                                        \
-        fprintf(stderr, "\033[31mFAIL\033[0m\n");                   \
-    }                                                               \
-} while (0)
 
 static struct timespec ts_of(long sec)
 {
@@ -95,23 +76,16 @@ static int test_backward_jump_safe(void)
 }
 
 /* 5) Suspend senaryosu: duvar saati +3600s fırladı, gerçek süre +5s.
- *    Predikat SADECE monotonic farka bakar → transfer yaşamalı.
- *    (Bad patch kanıtı: eski time(NULL) kontrolünde 3600 > 60 → timeout
- *     → unlinkat — download sessizce ölürdü.) */
+ *    Predikat SADECE monotonik farka bakar → transfer yaşamalı.
+ *    (Bad patch kanıtı — yorum: eski time(NULL) tabanlı kontrol
+ *     3600 > 60 der ve unlinkat ile download'ı sessizce öldürürdü;
+ *     predikata duvar saati hiç girmediğinden burada yalnızca
+ *     gerçek süre ölçülür.) */
 static int test_suspend_scenario_survives(void)
 {
-    long wall_jump   = 3600;               /* duvar atlaması (senaryo) */
-    long real_elapsed = 5;                 /* monotonic geçen süre */
-    long last_wall   = 100000;             /* kaydedilen duvar zamanı */
     struct timespec last_mono = ts_of(5000);
+    struct timespec now_mono  = ts_of(5000 + 5);   /* monotonic: +5s */
 
-    /* BAD PATCH hesabı — belge: duvar tabanlı kontrolün sonucu */
-    int old_would_abort = (last_wall + wall_jump - last_wall) >
-                          NOX_FILE_CHUNK_TIMEOUT_SEC;   /* 3600 > 60 → 1 */
-    TEST_ASSERT(old_would_abort == 1);   /* eski semantik gerçekten öldürürdü */
-
-    /* GOOD PATCH: monotonic predikat */
-    struct timespec now_mono = ts_of(5000 + real_elapsed);
     TEST_ASSERT(!file_transfer_chunk_expired(&last_mono, &now_mono,
                                              NOX_FILE_CHUNK_TIMEOUT_SEC));
     return 0;

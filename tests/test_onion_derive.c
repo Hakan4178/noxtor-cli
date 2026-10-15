@@ -82,32 +82,8 @@ static const uint8_t VEC_PUB2[32] = {
     0xef,0x84,0xa6,0xd2,0x02,0xd3,0x5b,0x1a,
     0x19,0x0e,0x24,0x6b,0x3a,0xd7,0x82,0xfb,
 };
+#include "test_common.h"
 
-
-/* ================================================================
- * TEST MAKROLARI
- * ================================================================ */
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define TEST_ASSERT(cond) do {                                      \
-    if (!(cond)) {                                                  \
-        fprintf(stderr, "FAIL %s:%d: %s\n",                        \
-                __FILE__, __LINE__, #cond);                         \
-        return 1;                                                   \
-    }                                                               \
-} while (0)
-
-#define RUN_TEST(test_fn) do {                                      \
-    tests_run++;                                                    \
-    fprintf(stderr, "  [%d] %-45s ", tests_run, #test_fn);          \
-    if (test_fn() == 0) {                                           \
-        tests_passed++;                                             \
-        fprintf(stderr, "\033[32mOK\033[0m\n");                     \
-    } else {                                                        \
-        fprintf(stderr, "\033[31mFAIL\033[0m\n");                   \
-    }                                                               \
-} while (0)
 
 /* ================================================================
  * TEST: Determinizm — aynı master_key → aynı seed/expanded/pub
@@ -267,27 +243,8 @@ static int test_null_safety(void)
  *
  * v3 onion adresi: base32(pub(32) || checksum(2) || 0x03)
  * checksum = SHA3-256(".onion checksum" || pub || 0x03)[0:2]
+ * (base32: test_common.h → nox_test_base32_encode)
  * ================================================================ */
-static void base32_encode(const uint8_t *in, size_t inlen, char *out)
-{
-    static const char *ALPHA = "abcdefghijklmnopqrstuvwxyz234567";
-    size_t bitbuf = 0;
-    int bits = 0;
-    size_t o = 0;
-
-    for (size_t i = 0; i < inlen; i++) {
-        bitbuf = (bitbuf << 8) | in[i];
-        bits += 8;
-        while (bits >= 5) {
-            out[o++] = ALPHA[(bitbuf >> (bits - 5)) & 0x1F];
-            bits -= 5;
-        }
-    }
-    if (bits > 0)
-        out[o++] = ALPHA[(bitbuf << (5 - bits)) & 0x1F];
-    out[o] = '\0';
-}
-
 static int derive_v3_address(const uint8_t pub[32], char *addr_out)
 {
     uint8_t checksum[32];
@@ -318,7 +275,7 @@ static int derive_v3_address(const uint8_t pub[32], char *addr_out)
     memcpy(blob + 32, checksum, 2);
     blob[34] = 0x03;
 
-    base32_encode(blob, 35, addr_out);
+    nox_test_base32_encode(blob, 35, addr_out);
     /* addr_out 56 char base32 + NUL — çağıran buffer ≥ 57 sağlamalı */
     return 0;
 }

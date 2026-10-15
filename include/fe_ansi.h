@@ -1,20 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * fe_ansi.h — Atomic ANSI backend arayüzü (Faz 1, commit 4)
+ * fe_ansi.h — Atomic ANSI backend arayüzü
  *
- * fe_ansi.c: Atomic ANSI Terminal Output + linenoise yolu. frontend.c'deki
- * VARSAYILAN backend'dir (statik registration — §1.2: fuzz hedefleri
- * registration yapmaz, bugünün stderr davranışı korunur).
+ * Varsayılan dispatch backend'i (frontend.c statik registration —
+ * fuzz/test registration yapmaz, stderr davranışı korunur).
+ * main.c: TUI aktifse frontend_register(&fe_tui_ops) override;
+ * cleanup'ta frontend_reset() → ANSI'ye dönüş.
  *
- * Registration yaşam döngüsü (main.c):
- *   - başlangıç: frontend.c'de statik init → &fe_ansi_ops
- *   - tui_init() sonrası TUI aktifse: frontend_register(&fe_tui_ops, ...)
- *   - cleanup: tui_shutdown() + frontend_reset() → ANSI'ye dönüş
- *     (bugünkü `tui_is_active()` runtime kontrolünün karşılığı)
+ * CLI-only API (prototipler frontend.h'de — imzalar değişmez):
+ * clear_prompt_area*, ui_line_*, ui_reset_sender; ui_print_prompt
+ * header'dan düştü (static, dış çağrı 0).
  *
- * CLI-only public API implementasyonları buradadır (prototipler
- * frontend.h'de kalır — 206 çağrı sitesi değişmez): clear_prompt_area*,
- * ui_line_*, ui_reset_sender. ui_print_prompt header'dan DÜŞTÜ (yalnız
- * redraw_input çağırır — dış çağrı 0).
+ * Backend durumu: struct ansi_ctx (theme+last_label) — default yolda
+ * ctx NULL → g_ansi fallback; tam ctx-erisim Faz 4 (GTK).
  */
 
 #ifndef PARANOID_FE_ANSI_H

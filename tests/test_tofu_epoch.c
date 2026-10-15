@@ -36,31 +36,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sodium.h>
+#include "test_common.h"
 
-/* ================================================================
- * TEST MAKROLARI (şablon: test_onion_bind.c)
- * ================================================================ */
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define TEST_ASSERT(cond) do {                                      \
-    if (!(cond)) {                                                  \
-        fprintf(stderr, "FAIL %s:%d: %s\n",                        \
-                __FILE__, __LINE__, #cond);                         \
-        return 1;                                                   \
-    }                                                               \
-} while (0)
-
-#define RUN_TEST(test_fn) do {                                      \
-    tests_run++;                                                    \
-    fprintf(stderr, "  [%d] %-45s ", tests_run, #test_fn);          \
-    if (test_fn() == 0) {                                           \
-        tests_passed++;                                             \
-        fprintf(stderr, "\033[32mOK\033[0m\n");                     \
-    } else {                                                        \
-        fprintf(stderr, "\033[31mFAIL\033[0m\n");                   \
-    }                                                               \
-} while (0)
 
 /* ================================================================
  * FIXTURE

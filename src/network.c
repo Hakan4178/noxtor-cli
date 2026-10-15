@@ -286,7 +286,9 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
   return NOX_OK;
 }
 
-static nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
+/* UNIT TEST ERİŞİMİ (test_net_io): static'ti, test görebilsin diye
+ * açıldı — üretimde tor_spawn zarfı çağırır. Davranış değişmedi. */
+nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
                                     int timeout_ms) {
   /* H-2: Tor Control yanıtları çok nadiren 10+ satır olur.
    * 64 satır limiti — sonsuz continuation saldırısını engeller. */
@@ -419,8 +421,9 @@ static void rm_rf(const char *path) {
   rmdir(path);
 }
 
-/* Stale PID'yi güvenli parse et (atoi yerine strtol + hata kontrolü) */
-static long safe_parse_pid(const char *str) {
+/* Stale PID'yi güvenli parse et (atoi yerine strtol + hata kontrolü)
+ * UNIT TEST ERİŞİMİ (test_net_cleanup): static'ti, saf fonksiyon. */
+long safe_parse_pid(const char *str) {
   char *endptr;
   errno = 0;
   long pid = strtol(str, &endptr, 10);
@@ -477,7 +480,9 @@ static bool is_our_stale_entry(const char *full_path, long pid) {
   return true;
 }
 
-static void cleanup_stale_tor_dirs(const char *config_dir) {
+/* UNIT TEST ERİŞİMİ (test_net_cleanup): tor_spawn çağırır;
+ * davranış kilitleri için açıldı. */
+void cleanup_stale_tor_dirs(const char *config_dir) {
   DIR *d = opendir(config_dir);
   if (!d)
     return;
@@ -1863,6 +1868,11 @@ void frame_header_encode(const struct frame_header *hdr, uint8_t *wire) {
 
 // Real attack surface in practice: untrusted 13B wire (magic/type/len)
 nox_err_t frame_header_decode(const uint8_t *wire, struct frame_header *hdr) {
+  /* Sertleştirme (test_wire_hardening): çağrı sözleşmesi ihlali
+   * (NULL wire/hdr) çökme/UB olmasın — fail-closed PROTO dön. */
+  if (!wire || !hdr)
+    return NOX_ERR_PROTO;
+
   hdr->magic = ((uint32_t)wire[0] << 24) | ((uint32_t)wire[1] << 16) |
                ((uint32_t)wire[2] << 8) | (uint32_t)wire[3];
   hdr->type = wire[4];

@@ -143,4 +143,21 @@ nox_err_t ctrl_send_command(int fd, const char *cmd);
 nox_err_t write_full(int fd, const void *buf, size_t len);
 nox_err_t read_full(int fd, void *buf, size_t len);
 
+/* ================================================================
+ * UNIT TEST ERİŞİMİ — production akışında da kullanılan iç
+ * yardımcılar; sözleşmeleri testlerle kilitli (static kaldırıldı).
+ * ================================================================ */
+
+/* Tor Control çok satırlı yanıt okuma (250-/250 ayrımı, 64 satır
+ * limiti H-2, toplam deadline B1). buf: birleşik satırlar + NUL. */
+nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
+                             int timeout_ms);
+
+/* "tor_data_<pid>"/"torrc_<pid>" kalıntılarını süpürür — yalnız
+ * ölü PID + bizim UID; symlink takibi yok (rm_rf O_NOFOLLOW). */
+void cleanup_stale_tor_dirs(const char *config_dir);
+
+/* strtol + ERANGE/endptr kontrolü; geçersiz → -1. */
+long safe_parse_pid(const char *str);
+
 #endif /* PARANOID_NETWORK_H */

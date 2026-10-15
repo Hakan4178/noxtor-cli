@@ -63,7 +63,9 @@ noxtor-cli, Tor üzerinden anonim mesajlaşma uygulaması. Çoklu peer bağlant�
 | `src/state_machine.c` | 456 | Peer durum makinesi (8 durum, 17 olay, 40 geçiş) |
 | `src/stdin_handler.c` | 1090 | Komut işleme, mesaj segmentasyonu |
 | `src/tui.c` | 797 | termbox2 tabanlı TUI (3 panel) |
-| `src/ui.c` | 675 | Terminal/ANSI çıktı katmanı |
+| `src/frontend.c` | 262 | Ortak frontend katmanı — `ui_print_*` sarmalayıcılar, dispatch (`frontend_emit`), `ui_strip_ansi`, `fe_now_tm` (eski adıyla ui.c) |
+| `src/fe_ansi.c` | 622 | Atomic ANSI backend — tema (`ansi_ctx`), çizim, `fe_ansi_ops` |
+| `src/fe_tui.c` | 84 | TUI backend — `fe_tui_ops` (termbox2 çizim yolları) |
 
 ### 2.2 Header Dosyaları
 
@@ -86,7 +88,9 @@ noxtor-cli, Tor üzerinden anonim mesajlaşma uygulaması. Çoklu peer bağlant�
 | `include/termbox2.h` | Header-only TUI kütüphanesi |
 | `include/tui.h` | TUI API (termbox2 ile compile) |
 | `include/types.h` | `app_state`, tüm enum'lar, struct'lar |
-| `include/ui.h` | UI çıktı API |
+| `include/frontend.h` | Ortak frontend API (`fe_event`, `frontend_ops`, dispatch) |
+| `include/fe_ansi.h` | ANSI backend ops (`fe_ansi_ops`) |
+| `include/fe_tui.h` | TUI backend ops (`fe_tui_ops`) |
 
 ---
 
@@ -116,10 +120,11 @@ network.c:1724    frame_header_decode()  ← 13-byte header decode
   │                               ↓
   │                          noise.c:899 noise_decrypt()
   │                               ↓
-  │                          ui.c:447 ui_print_incoming()
+  │                          frontend.c:149 ui_print_incoming()
   │                               ↓
-  │                          tui.c:380 tui_chat_append() veya
-  │                          stdout'a atomik yazdırma (atomic_message)
+  │                          frontend_emit() dispatch —
+  │                          fe_ansi.c:399 atomic_message() veya
+  │                          fe_tui.c:53 tui_chat_append()
   │
   └─ FILE frame (dosya) ───→ file_transfer.c:510 file_transfer_handle_rx()
                                   ↓
@@ -138,7 +143,7 @@ network.c:1724    frame_header_decode()  ← 13-byte header decode
 | `noise_decrypt()` | `noise.c:899` | ChaCha20-Poly1305 IETF AEAD decrypt |
 | `handshake_read()` | `noise.c:809` | Noise XX mesaj okuma |
 | `file_transfer_handle_rx()` | `file_transfer.c:510` | Dosya frame işleme |
-| `ui_print_incoming()` | `ui.c:447` | Mesajı ekrana yazdır |
+| `ui_print_incoming()` | `frontend.c:149` | Mesaj → fe_event + dispatch |
 | `tui_chat_append()` | `tui.c:380` | TUI chat buffer'a ekle |
 
 ### 3.2 RX Veri Akışı Detayı
@@ -271,7 +276,7 @@ file plain_buf (sodium_malloc, 4096, mlock) → immediate sodium_memzero(4096) a
 | Girdi | `ln_buf:stdin_handler.c:682` `chunk:283` `pt:event_loop.c:374` | sodium_malloc | ✓ per-alloc guard | `sodium_free` auto | satır |
 | Dosya | `plain_buf:file_transfer.c:262` | sodium_malloc | ✓ | `sodium_memzero(4096):426` | chunk |
 | Stack kopya | `salt:main.c:1042` `meta[305]:file_transfer.c:275` `dh_out:noise.c:658` | stack | ✗ | `sodium_memzero` manuel | µs |
-| UI kalıcı | `chat_lines:tui.c:429 strdup` `safe_msg:ui.c:423 malloc` | malloc/.bss | ✗ | `sodium_memzero+free` (anlık) / `free` wipe’suz (kalıcı) | kalıcı (scrollback 512) |
+| UI kalıcı | `chat_lines:tui.c:429 strdup` `safe_msg:fe_ansi.c:404 malloc` | malloc/.bss | ✗ | `sodium_memzero+free` (anlık) / `free` wipe’suz (kalıcı) | kalıcı (scrollback 512) |
 
 Not: `tui chat_lines` ve `safe_msg` bilerek `malloc` — `mlock` yok, `sodium_malloc` değil; mitigasyon `PR_SET_DUMPABLE 0` + `MADV_DONTDUMP`, ispat değil.
 
@@ -680,19 +685,25 @@ file_transfer_handle_rx()                [file_transfer.c:510]
 | `tui_print_welcome()` | `tui.c:187` | Hoşgeldin mesajı |
 | `tui_load_contacts()` | `tui.c:268` | DB'den kontakt yükle (static) |
 
-### 9.4 UI Fonksiyonlar
+### 9.4 UI Fonksiyonlar (Faz 1: `ui.c` → `frontend.c` + `fe_ansi.c` split)
 
-| Fonksiyon | Dosya:Satr | Görev |
+`ui_print_*` public sarmalayıcılar artık `frontend.c`'dedir: filtre/vsnprintf
++ `fe_event` doldurma + **tek dispatch** (`frontend_emit`). Asıl çizim
+backend'de: varsayılan `fe_ansi_ops` (statik registration), TUI aktifse
+`fe_tui_ops` override (`main.c` registration; cleanup'ta `frontend_reset()`).
+
+| Fonksiyon | Dosya:Satır | Görev |
 |-----------|-----------|-------|
-| `ui_init()` | `ui.c:77` | Tema ayarla |
-| `clear_prompt_area()` | `ui.c:132` | Prompt alanını temizle |
-| `ui_print_prompt()` | `ui.c:243` | Prompt çiz |
-| `atomic_message()` | `ui.c:391` | Atomik terminal çıktısı (static) |
-| `ui_print_incoming()` | `ui.c:447` | Gelen mesaj yazdır |
-| `ui_print_outgoing()` | `ui.c:467` | Giden mesaj yazdır |
-| `ui_print_system()` | `ui.c:489` | Sistem mesajı yazdır |
-| `ui_print_error()` | `ui.c:541` | Hata mesajı yazdır |
-| `ui_print_progress()` | `ui.c:623` | Dosya transfer ilerleme çubuğu |
+| `ui_init()` | `fe_ansi.c:105` | Tema ayarla (`g_ansi.theme`) |
+| `clear_prompt_area()` | `fe_ansi.c:163` | Prompt alanını temizle |
+| `ui_print_prompt()` | `fe_ansi.c:296` | Prompt çiz (static — dış çağrı 0) |
+| `atomic_message()` | `fe_ansi.c:399` | Atomik terminal çıktısı (static; FE_MSG_IN/OUT render) |
+| `render_progress()` | `fe_ansi.c:523` | İlerleme çubuğu (static; FE_PROGRESS render) |
+| `ui_print_incoming()` | `frontend.c:149` | Filtre + fe_event + dispatch |
+| `ui_print_outgoing()` | `frontend.c:160` | Giden mesaj → dispatch |
+| `ui_print_system()` | `frontend.c:171` | Sistem mesajı → dispatch |
+| `ui_print_error()` | `frontend.c:188` | Hata mesajı → dispatch |
+| `ui_print_progress()` | `frontend.c:207` | Dosya transfer ilerleme → dispatch |
 
 ---
 
@@ -945,7 +956,9 @@ noxtor-cli/
 │   ├── termbox2.h           # Header-only TUI kütüphanesi
 │   ├── tui.h                # TUI API
 │   ├── types.h              # app_state, enum'lar
-│   └── ui.h                 # UI API
+│   ├── frontend.h           # Ortak frontend API (dispatch, fe_event)
+│   ├── fe_ansi.h            # ANSI backend ops
+│   └── fe_tui.h             # TUI backend ops
 ├── src/
 │   ├── arena.c              # mmap + guard pages + canary
 │   ├── crypto.c             # Argon2id + Ed25519 + Curve25519
@@ -962,7 +975,9 @@ noxtor-cli/
 │   ├── state_machine.c      # 8 states, 17 events, 40 transitions
 │   ├── stdin_handler.c      # Command processing
 │   ├── tui.c                # termbox2 TUI
-│   └── ui.c                 # ANSI terminal UI
+│   ├── frontend.c           # Ortak frontend katmanı (dispatch)
+│   ├── fe_ansi.c            # Atomic ANSI backend
+│   └── fe_tui.c             # TUI backend
 ├── tests/
 │   ├── cbmc_arena.c         # CBMC harness (arena)
 │   ├── cbmc_crypto.c        # CBMC harness (crypto)
@@ -1032,15 +1047,16 @@ RX §3 — event_loop() → peer_fd EPOLLIN [event_loop.c:721]
    │  └─ handshake_split [974] → symmetric_split [505] → hkdf→hmac (sodium)
    ├─ TEXT (0x01) [event_loop.c:371] → seq≠rx_seq → sm_dispatch[EV_SEQ_MISMATCH] [state_machine.c:196]
    │                 └─ noise_decrypt() [noise.c:1023] → cipher_decrypt [144] → encode_nonce [80] → crypto_aead_chacha20poly1305_ietf_decrypt (sodium)
-   │                    └─ ui_print_incoming() [ui.c:471] → atomic_message [415] → strip_ansi_escape [343] (CSI/OSC/DCS leaf)
-   │                       ├─ TUI aktif → tui_chat_append [tui.c:380] → tui_chat_append_colored [385] → tui_refresh_all [586] → tui_draw_sidebar/chat/input
-   │                       └─ ANSI/linenoise → print_timestamp_short [389] → calc_current_input_lines [184] → redraw_input [199]
+   │                    └─ ui_print_incoming() [frontend.c:149] → frontend_emit (dispatch) →
+   │                       ├─ fe_tui_ops (TUI) → tui_chat_append [tui.c:380] → tui_chat_append_colored [385] → tui_refresh_all [586] → tui_draw_sidebar/chat/input
+   │                       └─ fe_ansi_ops (ANSI) → atomic_message [fe_ansi.c:399] → ui_strip_ansi [407] (CSI/OSC/DCS leaf) →
+   │                          print_timestamp_short [364] → calc_current_input_lines [~135] → redraw_input [~215]
    └─ FILE (0x02) [event_loop.c:414] → file_transfer_handle_rx() [file_transfer.c:547]
       ├─ sanitize_filename [29] (strrchr/memmove/whitelist, leaf)
       ├─ open_recv_file [488] → verify_downloads_dir_fd [83] (fstat/S_ISLNK/getuid/0777==0700 strict — dizin; dosya için db:077==0→fchmod 0600) → openat(O_EXCL|O_NOFOLLOW)
       ├─ write_to_file [471] (write EINTR loop, leaf)
       ├─ crypto_generichash_init/update/final (sodium, BLAKE2b) + fsync/fstatvfs
-      └─ sm_dispatch [state_machine.c:196] EV_FILE_RX_START/DONE + ui_print_error/system/progress [ui.c:513/565/647]
+      └─ sm_dispatch [state_machine.c:196] EV_FILE_RX_START/DONE + ui_print_error/system/progress [frontend.c:188/171/207] → render [fe_ansi.c]
 
 Not: sodium/libc (malloc, poll, read, sodium_malloc, crypto_aead_*) leaf olarak filtrelendi; ağaç sadece proje tanımlı fonksiyonları gösterir. Derinlik 5 tam, dış saldırı yüzeyi peel → decode → decrypt → UI/file tek çizgi.
 ```

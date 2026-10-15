@@ -12,43 +12,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sodium.h>
+#include "test_common.h"
 
-
-/* ================================================================
- * TEST MAKROLARI
- * ================================================================ */
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define TEST_ASSERT(cond) do {                                      \
-    if (!(cond)) {                                                  \
-        fprintf(stderr, "FAIL %s:%d: %s\n",                        \
-                __FILE__, __LINE__, #cond);                         \
-        return 1;                                                   \
-    }                                                               \
-} while (0)
-
-#define TEST_ASSERT_MEM_ZERO(ptr, len) do {                         \
-    const uint8_t *_p = (const uint8_t *)(ptr);                     \
-    for (size_t _i = 0; _i < (len); _i++) {                         \
-        if (_p[_i] != 0) {                                          \
-            fprintf(stderr, "FAIL: bellek sıfır değil"              \
-                    " offset=%zu val=0x%02x\n", _i, _p[_i]);       \
-            return 1;                                               \
-        }                                                           \
-    }                                                               \
-} while (0)
-
-#define RUN_TEST(test_fn) do {                                      \
-    tests_run++;                                                    \
-    fprintf(stderr, "  [%d] %-40s ", tests_run, #test_fn);          \
-    if (test_fn() == 0) {                                           \
-        tests_passed++;                                             \
-        fprintf(stderr, "\033[32mOK\033[0m\n");                     \
-    } else {                                                        \
-        fprintf(stderr, "\033[31mFAIL\033[0m\n");                   \
-    }                                                               \
-} while (0)
 
 /* ================================================================
  * TEST: arena_init — başarılı oluşturma
@@ -233,34 +198,26 @@ static int test_arena_default_size(void)
 }
 
 /* ================================================================
- * TEST: arena_destroy — bellek sıfırlanıyor mu
+ * TEST: arena_destroy — temiz kapanış (crash yok + struct sıfır)
  *
- * Not: Bu test arena_destroy sonrası belleğe erişir.
- * munmap sonrası erişim UB olduğu için, destroy öncesi kontrol.
+ * Not: munmap sonrası arena belleğine erişim UB olduğu için
+ * explicit_bzero burada kanıtlanamaz; test destroy'un crash'siz
+ * tamamlandığını ve yapının sıfırlandığını doğrular.
  * ================================================================ */
-static int test_arena_memory_zeroed(void)
+static int test_arena_destroy_clean_shutdown(void)
 {
     struct secure_arena a = {0};
     nox_err_t err = arena_init(&a, 4096);
     TEST_ASSERT(err == NOX_OK);
 
-    /* Hassas veri yaz */
+    /* Hassas veri yaz — destroy yolu gerçek veriyle çalışsın */
     uint8_t *secret = arena_alloc(&a, 32);
     TEST_ASSERT(secret != NULL);
     memset(secret, 0xAA, 32);
 
-    /* Destroy öncesi verinin orada olduğunu doğrula */
-    TEST_ASSERT(secret[0] == 0xAA);
-    TEST_ASSERT(secret[31] == 0xAA);
-
-    /*
-     * arena_destroy çağrıldığında explicit_bzero + munmap yapılır.
-     * munmap sonrası belleğe erişemeyiz.
-     * Burada sadece destroy'un crash olmadan tamamlandığını doğruluyoruz.
-     */
     arena_destroy(&a);
 
-    /* Struct sıfırlanmış olmalı */
+    /* Yapı sıfırlanmış olmalı */
     TEST_ASSERT_MEM_ZERO(&a, sizeof(a));
 
     return 0;
@@ -545,7 +502,7 @@ int main(void)
     RUN_TEST(test_arena_usage_tracking);
     RUN_TEST(test_arena_alloc_null);
     RUN_TEST(test_arena_default_size);
-    RUN_TEST(test_arena_memory_zeroed);
+    RUN_TEST(test_arena_destroy_clean_shutdown);
     RUN_TEST(test_arena_alloc_canary_null);
     RUN_TEST(test_arena_alloc_canary_zero_size);
     RUN_TEST(test_arena_alloc_canary_valid);

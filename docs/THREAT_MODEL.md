@@ -4,7 +4,7 @@ Mimari genel bakış `docs/architecture.md` içindedir.
 
 
 > **Status: DRAFT — incremental review.** Built from source review of
-> `tui.c`, `ui.c`, `network.c`, `event_loop.c`, `database.c`, `noise.c`,
+> `tui.c`, `frontend.c` (eski adıyla `ui.c`), `fe_ansi.c`, `fe_tui.c`, `network.c`, `event_loop.c`, `database.c`, `noise.c`,
 > `state_machine.c` + architecture docs. Sections marked `[TODO: verify against
 > source]` need confirmation against the remaining files; stub sections (§2.1,
 > §3.1, §4.7, §7.1) are intentionally draft placeholders for a complete
@@ -127,10 +127,10 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
   process via seccomp so a parser bug can't easily escalate to code
   execution with network/filesystem access; ANSI escape stripping on
   peer-controlled message content before it reaches the terminal
-  (`strip_ansi_escape` in `ui.c`).
+  (`ui_strip_ansi` in `frontend.c` — Faz 1'de `strip_ansi_escape`'in devamı).
 - **Known gaps (ordered by severity):**
 
-  1. **[RESOLVED — was HIGH, fixed in `13cbc75` / `src/ui.c:353`] Out-of-bounds read in `strip_ansi_escape` (`ui.c`).** Original finding: the fallback branch for "unrecognized 2-byte escape sequence" advanced by 2 (`src += 2`) without checking `src[1]` for NUL — a trailing `0x1b` caused OOB read/disclosure or crash. Current code (`src/ui.c:353-356`) now checks `if (src[1] != '\0') src+=2 else src++` (bare ESC → advance by 1). Verified against source; no longer exploitable. Kept for audit history; `strip_ansi_escape` remains only on the plain-terminal path — see #2 for the remaining TUI gap.
+  1. **[RESOLVED — was HIGH, fixed in `13cbc75` / `src/ui.c:353`] Out-of-bounds read in `strip_ansi_escape` (`ui.c`).** Original finding: the fallback branch for "unrecognized 2-byte escape sequence" advanced by 2 (`src += 2`) without checking `src[1]` for NUL — a trailing `0x1b` caused OOB read/disclosure or crash. Current code (now `src/frontend.c`, eski adıyla `src/ui.c:353-356`) now checks `if (src[1] != '\0') src+=2 else src++` (bare ESC → advance by 1). Verified against source; no longer exploitable. Kept for audit history; `strip_ansi_escape` remains only on the plain-terminal path — see #2 for the remaining TUI gap.
 
   2. **[MEDIUM] Sanitization asymmetry between TUI and non-TUI output
      paths.** `strip_ansi_escape` is applied in the plain-terminal
@@ -443,7 +443,7 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
   disposable VM / viewer sandbox. Noxtor verifies *who sent it* and *that it
   wasn't corrupted in transit* — not that it is safe to open." `[TODO:
   maintainer — decide wording and whether to add a first-download warning in
-  `ui.c`/`tui.c` or keep it docs-only]`
+  `frontend.c`/`tui.c` or keep it docs-only]`
 
 ### 4.8 Pre-hardening local race window (DRAFT STUB)
 
@@ -726,7 +726,7 @@ but do not attempt in-process mitigation beyond canary checks (which a
 targeted flip can also bypass).
 
 ### 5.16 Electromagnetic / TEMPEST / power / acoustic emanations
-Plaintext rendered in `src/tui.c:380` / `src/ui.c:391` and PIN keystrokes
+Plaintext rendered in `src/tui.c:380` / `src/fe_ansi.c` (atomic_message — eski adıyla ui.c:391) and PIN keystrokes
 necessarily emit EM, power and acoustic signals (monitor cable, keyboard
 sound, power draw). Capturing them requires lab-grade proximity/equipment.
 Shielding (TEMPEST room, low-emanation hardware) is an environment
@@ -781,7 +781,7 @@ Noxtor-verifiable property.
 | DB callback locking convention (`database.c`) | Deadlock avoidance during callback-driven I/O | `db_process_queue` unlocks before callback; other 3 visitor-based functions don't | ⚠️ inconsistent, latent footgun — see residual risks |
 | Queue decrypt-failure handling (`database.c`) | Corrupted/tampered queued-message detection | MAC-verified decrypt, warn + delete on failure | ⚠️ same destructive path for tampering and transient failure — see §4.3.5 |
 | Parser fuzzing | Memory corruption via malformed input | All external-input parsers fuzz-tested | ✅ ongoing, coverage TBD |
-| UI output sanitization (`ui.c`) | Terminal escape injection from peer message content | `strip_ansi_escape` on plain-terminal path (`src/ui.c:353` guard now present) | ✅ OOB fixed (§4.2.1 RESOLVED); ⚠️ still not applied on TUI path (§4.2.2) |
+| UI output sanitization (`frontend.c`, eski adıyla `ui.c`) | Terminal escape injection from peer message content | `ui_strip_ansi` on plain-terminal path (guard now present) | ✅ OOB fixed (§4.2.1 RESOLVED); ⚠️ still not applied on TUI path (§4.2.2) |
 | TOFU prompt (in-band) | Impersonation on first contact — trust decision | `ST_TOFU_PENDING` gate + `EV_TOFU_ACCEPTED/REJECTED` + `action_tofu_accept` | ✅ implemented — binding correctness is the open question (see §7, highest priority) |
 | Out-of-band peer verification (QR / safety number) | MITM on first contact even with correct TOFU UX | — | ❌ not yet implemented (README-listed gap) — see §4.7 |
 | obfs4 / Snowflake | Censorship / DPI blocking | Bridge support | 🟡 help-wanted per README |
@@ -894,8 +894,8 @@ Noxtor-verifiable property.
   so far, no visitor calls back into `db_*`, so this is inert — but it's
   an easy trap for a future contributor to fall into (call any `db_*`
   function from inside a `db_list_contacts` visitor and the process
-  self-deadlocks). Same underlying theme as `ui.c`'s `g_theme`
-  single-thread assumption: `database.c` already includes `pthread.h` and
+  self-deadlocks). Same underlying theme as `fe_ansi.c`'s `g_ansi`
+  single-thread assumption (commit 5: `ansi_ctx`'e taşındı — tek-instance): `database.c` already includes `pthread.h` and
   carries an unused `key_generation` field on `g_state` — signals that
   multi-threading (e.g. a future GUI thread) was anticipated but the
   locking discipline isn't yet uniform enough to survive it safely.
@@ -925,7 +925,7 @@ Noxtor-verifiable property.
     (well under the 128-byte block size), but this makes the helper
     unsafe to repurpose as a general HMAC primitive without revisiting
     that path first. Renamed to `noise_hmac_blake2b_64` to signal non-generic, fixed-64 digest.
-  - **Cross-cutting pattern worth naming explicitly:** `ui.c` (`g_theme`),
+  - **Cross-cutting pattern worth naming explicitly:** `fe_ansi.c` (`g_ansi` — commit 5'te `ansi_ctx`),
     `database.c` (`pthread_mutex_t` + unused `key_generation`), and now
     `noise.c` (`_Atomic` nonce counters) all show the same shape —
     scaffolding for a future multi-threaded frontend (a GTK UI thread has
@@ -974,7 +974,7 @@ maintainer's fix-order suggestion, not a CVSS score — adjust after
 | **1** | **Silent MAC-failure swallow** (§4.2.6, `event_loop.c:372`) — `NOX_MSG_TEXT` decrypt fail has no `else` (no log, no UI, no `sm_dispatch`) | Message integrity (§2) — tamper probing leaves zero trace | High (any on-path / malicious relay can inject at correct `seq`) | High (integrity detection completely bypassed) | 🔴 Open — most actionable |
 | **2** | **TOFU slot-recycling race** (§7, highest-priority open question) — `y/n` may bind to "active slot" not the prompting session; 2-min window + slot reuse | Sender authentication (§2) — TOFU UX defeated exactly when needed | Medium (requires peer A disconnect + peer C connect in window + user timing) | High (wrong peer silently trusted) | ❓ Unconfirmed — needs `stdin_handler.c` verification (next) |
 | **3** | **`recv_buf`-full spurious disconnect** (§4.2.7, `event_loop.c:164`) — checks `ps->fd>=0` not `recv_pos` after drain | Availability — peer-triggerable / legitimate-traffic disconnect | Medium (craft sizes to fill buffer exactly) | Medium (DoS, no confidentiality loss) | ⚠️ Open |
-| **4** | **TUI-path missing ANSI sanitize** (§4.2.2, `src/ui.c:453`) — raw peer content → `tui_chat_append` without `strip_ansi_escape` | UI integrity (misrender; future renderer could become escape injection) | Low-Med (requires future renderer change or termbox2 assumption break) | Low (today) → High (if renderer changes) | ⚠️ Open — fix is "sanitize before branch" |
+| **4** | **TUI-path missing ANSI sanitize** (§4.2.2, `src/frontend.c` — eski adıyla `src/ui.c:453`) — raw peer content → `tui_chat_append` without `ui_strip_ansi` | UI integrity (misrender; future renderer could become escape injection) | Low-Med (requires future renderer change or termbox2 assumption break) | Low (today) → High (if renderer changes) | ⚠️ Open — fix is "sanitize before branch" |
 | **5** | **Forensic `tor.log` on ungraceful exit** (§4.3.2) — `tor.log` survives `SIGKILL`/crash until next run | Plausible deniability / metadata (§2) — timestamped HS activity recoverable | Medium (physical seizure after crash) | Medium (metadata only, content stays encrypted under `db_key`) | ⚠️ Known — shutdown-path-only cleanup |
 
 `[TODO: maintainer — confirm this ordering; after `stdin_handler.c` review, #2 may move to #1 if the binding is indeed per-active-slot. Add CVSS/DREAD scores if funders require them; otherwise this ordered list is sufficient for planning.]`

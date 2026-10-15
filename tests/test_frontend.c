@@ -33,31 +33,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "test_common.h"
 
-/* ================================================================
- * TEST MAKROLARI (şablon: test_ansi_strip.c / test_onion_bind.c)
- * ================================================================ */
-static int tests_run    = 0;
-static int tests_passed = 0;
-
-#define TEST_ASSERT(cond) do {                                      \
-    if (!(cond)) {                                                  \
-        fprintf(stderr, "FAIL %s:%d: %s\n",                        \
-                __FILE__, __LINE__, #cond);                         \
-        return 1;                                                   \
-    }                                                               \
-} while (0)
-
-#define RUN_TEST(test_fn) do {                                      \
-    tests_run++;                                                    \
-    fprintf(stderr, "  [%d] %-45s ", tests_run, #test_fn);          \
-    if (test_fn() == 0) {                                           \
-        tests_passed++;                                             \
-        fprintf(stderr, "\033[32mOK\033[0m\n");                     \
-    } else {                                                        \
-        fprintf(stderr, "\033[31mFAIL\033[0m\n");                   \
-    }                                                               \
-} while (0)
 
 /* ================================================================
  * PROBE BACKEND — dispatch iskeleti testi (kısım A)
@@ -231,8 +208,10 @@ static int test_now_tm_mktime_roundtrip(void)
  * Return: yakalanan uzunluk (hata: -1). */
 typedef void (*fe_msg_fn)(struct app_state *, const char *);
 
-static int capture_msg(char *buf, size_t cap, fe_msg_fn fn,
-                       struct app_state *st, const char *msg)
+/* capture_begin/end — variadic ui_print_* çağrıları capture_msg'e
+ * sığmadığı için çekirdek ayrıldı: stderr'i boruya çevir / geri bağla
+ * ve biriken çıktıyı oku. (6 testteki tekrar eden bloğun yerine.) */
+static int capture_begin(int *saved_fd, int *read_fd)
 {
     int pipefd[2];
     if (pipe(pipefd) != 0) return -1;
@@ -243,19 +222,36 @@ static int capture_msg(char *buf, size_t cap, fe_msg_fn fn,
     if (dup2(pipefd[1], STDERR_FILENO) < 0) {
         close(saved); close(pipefd[0]); close(pipefd[1]); return -1;
     }
+    close(pipefd[1]);   /* yazma ucu STDERR_FILENO'da yaşar */
 
-    fn(st, msg);
+    *saved_fd = saved;
+    *read_fd  = pipefd[0];
+    return 0;
+}
 
+/* Return: okunan bayt (hata: -1). buf NUL-terminate edilir. */
+static int capture_end(int saved_fd, int read_fd, char *buf, size_t cap)
+{
     fflush(stderr);
-    dup2(saved, STDERR_FILENO);   /* stderr'i geri al */
-    close(saved);
-    close(pipefd[1]);
+    dup2(saved_fd, STDERR_FILENO);   /* stderr'i geri al */
+    close(saved_fd);
 
-    ssize_t n = read(pipefd[0], buf, cap - 1);
-    close(pipefd[0]);
+    ssize_t n = read(read_fd, buf, cap > 0 ? cap - 1 : 0);
+    close(read_fd);
     if (n < 0) return -1;
     buf[n] = '\0';
     return (int)n;
+}
+
+static int capture_msg(char *buf, size_t cap, fe_msg_fn fn,
+                       struct app_state *st, const char *msg)
+{
+    int saved, rfd;
+    if (capture_begin(&saved, &rfd) != 0) return -1;
+
+    fn(st, msg);
+
+    return capture_end(saved, rfd, buf, cap);
 }
 
 /* ── C1: incoming boş/beyaz-only filtre — çıktı YOK ────────────── */
@@ -320,23 +316,13 @@ static int test_system_content(void)
     static struct app_state st;
     char buf[512];
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return 1;
-    fflush(stderr);
-    int saved = dup(STDERR_FILENO);
-    TEST_ASSERT(saved >= 0);
-    TEST_ASSERT(dup2(pipefd[1], STDERR_FILENO) >= 0);
+    int saved, rfd;
+    TEST_ASSERT(capture_begin(&saved, &rfd) == 0);
 
     ui_print_system(&st, "sistem %d", 42);
 
-    fflush(stderr);
-    dup2(saved, STDERR_FILENO);
-    close(saved);
-    close(pipefd[1]);
-    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
-    close(pipefd[0]);
+    int n = capture_end(saved, rfd, buf, sizeof(buf));
     TEST_ASSERT(n > 0);
-    buf[n] = '\0';
 
     TEST_ASSERT(strstr(buf, "sistem 42") != NULL);
     return 0;
@@ -348,23 +334,13 @@ static int test_error_content(void)
     static struct app_state st;
     char buf[512];
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return 1;
-    fflush(stderr);
-    int saved = dup(STDERR_FILENO);
-    TEST_ASSERT(saved >= 0);
-    TEST_ASSERT(dup2(pipefd[1], STDERR_FILENO) >= 0);
+    int saved, rfd;
+    TEST_ASSERT(capture_begin(&saved, &rfd) == 0);
 
     ui_print_error(&st, "hata %s", "oldu");
 
-    fflush(stderr);
-    dup2(saved, STDERR_FILENO);
-    close(saved);
-    close(pipefd[1]);
-    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
-    close(pipefd[0]);
+    int n = capture_end(saved, rfd, buf, sizeof(buf));
     TEST_ASSERT(n > 0);
-    buf[n] = '\0';
 
     TEST_ASSERT(strstr(buf, "[!]") != NULL);
     TEST_ASSERT(strstr(buf, "hata oldu") != NULL);
@@ -382,23 +358,13 @@ static int test_system_truncation(void)
     char *buf = malloc(16384);
     TEST_ASSERT(buf != NULL);
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) { free(buf); return 1; }
-    fflush(stderr);
-    int saved = dup(STDERR_FILENO);
-    TEST_ASSERT(saved >= 0);
-    TEST_ASSERT(dup2(pipefd[1], STDERR_FILENO) >= 0);
+    int saved, rfd;
+    if (capture_begin(&saved, &rfd) != 0) { free(buf); return 1; }
 
     ui_print_system(&st, "%s", huge);   /* msg[4096] → 4095 + NUL */
 
-    fflush(stderr);
-    dup2(saved, STDERR_FILENO);
-    close(saved);
-    close(pipefd[1]);
-    ssize_t n = read(pipefd[0], buf, 16383);
-    close(pipefd[0]);
+    int n = capture_end(saved, rfd, buf, 16384);
     TEST_ASSERT(n > 0);
-    buf[n] = '\0';
 
     /* timestamp + renk escape'leri + cursor/prompt ≈ <128 byte ek;
      * içerik 4095'te kesildi (msg[4096] cap) — 4096+ ardışık A YOK */
@@ -414,21 +380,12 @@ static int test_progress_zero_total(void)
     static struct app_state st;
     char buf[256];
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return 1;
-    fflush(stderr);
-    int saved = dup(STDERR_FILENO);
-    TEST_ASSERT(saved >= 0);
-    TEST_ASSERT(dup2(pipefd[1], STDERR_FILENO) >= 0);
+    int saved, rfd;
+    TEST_ASSERT(capture_begin(&saved, &rfd) == 0);
 
     ui_print_progress(&st, "dosya", 0, 0, false);   /* total=0 → erken */
 
-    fflush(stderr);
-    dup2(saved, STDERR_FILENO);
-    close(saved);
-    close(pipefd[1]);
-    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
-    close(pipefd[0]);
+    int n = capture_end(saved, rfd, buf, sizeof(buf));
     TEST_ASSERT(n <= 0);   /* erken return: hiçbir çıktı yok */
     return 0;
 }
@@ -439,23 +396,13 @@ static int test_progress_renders(void)
     static struct app_state st;
     char buf[512];
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return 1;
-    fflush(stderr);
-    int saved = dup(STDERR_FILENO);
-    TEST_ASSERT(saved >= 0);
-    TEST_ASSERT(dup2(pipefd[1], STDERR_FILENO) >= 0);
+    int saved, rfd;
+    TEST_ASSERT(capture_begin(&saved, &rfd) == 0);
 
     ui_print_progress(&st, "rapor.txt", 100, 200, false);   /* %50 */
 
-    fflush(stderr);
-    dup2(saved, STDERR_FILENO);
-    close(saved);
-    close(pipefd[1]);
-    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
-    close(pipefd[0]);
+    int n = capture_end(saved, rfd, buf, sizeof(buf));
     TEST_ASSERT(n > 0);
-    buf[n] = '\0';
 
     TEST_ASSERT(strstr(buf, "\r") != NULL);        /* aynı satır güncellemesi */
     TEST_ASSERT(strstr(buf, "50%") != NULL);
@@ -478,12 +425,8 @@ static int test_fe_tui_noop_no_termbox(void)
     static struct app_state st;
     char buf[256];
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return 1;
-    fflush(stderr);
-    int saved = dup(STDERR_FILENO);
-    TEST_ASSERT(saved >= 0);
-    TEST_ASSERT(dup2(pipefd[1], STDERR_FILENO) >= 0);
+    int saved, rfd;
+    TEST_ASSERT(capture_begin(&saved, &rfd) == 0);
 
     frontend_register(&fe_tui_ops, &st);   /* TUI override — 5 tip emit */
 
@@ -501,12 +444,7 @@ static int test_fe_tui_noop_no_termbox(void)
 
     frontend_register(NULL, NULL);
 
-    fflush(stderr);
-    dup2(saved, STDERR_FILENO);
-    close(saved);
-    close(pipefd[1]);
-    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
-    close(pipefd[0]);
+    int n = capture_end(saved, rfd, buf, sizeof(buf));
     TEST_ASSERT(n <= 0);   /* no-op: stderr'e hiçbir şey yazılmadı */
     return 0;
 }

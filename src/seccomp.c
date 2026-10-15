@@ -192,10 +192,7 @@ static const struct {
   { .num = SCMP_SYS(memfd_secret),      .name = "memfd_secret",      .stage = 3 },
   { .num = SCMP_SYS(vmsplice),          .name = "vmsplice",          .stage = 3 },
 
-  /* H-6 (kalan): sandbox escape + exfil kanalları — mount sistemi eksik
-   * üyesi, yeni nesil file-attr syscall'ları (fchmodat2 ailesi), SysV IPC
-   * (shm/msg = prosesler arası veri kanalı), memfd ve mount keşfi.
-   * Hiçbiri kodda yok (08-05 grep + strace doğrulaması), stage 3'e özel. */
+  
   { .num = SCMP_SYS(mount_setattr),     .name = "mount_setattr",     .stage = 3 },
   /* Yeni nesil syscall'lar farklı sürümlerde farklı bağımlılıklara sahip:
    *  - open_tree_attr/file_setattr (Linux 6.13+) yalnız __NR_ sabidi olarak
@@ -299,7 +296,7 @@ nox_err_t seccomp_policy_load(int stage) {
    * Stage 1'de clone'a dokunmuyoruz — tor_spawn() fork()+execv() kullanıyor.
    * ─────────────────────────────────────────────────────────────── */
   if (stage >= 2) {
-    #define CLONE_THREAD 0x00100000
+    #define CLONE_THREAD 0x00010000  
 
     /* H-2 FIX: Tek kural — clone sadece CLONE_THREAD ile izin ver.
      * x86_64 clone(flags, newsp, ptid, ctid, tls):
