@@ -114,14 +114,17 @@ static int test_emit_null_event(void)
 /* ── A3: round-trip — SENKRON + KOPYASIZ + ctx kimliği ─────────── */
 static int test_emit_roundtrip_fields(void)
 {
+    static struct app_state g_st;   /* ev.state için (commit 4 alanı) */
+
     memset(&g_probe1, 0, sizeof(g_probe1));
     frontend_register(&probe1_ops, &g_probe1);
 
     struct fe_event ev;
     memset(&ev, 0, sizeof(ev));
-    ev.type = FE_MSG_IN;
-    ev.text = "abc";
-    ev.len  = 3;
+    ev.type  = FE_MSG_IN;
+    ev.text  = "abc";
+    ev.len   = 3;
+    ev.state = &g_st;               /* render kimi — aynen geçer */
 
     frontend_emit(&ev);
 
@@ -135,6 +138,7 @@ static int test_emit_roundtrip_fields(void)
     TEST_ASSERT(g_probe1.seen_ev->type == FE_MSG_IN);
     TEST_ASSERT(g_probe1.seen_ev->text == ev.text);
     TEST_ASSERT(g_probe1.seen_ev->len  == 3);
+    TEST_ASSERT(g_probe1.seen_ev->state == &g_st);   /* state de aynen taşındı */
 
     frontend_register(NULL, NULL);
     return 0;
@@ -183,7 +187,7 @@ static int test_now_tm_valid_fields(void)
     struct tm tm_buf;
     memset(&tm_buf, 0xAA, sizeof(tm_buf));   /* dolgu — her alan yazılmalı */
 
-    fe_now_tm(&tm_buf);
+    fe_now_tm(NULL, &tm_buf);                /* ts_out NULL: sadece tm */
 
     TEST_ASSERT(tm_buf.tm_year >= 70);       /* >= 1970 (epoch) */
     TEST_ASSERT(tm_buf.tm_year <= 300);      /* <= 2200 (saçma değer yok) */
@@ -201,7 +205,9 @@ static int test_now_tm_valid_fields(void)
 static int test_now_tm_mktime_roundtrip(void)
 {
     struct tm tm_buf;
-    fe_now_tm(&tm_buf);
+    time_t ts = 0;
+    fe_now_tm(&ts, &tm_buf);   /* ts + tm AYNI kaynaktan (commit 4) */
+    TEST_ASSERT(ts != 0);
 
     time_t roundtrip = mktime(&tm_buf);
     TEST_ASSERT(roundtrip != (time_t)-1);
@@ -209,6 +215,11 @@ static int test_now_tm_mktime_roundtrip(void)
     time_t now = time(NULL);
     long diff = (long)(roundtrip - now);
     TEST_ASSERT(diff >= -5 && diff <= 5);   /* timezone dönüşümü toleransı */
+
+    /* ts ↔ tm tutarlılığı: tm, ts'nin localtime'ı → mktime(ts→tm→ts) ≈ ts
+     * (tek clock kaynaklı oldukları için max 1 sn yazma sınırı) */
+    long ts_diff = (long)(roundtrip - ts);
+    TEST_ASSERT(ts_diff >= -1 && ts_diff <= 1);
     return 0;
 }
 
@@ -457,9 +468,11 @@ static int test_progress_renders(void)
  * ================================================================ */
 
 #ifndef HAVE_TERMBOX
-/* ── D1: !TUI'da fe_tui_* no-op — crash/çıktı yok ───────────────
- * inline no-op'lar devrede; asıl amaç: fe_tui.c her iki modda da
- * derlenip linklenir, non-TUI'da ölü kod kalır. */
+/* ── D1: !TUI'da fe_tui_ops emit no-op — crash/çıktı yok ────────
+ * inline no-op'lar devrede (tui_chat_append/refresh_all); asıl amaç:
+ * dispatch → TUI backend yolu her iki modda da linklenir, non-TUI'da
+ * ölü kod kalır. (TUI=1 modunda test atlanır — init'siz termbox'a
+ * dokunulmaz, o yol pty smoke ile doğrulanır.) */
 static int test_fe_tui_noop_no_termbox(void)
 {
     static struct app_state st;
@@ -472,11 +485,21 @@ static int test_fe_tui_noop_no_termbox(void)
     TEST_ASSERT(saved >= 0);
     TEST_ASSERT(dup2(pipefd[1], STDERR_FILENO) >= 0);
 
-    fe_tui_msg_in(&st, "gelen");
-    fe_tui_msg_out(&st, "giden");
-    fe_tui_msg_system(&st, "sistem");
-    fe_tui_msg_error(&st, "hata");
-    fe_tui_progress(&st);
+    frontend_register(&fe_tui_ops, &st);   /* TUI override — 5 tip emit */
+
+    struct fe_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.state = &st;
+    ev.text  = "m";
+    ev.len   = 1;
+
+    ev.type = FE_MSG_IN;    frontend_emit(&ev);
+    ev.type = FE_MSG_OUT;   frontend_emit(&ev);
+    ev.type = FE_SYSTEM;    frontend_emit(&ev);
+    ev.type = FE_ERROR;     frontend_emit(&ev);
+    ev.type = FE_PROGRESS;  frontend_emit(&ev);
+
+    frontend_register(NULL, NULL);
 
     fflush(stderr);
     dup2(saved, STDERR_FILENO);
@@ -500,6 +523,11 @@ int main(void)
     RUN_TEST(test_emit_roundtrip_fields);
     RUN_TEST(test_register_last_wins);
     RUN_TEST(test_unregister_resets);
+
+    /* A serisi unregister ile bitti → varsayılan (ANSI) backend'e dön.
+     * C serisi bu sayede bugünün stderr davranışını (varsayılan ANSI,
+     * registration'sız — fuzz senaryosu) test eder. */
+    frontend_reset();
 
     /* ── B: fe_now_tm ── */
     RUN_TEST(test_now_tm_valid_fields);

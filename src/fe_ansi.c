@@ -38,6 +38,10 @@
 
 #include <assert.h>
 #include <inttypes.h>  /* PRIu64 — [F4] */
+
+/* İleri bildirim — ui_print_prompt tanımı (satır ~279) çağrıdan (redraw_input)
+ * sonra geliyor; derleyici implicit-declaration veriyordu (WIP build fix) */
+static void ui_print_prompt(struct app_state *state);
 #include <sodium.h>    /* [F7] sodium_memzero — plain text scrub */
 #include <stdio.h>
 #include <stdlib.h>

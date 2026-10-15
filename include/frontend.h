@@ -102,22 +102,22 @@ void ui_print_progress(struct app_state *state,
                        bool is_upload);
 
 /* ================================================================
- * ORTAK YARDIMCI — zaman damgası (commit 2'de tekelleşti, commit 3'te
- * backend kullanımı için public yapıldı)
+ * ORTAK YARDIMCI — zaman damgası (commit 2'de tekelleşti, commit 4'te
+ * ts+tm birlikte tek kaynaktan — fe_event alan tutarlılığı)
  *
- * Tek clock_gettime(CLOCK_REALTIME) + tek localtime_r. Backend'ler
- * (fe_tui.c) timestamp'i buradan alır; kendi kopyası TUTMAZ.
+ * Tek clock_gettime(CLOCK_REALTIME) + tek localtime_r. ts_out NULL
+ * olabilir (sadece tm isteyen çağrılar). Backend'ler timestamp'i
+ * ev->tm'den alır; kendi kopyası TUTMAZ.
  * Hata davranışı: clock_gettime hatası → epoch (ts=0), localtime_r
  * hatası → sıfır tm (00:00:00) — mevcut davranışın aynısı.
  * ================================================================ */
-void fe_now_tm(struct tm *tm_out);
+void fe_now_tm(time_t *ts_out, struct tm *tm_out);
 
 /* ================================================================
- * STRUCTURED EVENT + OPS (Faz 1 iskeleti)
+ * STRUCTURED EVENT + OPS — commit 4'te canlıya alındı
  *
- * Amaç: dispatch'i tek noktaya indirmek. Mevcut ui_print_* imzaları bu
- * fazda KORUNUR ve henüz bu sisteme bağlanmaz — iskelet önce kurulur,
- * dönüşüm sonraki commit'lerde tek tek yapılır (davranış-değiştirmez).
+ * Akış: ui_print_* (common: filtre/vsnprintf + fe_fill_event) →
+ * frontend_emit → kayıtlı backend (varsayılan ANSI; TUI override).
  *
  * KURALLAR (tehdit modelinden):
  *   - Event SENKRON kullanılır: fe_event caller'ın buffer'ına pointer
@@ -125,6 +125,7 @@ void fe_now_tm(struct tm *tm_out);
  *     RAM'de plain text bekletilmez.
  *   - Backend emit'ten sonra event'teki pointer'ları KULLANAMAZ.
  *   - Backend frontend_emit'i GERİ ÇAĞIRMAZ (özyineleme tuzağı).
+ *   - text/filename sahiplenilmez; scrub sahibi caller'dır (common).
  * ================================================================ */
 
 enum fe_event_type {
@@ -139,17 +140,22 @@ struct fe_event {
     enum fe_event_type type;
 
     /* sanitize edilmiş UTF-8, NUL-terminated; senkron, sahiplenilmez.
-     * Faz 1'de yalnızca escape/C0 strip; Faz 1b'de UTF-8 doğrulama eklenir. */
+     * Faz 1'de yalnızca escape/C0 strip (backend'de); Faz 1b'de UTF-8
+     * doğrulama + ortak katman öncesi strip. */
     const char *text;
     size_t      len;
 
-    /* Core'dan timestamp — tek clock_gettime + localtime_r (faz 2'de
-     * doldurulacak; backend'ler kendi kopyalarını silmek üzere buna geçer). */
+    /* Core'dan timestamp — tek clock_gettime + localtime_r (fe_fill_event
+     * doldurur); backend'ler ev->tm'den formatlar, kendi kopyasını siler. */
     time_t      ts;
     struct tm   tm;
 
+    /* Render kimi için — senkron, sahiplenilmez. Dispatch'in tek
+     * state kaynağı (ctx registration'da backend-özel durum içindir). */
+    struct app_state *state;
+
     /* FE_PROGRESS alanları (diğer tiplerde kullanılmaz) */
-    const char *filename;   /* sanitize edilmiş; senkron */
+    const char *filename;   /* senkron, sahiplenilmez — backend strip eder */
     uint64_t    done;
     uint64_t    total;
     bool        is_upload;
@@ -162,11 +168,15 @@ struct frontend_ops {
 };
 
 /* Aktif backend'i set eder (son çağran kazanır). ctx backend'in kendi
- * durumudur (g_theme, g_last_label gibi — faz 4/5'te taşınacak). */
+ * durumudur (g_theme, g_last_label gibi — commit 5'te taşınacak). */
 void frontend_register(const struct frontend_ops *ops, void *ctx);
 
-/* Tek dispatch noktası — senkron, kopyasız. Backend kayıtlı değilse
- * no-op (fuzz hedefleri registration yapmaz, stderr davranışı korunur). */
+/* Varsayılan (ANSI) backend'e dön — tui_shutdown sonrası cleanup bunu
+ * çağırır (bugünkü tui_is_active() runtime kontrolünün karşılığı). */
+void frontend_reset(void);
+
+/* Tek dispatch noktası — senkron, kopyasız. Kayıtlı backend yoksa
+ * no-op (unregister senaryosu; varsayılan ANSI zaten statik kayıtlı). */
 void frontend_emit(const struct fe_event *ev);
 
 #endif /* PARANOID_FRONTEND_H */

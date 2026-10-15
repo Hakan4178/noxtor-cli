@@ -60,6 +60,7 @@
 #include "stdin_handler.h"
 #include "file_transfer.h"
 #include "tui.h"
+#include "fe_tui.h"     /* fe_tui_ops — TUI registration (commit 4) */
 #ifndef NO_SECCOMP
 #include "seccomp_policy.h"
 #endif
@@ -538,6 +539,10 @@ static void cleanup(struct app_state *state) {
    * terminal modunu son kez yazar (F-6 sıralama düzeltmesi). */
   ln_edit_deinit(state);
   tui_shutdown();
+  /* Dispatch ANSI'ye dönsün (commit 4): bugünkü `tui_is_active()`
+   * kontrolü kapanış sonrası çizimlerin ANSI yoluna dönmesini
+   * sağlıyordu — registration'ın karşılığı bu. */
+  frontend_reset();
   restore_terminal();
 
   if (!state->ghost_mode) {
@@ -1334,6 +1339,14 @@ int main(int argc, char *argv[]) {
      * ÖNCESİ: termbox2/terminfo bazı sistemlerde fork/clone kullanabiliyor. */
     tui_init();
     tui_refresh_all(&state);
+
+    /* ── Frontend registration (commit 4) ────────────
+     * Varsayılan zaten ANSI (frontend.c statik init). TUI açıldıysa
+     * override: `tui_is_active()` dallanmalarının dispatch karşılığı.
+     * Cleanup'ta tui_shutdown() + frontend_reset() ile ANSI'ye dönülür
+     * (bugünkü runtime kontrolün birebir karşılığı). */
+    if (tui_is_active())
+        frontend_register(&fe_tui_ops, NULL);
 
 #ifndef NO_SECCOMP
     if (seccomp_policy_load(2) != NOX_OK) {
