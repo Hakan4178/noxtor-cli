@@ -784,6 +784,8 @@ Stage 2 (Tor spawn sonrası, main.c:1301 — fork/execve artık gerekmez):
   execve, execveat, fork, vfork                ← process manipulation
   acct                                         ← telemetri vektörü
   pidfd_open, process_madvise, kcmp
+  io_setup, io_destroy, io_submit, io_cancel,
+  io_getevents, io_pgetevents             ← legacy AIO (io_uring gibi kapalı)
   mount, umount2, fsopen, fsconfig, fsmount, fspick,
   move_mount, open_tree, umount, pivot_root,
   open_by_handle_at                            ← filesystem API

@@ -5,10 +5,11 @@
  * DEĞİL. (Ders: kopya politika testi, kaynaktaki regresyonu gizler.)
  *
  * Her test ayrı child process'te çalışır:
- *   1. socket(AF_INET/AF_INET6) tüm tipler → SIGSYS beklenir
+ *   1. socket(AF_INET/AF_INET6) tüm tipler (K-03: +BT/SMC/RDS/QIPCRTR)
+ *                                          → SIGSYS beklenir
  *   2. clone() → SIGSYS; clone3 → ENOSYS (fallback yaşar)
  *   3. getaddrinfo/connect                → SIGSYS beklenir
- *   4. sendto/symlink/link/chmod/chown    → SIGSYS beklenir
+ *   4. sendto/symlink/link/chmod/chown/shmat (SHM_EXEC dahil) → SIGSYS
  *   5. AF_UNIX/socketpair/mmap RW serbest → yaşaması beklenir
  *
  * Build:
@@ -39,6 +40,7 @@
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/prctl.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <linux/prctl.h>
 #include <linux/netlink.h>
@@ -262,6 +264,31 @@ static void test_mprotect_rw_allow(void) {
   _exit(0);
 }
 
+/* ── shmat: W^X ailesinin kalbi (denetim: "stage 3'te yasaklanmıyor") ──
+ * shmat tümüyle yasak (blacklist .stage=2 → load(3)'e dahil; W^X ailesi
+ * stage-2'den aktarıldı). SHM_EXEC (Linux ≥2.6.9) segmenti YÜRÜTÜLEBİLİR
+ * eşler (man7 shmop(2): "Allow the contents ... to be executed") — W^X
+ * iddiası bu kural olmadan eksik kalırdı. Bu testler regresyonu yakalar. */
+#ifndef SHM_EXEC
+#define SHM_EXEC 0100000  /* linux/shm.h — glibc'te her sürümde yok */
+#endif
+
+static void test_shmat_shm_exec(void) {
+  if (apply_stage3() < 0) _exit(2);
+  /* Geçersiz shmid fark etmez — seccomp syscall girişinde KILL eder */
+  void *p = shmat(0, NULL, SHM_EXEC);
+  if (p != (void *)-1) (void)shmdt(p);
+  _exit(1);
+}
+
+static void test_shmat_plain(void) {
+  if (apply_stage3() < 0) _exit(2);
+  /* SHM_EXEC'siz shmat da yasak (kullanım yok — grep doğrulaması) */
+  void *p = shmat(0, NULL, 0);
+  if (p != (void *)-1) (void)shmdt(p);
+  _exit(1);
+}
+
 static void test_clone3_enosys(void) {
   if (apply_stage3() < 0) _exit(2);
   /* clone3 → ERRNO(ENOSYS): glibc pthread fallback'i sağlansın */
@@ -303,6 +330,50 @@ static void test_af_xdp(void) {
   _exit(1);
 }
 #endif
+
+/* ── K-03: eksik AF aileleri (probe8/9) — SIGSYS beklenir ──
+ * glibc sabitleri taşımayabilir; kernel uapi değerleriyle tamamla.
+ * Politika domain-genelinde kapattığı için tip kombinasyonları da ölür. */
+#ifndef AF_BLUETOOTH
+#define AF_BLUETOOTH 31
+#endif
+#ifndef AF_RDS
+#define AF_RDS 21
+#endif
+#ifndef AF_QIPCRTR
+#define AF_QIPCRTR 42
+#endif
+#ifndef AF_SMC
+#define AF_SMC 43
+#endif
+
+static void test_af_bluetooth(void) {
+  if (apply_stage3() < 0) _exit(2);
+  int fd = socket(AF_BLUETOOTH, SOCK_STREAM, 0);  /* probe8: STREAM açıktı */
+  if (fd >= 0) close(fd);
+  _exit(1);
+}
+
+static void test_af_smc(void) {
+  if (apply_stage3() < 0) _exit(2);
+  int fd = socket(AF_SMC, SOCK_STREAM, 0);  /* probe8: STREAM açıktı */
+  if (fd >= 0) close(fd);
+  _exit(1);
+}
+
+static void test_af_rds(void) {
+  if (apply_stage3() < 0) _exit(2);
+  int fd = socket(AF_RDS, SOCK_SEQPACKET, 0);  /* probe9 */
+  if (fd >= 0) close(fd);
+  _exit(1);
+}
+
+static void test_af_qipcrtr(void) {
+  if (apply_stage3() < 0) _exit(2);
+  int fd = socket(AF_QIPCRTR, SOCK_DGRAM, 0);  /* probe9 */
+  if (fd >= 0) close(fd);
+  _exit(1);
+}
 
 /* ── Stage 3 — gerçek event-loop syscall'ları (yaşaması beklenir) ──
  * NoxTor'un stage 3'te fiilen kullandığı syscall'lar:
@@ -507,6 +578,8 @@ int main(void) {
   total++; passed += run_test("mprotect_exec", "mprotect(PROT_READ|PROT_EXEC)   ", test_mprotect_exec, 1);
   total++; passed += run_test("mmap_exec",     "mmap(PROT_READ|WRITE|EXEC)      ", test_mmap_exec, 1);
   total++; passed += run_test("mmap_rw",       "mmap(PROT_READ|WRITE) serbest   ", test_mmap_rw_allow, 0);
+  total++; passed += run_test("shm_exec",      "shmat(SHM_EXEC)                 ", test_shmat_shm_exec, 1);
+  total++; passed += run_test("shm_plain",     "shmat(plain, yasak)             ", test_shmat_plain, 1);
 
   /* fs/kanal ek testleri */
   total++; passed += run_test("symlink",  "symlink()                      ", test_symlink, 1);
@@ -526,6 +599,12 @@ int main(void) {
 #ifdef AF_XDP
   total++; passed += run_test("af_xdp",   "socket(AF_XDP)                 ", test_af_xdp, 1);
 #endif
+
+  /* K-03: eksik AF aileleri (denetim probe8/9 — kapatıldı) */
+  total++; passed += run_test("af_bt",  "socket(AF_BLUETOOTH, STREAM)   ", test_af_bluetooth, 1);
+  total++; passed += run_test("af_smc", "socket(AF_SMC, STREAM)         ", test_af_smc, 1);
+  total++; passed += run_test("af_rds", "socket(AF_RDS, SEQPACKET)      ", test_af_rds, 1);
+  total++; passed += run_test("af_qip", "socket(AF_QIPCRTR, DGRAM)      ", test_af_qipcrtr, 1);
 
   /* Stage 3 — gerçek event-loop syscall'ları (yaşaması beklenir) */
   total++; passed += run_test("ep1",     "epoll_create1() serbest        ", test_epoll_create1, 0);

@@ -203,6 +203,7 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
 {
     if (!master_key || !pin || !salt) {
         if (pin && pin_len > 0) sodium_memzero(pin, pin_len);
+        if (master_key) sodium_memzero(master_key, NOX_KEY_LEN);
         return NOX_ERR_PIN;
     }
 
@@ -211,12 +212,14 @@ nox_err_t crypto_derive_master_key(uint8_t master_key[NOX_KEY_LEN],
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "PIN çok kısa (min %u karakter)", NOX_PIN_MIN_LEN);
         sodium_memzero(pin, pin_len);
+        sodium_memzero(master_key, NOX_KEY_LEN);
         return NOX_ERR_PIN;
     }
     if (pin_len > NOX_PIN_MAX_LEN) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "PIN çok uzun (max %u karakter)", NOX_PIN_MAX_LEN);
         sodium_memzero(pin, pin_len);
+        sodium_memzero(master_key, NOX_KEY_LEN);
         return NOX_ERR_PIN;
     }
 
@@ -261,6 +264,7 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
                                    NOX_SUBKEY_DB,
                                    NOX_KDF_CTX, master_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "db_key türetme başarısız");
+        sodium_memzero(db_key, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 
@@ -269,6 +273,7 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
                                    NOX_KDF_CTX, master_key) != 0) {
         NOX_ERROR(LOG_MOD_CRYPTO, "identity_unlock_key türetme başarısız");
         sodium_memzero(db_key, NOX_KEY_LEN);
+        sodium_memzero(identity_unlock_key, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 
@@ -278,6 +283,7 @@ nox_err_t crypto_derive_subkeys(const uint8_t master_key[NOX_KEY_LEN],
         NOX_ERROR(LOG_MOD_CRYPTO, "session_key türetme başarısız");
         sodium_memzero(db_key, NOX_KEY_LEN);
         sodium_memzero(identity_unlock_key, NOX_KEY_LEN);
+        sodium_memzero(session_key, NOX_KEY_LEN);
         return NOX_ERR_CRYPTO;
     }
 
@@ -348,6 +354,7 @@ nox_err_t derive_tor_expanded_key(uint8_t expanded_out[64],
     uint8_t dummy_sk[64];
     if (crypto_sign_seed_keypair(pub_out, dummy_sk, seed) != 0) {
         sodium_memzero(expanded_out, 64);
+        sodium_memzero(pub_out, 32);
         sodium_memzero(dummy_sk, sizeof(dummy_sk));
         return NOX_ERR_CRYPTO;
     }
@@ -808,6 +815,8 @@ nox_err_t crypto_load_identity(int config_dir_fd,
     if (fd < 0) {
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key açılamadı: %s", strerror(errno));
+        sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_IO;
     }
 
@@ -817,6 +826,8 @@ nox_err_t crypto_load_identity(int config_dir_fd,
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "fstat başarısız: %s", strerror(errno));
         close(fd);
+        sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_IO;
     }
     if (st.st_size != (off_t)IDENTITY_FILE_SIZE) {
@@ -824,6 +835,8 @@ nox_err_t crypto_load_identity(int config_dir_fd,
                   "identity.key boyutu hatalı (%lld byte, beklenen %zu)",
                   (long long)st.st_size, (size_t)IDENTITY_FILE_SIZE);
         close(fd);
+        sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_IO;
     }
 
@@ -832,6 +845,8 @@ nox_err_t crypto_load_identity(int config_dir_fd,
     if (!file_buf) {
         NOX_ERROR(LOG_MOD_CRYPTO, "sodium_malloc başarısız");
         close(fd);
+        sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_ALLOC;
     }
 
@@ -841,6 +856,8 @@ nox_err_t crypto_load_identity(int config_dir_fd,
     if (err != NOX_OK) {
         NOX_ERROR(LOG_MOD_CRYPTO, "identity.key okunamadı veya bozuk");
         sodium_free(file_buf);   /* otomatik sıfırlar */
+        sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_IO;
     }
 
@@ -859,6 +876,7 @@ nox_err_t crypto_load_identity(int config_dir_fd,
         NOX_ERROR(LOG_MOD_CRYPTO,
                   "identity.key çözme başarısız — yanlış PIN?");
         sodium_memzero(secret_key_out, crypto_sign_SECRETKEYBYTES);
+        sodium_memzero(public_key_out, NOX_KEY_LEN);
         return NOX_ERR_AUTH;
     }
 
@@ -924,6 +942,7 @@ nox_err_t crypto_ed25519_to_curve25519(
             NOX_ERROR(LOG_MOD_CRYPTO,
                       "Ed25519 public key Curve25519'a dönüştürme başarısız");
             sodium_memzero(curve25519_pk, NOX_KEY_LEN);
+            if (curve25519_sk) sodium_memzero(curve25519_sk, NOX_KEY_LEN);
             return NOX_ERR_CRYPTO;
         }
     }

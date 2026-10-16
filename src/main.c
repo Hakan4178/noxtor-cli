@@ -95,6 +95,14 @@
 #include <sys/prctl.h>
 #include <linux/capability.h>
 
+/* W^X (kernel ≥6.3): MDWE sabitleri — eski glibc header'larında olmayabilir */
+#ifndef PR_SET_MDWE
+#define PR_SET_MDWE 65
+#endif
+#ifndef PR_MDWE_REFUSE_EXEC_GAIN
+#define PR_MDWE_REFUSE_EXEC_GAIN (1UL << 0)
+#endif
+
 /* ================================================================
  * GLOBAL SHUTDOWN FLAG — async-signal-safe
  *
@@ -137,7 +145,14 @@ static void sigchld_handler(int sig) {
 __attribute__((constructor))
 static void seccomp_stage1_early(void) {
 #ifdef PR_SET_NO_NEW_PRIVS
-  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+  /* Fail-closed: seccomp_load() NO_NEW_PRIVS'siz (ve CAP_SYS_ADMIN'siz)
+   * başarısız olur; erken patla, sebebi belli olsun. Bu noktada hassas
+   * veri yok (PIN/adım 6 öncesi), ham write + _exit yeterli. */
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    const char msg[] = "FATAL: PR_SET_NO_NEW_PRIVS başarısız\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+  }
 #endif
   if (seccomp_policy_load(1) != NOX_OK) {
     const char msg[] = "FATAL: seccomp stage 1 yüklenemedi\n";
@@ -147,16 +162,29 @@ static void seccomp_stage1_early(void) {
 }
 #endif
 
-/* K-7/Y-1 FIX: main()'den ÖNCE dumpable + core dump engeli. Eski kod adım
- * 8b'de yapıyordu — PIN (adım 6) o noktada HENÜZ OKUNMUŞTU ve süreç
- * ptrace/core-dump'a açıktı. Constructor seccomp stage 1'den bile önce
- * çalışır (seccomp'ta PR_SET_DUMPABLE KILL kuralı stage 2'de, çakışma yok;
- * setrlimit seccomp'ta yasaklı değil). NO_SECCOMP build'de de aktif. */
+/* main()'den ÖNCE dumpable + core dump engeli. Eski kod adım 8b'de
+ * yapıyordu — PIN (adım 6) o noktada HENÜZ OKUNMUŞTU ve süreç
+ * ptrace/core-dump'a açıktı. Bu constructor ile seccomp stage 1
+ * birbirine göre sıra garantisi yok (ikisi de önceliksiz, bkz. GCC
+ * constructor priority) — gerek de yok: stage-1 DUMPABLE/rlimit'e
+ * dokunmaz, bu fonksiyon seccomp'a dokunmaz; ikisi de ilk sırdan
+ * (PIN/adım 6) önce ve fail-closed koşar. NO_SECCOMP build'de de aktif. */
 __attribute__((constructor))
 static void early_hardening_init(void) {
-  prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+  /* Fail-closed: bu iki çağrı constructor'da koşar — PIN (adım 6), arena
+   * (adım 8) ve anahtarlar henüz yok, silinecek hassas veri yok; log
+   * sistemi de yok, o yüzden ham write + _exit (komşu constructor kalıbı). */
+  if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) {
+    const char msg[] = "FATAL: PR_SET_DUMPABLE(0) başarısız\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+  }
   struct rlimit core_zero = {0, 0};
-  (void)setrlimit(RLIMIT_CORE, &core_zero);
+  if (setrlimit(RLIMIT_CORE, &core_zero) != 0) {
+    const char msg[] = "FATAL: RLIMIT_CORE sıfırlanamadı\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+  }
 }
 
 static void setup_signal_handlers(void) {
@@ -1347,6 +1375,24 @@ int main(int argc, char *argv[]) {
      * (bugünkü runtime kontrolün birebir karşılığı). */
     if (tui_is_active())
         frontend_register(&fe_tui_ops, NULL);
+
+    /* ── W^X çekirdek desteği: Memory-Deny-Write-Execute (kernel ≥6.3) ──
+     * Seccomp W^X kurallarının çekirdek-düzeyi tamamlayıcısı (systemd 254+
+     * MemoryDenyWriteExecute için PR_SET_MDWE kullanıyor): W|X mmap ve
+     * exec-gain mprotect çekirdek tarafından reddedilir — seccomp kuralı
+     * atlasa/eksik kalsa bile ağır. TUI init SONRASI (GL/dlopen penceresi
+     * kapandı), stage-2 ÖNCESİ: prctl option filtresi PR_SET_MDWE'yi
+     * stage-2'den itibaren KILL eder — tek set noktası burasıdır.
+     * Tor çocuğu etkilenmez (zaten spawn edildi; filtreyi de almadı).
+     * Eski kernel (EINVAL): geç — seccomp W^X yine aktif. */
+    if (prctl(PR_SET_MDWE, (unsigned long)PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) == 0) {
+      NOX_INFO(LOG_MOD_MAIN,
+               "W^X: PR_SET_MDWE aktif (çekirdek düzeyi exec-gain engeli)");
+    } else {
+      NOX_INFO(LOG_MOD_MAIN,
+               "W^X: PR_SET_MDWE yok (kernel <6.3? — errno=%d) — seccomp W^X devrede",
+               errno);
+    }
 
 #ifndef NO_SECCOMP
     if (seccomp_policy_load(2) != NOX_OK) {

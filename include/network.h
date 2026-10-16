@@ -41,6 +41,13 @@ nox_err_t tor_spawn(struct app_state *state);
 /* Cookie ile authenticate ol */
 nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir);
 
+/* Control soketi peer doğrulaması (bulgu 2.1) — SO_PEERCRED ile karşı
+ * ucun beklenen Tor süreci (expected_pid) ve aynı UID olduğunu kanıtlar.
+ * connect() sonrası, cookie/ADD_ONION göndermeden ÖNCE çağrılır; peer
+ * kimliği bağlantı boyunca sabittir. Hata: NOX_ERR_TOR (uyuşmazlık) |
+ * NOX_ERR_NET (getsockopt hatası). */
+nox_err_t tor_verify_peer(int fd, pid_t expected_pid);
+
 /* Bootstrap %100 olana kadar bekle */
 nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec);
 

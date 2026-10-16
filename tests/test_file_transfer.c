@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <sodium.h>
 #include "test_common.h"
@@ -253,6 +254,65 @@ static int test_rx_data_chunk_success(void)
     return 0;
 }
 
+/* 4) F9 REGRESYON: chunk-timeout FILE_RX hayaletini bırakmamalı.
+ * event_loop.c timeout bloğu unlink+close+memzero yapıp EV_FILE_DONE
+ * dispatch etmiyordu (rx_abort ediyordu) → ST_FILE_RX + active=false,
+ * /switch 3600sn bloklu. Patch: FILE_RX ise EV_FILE_DONE dispatch.
+ * Bu test patch sözleşmesini kilitler: expired predikat + timeout
+ * temizliği sonrası state ACTIVE'a dönmeli, yarım dosya silinmeli. */
+static int test_rx_chunk_timeout_returns_to_active(void)
+{
+    if (fixture_rx() != 0) { TEST_ASSERT(!"fixture"); }
+    struct peer_session *ps = &st.peers[0];
+
+    /* RX başlamış gibi: state FILE_RX, yarım dosya diskte */
+    ps->state = ST_FILE_RX;
+    int fd = openat(st.downloads_dir_fd, "timeout.bin",
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    TEST_ASSERT(fd >= 0);
+    ps->rx_file.active = true;
+    ps->rx_file.fd = fd;
+    ps->rx_file.expected_size = 64;
+    ps->rx_file.received_bytes = 16;
+    snprintf(ps->rx_file.local_name, sizeof(ps->rx_file.local_name),
+             "timeout.bin");
+    clock_gettime(CLOCK_MONOTONIC, &ps->rx_file.last_chunk_ts);
+    ps->rx_file.last_chunk_ts.tv_sec -= (NOX_FILE_CHUNK_TIMEOUT_SEC + 5);
+
+    /* predikat: bayat timestamp expired, taze değil */
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    TEST_ASSERT(file_transfer_chunk_expired(&ps->rx_file.last_chunk_ts,
+                                            &now_ts,
+                                            NOX_FILE_CHUNK_TIMEOUT_SEC));
+    TEST_ASSERT(!file_transfer_chunk_expired(&now_ts, &now_ts,
+                                             NOX_FILE_CHUNK_TIMEOUT_SEC));
+    TEST_ASSERT(!file_transfer_chunk_expired(NULL, &now_ts,
+                                             NOX_FILE_CHUNK_TIMEOUT_SEC));
+
+    /* event_loop.c timeout bloğuyla aynı temizlik (patch sonrası) */
+    if (st.downloads_dir_fd >= 0 && ps->rx_file.local_name[0] != '\0') {
+        unlinkat(st.downloads_dir_fd, ps->rx_file.local_name, 0);
+    }
+    if (ps->rx_file.fd >= 0) {
+        close(ps->rx_file.fd);
+    }
+    sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
+    ps->rx_file.fd = -1;
+    if (ps->state == ST_FILE_RX) {
+        sm_dispatch(ps, &st, EV_FILE_DONE);
+    }
+
+    /* sözleşme: hayalet yok — ACTIVE + temiz struct + dosya silindi */
+    TEST_ASSERT(ps->rx_file.active == false);
+    TEST_ASSERT(ps->rx_file.fd == -1);
+    TEST_ASSERT(ps->state == ST_ACTIVE);
+    TEST_ASSERT(faccessat(st.downloads_dir_fd, "timeout.bin", F_OK, 0) == -1);
+
+    fixture_teardown();
+    return 0;
+}
+
 int main(void)
 {
     if (sodium_init() < 0) {
@@ -265,6 +325,7 @@ int main(void)
     RUN_TEST(test_rx_abort_unlinks_orphan);
     RUN_TEST(test_rx_decrypt_fail_inactive);
     RUN_TEST(test_rx_data_chunk_success);
+    RUN_TEST(test_rx_chunk_timeout_returns_to_active);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n",
             tests_passed, tests_run);

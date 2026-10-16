@@ -874,11 +874,59 @@ static void tor_child_cleanup(pid_t pid) {
   NOX_INFO(LOG_MOD_NET, "Tor orphan child temizlendi (PID=%d)", pid);
 }
 
+/* ── Bulgu 2.1: control soketi peer doğrulaması ─────────────────────
+ * SO_PEERCRED, bağlantının karşı ucunun kimliğini çekirdekten okur.
+ * Unix soketlerde peer kimliği connect() anında sabitlenir ve bağlantı
+ * boyunca değişmez; bu yüzden TEK doğrulama, "cookie/özel anahtar
+ * göndermeden önce doğrula" şartını tam karşılar.
+ *
+ * Neden gerekli: "connect() başarılı" yalnız adreste bağlantı kabul
+ * eden bir soket bulunduğunu kanıtlar — dinleyenin GERÇEKTEN spawn
+ * edilen Tor olduğunu kanıtlamaz. control.sock yolu aynı UID'li başka
+ * bir süreç tarafından Tor'dan önce bind edilirse (yarış), istemci
+ * cookie'yi ve ADD_ONION özel anahtarını saldırganın soketine
+ * gönderirdi. 0700 dizin yalnız diğer kullanıcıları sınırlar.
+ *
+ * Tor child'ı daemonize etmeden doğrudan exec edilir (torrc'de
+ * RunAsDaemon/User yok) → dinleyici soket tor_pid sürecine aittir.
+ * Semantik doğrulama: /tmp/opencode/peercred_probe.c (peer = dinleyen
+ * sürecin pid'i). Regresyon: tests/test_tor_peer.c. */
+nox_err_t tor_verify_peer(int fd, pid_t expected_pid) {
+  struct ucred cred;
+  socklen_t len = sizeof(cred);
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) {
+    NOX_ERROR(LOG_MOD_NET, "SO_PEERCRED alınamadı: %s", strerror(errno));
+    return NOX_ERR_NET;
+  }
+  if (len != (socklen_t)sizeof(cred)) {
+    NOX_ERROR(LOG_MOD_NET, "SO_PEERCRED beklenmeyen uzunluk: %u",
+              (unsigned)len);
+    return NOX_ERR_NET;
+  }
+  if (cred.pid != expected_pid) {
+    NOX_ERROR(LOG_MOD_NET,
+              "control soketi peer PID uyuşmuyor: beklenen=%d gelen=%d "
+              "— sahte soket olabilir, bağlantı reddedildi",
+              (int)expected_pid, (int)cred.pid);
+    return NOX_ERR_TOR;
+  }
+  if (cred.uid != getuid()) {
+    NOX_ERROR(LOG_MOD_NET,
+              "control soketi peer UID uyuşmuyor: beklenen=%d gelen=%d",
+              (int)getuid(), (int)cred.uid);
+    return NOX_ERR_TOR;
+  }
+  NOX_INFO(LOG_MOD_NET, "control soketi peer doğrulandı (PID=%d, UID=%d)",
+           (int)cred.pid, (int)cred.uid);
+  return NOX_OK;
+}
+
 /* control.sock dosyasının oluşmasını bekler, Tor sürecini takip eder.
  * access() TOCTOU yarışı yerine direkt connect() kullanılır:
  *   - connect() başarısızsa → soket henüz hazır değil, retry
- *   - connect() başarılıysa → soket hazır VE bağlantıyı kurduk
- * Aynı zamanda soketin gerçekten bir AF_UNIX soketi olduğunu doğrular. */
+ *   - connect() başarılıysa → bağlantı kuruldu; peer kimliği SO_PEERCRED
+ *     ile doğrulanır (bulgu 2.1: "bağlantı var" ≠ "karşıdaki Tor").
+ *     Peer tor_pid değilse retry yok — kesin hata (sahte soket). */
 static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
                                          int timeout_sec) {
   const struct timespec probe_delay = {.tv_sec = 0, .tv_nsec = 100000000}; /* 100 ms */
@@ -937,7 +985,12 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
     addr.sun_path[copy_len] = '\0';
 
     if (connect(probe_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+      /* Bulgu 2.1: dinleyenin gerçekten spawn edilen Tor olduğunu kanıtla.
+       * Mismatch'te retry yok — beklenen süreç hiç gelmeyecek. */
+      nox_err_t peer_err = tor_verify_peer(probe_fd, tor_pid);
       close(probe_fd);
+      if (peer_err != NOX_OK)
+        return peer_err;
       return NOX_OK;
     }
     close(probe_fd);
@@ -1128,6 +1181,17 @@ nox_err_t tor_spawn(struct app_state *state) {
     /* A2 FIX: child orphan kalmasın */
     tor_child_cleanup(pid);
     return NOX_ERR_TOR;
+  }
+
+  /* Bulgu 2.1: asıl control kanalı — cookie ve ADD_ONION özel anahtarı
+   * bu fd üzerinden gider; peer doğrulanmadan devam edilmez. */
+  err = tor_verify_peer(ctrl_fd, pid);
+  if (err != NOX_OK) {
+    NOX_ERROR(LOG_MOD_NET,
+              "Tor control soketi peer doğrulaması başarısız — bağlantı iptal");
+    close(ctrl_fd);
+    tor_child_cleanup(pid);
+    return err;
   }
 
   /* A2 FIX: tor_pid YALNIZCA tam başarı sonrası atanır. Başarısız

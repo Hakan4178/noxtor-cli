@@ -2,7 +2,8 @@
  * landlock_sandbox.h — Landlock LSM dosya erişim kısıtlaması
  *
  * open/openat/creat'i sadece downloads dizinine kısıtlar.
- * Kernel 5.13+ gerektirir. Desteklemiyorsa sessizce fallback.
+ * Kernel 5.13+ gerektirir. Desteklemiyorsa fail-closed
+ * (landlock_sandbox_init NOX_ERR_* döner, sessiz devam yok).
  */
 
 #ifndef PARANOID_LANDLOCK_SANDBOX_H

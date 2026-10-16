@@ -4,8 +4,10 @@
  * open/openat/creat'i sadece downloads dizinine kısıtlar.
  * seccomp'un yapamadığı path-based filtering'i yapar.
  *
- * Kernel 5.13+ gerektirir (Landlock ABI v1+).
- * Kernel desteklemiyorsa sessizce fallback.
+ * Kernel 5.13+ gerektirir (Landlock ABI v1+; yeni haklar ABI'ye göre
+ * koşullu eklenir, tablo için landlock_sandbox_init'e bak).
+ * Kernel desteklemiyorsa fail-closed: NOX_ERR_* döner, çağıran
+ * (--allow-unsandboxed-fs yoksa) çıkmak zorundadır.
  *
  * Kullanım:
  *   landlock_sandbox_init(config_dir_fd, downloads_dir_fd);
@@ -89,7 +91,7 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     NOX_INFO(LOG_MOD_MAIN, "landlock: ABI v%d tespit edildi", abi);
 
     /* ── Ruleset oluştur ── */
-    /* ABI versiyonuna göre desteklenen flag'lericonditional ekle */
+    /* ABI versiyonuna göre desteklenen hakları koşullu ekle */
     __u32 handled = NOX_LL_BASE_RIGHTS;
     if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
     if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
@@ -100,6 +102,13 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     struct landlock_ruleset_attr ruleset_attr = {
         .handled_access_fs = handled,
     };
+
+    /* ABI v6+: domain-dışı abstract unix soketlere connect'i kapat.
+     * Tüm soketlerimiz path-based (sun_path[0]=='/' */
+#ifdef LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+    if (abi >= 6)
+        ruleset_attr.scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
+#endif
 
     int ruleset_fd = sys_landlock_create_ruleset(&ruleset_attr,
                                                   sizeof(ruleset_attr), 0);
@@ -202,7 +211,7 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     close(ruleset_fd);
 
     NOX_INFO(LOG_MOD_MAIN,
-             "landlock: sandbox aktif — sadece downloads dir okunabilir/yazılabilir");
+             "landlock: sandbox aktif — downloads RW + config RO, dışı yasak");
     return NOX_OK;
 }
 

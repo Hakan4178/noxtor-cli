@@ -320,6 +320,10 @@ test: $(TEST_BINS)
 	    echo ">> onion e2e (determinizm + canlı Tor)"; \
 	    $(TEST_DIR)/test_onion_derive.sh || failed=1; \
 	fi; \
+	if [ $$failed -eq 0 ] && [ -x $(TEST_DIR)/test_seccomp_badpatch.sh ]; then \
+	    echo ">> seccomp bad-patch dedektörü (K-01 negatif kontrol)"; \
+	    $(TEST_DIR)/test_seccomp_badpatch.sh || failed=1; \
+	fi; \
 	[ $$failed -eq 0 ] && echo "=== Tüm testler başarılı ===" || exit 1
 
 # ----------------------------------------------------------------

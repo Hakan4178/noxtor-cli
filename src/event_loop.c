@@ -37,7 +37,8 @@
  * fd → peer_session eşlemesi: epoll'taki data.fd integer'ını
  * peer_session struct'ındaki fd veya listen_fd alanlarıyla eşleştirir.
  * ================================================================ */
-static struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
+/* UNIT TEST ERİŞİMİ (test_event_frames): saf arama — davranış kilitleri. */
+struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
 {
     for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
         struct peer_session *ps = &state->peers[i];
@@ -69,8 +70,9 @@ NOX_STATIC_ASSERT(48 + NOX_HS_PAYLOAD_V1_LEN + NOX_MAC_LEN <=
                       NOISE_MAX_HANDSHAKE_LEN,
                   "msg3 (enc(s)||enc(payload)) 256B'ye sığmalı");
 
-static nox_err_t hs_build_claim_payload(uint8_t pl[NOX_HS_PAYLOAD_V1_LEN],
-                                        const struct app_state *state)
+/* UNIT TEST ERİŞİMİ (test_event_frames): claim format/signature kilidi. */
+nox_err_t hs_build_claim_payload(uint8_t pl[NOX_HS_PAYLOAD_V1_LEN],
+                                 const struct app_state *state)
 {
     if (!pl || !state)
         return NOX_ERR_CRYPTO;
@@ -104,8 +106,10 @@ static nox_err_t hs_build_claim_payload(uint8_t pl[NOX_HS_PAYLOAD_V1_LEN],
  * session kurulduktan sonra işlenebilir.
  * ================================================================ */
 // Real attack surface in practice: untrusted network (AF_UNIX, attacker-controlled wire)
-static void process_peer_frames(struct peer_session *ps, struct app_state *state,
-                                int fd) {
+/* UNIT TEST ERİŞİMİ (test_event_frames): socketpair/buffer izolasyonuyla
+ * frame dağıtım yolu — TEXT/SEQ/MAC/CTRL/FILE davranış kilitleri. */
+void process_peer_frames(struct peer_session *ps, struct app_state *state,
+                         int fd) {
   while (ps->recv_pos >= FRAME_HEADER_WIRE_SIZE) {
 
     struct frame_header fh;
@@ -718,6 +722,12 @@ void event_loop(struct app_state *state) {
           }
           sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
           ps->rx_file.fd = -1;
+          /* F9 FIX: chunk-timeout SM'yi FILE_RX'te asılı bırakıyordu.
+           * rx_abort yolu EV_FILE_DONE dispatch ederken timeout etmiyordu;
+           * state FILE_RX + active=false hayaleti /switch'i 3600sn blokluyordu. */
+          if (ps->state == ST_FILE_RX) {
+            sm_dispatch(ps, state, EV_FILE_DONE);
+          }
         }
       }
 
