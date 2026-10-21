@@ -174,22 +174,22 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
   uint8_t *payload = sodium_malloc(4096 + NOX_MAC_LEN);
   if (!payload) return NOX_ERR_ALLOC;
 
-  ssize_t ct_len = noise_encrypt(ps->session,
-                                 (const uint8_t *)text,
-                                 pt_len, payload);
-  if (ct_len < 0) {
-    sodium_free(payload);
-    return NOX_ERR_CRYPTO;
-  }
-
+  /* H2: Header şifrelemeden ÖNCE kurulur; 13 byte ham wire kopyası AD olur. */
   struct frame_header fh = {
       .magic = NOX_FRAME_MAGIC,
       .type = NOX_MSG_TEXT,
       .seq = ps->tx_seq,
-      .len = (uint32_t)ct_len,
+      .len = (uint32_t)(pt_len + NOX_MAC_LEN),
   };
   uint8_t wire[FRAME_HEADER_WIRE_SIZE];
   frame_header_encode(&fh, wire);
+
+  ssize_t ct_len = noise_encrypt(ps->session, wire, sizeof(wire),
+                                 (const uint8_t *)text, pt_len, payload);
+  if (ct_len != (ssize_t)fh.len) {
+    sodium_free(payload);
+    return NOX_ERR_CRYPTO;
+  }
 
   struct iovec iov[2] = {
       { .iov_base = (void *)wire,   .iov_len = FRAME_HEADER_WIRE_SIZE },
@@ -251,22 +251,24 @@ nox_err_t send_segmented_message_to(struct app_state *state,
     chunk[chunk_len] = '\0';
 
     size_t pt_len = chunk_len + 1;
-    ssize_t ct_len =
-        noise_encrypt(ps->session, (const uint8_t *)chunk, pt_len, ct);
-    if (ct_len < 0) {
-      sodium_free(chunk);
-      sodium_free(ct);
-      return NOX_ERR_CRYPTO;
-    }
-
+    /* H2: Header önce kurulur; 13 byte ham wire kopyası AD olur. */
     struct frame_header fh = {
         .magic = NOX_FRAME_MAGIC,
         .type = NOX_MSG_TEXT,
         .seq = ps->tx_seq,
-        .len = (uint32_t)ct_len,
+        .len = (uint32_t)(pt_len + NOX_MAC_LEN),
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     frame_header_encode(&fh, wire);
+
+    ssize_t ct_len =
+        noise_encrypt(ps->session, wire, sizeof(wire),
+                      (const uint8_t *)chunk, pt_len, ct);
+    if (ct_len != (ssize_t)fh.len) {
+      sodium_free(chunk);
+      sodium_free(ct);
+      return NOX_ERR_CRYPTO;
+    }
 
     struct iovec iov[2] = {
         { .iov_base = (void *)wire, .iov_len = FRAME_HEADER_WIRE_SIZE },
@@ -554,7 +556,9 @@ void process_line(struct app_state *state, const char *line) {
       NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
       state->hs_attempt_count++;
       int peer_fd = -1;
-      nox_err_t err = socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
+      nox_err_t err = socks5_connect(target, NOX_VIRTUAL_PORT,
+                                     state->socks_path, state->tor_pid,
+                                     &peer_fd);
       if (err != NOX_OK) { ui_print_error(state, "bağlantı başarısız"); return; }
       target_ps->fd = peer_fd;
       snprintf(target_ps->peer_onion, sizeof(target_ps->peer_onion), "%s", target);

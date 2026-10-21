@@ -1705,9 +1705,22 @@ nox_err_t listener_create(const char *tor_data_dir, char *listen_path_out,
  *
  * AF_UNIX SocksSocket ile bağlanır, SOCKS5 handshake aynı kalır.
  * Onion adresi domain name olarak gönderilir (tip 0x03).
+ *
+ * Bulgu 2.1b: connect sonrası peer kimliği SO_PEERCRED ile doğrulanır.
+ * Tor AYAKTAYKEN socks.sock yolu unlink/rebind ile değiştirilebilir;
+ * kimlik kanıtlanmadan greeting gönderilmez (fail-closed).
  * ================================================================ */
 nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
-                          const char *socks_path, int *fd_out) {
+                          const char *socks_path, pid_t expected_tor_pid,
+                          int *fd_out) {
+  /* Fail-closed: Tor PID'i bilinmiyorsa kimlik kanıtı kurulamaz. */
+  if (expected_tor_pid <= 0) {
+    NOX_ERROR(LOG_MOD_NET,
+              "SOCKS5: geçersiz Tor PID (%d) — bağlantı reddedildi",
+              (int)expected_tor_pid);
+    return NOX_ERR_TOR;
+  }
+
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
     return NOX_ERR_NET;
@@ -1728,6 +1741,17 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     NOX_ERROR(LOG_MOD_NET, "SOCKS5 UNIX socket bağlantısı başarısız");
     close(fd);
     return NOX_ERR_NET;
+  }
+
+  /* Bulgu 2.1b: socks.sock yolu Tor AYAKTAYKEN unlink/rebind edilebilir
+   * (control kanalı ayrı ve doğrulanmış olsa bile). Peer kimliği
+   * kanıtlanmadan SOCKS greeting'i bile gönderilmez. */
+  nox_err_t peer_err = tor_verify_peer(fd, expected_tor_pid);
+  if (peer_err != NOX_OK) {
+    NOX_ERROR(LOG_MOD_NET,
+              "SOCKS5 soketi beklenen Tor sürecine ait değil — bağlantı iptal");
+    close(fd);
+    return peer_err;
   }
 
   /* Greeting */

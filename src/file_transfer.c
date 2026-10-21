@@ -26,6 +26,14 @@
  * YARDIMCI METOTLAR
  * ================================================================ */
 
+/* H3: RX plaintext tamponunu sıfırla. Dispatch sonrası ham `pt` işaretçisi
+ * kullanılamaz — cleanup rx_pt_buf'u serbest bırakıp NULL'lamış olabilir;
+ * bu yüzden sahip alan guard'la okunur (plan §2.4). */
+static void rx_pt_zero(struct peer_session *ps) {
+  if (ps->rx_pt_buf)
+    sodium_memzero(ps->rx_pt_buf, NOX_MAX_MSG_LEN + 1);
+}
+
 /* PATCH: HIGH‑2 — max_len sınırı ve null garantisi eklenmiş sanitize */
 // Real attack surface in practice: untrusted filename (path traversal)
 void sanitize_filename(char *name, size_t max_len) {
@@ -292,12 +300,24 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   memcpy(meta + 273, ps->tx_file.hash, 32);
   sodium_memzero(file_hash, sizeof(file_hash));
 
+  /* H2: Header şifrelemeden ÖNCE kurulur — 13 byte ham wire kopyası
+   * AEAD'ye AD olarak girer; uzunluk deterministik (pt + MAC). */
+  struct frame_header mfh = {
+      .magic = NOX_FRAME_MAGIC,
+      .type = NOX_MSG_FILE,
+      .seq = ps->tx_seq,
+      .len = (uint32_t)(sizeof(meta) + NOX_MAC_LEN),
+  };
+  uint8_t mwire[FRAME_HEADER_WIRE_SIZE];
+  frame_header_encode(&mfh, mwire);
+
   /* Şifrele ve gönder */
   uint8_t meta_ct[305 + NOX_MAC_LEN];
   ssize_t meta_ct_len =
-      noise_encrypt(ps->session, meta, sizeof(meta), meta_ct);
+      noise_encrypt(ps->session, mwire, sizeof(mwire), meta, sizeof(meta),
+                    meta_ct);
   sodium_memzero(meta, sizeof(meta));
-  if (meta_ct_len < 0) {
+  if (meta_ct_len != (ssize_t)mfh.len) {
     ui_print_error(state, "Metadata şifreleme hatası.");
     sodium_memzero(meta_ct, sizeof(meta_ct));
     close(file_fd);
@@ -306,15 +326,6 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
     ps->tx_file.fd = -1;
     return;
   }
-
-  struct frame_header mfh = {
-      .magic = NOX_FRAME_MAGIC,
-      .type = NOX_MSG_FILE,
-      .seq = ps->tx_seq,
-      .len = (uint32_t)meta_ct_len,
-  };
-  uint8_t mwire[FRAME_HEADER_WIRE_SIZE];
-  frame_header_encode(&mfh, mwire);
 
   struct iovec iov[2] = {
       { .iov_base = (void *)mwire,   .iov_len = FRAME_HEADER_WIRE_SIZE },
@@ -422,20 +433,23 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
       return;
     }
 
-      ssize_t ct_len = noise_encrypt(ps->session,
-                                     ps->tx_file.plain_buf,
-                                     (size_t)r,
+      /* H2: Header önce encode edilir; AD = tx_buf'ın ilk 13 byte'ı.
+       * Şifreli çıktı header'ın hemen ardına yazılır (bölgeler çakışmaz). */
+      struct frame_header fh = {
+          .magic = NOX_FRAME_MAGIC,
+          .type = NOX_MSG_FILE,
+          .seq = ps->tx_seq,
+          .len = (uint32_t)((size_t)r + NOX_MAC_LEN),
+      };
+      frame_header_encode(&fh, ps->tx_file.tx_buf);
+
+      ssize_t ct_len = noise_encrypt(ps->session, ps->tx_file.tx_buf,
+                                     FRAME_HEADER_WIRE_SIZE,
+                                     ps->tx_file.plain_buf, (size_t)r,
                                      ps->tx_file.tx_buf + FRAME_HEADER_WIRE_SIZE);
       sodium_memzero(ps->tx_file.plain_buf, 4096);
 
-      if (ct_len > 0) {
-        struct frame_header fh = {
-            .magic = NOX_FRAME_MAGIC,
-            .type = NOX_MSG_FILE,
-            .seq = ps->tx_seq,
-            .len = (uint32_t)ct_len,
-        };
-        frame_header_encode(&fh, ps->tx_file.tx_buf);
+      if (ct_len > 0 && (size_t)ct_len == (size_t)fh.len) {
         ps->tx_file.tx_len = FRAME_HEADER_WIRE_SIZE + (size_t)ct_len;
         ps->tx_file.tx_offset = 0;
       } else {
@@ -550,30 +564,26 @@ static nox_err_t open_recv_file(struct app_state *state,
 }
 
 // Real attack surface in practice: untrusted FILE frame (METADATA+DATA, disk write)
+/* H3: `pt` çözülmüş düz metindir (event_loop, ps->rx_pt_buf). Sahiplik
+ * çağıranda; bu fonksiyon yalnız tüketir, ASLA serbest bırakmaz.
+ * pt_len == 0 → AEAD doğrulaması başarısız (eski decrypt fail yolu).
+ * Kural: kullan → sıfırla → dispatch (dispatch cleanup'ı tetikleyebilir). */
 nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
-                                         const uint8_t *payload, uint32_t len) {
-  if (len < NOX_MAC_LEN || len > 4096 + NOX_MAC_LEN) {
-    ui_print_error(state, "Gecersiz payload uzunlugu: %u", len);
+                                         uint8_t *pt, uint32_t pt_len) {
+  if (pt_len > NOX_MAX_MSG_LEN || (pt_len > 0 && !pt)) {
+    ui_print_error(state, "Gecersiz payload uzunlugu: %u", pt_len);
     return false;
   }
 
-  uint8_t *pt = sodium_malloc(len);
-  if (!pt) {
-    ui_print_error(state, "Bellek tahsisi basarisiz.");
-    return false;
-  }
-
-  ssize_t pt_len = noise_decrypt(ps->session, payload, len, pt);
   nox_hardbool_t is_metadata = 0;
-  if (pt_len <= 0) {
+  if (pt_len == 0) {
     if (ps->rx_file.active) {
       NOX_WARN(LOG_MOD_NET, "FILE decrypt fail — transfer abort, seq=%u", ps->rx_seq);
       ui_print_error(state, "Hata: Akran bağlantısında geçersiz sıra numarası algılandı (Replay Attack veya paket kaybı)!");
       goto rx_abort;
     } else {
-      NOX_WARN(LOG_MOD_NET, "FILE decrypt fail outside transfer — seq=%u len=%u", ps->rx_seq, len);
+      NOX_WARN(LOG_MOD_NET, "FILE decrypt fail outside transfer — seq=%u", ps->rx_seq);
       ui_print_error(state, "Hata: Akran bağlantısında geçersiz sıra numarası algılandı (Replay Attack veya paket kaybı)!");
-      sodium_free(pt);
       return true;
     }
   }
@@ -622,7 +632,8 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             NOX_WARN(LOG_MOD_MAIN, "METADATA hash sıfır — sahte/bozuk frame reddedildi");
             ui_print_error(state, "Gelen METADATA reddedildi (geçersiz hash)");
             sodium_memzero(file_hash, sizeof(file_hash));
-            sodium_free(pt);
+            /* H3: return öncesi plaintext sıfırla */
+            rx_pt_zero(ps);
             return true;
           }
 
@@ -640,12 +651,14 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             strncpy(ps->rx_file.filename, safe_name, 255);
             ps->rx_file.filename[255] = '\0';
 
+            /* H3: metadata tüketildi — dispatch öncesi sıfırla */
+            rx_pt_zero(ps);
             sm_dispatch(ps, state, EV_FILE_RX_START);
 
             if (crypto_generichash_init(&ps->rx_file.hash_state, NULL, 0, 32) != 0) {
               /* M-F3 FIX: inline temizlik unlinkat'i atliyordu — hash_init
                * OOM'unda yarim dosya kalici orphan oluyordu. rx_abort ortak
-               * temizlik: close + unlinkat + EV_FILE_DONE + pt free. */
+               * temizlik: close + unlinkat + EV_FILE_DONE (+ RX pt sıfırlama). */
               ui_print_error(state, "Hash state başlatılamadı");
               goto rx_abort;
             }
@@ -710,7 +723,7 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
       uint8_t final_hash[32];
       if (crypto_generichash_final(&ps->rx_file.hash_state, final_hash, 32) != 0) {
         NOX_ERROR(LOG_MOD_MAIN, "Hash tamamlanamadı");
-        sodium_free(pt);
+        rx_pt_zero(ps);
         unlinkat(state->downloads_dir_fd, ps->rx_file.local_name, 0);
         if (ps->rx_file.fd >= 0) { close(ps->rx_file.fd); ps->rx_file.fd = -1; }
         sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
@@ -745,6 +758,8 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
       sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
       /* A-1 FIX: fd'yi -1 yap (sodium_memzero sonrası 0 olur) */
       ps->rx_file.fd = -1;
+      /* H3: dispatch öncesi plaintext sıfırla */
+      rx_pt_zero(ps);
       sm_dispatch(ps, state, EV_FILE_DONE);
     } else {
       ui_print_progress(state, ps->rx_file.filename,
@@ -753,7 +768,8 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
     }
   }
 
-  sodium_free(pt);
+  /* H3: başarılı tüketim — sıfırla, sahiplik çağıranda */
+  rx_pt_zero(ps);
   return true;
 
 rx_abort:
@@ -769,8 +785,9 @@ rx_abort:
   ui_print_error(state, "Transfer iptal edildi ve yarım kalan dosya silindi.");
   sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
   ps->rx_file.fd = -1;
+  /* H3: dispatch öncesi plaintext sıfırla */
+  rx_pt_zero(ps);
   sm_dispatch(ps, state, EV_FILE_DONE);
-  sodium_free(pt);
   return true;
 }
 

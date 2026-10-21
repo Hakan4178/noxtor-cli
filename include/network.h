@@ -87,9 +87,15 @@ void tor_shutdown(struct app_state *state);
  *
  * AF_UNIX SocksSocket üzerinden SOCKS5 CONNECT.
  * Onion adresi domain name olarak gönderilir (tip 0x03).
+ *
+ * expected_tor_pid: connect sonrası SO_PEERCRED doğrulaması (bulgu 2.1b).
+ * socks.sock yolu Tor AYAKTAYKEN aynı-UID saldırgan tarafından
+ * unlink/rebind edilebilir; peer spawn edilen tor_pid değilse SOCKS
+ * greeting'i BİLE gönderilmeden fail-closed dönülür.
  * ================================================================ */
 nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
-                          const char *socks_path, int *fd_out);
+                          const char *socks_path, pid_t expected_tor_pid,
+                          int *fd_out);
 
 /* ================================================================
  * UNIX DOMAIN LISTENER — Gelen peer bağlantıları

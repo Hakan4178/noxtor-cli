@@ -308,6 +308,14 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
     sodium_memzero(ps->recv_buf, sizeof(ps->recv_buf));
     ps->recv_pos = 0;
 
+    /* 6b. H2/H3: RX plaintext çalışma tamponu — tek sahibi peer,
+     * tek serbest noktası burası. Bir sonraki oturuma plaintext sızmaz. */
+    if (ps->rx_pt_buf) {
+        sodium_memzero(ps->rx_pt_buf, NOX_MAX_MSG_LEN + 1);
+        sodium_free(ps->rx_pt_buf);
+        ps->rx_pt_buf = NULL;
+    }
+
     /* 7. Peer identity — name ve unread_count */
     sodium_memzero(ps->name, sizeof(ps->name));
     ps->unread_count = 0;

@@ -194,24 +194,32 @@ nox_err_t handshake_split(struct noise_handshake *hs,
  * noise_encrypt — Transport mesajı şifrele
  *
  * @session:   Aktif session
+ * @ad:        İlişkili veri — frame header'ın 13 byte ham wire kopyası
+ * @ad_len:    AD uzunluğu (FRAME_HEADER_WIRE_SIZE; 0 geçersiz)
  * @plaintext: Şifrelenecek mesaj
  * @pt_len:    Plaintext uzunluğu
  * @out:       Çıktı buffer (pt_len + 16 byte MAC)
+ *
+ * H2: AD ZORUNLU. Header AEAD kapsamı dışında kalırsa saldırgan
+ * seq/type/len alanlarını değiştirebilir; NULL/0 → -1 (fail-closed).
  *
  * Return: Şifreli veri uzunluğu veya -1
  */
 __attribute__((strub))
 ssize_t noise_encrypt(struct noise_session *session,
+                      const uint8_t *ad, size_t ad_len,
                       const uint8_t *plaintext, size_t pt_len,
                       uint8_t *out);
 
 /*
  * noise_decrypt — Transport mesajını çöz
  *
- * Return: Plaintext uzunluğu veya -1
+ * @ad/@ad_len: Şifrelemedeki header kopyasının AYNISI (H2).
+ * Return: Plaintext uzunluğu veya -1 (AD veya MAC uyuşmazlığı).
  */
 __attribute__((strub))
 ssize_t noise_decrypt(struct noise_session *session,
+                      const uint8_t *ad, size_t ad_len,
                       const uint8_t *ciphertext, size_t ct_len,
                       uint8_t *out);
 

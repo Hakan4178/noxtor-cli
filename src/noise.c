@@ -1121,22 +1121,30 @@ nox_err_t handshake_split(struct noise_handshake *hs,
 // Real attack surface in practice: local plaintext (transport, strub)
 __attribute__((strub))
 __attribute__((optimize("harden-control-flow-redundancy")))
-ssize_t noise_encrypt(struct noise_session *session, const uint8_t *plaintext,
-                      size_t pt_len, uint8_t *out) {
+ssize_t noise_encrypt(struct noise_session *session, const uint8_t *ad,
+                      size_t ad_len, const uint8_t *plaintext, size_t pt_len,
+                      uint8_t *out) {
   if (!session || !out)
+    return -1;
+  /* H2: AD zorunlu — header AEAD kapsamı dışında kalırsa seq/type/len
+   * değiştirilebilir. Boş AD eski kırılgan sözleşmedir; kabul edilmez. */
+  if (!ad || ad_len == 0)
     return -1;
   if (pt_len > NOX_MAX_MSG_LEN)
     return -1;
   if (pt_len > 0 && !plaintext)
     return -1;
-  return cipher_encrypt(&session->tx, NULL, 0, plaintext, pt_len, out);
+  return cipher_encrypt(&session->tx, ad, ad_len, plaintext, pt_len, out);
 }
 
 // Real attack surface in practice: untrusted ciphertext (AEAD, nonce invariant)
 __attribute__((strub))
-ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ciphertext,
-                      size_t ct_len, uint8_t *out) {
+ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ad,
+                      size_t ad_len, const uint8_t *ciphertext, size_t ct_len,
+                      uint8_t *out) {
   if (!session || !out)
+    return -1;
+  if (!ad || ad_len == 0)
     return -1;
   if (ct_len > NOISE_MAX_PAYLOAD_LEN)
     return -1;
@@ -1144,7 +1152,7 @@ ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ciphertext,
     return -1;
   if (ct_len > 0 && !ciphertext)
     return -1;
-  return cipher_decrypt(&session->rx, NULL, 0, ciphertext, ct_len, out);
+  return cipher_decrypt(&session->rx, ad, ad_len, ciphertext, ct_len, out);
 }
 
 /* ================================================================

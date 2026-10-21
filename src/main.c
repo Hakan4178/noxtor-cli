@@ -1332,13 +1332,47 @@ int main(int argc, char *argv[]) {
       uint8_t ct[64 + NOX_MAC_LEN];
       uint8_t pt[64];
 
-      ssize_t ct_len = noise_encrypt(&sa, (const uint8_t *)test_msg,
+      /* H2: transport AD zorunlu — demo'da gerçek 13 byte wire header */
+      struct frame_header demo_fh = {
+          .magic = NOX_FRAME_MAGIC,
+          .type = NOX_MSG_TEXT,
+          .seq = 0,
+          .len = (uint32_t)(strlen(test_msg) + 1 + NOX_MAC_LEN),
+      };
+      uint8_t demo_ad[FRAME_HEADER_WIRE_SIZE];
+      frame_header_encode(&demo_fh, demo_ad);
+
+      ssize_t ct_len = noise_encrypt(&sa, demo_ad, sizeof(demo_ad),
+                                     (const uint8_t *)test_msg,
                                      strlen(test_msg) + 1, ct);
       NOX_INFO(LOG_MOD_NOISE, "şifrelendi: %zd byte", ct_len);
 
-      ssize_t pt_len = noise_decrypt(&sb, ct, (size_t)ct_len, pt);
-      NOX_INFO(LOG_MOD_NOISE, "çözüldü: \"%s\" (%zd byte)", (const char *)pt,
-               pt_len);
+      /* H2 negatif: yanlış AD tag fail etmeli ve nonce'u ilerletmemeli;
+       * ardından doğru AD ile aynı ct açılabilmeli. */
+      if (ct_len > 0) {
+        uint8_t bad_ad[FRAME_HEADER_WIRE_SIZE];
+        memcpy(bad_ad, demo_ad, sizeof(bad_ad));
+        bad_ad[sizeof(bad_ad) - 1] ^= 0x01;
+        ssize_t bad_len = noise_decrypt(&sb, bad_ad, sizeof(bad_ad), ct,
+                                        (size_t)ct_len, pt);
+        if (bad_len != -1)
+          NOX_ERROR(LOG_MOD_NOISE,
+                    "H2 negatif test BAŞARISIZ: yanlış AD kabul edildi");
+        else
+          NOX_INFO(LOG_MOD_NOISE,
+                   "H2 negatif test: yanlış AD reddedildi (tag fail)");
+
+        ssize_t pt_len = noise_decrypt(&sb, demo_ad, sizeof(demo_ad), ct,
+                                       (size_t)ct_len, pt);
+        if (pt_len > 0)
+          NOX_INFO(LOG_MOD_NOISE, "çözüldü: \"%s\" (%zd byte)",
+                   (const char *)pt, pt_len);
+        else
+          NOX_ERROR(LOG_MOD_NOISE,
+                    "H2 pozitif test BAŞARISIZ: doğru AD reddedildi");
+      } else {
+        NOX_ERROR(LOG_MOD_NOISE, "transport encrypt BAŞARISIZ: %zd", ct_len);
+      }
 
       /* Temizle */
       sodium_memzero(&sa, sizeof(sa));

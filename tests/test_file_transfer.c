@@ -164,11 +164,10 @@ static int test_rx_abort_unlinks_orphan(void)
     snprintf(ps->rx_file.local_name, sizeof(ps->rx_file.local_name),
              "orphan.bin");
 
-    /* geçersiz MAC'li frame → noise_decrypt başarısız → rx_abort */
+    /* H3: decrypt event_loop'ta; pt_len=0 = AEAD fail sinyali → rx_abort */
     uint8_t garbage[64];
     randombytes_buf(garbage, sizeof(garbage));
-    TEST_ASSERT(file_transfer_handle_rx(&st, ps, garbage,
-                                        (uint32_t)sizeof(garbage)));
+    TEST_ASSERT(file_transfer_handle_rx(&st, ps, garbage, 0));
 
     /* M-F3 sözleşmesi: dosya SİLİNDİ, struct sıfır, fd geçersiz */
     TEST_ASSERT(faccessat(st.downloads_dir_fd, "orphan.bin", F_OK, 0) == -1);
@@ -186,10 +185,10 @@ static int test_rx_decrypt_fail_inactive(void)
     if (fixture_rx() != 0) { TEST_ASSERT(!"fixture"); }
     struct peer_session *ps = &st.peers[0];
 
+    /* H3: decrypt event_loop'ta; pt_len=0 = AEAD fail sinyali */
     uint8_t garbage[48];
     randombytes_buf(garbage, sizeof(garbage));
-    TEST_ASSERT(file_transfer_handle_rx(&st, ps, garbage,
-                                        (uint32_t)sizeof(garbage)));
+    TEST_ASSERT(file_transfer_handle_rx(&st, ps, garbage, 0));
 
     TEST_ASSERT(ps->rx_file.active == false);   /* abort yok */
     TEST_ASSERT(ps->rx_file.fd == -1);
@@ -232,12 +231,9 @@ static int test_rx_data_chunk_success(void)
     TEST_ASSERT(crypto_generichash_update(&ps->rx_file.hash_state,
                                           size_hdr, 8) == 0);
 
-    /* "test" chunk'ını sender session ile şifrele → handle_rx */
-    uint8_t ct[64];
-    ssize_t ct_len = noise_encrypt(g_sess_i, (const uint8_t *)"test", 4, ct);
-    TEST_ASSERT(ct_len == 4 + (ssize_t)NOX_MAC_LEN);
-
-    TEST_ASSERT(file_transfer_handle_rx(&st, ps, ct, (uint32_t)ct_len));
+    /* H3: handle_rx artık düz metin alır (decrypt event_loop'ta) */
+    uint8_t chunk[] = "test";
+    TEST_ASSERT(file_transfer_handle_rx(&st, ps, chunk, 4));
 
     /* tamamlandı: struct sıfır, dosya diskte ve içerik doğru */
     TEST_ASSERT(ps->rx_file.active == false);

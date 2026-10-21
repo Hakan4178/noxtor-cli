@@ -64,11 +64,12 @@ size_t __CPROVER_POINTER_OFFSET(const void *p) { (void)p; return 0; }
  * DİŞ STUB'LAR — send_* fonksiyonlarının bağımlılıkları
  * ================================================================ */
 
-/* noise_encrypt — nondeterministic: [-1, 4096+MAC_LEN] */
+/* noise_encrypt — nondeterministic: [-1, 4096+MAC_LEN]; H2: AD zorunlu */
 static ssize_t noise_encrypt(struct noise_session *session,
+                             const uint8_t *ad, size_t ad_len,
                              const uint8_t *pt, size_t pt_len,
                              uint8_t *ct) {
-  (void)session; (void)pt; (void)ct;
+  (void)session; (void)ad; (void)ad_len; (void)pt; (void)ct;
   if (__VERIFIER_nondet_bool())
     return -1;
   ssize_t len = (ssize_t)(__VERIFIER_nondet_size_t() % (4096 + NOX_MAC_LEN)) + 1;
@@ -175,22 +176,22 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
   uint8_t *payload = sodium_malloc(4096 + NOX_MAC_LEN);
   if (!payload) return NOX_ERR_ALLOC;
 
-  ssize_t ct_len = noise_encrypt(state->session,
-                                 (const uint8_t *)text,
-                                 pt_len, payload);
-  if (ct_len < 0) {
-    sodium_free(payload);
-    return NOX_ERR_CRYPTO;
-  }
-
+  /* H2: Header önce kurulur; 13 byte ham wire kopyası AD olur. */
   struct frame_header fh = {
       .magic = NOX_FRAME_MAGIC,
       .type = NOX_MSG_TEXT,
       .seq = state->tx_seq++,
-      .len = (uint32_t)ct_len,
+      .len = (uint32_t)(pt_len + NOX_MAC_LEN),
   };
   uint8_t wire[FRAME_HEADER_WIRE_SIZE];
   frame_header_encode(&fh, wire);
+
+  ssize_t ct_len = noise_encrypt(state->session, wire, sizeof(wire),
+                                 (const uint8_t *)text, pt_len, payload);
+  if (ct_len != (ssize_t)fh.len) {
+    sodium_free(payload);
+    return NOX_ERR_CRYPTO;
+  }
 
   nox_err_t err = NOX_OK;
   if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
@@ -223,22 +224,24 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
     chunk[chunk_len] = '\0';
 
     size_t pt_len = chunk_len + 1;
-    ssize_t ct_len =
-        noise_encrypt(state->session, (const uint8_t *)chunk, pt_len, ct);
-    if (ct_len < 0) {
-      sodium_free(chunk);
-      sodium_free(ct);
-      return NOX_ERR_CRYPTO;
-    }
-
+    /* H2: Header önce kurulur; 13 byte ham wire kopyası AD olur. */
     struct frame_header fh = {
         .magic = NOX_FRAME_MAGIC,
         .type = NOX_MSG_TEXT,
         .seq = state->tx_seq++,
-        .len = (uint32_t)ct_len,
+        .len = (uint32_t)(pt_len + NOX_MAC_LEN),
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     frame_header_encode(&fh, wire);
+
+    ssize_t ct_len =
+        noise_encrypt(state->session, wire, sizeof(wire),
+                      (const uint8_t *)chunk, pt_len, ct);
+    if (ct_len != (ssize_t)fh.len) {
+      sodium_free(chunk);
+      sodium_free(ct);
+      return NOX_ERR_CRYPTO;
+    }
 
     if (write_full(state->peer_fd, wire, FRAME_HEADER_WIRE_SIZE) != NOX_OK ||
         write_full(state->peer_fd, ct, (size_t)ct_len) != NOX_OK) {

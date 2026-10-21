@@ -236,6 +236,13 @@ struct peer_session {
     uint8_t  recv_buf[RECV_BUF_CAPACITY];
     size_t   recv_pos;
 
+    /* ── H2/H3: RX plaintext çalışma tamponu ──
+     * Tek sahibi peer'dir; tek serbest noktası action_cleanup'tır.
+     * TEXT ve FILE aynı tamponu kullanır. Kural: kullan → sıfırla →
+     * dispatch (dispatch action_cleanup'ı tetikleyebilir).
+     * Boyut: NOX_MAX_MSG_LEN + 1 (NUL için). Lazy sodium_malloc. */
+    uint8_t *rx_pt_buf;
+
     /* ── M-2 FIX: idle timeout için son aktivite ── */
     struct timespec last_active;
 

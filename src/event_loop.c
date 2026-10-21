@@ -99,12 +99,26 @@ nox_err_t hs_build_claim_payload(uint8_t pl[NOX_HS_PAYLOAD_V1_LEN],
 }
 
 /* ================================================================
+ * H2/H3: RX PLAINTEXT TAMPONU
+ *
+ * Peer başına tek tampon. Sahibi peer_session'dır; serbest bırakma
+ * yalnızca action_cleanup'ta yapılır. TEXT ve FILE çözümü aynı
+ * tamponu kullanır. Kural: kullan → sıfırla → dispatch.
+ * ================================================================ */
+static uint8_t *peer_rx_pt(struct peer_session *ps) {
+  if (!ps->rx_pt_buf)
+    ps->rx_pt_buf = sodium_malloc(NOX_MAX_MSG_LEN + 1);
+  return ps->rx_pt_buf;
+}
+
+/* ================================================================
  * FRAME PROCESSING — recv_buf'daki frame'leri işle
  *
  * Hem EPOLLIN handler'dan hem de epoll_wait öncesi drain'den
  * çağrılır. Bu sayede TOFU_PENDING sonrası bekleyen frame'ler
  * session kurulduktan sonra işlenebilir.
  * ================================================================ */
+
 // Real attack surface in practice: untrusted network (AF_UNIX, attacker-controlled wire)
 /* UNIT TEST ERİŞİMİ (test_event_frames): socketpair/buffer izolasyonuyla
  * frame dağıtım yolu — TEXT/SEQ/MAC/CTRL/FILE davranış kilitleri. */
@@ -141,6 +155,11 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
     }
 
     /* Frame tamamlandı — payload'ı ayıkla */
+    /* H2: header'ın ham 13 byte'ı AEAD'ye AD olarak girer. Kopya
+     * memmove'dan ÖNCE alınır — recv_buf kaydırılınca içerik değişir. */
+    uint8_t ad[FRAME_HEADER_WIRE_SIZE];
+    memcpy(ad, ps->recv_buf, sizeof(ad));
+
     uint8_t *payload = sodium_malloc(fh.len);
     if (!payload) {
       ps->recv_pos = 0;
@@ -477,16 +496,22 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
       }
 
       if (fh.type == NOX_MSG_TEXT) {
-        /* A-1 FIX: sodium_malloc ile swap koruması */
+        /* H3: peer'ın tek RX tamponuna çözülür (sodium_malloc ile swap
+         * koruması); serbest bırakma action_cleanup'a aittir. */
         size_t max_pt = fh.len; /* MAC çıkarılmadan üst sınır */
-        uint8_t *pt = sodium_malloc(max_pt + 1);
+        uint8_t *pt = peer_rx_pt(ps);
         if (pt) {
           ssize_t pt_len =
-              noise_decrypt(ps->session, payload, fh.len, pt);
+              noise_decrypt(ps->session, ad, sizeof(ad), payload, fh.len, pt);
           /* A-1 FIX: pt_len overflow kontrolü */
           if (pt_len > 0 && (size_t)pt_len <= max_pt) {
             pt[pt_len] = '\0';
             ui_print_incoming(state, (const char *)pt);
+
+            /* H3: kullan → sıfırla → dispatch. Kuyruk flush callback'i
+             * writev hatasında EV_PEER_DISCONNECTED dispatch eder ve
+             * action_cleanup tamponu serbest bırakır; metin kopyalandı. */
+            sodium_memzero(pt, NOX_MAX_MSG_LEN + 1);
 
             /* BUG-1 FIX: İlk mesaj alındı → kuyruğu gönder
              * H-1 FIX: kuyruk sızıntısı — eğer session TOFU ile kurulduysa
@@ -516,12 +541,42 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
             /* EVT-1 FIX: rx_seq++ only after successful decryption */
             ps->rx_seq++;
             clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+          } else {
+            /* Adım 2: eski sessiz fail politikası korunur; Adım 4
+             * fail-closed kopmaya çevirir. Doğrulanmamış plaintext
+             * tamponda bırakılmaz. */
+            sodium_memzero(pt, NOX_MAX_MSG_LEN + 1);
           }
-          sodium_free(pt); /* otomatik sıfırlar */
         }
       } else if (fh.type == NOX_MSG_FILE) {
+        nox_hardbool_t handled = 0;
+        /* Eski handle_rx sözleşmesi: MAC'ten kısa FILE payload tüketilmez.
+         * Üst sınır decode'da (4096+MAC) zaten uygulanıyor. */
+        if (fh.len < NOX_MAC_LEN) {
+          ui_print_error(state, "Gecersiz payload uzunlugu: %u", fh.len);
+        } else {
+          uint8_t *pt = peer_rx_pt(ps);
+          if (!pt) {
+            /* Eski handle_rx sözleşmesi: tahsis hatası frame'i tüketmez. */
+            ui_print_error(state, "Bellek tahsisi basarisiz.");
+          } else {
+            ssize_t pt_len = noise_decrypt(ps->session, ad, sizeof(ad),
+                                           payload, fh.len, pt);
+
+            /* H3: plaintext'i event_loop çözer; handle_rx yalnız tüketir.
+             * len==0 → decrypt fail (Adım 2'de eski politika handle_rx'te). */
+            handled = file_transfer_handle_rx(
+                state, ps, pt, pt_len > 0 ? (uint32_t)pt_len : 0);
+
+            /* Kullan → sıfırla → dispatch: handle_rx içindeki dispatch'ler
+             * tamponu serbest bırakabilir; cleanup NULL'lamışsa no-op. */
+            if (ps->rx_pt_buf)
+              sodium_memzero(ps->rx_pt_buf, NOX_MAX_MSG_LEN + 1);
+          }
+        }
+
         /* EVT-1 FIX: rx_seq++ only if file processing succeeded */
-        if (file_transfer_handle_rx(state, ps, payload, fh.len)) {
+        if (handled) {
           ps->rx_seq++;
           clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
         }
