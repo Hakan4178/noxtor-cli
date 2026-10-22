@@ -1072,9 +1072,16 @@ nox_err_t handshake_split(struct noise_handshake *hs,
                           struct noise_session *session) {
   if (!hs || !session)
     return NOX_ERR_PROTO;
-  if (hs->split_done || hs->failed)
+  /* İkinci split mevcut session'ı bozmamalı. */
+  if (hs->split_done)
     return NOX_ERR_STATE;
-  if (!handshake_is_complete(hs))
+  /* sodium_malloc 0xdb ile doldurur; hardbool(0) için 0xdb geçersiz
+   * temsil (false=0, true=0xff) olduğundan ilk okuma trap eder,
+   * hardbool'suz derlemede ise true okunup guard atlanır. Her iki
+   * durumda da session'ı split öncesi deterministik olarak sıfırla.
+   * Başarılı split cipher_init_key ile tx/rx'i yeniden kurar. */
+  sodium_memzero(session, sizeof(*session));
+  if (hs->failed || !handshake_is_complete(hs))
     return NOX_ERR_STATE;
 
   nox_err_t err;
@@ -1126,6 +1133,11 @@ ssize_t noise_encrypt(struct noise_session *session, const uint8_t *ad,
                       uint8_t *out) {
   if (!session || !out)
     return -1;
+  /* Transport keyless fail-closed (H2/P0): cipher_encrypt'in handshake
+   * pass-through'u transport sınırına sızmamalı. Sıfırlanmış/yarım split
+   * session'da AD'siz düz metin yazılmasını engeller. */
+  if (!session->tx.has_key)
+    return -1;
   /* H2: AD zorunlu — header AEAD kapsamı dışında kalırsa seq/type/len
    * değiştirilebilir. Boş AD eski kırılgan sözleşmedir; kabul edilmez. */
   if (!ad || ad_len == 0)
@@ -1143,6 +1155,11 @@ ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ad,
                       size_t ad_len, const uint8_t *ciphertext, size_t ct_len,
                       uint8_t *out) {
   if (!session || !out)
+    return -1;
+  /* Transport keyless fail-closed (H2/P0): cipher_decrypt'in handshake
+   * pass-through'u 16B+ her girdiyi doğrulanmış plaintext gibi kabul
+   * etmemeli. Sıfırlanmış/yarım split session'ı reddet. */
+  if (!session->rx.has_key)
     return -1;
   if (!ad || ad_len == 0)
     return -1;

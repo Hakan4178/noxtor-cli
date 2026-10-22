@@ -15,7 +15,8 @@
  *   5. Negatif: epoch eşit ama fp farklı → RET (token fp boyutu)
  *   6. Negatif: fp eşit ama epoch farklı → RET (token epoch boyutu)
  *   7. Token tutuyor ama hs ölü → accept fail-closed + cleanup
- *   8. GERÇEK accept yolu: loopback Noise XX handshake + test db ile
+ *   8. Prompt sahibi cleanup → global prompt token'ı kapanır
+ *   9. GERÇEK accept yolu: loopback Noise XX handshake + test db ile
  *      tam onay → ST_ACTIVE, session kuruldu, rehberde kayıtlı,
  *      snapshot sıfırlandı
  *
@@ -279,7 +280,23 @@ static int test_yes_without_hs_cleans_up(void)
     return 0;
 }
 
-/* 8) GERÇEK accept yolu: tam onay akışı — ST_ACTIVE + session + rehber */
+/* 8) Prompt sahibi peer cleanup → global onay token'ı kapanır.
+ *    Aksi halde slot recycle sonrası ilk "y" bayat token'a takılıp
+ *    gereksiz re-arm turu üretir. */
+static int test_cleanup_clears_prompt_token(void)
+{
+    fixture_reset();
+    TEST_ASSERT(prompt_with(0xA1) == NOX_OK);
+    TEST_ASSERT(st.tofu_prompt_epoch != 0);
+    TEST_ASSERT(sm_dispatch(slot0(), &st, EV_PEER_DISCONNECTED) == NOX_OK);
+
+    TEST_ASSERT(slot0()->state == ST_IDLE);
+    TEST_ASSERT(st.tofu_prompt_epoch == 0);
+    TEST_ASSERT(sodium_is_zero(st.tofu_prompt_fp, NOX_KEY_LEN));
+    return 0;
+}
+
+/* 9) GERÇEK accept yolu: tam onay akışı — ST_ACTIVE + session + rehber */
 static int test_real_accept_path(void)
 {
     fixture_reset();
@@ -336,6 +353,7 @@ int main(void)
     RUN_TEST(test_epoch_match_fp_mismatch_rejected);
     RUN_TEST(test_fp_match_epoch_mismatch_rejected);
     RUN_TEST(test_yes_without_hs_cleans_up);
+    RUN_TEST(test_cleanup_clears_prompt_token);
     RUN_TEST(test_real_accept_path);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n",

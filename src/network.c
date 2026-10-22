@@ -52,8 +52,9 @@ static void safe_nanosleep(const struct timespec *req) {
  *
  * A-2 FIX: Onion v3 adres format doğrulaması
  * Format: 56 karakter base32 + ".onion" = 62 karakter
- * Public: tor_create_new_hs / tor_create_persistent_hs (S3 — kendi HS)
- *         ve socks5_connect (peer adresi) tarafından çağrılır.
+ * Public kullanım: socks5_connect (peer adresi) ve event_loop (handshake
+ * claim). Kendi HS yolunda parse_service_id ayrıca adresin içindeki pub'ı
+ * beklenen anahtarla sodium_memcmp eder.
  *
  * H-2 FIX: v3 checksum (SHA3-256 truncated) artık ZORUNLU.
  *   Eski yorum "libsodium SHA3-256 sunmaz" yanlıştı —
@@ -118,7 +119,7 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
                             (long)(deadline.tv_nsec - now.tv_nsec) / 1000000L;
         if (remaining_ms <= 0) {
           NOX_ERROR(LOG_MOD_NET, "write_full timeout (deadline aşıldı)");
-          return NOX_ERR_IO;
+          return NOX_ERR_TIMEOUT;
         }
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
         int poll_timeout = (remaining_ms > INT_MAX) ? INT_MAX : (int)remaining_ms;
@@ -127,7 +128,7 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
           return NOX_ERR_IO;
         if (pret == 0) {
           NOX_ERROR(LOG_MOD_NET, "write_full timeout (deadline aşıldı)");
-          return NOX_ERR_IO;
+          return NOX_ERR_TIMEOUT;
         }
         continue;
       }
@@ -141,6 +142,12 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
 }
 
 nox_err_t read_full(int fd, void *buf, size_t len) {
+  /* Geçersiz fd poll()'a girmeden I/O hatası olarak reddedilsin; Linux
+   * poll() negatif fd'yi yok sayıp 0 dönebildiği için timeout koduyla
+   * karışmamalı. */
+  if (fd < 0)
+    return NOX_ERR_IO;
+
   /* B5 FIX: Toplam monotonic deadline — slow loris'i engeller.
    * Desen ctrl_read_line ile aynı: önce poll(kalan süre), sonra read.
    * Blocking fd'de read() EAGAIN dönmez; poll-öncelikli desen hem
@@ -164,7 +171,7 @@ nox_err_t read_full(int fd, void *buf, size_t len) {
                         (long)(deadline.tv_nsec - now.tv_nsec) / 1000000L;
     if (remaining_ms <= 0) {
       NOX_ERROR(LOG_MOD_NET, "read_full timeout (deadline aşıldı)");
-      return NOX_ERR_IO; /* Timeout — toplam süre sınırlı */
+      return NOX_ERR_TIMEOUT; /* Timeout — toplam süre sınırlı */
     }
 
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
@@ -178,7 +185,7 @@ nox_err_t read_full(int fd, void *buf, size_t len) {
     }
     if (ret == 0) {
       NOX_ERROR(LOG_MOD_NET, "read_full timeout (deadline aşıldı)");
-      return NOX_ERR_IO;
+      return NOX_ERR_TIMEOUT;
     }
 
     ssize_t r;
@@ -219,7 +226,7 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
 
   /* A-1: Deadline tabanlı timeout — her byte'da timeout resetlenmez.
    * Slow loris saldırısını engeller: tüm satır tek timeout_ms içinde
-   * tamamlanmalı, aksi takdirde NOX_ERR_TOR döner. */
+   * tamamlanmalı, aksi takdirde NOX_ERR_TIMEOUT döner. */
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
   deadline.tv_sec += timeout_ms / 1000;
@@ -242,7 +249,7 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
                         (long)(deadline.tv_nsec - now.tv_nsec) / 1000000L;
     if (remaining_ms <= 0) {
       NOX_ERROR(LOG_MOD_NET, "ctrl okuma timeout");
-      return NOX_ERR_TOR;
+      return NOX_ERR_TIMEOUT;
     }
 
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
@@ -256,7 +263,7 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size, int timeout_ms) {
     }
     if (ret == 0) {
       NOX_ERROR(LOG_MOD_NET, "ctrl okuma timeout");
-      return NOX_ERR_TOR;
+      return NOX_ERR_TIMEOUT;
     }
 
     char c;
@@ -319,7 +326,7 @@ nox_err_t ctrl_read_response(int fd, char *buf, size_t buf_size,
                         (long)(rdl.tv_nsec - now.tv_nsec) / 1000000L;
     if (remaining_ms <= 0) {
       NOX_ERROR(LOG_MOD_NET, "ctrl yanıt toplam timeout aşıldı");
-      return NOX_ERR_TOR;
+      return NOX_ERR_TIMEOUT;
     }
 
     char line[256];
@@ -908,13 +915,13 @@ nox_err_t tor_verify_peer(int fd, pid_t expected_pid) {
               "control soketi peer PID uyuşmuyor: beklenen=%d gelen=%d "
               "— sahte soket olabilir, bağlantı reddedildi",
               (int)expected_pid, (int)cred.pid);
-    return NOX_ERR_TOR;
+    return NOX_ERR_PEER;
   }
   if (cred.uid != getuid()) {
     NOX_ERROR(LOG_MOD_NET,
               "control soketi peer UID uyuşmuyor: beklenen=%d gelen=%d",
               (int)getuid(), (int)cred.uid);
-    return NOX_ERR_TOR;
+    return NOX_ERR_PEER;
   }
   NOX_INFO(LOG_MOD_NET, "control soketi peer doğrulandı (PID=%d, UID=%d)",
            (int)cred.pid, (int)cred.uid);
@@ -998,7 +1005,8 @@ static nox_err_t wait_for_control_socket(pid_t tor_pid, const char *socket_path,
     safe_nanosleep(&probe_delay);
   }
 
-  return NOX_ERR_TOR;
+  NOX_ERROR(LOG_MOD_NET, "control soketi zaman aşımına uğradı");
+  return NOX_ERR_TIMEOUT;
 }
 
 nox_err_t tor_spawn(struct app_state *state) {
@@ -1341,16 +1349,25 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec) {
   }
 
   NOX_ERROR(LOG_MOD_NET, "Tor bootstrap timeout (%ds)", timeout_sec);
-  return NOX_ERR_TOR;
+  return NOX_ERR_TIMEOUT;
 }
 
 /* ================================================================
  * HIDDEN SERVICE — ADD_ONION
  * ================================================================ */
 /* ServiceID parse helper — ADD_ONION yanıtından 56 char base32 okur.
- * onion_out en az 63 byte olmalı (56 + ".onion\0"). */
+ * onion_out en az 63 byte olmalı (56 + ".onion\0").
+ *
+ * expected_pub: ADD_ONION'a gönderdiğimiz seed'den türetilen 32 byte
+ * Ed25519 public key. Tor'un döndürdüğü adresin içindeki pub ile
+ * sodium_memcmp edilir; eşleşme yoksa adres çağırana HİÇ verilmez.
+ * Böylece "geçerli checksum'lı ama başka anahtara ait" bir ServiceID
+ * (compromised Tor / control-socket injector) fail-closed reddedilir. */
 static nox_err_t parse_service_id(const char *resp,
+                                   const uint8_t expected_pub[NOX_KEY_LEN],
                                    char *onion_out, size_t onion_len) {
+  if (!expected_pub)
+    return NOX_ERR_CRYPTO;
   const char *sid = strstr(resp, "ServiceID=");
   if (!sid) {
     NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtında ServiceID yok");
@@ -1384,10 +1401,26 @@ static nox_err_t parse_service_id(const char *resp,
   memcpy(candidate + 56, ".onion", 7);
   candidate[62] = '\0';
 
-  if (!validate_onion_address(candidate)) {
+  /* Format + version + checksum zinciri (crypto_onion_pubkey). */
+  uint8_t addr_pub[NOX_KEY_LEN];
+  nox_err_t verify_err = crypto_onion_pubkey(addr_pub, candidate);
+  if (verify_err != NOX_OK) {
     NOX_ERROR(LOG_MOD_NET, "ADD_ONION yanıtı geçersiz format");
+    sodium_memzero(addr_pub, sizeof(addr_pub));
     sodium_memzero(candidate, sizeof(candidate));
-    return NOX_ERR_TOR;
+    return NOX_ERR_ONION;
+  }
+
+  /* Semantik bağ: adres gerçekten bizim gönderdiğimiz anahtara mı ait?
+   * Geçerli checksum tek başına yetmez; saldırgan kendi pub'ı için de
+   * geçerli bir v3 adresi üretebilir. Sabit zamanlı karşılaştırma. */
+  int pub_mismatch = sodium_memcmp(addr_pub, expected_pub, NOX_KEY_LEN);
+  sodium_memzero(addr_pub, sizeof(addr_pub));
+  if (pub_mismatch != 0) {
+    NOX_ERROR(LOG_MOD_NET,
+              "ADD_ONION ServiceID beklenen onion anahtarına bağlı değil");
+    sodium_memzero(candidate, sizeof(candidate));
+    return NOX_ERR_ONION;
   }
 
   memcpy(onion_out, candidate, 63);
@@ -1472,8 +1505,8 @@ __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *list
   if (err != NOX_OK)
     goto cleanup;
 
-  /* ServiceID parse */
-  err = parse_service_id(resp, onion_out, onion_len);
+  /* ServiceID parse + seed/pub bağı (fail-closed) */
+  err = parse_service_id(resp, pub, onion_out, onion_len);
   if (err != NOX_OK)
     goto cleanup;
 
@@ -1559,10 +1592,10 @@ __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *
   if ((err = ctrl_send_command(ctrl_fd, cmd)) != NOX_OK)
     goto cleanup;
 
-  /* 6. ServiceID parse */
+  /* 6. ServiceID parse + seed/pub bağı (fail-closed) */
   err = ctrl_read_response(ctrl_fd, resp, sizeof(resp), NOX_READ_TIMEOUT_MS);
   if (err == NOX_OK)
-    err = parse_service_id(resp, onion_out, onion_len);
+    err = parse_service_id(resp, pub, onion_out, onion_len);
 
 cleanup:
   /* D4 — TEK noktadan temizlik, başarı veya hata fark etmez */
@@ -1718,7 +1751,7 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     NOX_ERROR(LOG_MOD_NET,
               "SOCKS5: geçersiz Tor PID (%d) — bağlantı reddedildi",
               (int)expected_tor_pid);
-    return NOX_ERR_TOR;
+    return NOX_ERR_PEER;
   }
 
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1773,7 +1806,7 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
   if (!validate_onion_address(onion_addr)) {
     NOX_ERROR(LOG_MOD_NET, "socks5_connect: geçersiz onion adresi");
     close(fd);
-    return NOX_ERR_NET;
+    return NOX_ERR_ONION;
   }
 
   size_t addr_len = strlen(onion_addr);
@@ -1952,6 +1985,12 @@ void frame_header_encode(const struct frame_header *hdr, uint8_t *wire) {
   wire[10] = (uint8_t)(hdr->len >> 16);
   wire[11] = (uint8_t)(hdr->len >> 8);
   wire[12] = (uint8_t)(hdr->len);
+}
+
+/* H2: tek AD üreticisi — transport gönderim siteleri buradan geçer.
+ * Alıcı re-encode etmez; recv_buf'taki ham 13 byte'ı AD'ye verir. */
+void frame_ad(const struct frame_header *hdr, uint8_t *wire) {
+  frame_header_encode(hdr, wire);
 }
 
 // Real attack surface in practice: untrusted 13B wire (magic/type/len)

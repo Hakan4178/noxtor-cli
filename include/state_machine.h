@@ -56,6 +56,7 @@ typedef enum {
     EV_SEQ_MISMATCH,        /* Beklenmeyen sequence number              */
     EV_ARENA_FAIL,          /* Arena allocation başarısız                */
     EV_TOR_DIED,            /* Tor process öldü (SIGCHLD veya kill)     */
+    EV_CRYPTO_FAIL,         /* AEAD/protokol hatası — fail-closed kopma  */
     EV_COUNT                /* sentinel                                  */
 } peer_event_t;
 

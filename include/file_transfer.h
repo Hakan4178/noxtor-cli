@@ -13,6 +13,11 @@
 #define NOX_MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL * 1024ULL)
 #endif
 
+/* Tek dosya boyutu kotası — sınır aşılırsa NOX_ERR_QUOTA döner.
+ * K-26 toplam kota/onay politikası ayrı katmandır; bu helper yalnız
+ * mevcut NOX_MAX_FILE_SIZE sınırını tek bir hata koduna bağlar. */
+nox_err_t file_transfer_check_quota(uint64_t size);
+
 /* Dosya adını temizleyerek path traversal açıklarını önler */
 void sanitize_filename(char *name, size_t max_len);
 

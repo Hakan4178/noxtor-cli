@@ -7,6 +7,7 @@
 #include "network.h"
 #include "noise.h"
 #include "state_machine.h"
+#include "stdin_handler.h"
 #include "frontend.h"
 
 #include <assert.h>
@@ -25,6 +26,12 @@
 /* ================================================================
  * YARDIMCI METOTLAR
  * ================================================================ */
+
+/* K-26: tek dosya boyutu kotası. Toplam kota/onay ayrı iştir; bu
+ * helper 100 GiB tavanını tek bir nox_err_t değerine bağlar. */
+nox_err_t file_transfer_check_quota(uint64_t size) {
+  return (size > NOX_MAX_FILE_SIZE) ? NOX_ERR_QUOTA : NOX_OK;
+}
 
 /* H3: RX plaintext tamponunu sıfırla. Dispatch sonrası ham `pt` işaretçisi
  * kullanılamaz — cleanup rx_pt_buf'u serbest bırakıp NULL'lamış olabilir;
@@ -180,7 +187,9 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
     close(file_fd);
     return;
   }
-  if ((uint64_t)st.st_size > NOX_MAX_FILE_SIZE) {
+  nox_err_t quota_err = file_transfer_check_quota((uint64_t)st.st_size);
+  if (quota_err != NOX_OK) {
+    NOX_WARN(LOG_MOD_NET, "dosya reddedildi: %s", nox_strerror(quota_err));
     ui_print_error(state,
         "Dosya çok büyük (maksimum %llu MB)",
         (unsigned long long)(NOX_MAX_FILE_SIZE / 1024 / 1024));
@@ -309,7 +318,7 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
       .len = (uint32_t)(sizeof(meta) + NOX_MAC_LEN),
   };
   uint8_t mwire[FRAME_HEADER_WIRE_SIZE];
-  frame_header_encode(&mfh, mwire);
+  frame_ad(&mfh, mwire);
 
   /* Şifrele ve gönder */
   uint8_t meta_ct[305 + NOX_MAC_LEN];
@@ -357,7 +366,11 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
 
 void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
   int fd = ps->fd;
-  if (fd < 0 || !ps->tx_file.active) {
+  if (fd < 0)
+    return;
+  if (!ps->tx_file.active) {
+    /* Transfer bittiyse/iptal olduysa tx_buf engeli kalkmıştır. */
+    (void)peer_tx_flush_pending(state, ps);
     return;
   }
 
@@ -415,6 +428,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
       sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
       ps->tx_file.fd = -1;
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
+      (void)peer_tx_flush_pending(state, ps);
       return;
     }
     size_t to_read = remaining < 4096 ? remaining : 4096;
@@ -441,7 +455,7 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
           .seq = ps->tx_seq,
           .len = (uint32_t)((size_t)r + NOX_MAC_LEN),
       };
-      frame_header_encode(&fh, ps->tx_file.tx_buf);
+      frame_ad(&fh, ps->tx_file.tx_buf);
 
       ssize_t ct_len = noise_encrypt(ps->session, ps->tx_file.tx_buf,
                                      FRAME_HEADER_WIRE_SIZE,
@@ -478,6 +492,12 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
       epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
     }
   }
+
+  /* Adım 4.5: tx_buf boşaldıysa ertelenen TEXT'i şimdi gönder.
+   * Sıra: chunk k (tx_seq k→k+1) → TEXT k+1 (→k+2) → sonraki chunk k+2.
+   * Chunk hâlâ yarım bekliyorsa guard no-op; sıra bozulmaz. */
+  if (!ps_tx_pending(ps))
+    (void)peer_tx_flush_pending(state, ps);
 }
 
 /* ================================================================
@@ -609,7 +629,11 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
         ((uint64_t)pt[271] << 8) | ((uint64_t)pt[272]);
 
     /* Dosya boyut sınırı kontrolü */
-    if (net_size == 0 || net_size > NOX_MAX_FILE_SIZE) {
+    nox_err_t quota_err = file_transfer_check_quota(net_size);
+    if (net_size == 0 || quota_err != NOX_OK) {
+      if (quota_err != NOX_OK)
+        NOX_WARN(LOG_MOD_NET, "gelen dosya reddedildi: %s",
+                 nox_strerror(quota_err));
       ui_print_error(state,
                      "Gelen dosya reddedildi: Geçersiz veya çok büyük dosya boyutu (%lu byte)",
                      (unsigned long)net_size);

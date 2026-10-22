@@ -299,6 +299,11 @@ TEST_LDFLAGS = $(LINK_COMMON)
 # Faz E'den itibaren linenoise de dahil (stdin_handler entegrasyonu).
 TEST_SRC_OBJS = $(filter-out $(SRC_DIR)/main.test.o, $(SRCS:%.c=%.test.o))
 
+# Header değişiklikleri src/*.test.o'ları da yeniden derlemeli; aksi halde
+# test binary'leri eski struct ABI'siyle linklenip yanıltıcı sonuç verebilir.
+TEST_SRC_DEPS := $(TEST_SRC_OBJS:%.o=%.d)
+-include $(TEST_SRC_DEPS)
+
 $(SRC_DIR)/%.test.o: $(SRC_DIR)/%.c
 	$(MSG) 'CC' '$< (test)'
 	$(Q)$(CC) $(TEST_CFLAGS) $(DEPFLAGS) -I$(INC_DIR) -c $< -o $@

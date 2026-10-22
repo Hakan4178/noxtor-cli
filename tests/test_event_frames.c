@@ -34,13 +34,13 @@
  *     test_len_grow_tamper                   (len şişirme: çerçeve kayması)
  *     test_probe_storm_first_fail_disconnect (probe fırtınası: fail-fast)
  *     test_reconnect_same_slot_resets        (cleanup sonrası slot yeniden kullanımı)
- *     test_empty_payload_consumed            (auth başarısı = tüket; boş pt dahil)
+ *     test_empty_payload_rejected            (boş TEXT/FILE = ilk occurrence fatal)
  *     test_handshake_payload_lengths_rejected(57/63/126 payload → msg3 yazılmamalı)
  *     test_handshake_version_rejected        (ver != 0x01 → msg3 yazılmamalı)
  *     test_msg3_not_written_on_onion_mismatch(MITM onion mismatch → kimlik sızmasın)
- *   AD bağlama + fail-closed decode + fatal handler + handshake pre-verify
- *   sonrası bu on yedi test yeşile döner. (rx_seq wrap, çok-peer izolasyonu
- *   ve reconnect testi bugün de yeşil.)
+ *   Adım 4 (AD bağlama + fail-closed decode/fatal handler + boş payload)
+ *   sonrası 12 test yeşile döner; fatal cleanup reconnect testini de yeşile
+ *   çevirir → 25/29; kalan 4 = [19] + 3 handshake hard-cut testi (Adım 4.5/5).
  */
 
 #include "common.h"
@@ -461,7 +461,7 @@ static int run_hs_reject_case(const uint8_t *payload, size_t payload_len,
  * TESTLER
  * ================================================================ */
 
-/* 1) fd → peer eşlemesi */
+/* 1) fd → peer eşlemesi + K-10 gerçek doluluk yüklemi */
 static int test_find_peer_by_fd(void)
 {
     static struct app_state s;   /* 172KB — stack'e sığdırmayalım */
@@ -474,6 +474,13 @@ static int test_find_peer_by_fd(void)
     TEST_ASSERT(find_peer_by_fd(&s, 7) == &s.peers[1]);
     TEST_ASSERT(find_peer_by_fd(&s, 3) == &s.peers[0]);
     TEST_ASSERT(find_peer_by_fd(&s, 99) == NULL);
+
+    /* K-10: drain sonrası karar recv_pos'tan; fd>=0 tek başına yetmez. */
+    TEST_ASSERT(!peer_recv_buf_full(NULL));
+    s.peers[2].recv_pos = sizeof(s.peers[2].recv_buf) - 1U;
+    TEST_ASSERT(!peer_recv_buf_full(&s.peers[2]));
+    s.peers[2].recv_pos = sizeof(s.peers[2].recv_buf);
+    TEST_ASSERT(peer_recv_buf_full(&s.peers[2]));
     return 0;
 }
 
@@ -1276,15 +1283,14 @@ static int test_reconnect_same_slot_resets(void)
     return 0;
 }
 
-/* 26) Boş payload tüketimi ("auth başarısı = tüket" sözleşmesi):
- *     geçerli MAC'li boş TEXT frame bugün nonce'u İLERLETİYOR ama
- *     rx_seq'i ilerletmiyor (pt_len > 0 koşulu) → sonraki frame (seq=1)
- *     pre-check'te takılır, oturum kendiliğinden kopar. Saldırgan
- *     erişemez (anahtar gerekir) — peer-bug interop desync'i; yine de
- *     fix sözleşmesinin parçası: başarılı decrypt = tüket, boş pt'de
- *     dispatch yok ama rx_seq++ olmalı. */
-static int test_empty_payload_consumed(void)
+/* 26) Boş payload = protokol ihlali (ilhak yok):
+ *     geçerli MAC'li boş TEXT/FILE frame artık nonce'u tüketir ama
+ *     uygulama katmanına geçmez; ilk occurrence'ta fail-closed kopma.
+ *     Böylece "auth başarısı = tüket" (rx_seq++) korunurken boş pt
+ *     sessizce kabul edilmez. */
+static int test_empty_payload_rejected(void)
 {
+    /* (a) TEXT */
     TEST_ASSERT(fixture_base() == 0);
     TEST_ASSERT(attach_session() == 0);
     struct peer_session *ps = &st.peers[0];
@@ -1296,18 +1302,23 @@ static int test_empty_payload_consumed(void)
     process_peer_frames(ps, &st, ps->fd);
 
     TEST_ASSERT(ps->recv_pos == 0);
-    TEST_ASSERT(ps->rx_seq == 1);    /* RED: bugün 0 (nonce ilerledi) */
-    TEST_ASSERT(ps->state == ST_ACTIVE);
+    TEST_ASSERT(ps->state == ST_IDLE);
+    TEST_ASSERT(ps->session == NULL);
+    fixture_teardown();
 
-    uint8_t ct2[64];
-    uint32_t n2 = enc_text(1, "sonraki mesaj", ct2);
-    TEST_ASSERT(n2 == strlen("sonraki mesaj") + NOX_MAC_LEN);
-    frame_put(ps, NOX_MSG_TEXT, 1, ct2, n2);
+    /* (b) FILE */
+    TEST_ASSERT(fixture_base() == 0);
+    TEST_ASSERT(attach_session() == 0);
+    ps = &st.peers[0];
+
+    n = enc_file(0, "", 0, ct);
+    TEST_ASSERT(n == NOX_MAC_LEN);
+    frame_put(ps, NOX_MSG_FILE, 0, ct, n);
     process_peer_frames(ps, &st, ps->fd);
 
     TEST_ASSERT(ps->recv_pos == 0);
-    TEST_ASSERT(ps->rx_seq == 2);
-    TEST_ASSERT(ps->state == ST_ACTIVE);
+    TEST_ASSERT(ps->state == ST_IDLE);
+    TEST_ASSERT(ps->session == NULL);
     fixture_teardown();
     return 0;
 }
@@ -1436,7 +1447,7 @@ int main(void)
     RUN_TEST(test_rx_seq_wrap);
     RUN_TEST(test_multi_peer_isolation);
     RUN_TEST(test_reconnect_same_slot_resets);
-    RUN_TEST(test_empty_payload_consumed);
+    RUN_TEST(test_empty_payload_rejected);
     RUN_TEST(test_handshake_payload_lengths_rejected);
     RUN_TEST(test_handshake_version_rejected);
     RUN_TEST(test_msg3_not_written_on_onion_mismatch);

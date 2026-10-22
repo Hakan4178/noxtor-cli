@@ -4,11 +4,12 @@
  * Kapsam:
  *   read_full        — tam okuma, EOF ortada, len=0, bad fd
  *   ctrl_read_line   — satır + CRLF, C3 overflow (newline'sız dolan
- *                      buffer), kapalı peer, hızlı timeout (enjekte
- *                      edilebilir!), minik buffer
- *   ctrl_read_response — tek satır, 250- devam birleştirme, 4xx/5xx hata,
- *                      H-2 64-satır limiti (off-by-one sınırı dahil),
- *                      buffer tavanı, hızlı timeout
+ *                      buffer), kapalı peer (NOX_ERR_TOR), hızlı timeout
+ *                      (NOX_ERR_TIMEOUT, enjekte edilebilir!), minik buffer
+ *   ctrl_read_response — tek satır, 250- devam birleştirme, 4xx/5xx hata
+ *                      (NOX_ERR_TOR), H-2 64-satır limiti (off-by-one
+ *                      sınırı dahil), buffer tavanı, hızlı timeout
+ *                      (NOX_ERR_TIMEOUT)
  *   ctrl_send_command — write_full zarfı
  *   epoll_add/remove  — ekle/sil, double-remove (H-13 ENOENT→OK),
  *                      -1 epoll fd'de çökme yok
@@ -161,7 +162,7 @@ static int test_ctrl_read_line_fast_timeout(void)
 
     char buf[64];
     TEST_ASSERT(ctrl_read_line(sv[0], buf, sizeof(buf), 150) ==
-                NOX_ERR_TOR);
+                NOX_ERR_TIMEOUT);
 
     close(sv[0]); close(sv[1]);
     return 0;
@@ -280,7 +281,7 @@ static int test_ctrl_response_fast_timeout(void)
 
     char buf[256];
     TEST_ASSERT(ctrl_read_response(sv[0], buf, sizeof(buf), 150) ==
-                NOX_ERR_TOR);
+                NOX_ERR_TIMEOUT);
 
     close(sv[0]); close(sv[1]);
     return 0;

@@ -44,7 +44,7 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir);
 /* Control soketi peer doğrulaması (bulgu 2.1) — SO_PEERCRED ile karşı
  * ucun beklenen Tor süreci (expected_pid) ve aynı UID olduğunu kanıtlar.
  * connect() sonrası, cookie/ADD_ONION göndermeden ÖNCE çağrılır; peer
- * kimliği bağlantı boyunca sabittir. Hata: NOX_ERR_TOR (uyuşmazlık) |
+ * kimliği bağlantı boyunca sabittir. Hata: NOX_ERR_PEER (uyuşmazlık) |
  * NOX_ERR_NET (getsockopt hatası). */
 nox_err_t tor_verify_peer(int fd, pid_t expected_pid);
 
@@ -75,8 +75,9 @@ __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *
 /* Onion v3 adres doğrulaması — base32 + ".onion" suffix + v3 checksum
  * (H-2 FIX: SHA3-256 checksum zorunlu — zincir crypto_onion_pubkey'te).
  * 62 karakter tam v3 .onion adresi için true döner.
- * socks5_connect (peer), parse_service_id (kendi HS) ve event_loop
- * (handshake claim) tarafından çağrılır. (hardened) */
+ * socks5_connect (peer) ve event_loop (handshake claim) tarafından
+ * çağrılır. Kendi HS yolunda parse_service_id ayrıca adresin içindeki
+ * pub'ı beklenen anahtarla sodium_memcmp eder. (hardened) */
 nox_hardbool_t validate_onion_address(const char *addr);
 
 /* Tor process'ini düzgün kapat */
@@ -92,6 +93,7 @@ void tor_shutdown(struct app_state *state);
  * socks.sock yolu Tor AYAKTAYKEN aynı-UID saldırgan tarafından
  * unlink/rebind edilebilir; peer spawn edilen tor_pid değilse SOCKS
  * greeting'i BİLE gönderilmeden fail-closed dönülür.
+ * Hata: NOX_ERR_PEER (PID bilinmiyor veya peer uyuşmuyor).
  * ================================================================ */
 nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
                           const char *socks_path, pid_t expected_tor_pid,
@@ -132,6 +134,12 @@ nox_err_t epoll_modify_fd(int epoll_fd, int fd, uint32_t events);
 /* Frame header'ı network byte order'a serialize et */
 void frame_header_encode(const struct frame_header *hdr,
                          uint8_t *wire);
+
+/* H2: AD'li transport gönderimlerinin tek header üreticisi.
+ * frame_header_encode ile aynı 13 byte'ı üretir; receiver ham 13B'yi
+ * AD olarak korur. Transport gönderim siteleri doğrudan encode yerine
+ * bu fonksiyonu kullanır (handshake CTRL yazımları istisna). */
+void frame_ad(const struct frame_header *hdr, uint8_t *wire);
 
 /* Wire bytes'tan frame header'ı parse et */
 nox_err_t frame_header_decode(const uint8_t *wire,

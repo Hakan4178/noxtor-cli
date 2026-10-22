@@ -65,6 +65,7 @@ static const char *const event_names[] = {
     [EV_SEQ_MISMATCH]      = "SEQ_MISMATCH",
     [EV_ARENA_FAIL]        = "ARENA_FAIL",
     [EV_TOR_DIED]          = "TOR_DIED",
+    [EV_CRYPTO_FAIL]       = "CRYPTO_FAIL",
 };
 
 const char *sm_state_name(peer_state_t st)
@@ -189,6 +190,16 @@ static const state_transition_t transitions[] = {
   { ST_FILE_TX,          EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
   { ST_FILE_RX,          EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
 
+/* ── Crypto/Protocol Fail — Her durumdan idle'e ─────────────────── */
+  { ST_IDLE,             EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_CONNECTING,       EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_HANDSHAKE_INIT,   EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_HANDSHAKE_RESP,   EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_TOFU_PENDING,     EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_ACTIVE,           EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_FILE_TX,          EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_FILE_RX,          EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+
 /* ── Rate Limit ────────────────────────────────────────────────── */
   { ST_HANDSHAKE_INIT, EV_RATE_LIMIT,          ST_IDLE,           action_cleanup      },
   { ST_HANDSHAKE_RESP, EV_RATE_LIMIT,          ST_IDLE,           action_cleanup      },
@@ -275,7 +286,15 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
     sodium_memzero(ps->peer_onion, sizeof(ps->peer_onion));
     sodium_memzero(ps->connect_target, sizeof(ps->connect_target));
 
-    /* 4. TOFU state — Hassas verileri sıfırla */
+    /* 4. TOFU state — Hassas verileri sıfırla.
+     * C2: cleanup, aktif prompt'un sahibi olan peer'ı kaldırıyorsa global
+     * onay token'ını da kapat. Epoch global monoton olduğundan eşleşme
+     * başka bir peer'ın prompt'unu yanlışlıkla kapatmaz. */
+    if (state->tofu_prompt_epoch != 0 &&
+        ps->tofu_epoch == state->tofu_prompt_epoch) {
+        state->tofu_prompt_epoch = 0;
+        sodium_memzero(state->tofu_prompt_fp, sizeof(state->tofu_prompt_fp));
+    }
     ps->tofu_pending = false;
     ps->tofu_peer_fd = -1;
     ps->tofu_was_zero_key = false;
@@ -302,6 +321,11 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
             sodium_free(ps->tx_file.plain_buf);
         sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
         ps->tx_file.fd = -1;
+    }
+    /* Adım 4.5: ertelenen TEXT tek slotu — sodium_free zeroize eder. */
+    if (ps->pending_msg) {
+        sodium_free(ps->pending_msg);
+        ps->pending_msg = NULL;
     }
 
     /* 6. Recv buffer sıfırlama */
@@ -423,6 +447,10 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
         sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         return NOX_ERR_ALLOC;
     }
+    /* sodium_malloc 0xdb doldurur; hardbool(0)'da 0xdb trap,
+     * fallback bool'da true olur. Deterministik zero-init
+     * (handshake_split de sıfırlar). */
+    sodium_memzero(ps->session, sizeof(*ps->session));
 
     if (handshake_split(ps->hs, ps->session) != NOX_OK) {
         ui_print_error(state, "session split başarısız");

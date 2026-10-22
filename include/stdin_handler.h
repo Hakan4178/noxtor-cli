@@ -38,6 +38,14 @@ nox_err_t send_segmented_message_to(struct app_state *state,
                                     struct peer_session *ps,
                                     const char *msg);
 
+/* Adım 4.5 — gönderim sırası koruması.
+ * ps_tx_pending: peer'ın FILE chunk'ı tx_buf'ta bekliyor mu? (yazma yok)
+ * peer_tx_flush_pending: chunk flush edildikten sonra ertelenen TEXT'i
+ * gönderir. Slot boşsa veya hâlâ chunk bekliyorsa NOX_OK (no-op). */
+bool ps_tx_pending(const struct peer_session *ps);
+nox_err_t peer_tx_flush_pending(struct app_state *state,
+                                struct peer_session *ps);
+
 /* Çevrimdışı mesajları parçalara ayırıp kuyruğa alır */
 nox_err_t queue_segmented_message(const char *recipient_onion, const char *msg);
 

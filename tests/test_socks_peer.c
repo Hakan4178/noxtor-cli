@@ -7,8 +7,8 @@
  * SOCKS greeting'i BİLE gönderilmez (fail-closed).
  *
  * Senaryolar (gerçek AF_UNIX soketleri, ayrı child dinleyici):
- *   1) yanlış PID → NOX_ERR_TOR + dinleyicide 0 byte (sır sızmaz)
- *   2) expected_pid <= 0 → NOX_ERR_TOR, bağlantı hiç denenmez
+ *   1) yanlış PID → NOX_ERR_PEER + dinleyicide 0 byte (sır sızmaz)
+ *   2) expected_pid <= 0 → NOX_ERR_PEER, bağlantı hiç denenmez
  *   3) doğru PID → NOX_OK + SOCKS5 handshake tamamlanır
  *
  * Sertleştirme: dinleyici okuduğu baytları SAYAR ve sonucu yapı olarak
@@ -317,7 +317,7 @@ static int run_case(const char *label, const char *onion, enum server_mode mode,
     memset(&sr, 0, sizeof(sr));
     int res_ok = (read_exact_fd(res[0], &sr, sizeof(sr)) == 0);
 
-    int err_ok = expect_ok ? (err == NOX_OK) : (err == NOX_ERR_TOR);
+    int err_ok = expect_ok ? (err == NOX_OK) : (err == NOX_ERR_PEER);
     int mode_ok = 0;
     if (mode == SRV_WATCH) {
       mode_ok = (sr.accepted == 1 && sr.bytes == 0);
@@ -331,7 +331,7 @@ static int run_case(const char *label, const char *onion, enum server_mode mode,
     printf("[%s] %s: err=%d (beklenen %s), accepted=%d, bytes=%zu, "
            "handshake=%s\n",
            ok ? "OK" : "FAIL", label, (int)err,
-           expect_ok ? "NOX_OK" : "NOX_ERR_TOR", sr.accepted, sr.bytes,
+           expect_ok ? "NOX_OK" : "NOX_ERR_PEER", sr.accepted, sr.bytes,
            sr.handshake_ok ? "OK" : "yok");
     if (!child_ok)
       printf("       dinleyici exit=%d (beklenen 0)\n", exit_code_of(st));
@@ -365,10 +365,10 @@ int main(void) {
   int passed = 0;
   const int total = 3;
 
-  /* 1) Saldırgan dinleyici: peer pid != tor_pid → NOX_ERR_TOR + 0 byte. */
+  /* 1) Saldırgan dinleyici: peer pid != tor_pid → NOX_ERR_PEER + 0 byte. */
   passed += run_case("yanlış PID", onion, SRV_WATCH, getpid(), 0);
 
-  /* 2) expected_pid <= 0 → NOX_ERR_TOR, bağlantı denemesi yok. */
+  /* 2) expected_pid <= 0 → NOX_ERR_PEER, bağlantı denemesi yok. */
   passed += run_case("PID<=0", onion, SRV_NO_CONNECT, 0, 0);
 
   /* 3) Doğru PID → NOX_OK + handshake tamam (pozitif kontrol). */

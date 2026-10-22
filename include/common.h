@@ -106,6 +106,10 @@ typedef enum {
     NOX_ERR_STATE       = -13,  /* geçersiz state geçişi             */
     NOX_ERR_NOT_FOUND   = -14,  /* aranan öğe bulunamadı             */
     NOX_ERR_LANDLOCK_UNSUPPORTED = -15,  /* sandbox kurulamadı (C-2)  */
+    NOX_ERR_TIMEOUT     = -16,  /* işlem zaman aşımı                 */
+    NOX_ERR_PEER        = -17,  /* peer kimliği doğrulanamadı        */
+    NOX_ERR_ONION       = -18,  /* onion/ServiceID doğrulama hatası  */
+    NOX_ERR_QUOTA       = -19,  /* dosya boyutu/kota sınırı          */
 } nox_err_t;
 
 /* Hata kodu → okunabilir string */
@@ -231,9 +235,9 @@ void nox_hexdump(log_module_t mod, const char *label,
 /* ================================================================
  * HARDENED BOOLEAN — GCC hardbool (control-flow hardening)
  *
- * split_done / failed gibi kritik sentinel'lar fault injection ile
- * 0/1 dışı değere çekilirse hardened check __builtin_trap ile yakalar.
- * GCC >=14 destekler, altı fallback bool.
+ * hardbool(0): false=0x00, true=0xff. Bu iki temsil dışındaki her
+ * değer (fault injection, uninitialized 0xdb) kullanımda __builtin_trap
+ * ile yakalanır. GCC >=14 destekler; altında fallback bool.
  * ================================================================ */
 #if defined(__GNUC__) && __GNUC__ >= 14
 typedef unsigned char __attribute__((hardbool(0))) nox_hardbool_t;

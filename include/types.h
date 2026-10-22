@@ -250,6 +250,13 @@ struct peer_session {
     struct file_rx_state rx_file;
     struct file_tx_state tx_file;
 
+    /* ── Adım 4.5: gönderim sırası — tek slot ertelenen TEXT ──
+     * Bir FILE chunk'ı tx_buf'ta yarım yazılmışken doğrudan TEXT gönderimi
+     * wire sırasını (dolayısıyla nonce sırasını) bozar. Bu slot tam
+     * plaintext kopyasını tutar; sodium_free cleanup'ta zeroize eder.
+     * NULL = boş slot. Sahibi peer_session'dır. */
+    char *pending_msg;
+
     /* ── Okunmamış mesaj sayacı ── */
     uint32_t unread_count;
 };

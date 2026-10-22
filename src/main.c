@@ -1340,7 +1340,7 @@ int main(int argc, char *argv[]) {
           .len = (uint32_t)(strlen(test_msg) + 1 + NOX_MAC_LEN),
       };
       uint8_t demo_ad[FRAME_HEADER_WIRE_SIZE];
-      frame_header_encode(&demo_fh, demo_ad);
+      frame_ad(&demo_fh, demo_ad);
 
       ssize_t ct_len = noise_encrypt(&sa, demo_ad, sizeof(demo_ad),
                                      (const uint8_t *)test_msg,

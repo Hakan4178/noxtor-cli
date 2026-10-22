@@ -147,6 +147,16 @@ static void fixture_teardown(void)
  * TESTLER
  * ================================================================ */
 
+/* 0) K-26 kotası: 100 GiB tavanı NOX_ERR_QUOTA'ya bağlanıyor */
+static int test_quota_bounds(void)
+{
+    TEST_ASSERT(file_transfer_check_quota(0) == NOX_OK);
+    TEST_ASSERT(file_transfer_check_quota(NOX_MAX_FILE_SIZE) == NOX_OK);
+    TEST_ASSERT(file_transfer_check_quota(NOX_MAX_FILE_SIZE + 1) ==
+                NOX_ERR_QUOTA);
+    return 0;
+}
+
 /* 1) M-F3 REGRESYON: aktif RX + decrypt fail → rx_abort → orphan silinir */
 static int test_rx_abort_unlinks_orphan(void)
 {
@@ -318,6 +328,7 @@ int main(void)
 
     fprintf(stderr, "=== file_transfer RX testleri (M-F3 dahil) ===\n");
 
+    RUN_TEST(test_quota_bounds);
     RUN_TEST(test_rx_abort_unlinks_orphan);
     RUN_TEST(test_rx_decrypt_fail_inactive);
     RUN_TEST(test_rx_data_chunk_success);

@@ -154,12 +154,35 @@ struct queue_flush_ctx {
   struct peer_session *ps;
 };
 
+/* Adım 4.5: FILE chunk'ı tx_buf'ta yarım beklerken transport'a yazma
+ * yapılmamalı. Bu predikat tüm transport gönderim yollarının ortak
+ * giriş guard'ıdır. */
+bool ps_tx_pending(const struct peer_session *ps) {
+  return ps && ps->tx_file.active && ps->tx_file.tx_len > 0;
+}
+
+/* Slot dolu / gönderim sırası beklemede: sessiz düşürme yok, net ret. */
+static nox_err_t tx_busy(struct app_state *state, const char *what) {
+  NOX_WARN(LOG_MOD_NET, "%s: önceki gönderim bekliyor — yeni mesaj alınmadı",
+           what);
+  if (state)
+    ui_print_error(state,
+                   "Önceki mesaj gönderiliyor — yeni mesaj alınmadı.");
+  return NOX_ERR_STATE;
+}
+
 nox_err_t send_queued_callback(const char *text, void *ctx) {
   struct queue_flush_ctx *qctx = (struct queue_flush_ctx *)ctx;
   struct app_state *state = qctx->state;
   struct peer_session *ps = qctx->ps;
   if (!state || !ps || ps->fd < 0 || !ps->session)
     return NOX_ERR_NET;
+
+  /* DB kuyruğu kalıcıdır; burada pending_msg'e alıp NOX_OK dönmek
+   * db_process_queue'nin satırı hemen silmesine yol açar. Net ret ile
+   * kayıt korunur ve sıra bozulmaz; kuyruk bir sonraki flush'ta denenir. */
+  if (ps_tx_pending(ps) || ps->pending_msg)
+    return tx_busy(state, "send_queued_callback");
 
   size_t pt_len = strlen(text) + 1;
 
@@ -182,7 +205,7 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
       .len = (uint32_t)(pt_len + NOX_MAC_LEN),
   };
   uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-  frame_header_encode(&fh, wire);
+  frame_ad(&fh, wire);
 
   ssize_t ct_len = noise_encrypt(ps->session, wire, sizeof(wire),
                                  (const uint8_t *)text, pt_len, payload);
@@ -227,9 +250,9 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
   return send_segmented_message_to(state, ps, msg);
 }
 
-nox_err_t send_segmented_message_to(struct app_state *state,
-                                    struct peer_session *ps,
-                                    const char *msg) {
+static nox_err_t send_segmented_message_now(struct app_state *state,
+                                            struct peer_session *ps,
+                                            const char *msg) {
   (void)state;
   if (!ps || !ps->session || ps->fd < 0)
     return NOX_ERR_NET;
@@ -259,7 +282,7 @@ nox_err_t send_segmented_message_to(struct app_state *state,
         .len = (uint32_t)(pt_len + NOX_MAC_LEN),
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-    frame_header_encode(&fh, wire);
+    frame_ad(&fh, wire);
 
     ssize_t ct_len =
         noise_encrypt(ps->session, wire, sizeof(wire),
@@ -298,6 +321,72 @@ nox_err_t send_segmented_message_to(struct app_state *state,
   sodium_free(chunk);
   sodium_free(ct);
   return NOX_OK;
+}
+
+/* Ertelenen TEXT'i tek slotta sakla. Slot dolunca net ret; kuyruk yok. */
+static nox_err_t tx_defer_message(struct app_state *state,
+                                  struct peer_session *ps,
+                                  const char *msg) {
+  if (ps->pending_msg)
+    return tx_busy(state, "send_segmented_message_to");
+
+  size_t len = strlen(msg);
+  char *copy = sodium_malloc(len + 1);
+  if (!copy)
+    return NOX_ERR_ALLOC;
+  memcpy(copy, msg, len + 1);
+  ps->pending_msg = copy;
+
+  NOX_INFO(LOG_MOD_NET,
+           "TEXT ertelendi: FILE chunk bekliyor (%zu byte, slot tek)", len);
+  return NOX_OK;
+}
+
+nox_err_t send_segmented_message_to(struct app_state *state,
+                                    struct peer_session *ps,
+                                    const char *msg) {
+  if (!ps || !ps->session || ps->fd < 0)
+    return NOX_ERR_NET;
+  if (!msg)
+    return NOX_ERR_PROTO;
+  if (msg[0] == '\0')
+    return NOX_OK;
+
+  /* Slot doluysa sırayı korumak için yeni mesajı kabul etme. */
+  if (ps->pending_msg)
+    return tx_busy(state, "send_segmented_message_to");
+
+  /* FILE chunk'ı tx_buf'ta yarım bekliyorsa nonce/wire sırası bozulur:
+   * TEXT'i hemen yazma, tek slotta ertele. */
+  if (ps_tx_pending(ps))
+    return tx_defer_message(state, ps, msg);
+
+  return send_segmented_message_now(state, ps, msg);
+}
+
+nox_err_t peer_tx_flush_pending(struct app_state *state,
+                                struct peer_session *ps) {
+  if (!ps || !ps->pending_msg)
+    return NOX_OK;
+  if (ps->fd < 0 || !ps->session)
+    return NOX_ERR_NET;
+  if (ps_tx_pending(ps))
+    return NOX_OK; /* chunk hâlâ bekliyor; sıra bozulmaz */
+
+  char *msg = ps->pending_msg;
+  ps->pending_msg = NULL;
+  uint32_t tx_before = ps->tx_seq;
+  nox_err_t err = send_segmented_message_now(state, ps, msg);
+
+  /* Hiçbir frame çıkmadıysa (alloc/encrypt hatası) mesajı kaybetme;
+   * kısmi gönderimden sonra ise tekrar denemek duplikasyon üretir. */
+  if (err != NOX_OK && ps->fd >= 0 && ps->session &&
+      ps->tx_seq == tx_before) {
+    ps->pending_msg = msg;
+    return err;
+  }
+  sodium_free(msg);
+  return err;
 }
 
 /* Uzun bir mesajı güvenli chunk'lara ayırıp SQLite veritabanı kuyruğuna yazar

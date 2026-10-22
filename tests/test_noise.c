@@ -848,6 +848,50 @@ static int test_ad_required(void)
 }
 
 /* ================================================================
+ * TEST: Transport keyless fail-closed (P0 — Adım 2.5)
+ *
+ * Sıfırlanmış session'da tx/rx.has_key == false iken noise_* transport
+ * sarmalayıcıları cipher_* pass-through'a düşmemeli; -1 dönmeli ve
+ * çıktı tamponuna dokunmamalı.
+ * ================================================================ */
+static int test_transport_rejects_keyless_encrypt(void)
+{
+    struct noise_session s;
+    memset(&s, 0, sizeof(s));
+
+    const uint8_t pt[] = "x";
+    uint8_t out[64], expected[64];
+    memset(out, 0xA5, sizeof(out));
+    memset(expected, 0xA5, sizeof(expected));
+
+    TEST_ASSERT(!s.tx.has_key);
+    TEST_ASSERT(noise_encrypt(&s, AD, sizeof(AD), pt, sizeof(pt), out) == -1);
+    TEST_ASSERT(sodium_memcmp(out, expected, sizeof(out)) == 0);
+    TEST_ASSERT(atomic_load(&s.tx.n) == 0);
+
+    return 0;
+}
+
+static int test_transport_rejects_keyless_decrypt(void)
+{
+    struct noise_session s;
+    memset(&s, 0, sizeof(s));
+
+    uint8_t ct[NOX_MAC_LEN + 1];
+    memset(ct, 0, sizeof(ct));
+    uint8_t out[64], expected[64];
+    memset(out, 0xA5, sizeof(out));
+    memset(expected, 0xA5, sizeof(expected));
+
+    TEST_ASSERT(!s.rx.has_key);
+    TEST_ASSERT(noise_decrypt(&s, AD, sizeof(AD), ct, sizeof(ct), out) == -1);
+    TEST_ASSERT(sodium_memcmp(out, expected, sizeof(out)) == 0);
+    TEST_ASSERT(atomic_load(&s.rx.n) == 0);
+
+    return 0;
+}
+
+/* ================================================================
  * MAIN
  * ================================================================ */
 int main(void)
@@ -865,6 +909,8 @@ int main(void)
     RUN_TEST(test_mac_tamper);
     RUN_TEST(test_ad_binding);
     RUN_TEST(test_ad_required);
+    RUN_TEST(test_transport_rejects_keyless_encrypt);
+    RUN_TEST(test_transport_rejects_keyless_decrypt);
     RUN_TEST(test_nonce_no_increment_on_fail);
     RUN_TEST(test_double_split);
     RUN_TEST(test_remote_static_key);

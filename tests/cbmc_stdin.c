@@ -82,9 +82,8 @@ static nox_err_t write_full(int fd, const void *buf, size_t len) {
   return __VERIFIER_nondet_bool() ? NOX_OK : NOX_ERR_IO;
 }
 
-/* frame_header_encode — noop (CBMC için yeterli) */
-static void frame_header_encode(const struct frame_header *hdr,
-                                uint8_t *wire) {
+/* frame_ad — noop (CBMC için yeterli); üretimde tek AD üreticisi. */
+static void frame_ad(const struct frame_header *hdr, uint8_t *wire) {
   (void)hdr; (void)wire;
 }
 
@@ -184,7 +183,7 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
       .len = (uint32_t)(pt_len + NOX_MAC_LEN),
   };
   uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-  frame_header_encode(&fh, wire);
+  frame_ad(&fh, wire);
 
   ssize_t ct_len = noise_encrypt(state->session, wire, sizeof(wire),
                                  (const uint8_t *)text, pt_len, payload);
@@ -232,7 +231,7 @@ nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
         .len = (uint32_t)(pt_len + NOX_MAC_LEN),
     };
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-    frame_header_encode(&fh, wire);
+    frame_ad(&fh, wire);
 
     ssize_t ct_len =
         noise_encrypt(state->session, wire, sizeof(wire),
