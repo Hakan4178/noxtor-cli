@@ -1,3 +1,4 @@
+# Derleme ve bağımlılık çıktıları
 **/*.o
 src/**/*.o
 *.o
@@ -5,6 +6,34 @@ src/**/*.o
 src/**/*.d
 *.d
 *.out
+gmon.out
+*.log
+__pycache__/
+*.pyc
+/build/
+/out/
+
+# Test/fuzz çalıştırılabilirleri — kaynak dosyalar hariç
+/tests/test_*
+!/tests/test_*.c
+!/tests/test_*.h
+!/tests/test_*.sh
+/tests/fuzz_*
+!/tests/fuzz_*.c
+!/tests/fuzz_*.h
+/fuzz/fuzz_*
+!/fuzz/fuzz_*.c
+!/fuzz/fuzz_*.h
+
+# Ürün çıktısı ve kök artıkları
+/noxtor-cli
+/noxtor-cli.zip
+/core.*
+/Ekran Görüntüsü*.png
+
+# Araç ve arşiv dizinleri
 *.opencode
+.opencode/
 memory-bank
 docs-priv
+/esbmc/

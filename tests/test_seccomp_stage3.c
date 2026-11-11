@@ -9,7 +9,8 @@
  *                                          → SIGSYS beklenir
  *   2. clone() → SIGSYS; clone3 → ENOSYS (fallback yaşar)
  *   3. getaddrinfo/connect                → SIGSYS beklenir
- *   4. sendto/symlink/link/chmod/chown/shmat (SHM_EXEC dahil) → SIGSYS
+ *   4. symlink/link/chmod/chown/shmat (SHM_EXEC dahil) → SIGSYS
+ *      sendto → serbest (glibc send uyumu; TODO(IPC-SENDTO))
  *   5. AF_UNIX/socketpair/mmap RW serbest → yaşaması beklenir
  *
  * Build:
@@ -236,11 +237,12 @@ static void test_chown(void) {
 
 static void test_sendto(void) {
   if (apply_stage3() < 0) _exit(2);
-  /* AF_UNIX socketpair serbest, ama sendto() stage 3'te yasak */
+  /* sendto stage 3'te serbest: glibc send() sendto(NULL) kullanır.
+   * TODO(IPC-SENDTO): IPC gelince politika tekrar değerlendirilecek. */
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) _exit(2);
   sendto(sv[0], "x", 1, 0, NULL, 0);
-  _exit(1);
+  _exit(0);
 }
 
 static void test_socketpair_allow(void) {
@@ -586,7 +588,7 @@ int main(void) {
   total++; passed += run_test("link",     "link()                         ", test_link, 1);
   total++; passed += run_test("chmod",    "chmod()                        ", test_chmod, 1);
   total++; passed += run_test("chown",    "chown()                        ", test_chown, 1);
-  total++; passed += run_test("sendto",   "sendto(AF_UNIX)                ", test_sendto, 1);
+  total++; passed += run_test("sendto",   "sendto(AF_UNIX) serbest        ", test_sendto, 0);
   total++; passed += run_test("spair",    "socketpair(AF_UNIX) serbest    ", test_socketpair_allow, 0);
   total++; passed += run_test("mprot_rw", "mprotect(READ|WRITE) serbest   ", test_mprotect_rw_allow, 0);
   total++; passed += run_test("clone3",   "clone3 → ENOSYS (fallback)     ", test_clone3_enosys, 0);

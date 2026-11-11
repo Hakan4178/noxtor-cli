@@ -43,10 +43,11 @@ static int test_strerror_exhaustive(void)
         { NOX_ERR_PEER,     "peer kimliği doğrulanamadı" },
         { NOX_ERR_ONION,    "onion kimlik doğrulama hatası" },
         { NOX_ERR_QUOTA,    "dosya boyutu/kota sınırı aşıldı" },
+        { NOX_ERR_AGAIN,    "kaynak meşgul — tekrar deneyin" },
     };
 
     const size_t n = sizeof(cases) / sizeof(cases[0]);
-    TEST_ASSERT(n == 20);
+    TEST_ASSERT(n == 21);
 
     for (size_t i = 0; i < n; i++) {
         const char *s = nox_strerror(cases[i].code);

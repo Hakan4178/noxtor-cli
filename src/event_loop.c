@@ -13,6 +13,7 @@
 #include "state_machine.h"
 #include "stdin_handler.h"
 #include "file_transfer.h"
+#include "frame_queue.h"
 #include "database.h"
 #include "noise.h"
 #include "network.h"
@@ -46,6 +47,70 @@ struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
             return ps;
     }
     return NULL;
+}
+
+/* Kuyruk boşken ertelenen TEXT'i ve durmuş DB kuyruğunu sürdürür.
+ * EPOLLOUT handler'ı ve 2 sn'lik bakım turu aynı yolu kullanır; böylece
+ * yalnız pending/db_retry bayrağı kaldığında iş asılı kalmaz.
+ * Dönüş false = oturum kapandı. */
+static bool peer_tx_resume(struct app_state *state,
+                           struct peer_session *ps)
+{
+    if (!frame_queue_empty(ps) || ps_tx_pending(ps))
+        return ps->fd >= 0;
+
+    if (ps->pending_msg) {
+        (void)peer_tx_flush_pending(state, ps);
+        if (ps->fd < 0)
+            return false;
+    }
+
+    if (ps->db_retry_pending && frame_queue_empty(ps) &&
+        !ps->tx_file.active) {
+        struct queue_flush_ctx qctx = { .state = state, .ps = ps };
+        nox_err_t dberr = db_process_queue(ps->peer_onion,
+                                           send_queued_callback, &qctx);
+        /* Bayrağı yalnız tam başarıda temizle: DB/alloc hatasında
+         * callback hiç çağrılmamış olabilir; retry kaybolmasın.
+         * AGAIN'de callback bayrağı zaten yeniden kurar. */
+        if (dberr == NOX_OK)
+            ps->db_retry_pending = false;
+    }
+
+    return ps->fd >= 0;
+}
+
+/* ================================================================
+ * EPOLLOUT — TX sırası tek noktadan yürür
+ *
+ * Kural: kuyruk doluyken FILE chunk'ı şifrelenmez. Aksi halde yeni
+ * chunk, bekleyen TEXT'in önüne geçer; alıcı nonce sırasını kaybeder.
+ * Dönüş false = oturum kapandı (çağıran EPOLLIN'e devam etmemeli).
+ * ================================================================ */
+static bool handle_peer_tx_ready(struct app_state *state,
+                                 struct peer_session *ps)
+{
+    /* Önce kuyruk: enqueue sırası = nonce sırası = yazma sırası. */
+    if (!frame_queue_empty(ps)) {
+        (void)frame_queue_flush(state, ps);
+    } else if (ps->tx_file.active) {
+        file_transfer_handle_tx(state, ps);
+    }
+
+    if (ps->fd < 0)
+        return false;
+
+    /* Kuyruk boşaldıysa ertelenen TEXT'i ve durmuş DB kuyruğunu aynı
+     * oturumda sürdür. FILE chunk'ı bekliyorsa dokunma. */
+    if (!peer_tx_resume(state, ps))
+        return false;
+
+    if (ps->tx_file.active || !frame_queue_empty(ps))
+        (void)epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN | EPOLLOUT);
+    else
+        (void)epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN);
+
+    return ps->fd >= 0;
 }
 
 /* K-10: doluluk kararı yalnız tamponun gerçek durumundan verilir.
@@ -269,6 +334,17 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
     }
     ps->recv_pos = remaining;
 
+    /* K-14: handshake nesnesi tükendikten sonra (oturum kurulmuş) gelen
+     * CTRL frame'i tanımlı bir protokol mesajı değildir. Sessizce yutmak
+     * yerine fail-fast kapat; aksi halde peer rx_seq'i ilerletmeden
+     * bağlantıyı canlı tutabilir. Handshake nesnesi hâlâ dururken
+     * (msg_index >= 3) eski Y-2 davranışı korunur (test 13). */
+    if (fh.type == NOX_MSG_CTRL && !ps->hs) {
+      peer_proto_fatal(ps, state, "handshake dışı CTRL frame");
+      sodium_free(payload);
+      break;
+    }
+
     /* Y-2 FIX: Handshake tamamlanmış (msg_index >= 3) bir peer'ın ek CTRL
      * frame'leri handshake_read'e giderse NOX_ERR_STATE → EV_HANDSHAKE_ERROR
      * → TOFU-PENDING bekleyen slot ölür. CTRL yalnızca handshake aktifken
@@ -423,6 +499,9 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
               ps->tx_seq = 0;
               ps->rx_seq = 0;
               ps->queue_flushed = false;
+              frame_queue_reset(ps);
+              ps->pending_msg_off = 0;
+              ps->db_retry_pending = false;
               ps->peer_verified = true; /* H-1 FIX: doğrulanmış peer — kuyruk flush serbest */
               ps->tofu_was_zero_key = false;
               clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
@@ -985,6 +1064,18 @@ void event_loop(struct app_state *state) {
       if (has_frames) ui_line_resume(state);
     }
 
+    /* ── C1: ertelenen TX işlerini EPOLLOUT'a bağımlı olmadan sürdür ──
+     * epoll_wait 2 sn timeout'lu; yalnız pending_msg/db_retry_pending
+     * kaldığında bile iş asılı kalmaz. Kalıcı DB/alloc hatası busy-loop
+     * üretmez: deneme en erken bir sonraki turda yapılır. */
+    for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
+      struct peer_session *ps = &state->peers[pi];
+      if (ps->session && ps->fd >= 0 &&
+          (ps->pending_msg || ps->db_retry_pending)) {
+        (void)peer_tx_resume(state, ps);
+      }
+    }
+
     int nfds = epoll_wait(state->epoll_fd, events,
                           1 + 2 * NOX_MAX_PEERS, 2000);
 
@@ -1115,11 +1206,8 @@ void event_loop(struct app_state *state) {
 
       /* Peer'a Veri Gönderimi (EPOLLOUT) */
       if (events[i].events & EPOLLOUT) {
-        if (ps->tx_file.active) {
-          file_transfer_handle_tx(state, ps);
-        } else {
-          epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-        }
+        if (!handle_peer_tx_ready(state, ps))
+          continue;
       }
 
       /* Peer'dan Veri Alımı (EPOLLIN) */

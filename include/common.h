@@ -110,6 +110,7 @@ typedef enum {
     NOX_ERR_PEER        = -17,  /* peer kimliği doğrulanamadı        */
     NOX_ERR_ONION       = -18,  /* onion/ServiceID doğrulama hatası  */
     NOX_ERR_QUOTA       = -19,  /* dosya boyutu/kota sınırı          */
+    NOX_ERR_AGAIN       = -20,  /* geçici meşgul; tekrar denenebilir */
 } nox_err_t;
 
 /* Hata kodu → okunabilir string */

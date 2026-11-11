@@ -15,6 +15,7 @@
 #include "common.h"
 #include "database.h"
 #include "file_transfer.h"
+#include "frame_queue.h"
 #include "network.h"
 #include "noise.h"
 #include "stdin_handler.h"
@@ -306,6 +307,8 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
 
     /* 5. Dosya transferleri — peer'a özel state */
     ps->queue_flushed = false;
+    ps->db_retry_pending = false;
+    frame_queue_reset(ps);
     if (ps->rx_file.active) {
         if (ps->rx_file.fd >= 0)
             close(ps->rx_file.fd);
@@ -327,6 +330,7 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
         sodium_free(ps->pending_msg);
         ps->pending_msg = NULL;
     }
+    ps->pending_msg_off = 0;
 
     /* 6. Recv buffer sıfırlama */
     sodium_memzero(ps->recv_buf, sizeof(ps->recv_buf));
@@ -465,6 +469,9 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
     ps->tx_seq = 0;
     ps->rx_seq = 0;
     ps->queue_flushed = false;
+    frame_queue_reset(ps);
+    ps->pending_msg_off = 0;
+    ps->db_retry_pending = false;
     /* H-1 FIX: TOFU ile kurulan oturum doğrulanmamış sayılır — kuyruk
      * sızıntısını önlemek için peer_verified=false bırakılır. İlk
      * doğrulanmış SESSION_READY oturumunda peer_verified=true olacak. */

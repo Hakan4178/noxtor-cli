@@ -18,7 +18,7 @@
 /*
  * arena_init — Güvenli arena oluştur
  *
- * @a:    Boş arena struct'ı
+ * @a:    Boş (sıfırlanmış) arena struct'ı — `= {0}`
  * @size: İstenen kullanılabilir alan (guard page'ler hariç)
  *
  * Yaptıkları:
@@ -30,7 +30,7 @@
  *   5. Rastgele canary üret
  *   6. Canary'yi usable alanın sonuna yaz
  *
- * Return: NOX_OK veya NOX_ERR_ALLOC
+ * Return: NOX_OK, NOX_ERR_ALLOC veya NOX_ERR_STATE (arena zaten aktif)
  */
 __attribute__((strub))
 nox_err_t arena_init(struct secure_arena *a, size_t size);

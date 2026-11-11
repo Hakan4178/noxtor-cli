@@ -84,16 +84,17 @@ nox_hardbool_t validate_onion_address(const char *addr) {
  * - torrc dosyası (kendi config dosyamız)
  * - SOCKS5 greeting (sabit byte'lar)
  * Hassas veri 3. partiye gitmez — FP. */
-nox_err_t write_full(int fd, const void *buf, size_t len) {
+nox_err_t write_full_timeout(int fd, const void *buf, size_t len,
+                             int timeout_ms) {
   assert(buf != NULL || len == 0);
   /* B5 FIX: Toplam monotonic deadline — write buffer dolarsa blocking
    * fd'de write sonsuz bloklayabilir; POLLOUT beklenerek yalnız yazılabilir
-   * durumda write çağrılır. Toplam süre NOX_READ_TIMEOUT_MS ile sınırlı
+   * durumda write çağrılır. Toplam süre timeout_ms ile sınırlı
    * (read_full ile aynı tek tip desen). MAX_RETRIES sayacı gereksizleşir. */
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += NOX_READ_TIMEOUT_MS / 1000;
-  deadline.tv_nsec += (long)(NOX_READ_TIMEOUT_MS % 1000) * 1000000L;
+  deadline.tv_sec += timeout_ms / 1000;
+  deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
   if (deadline.tv_nsec >= 1000000000L) {
     deadline.tv_sec++;
     deadline.tv_nsec -= 1000000000L;
@@ -141,7 +142,11 @@ nox_err_t write_full(int fd, const void *buf, size_t len) {
   return NOX_OK;
 }
 
-nox_err_t read_full(int fd, void *buf, size_t len) {
+nox_err_t write_full(int fd, const void *buf, size_t len) {
+  return write_full_timeout(fd, buf, len, NOX_READ_TIMEOUT_MS);
+}
+
+nox_err_t read_full_timeout(int fd, void *buf, size_t len, int timeout_ms) {
   /* Geçersiz fd poll()'a girmeden I/O hatası olarak reddedilsin; Linux
    * poll() negatif fd'yi yok sayıp 0 dönebildiği için timeout koduyla
    * karışmamalı. */
@@ -154,8 +159,8 @@ nox_err_t read_full(int fd, void *buf, size_t len) {
    * blocking hem non-blocking fd'de gerçek timeout verir. */
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += NOX_READ_TIMEOUT_MS / 1000;
-  deadline.tv_nsec += (long)(NOX_READ_TIMEOUT_MS % 1000) * 1000000L;
+  deadline.tv_sec += timeout_ms / 1000;
+  deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
   if (deadline.tv_nsec >= 1000000000L) {
     deadline.tv_sec++;
     deadline.tv_nsec -= 1000000000L;
@@ -209,6 +214,10 @@ nox_err_t read_full(int fd, void *buf, size_t len) {
     received += (size_t)r;
   }
   return NOX_OK;
+}
+
+nox_err_t read_full(int fd, void *buf, size_t len) {
+  return read_full_timeout(fd, buf, len, NOX_READ_TIMEOUT_MS);
 }
 
 /* ================================================================

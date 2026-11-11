@@ -9,7 +9,7 @@
  *   → s, se                       (initiator → responder)
  *
  * Handshake bitince iki CipherState döner (tx/rx).
- * Transport: ChaChaPoly-1305 AEAD, 64-bit nonce counter.
+ * Transport: ChaCha20-Poly1305 AEAD, 64-bit nonce counter.
  */
 
 #ifndef PARANOID_NOISE_H
@@ -55,7 +55,12 @@ void cipher_init_key(struct noise_cipher_state *cs,
  * @pt_len:  Plaintext uzunluğu
  * @out:     Çıktı buffer (pt_len + 16 byte MAC)
  *
- * Return: Şifreli veri uzunluğu (pt_len + MAC) veya -1
+ * Nonce: keyed şifreleme AEAD öncesi bir nonce rezerve eder; AEAD
+ * rezervasyon sonrası başarısız olsa bile nonce tüketilmiş kalır,
+ * geri alınmaz.
+ *
+ * Return: Keyed: şifreli veri uzunluğu (pt_len + MAC); keyless
+ *         handshake pass-through: pt_len; hata: -1.
  */
 __attribute__((strub))
 ssize_t cipher_encrypt(struct noise_cipher_state *cs,
@@ -66,7 +71,7 @@ ssize_t cipher_encrypt(struct noise_cipher_state *cs,
 /*
  * cipher_decrypt — AEAD çözme
  *
- * Return: Plaintext uzunluğu veya -1 (MAC hatası)
+ * Return: Plaintext uzunluğu veya -1 (geçersiz boyut/nonce tükendi/MAC)
  */
 __attribute__((strub))
 ssize_t cipher_decrypt(struct noise_cipher_state *cs,
@@ -114,7 +119,7 @@ __attribute__((strub)) nox_err_t symmetric_split(struct noise_symmetric_state *s
 /* ================================================================
  * HANDSHAKE API — XX pattern
  *
- * ASSUMPTION: libsodium X25519 rejects invalid points (see src/noise.c:464 noise_dh).
+ * ASSUMPTION: libsodium X25519 rejects invalid points (see noise_dh() in src/noise.c).
  * INVARIANT: noise_dh never returns NOX_OK with all-zero shared secret.
  * VERIFICATION: unit/differential fuzz (noise-c), ref impl, formal (cbmc) where feasible.
  * ================================================================ */
@@ -143,7 +148,8 @@ nox_err_t handshake_init(struct noise_handshake *hs,
  * @out:     Çıktı buffer
  * @out_len: Çıktı buffer boyutu (in), yazılan byte sayısı (out)
  *
- * Return: NOX_OK, NOX_ERR_PROTO (yanlış sıra), NOX_ERR_OVERFLOW
+ * Return: NOX_OK; NOX_ERR_STATE (yanlış sıra/failed/split);
+ *         NOX_ERR_PROTO (geçersiz argüman/kapasite); NOX_ERR_CRYPTO/ALLOC.
  */
 __attribute__((strub))
 nox_err_t handshake_write(struct noise_handshake *hs,
@@ -160,7 +166,9 @@ nox_err_t handshake_write(struct noise_handshake *hs,
  * @out_cap: Payload output buffer kapasitesi (in)
  * @pl_len:  Çözülen byte sayısı (out)
  *
- * Return: NOX_OK, NOX_ERR_AUTH (MAC hatası), NOX_ERR_PROTO
+ * Return: NOX_OK; NOX_ERR_STATE (yanlış sıra/failed/split);
+ *         NOX_ERR_PROTO (geçersiz argüman/uzunluk); NOX_ERR_AUTH;
+ *         NOX_ERR_CRYPTO/ALLOC.
  */
 __attribute__((strub))
 nox_err_t handshake_read(struct noise_handshake *hs,
@@ -179,7 +187,8 @@ nox_hardbool_t handshake_is_complete(const struct noise_handshake *hs);
  * @hs:      Tamamlanmış HandshakeState
  * @session: Çıktı — tx/rx CipherState + remote public key
  *
- * Handshake state bu çağrıdan sonra explicit_bzero ile silinir.
+ * Başarılı split sonrası handshake anahtarları silinir ve split_done
+ * işaretlenir; aynı handshake ikinci kez split edilemez.
  */
 
 __attribute__((strub))

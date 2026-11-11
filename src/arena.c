@@ -173,12 +173,29 @@ static void secure_abort(const struct secure_arena *a, const char *msg) {
  *
  * Hata durumlarında NOX_ERR_ALLOC döner; kısmi tahsisler temizlenir.
  * NOX_ARENA_STRICT_LOCK tanımlıysa mlock başarısızliğinde de NOX_ERR_ALLOC döner.
+ * Arena zaten aktifse (a->base != NULL) NOX_ERR_STATE döner.
  * ================================================================ */
 __attribute__((strub))
  nox_err_t arena_init(struct secure_arena *a, size_t size)
 {
     if (!a || size == 0)
         return NOX_ERR_ALLOC;
+
+    /* T-05 — çift init fail-closed.
+     *
+     * Sözleşme: çağıran struct'ı `= {0}` ile başlatır (arena_destroy
+     * da aynı varsayımı yapar). Canlı bir mapping varken tekrar init
+     * edilirse yeni mmap eski a->base'in üzerine yazılır; eski alan
+     * munmap/wipe edilemez ve mlock'lu anahtar materyali süreç
+     * sonuna kadar map'li kalır. Bu yüzden reddet ve struct'a DOKUNMA
+     * (canlı arena'nın metadata'sını bozmamak için).
+     */
+    if (a->base != NULL) {
+        NOX_ERROR(LOG_MOD_ARENA,
+                  "arena_init: arena zaten aktif (base=%p) — çift init reddedildi",
+                  a->base);
+        return NOX_ERR_STATE;
+    }
 
     /* P7 — sodium_init() guard
      *

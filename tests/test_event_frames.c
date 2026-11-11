@@ -38,9 +38,13 @@
  *     test_handshake_payload_lengths_rejected(57/63/126 payload → msg3 yazılmamalı)
  *     test_handshake_version_rejected        (ver != 0x01 → msg3 yazılmamalı)
  *     test_msg3_not_written_on_onion_mismatch(MITM onion mismatch → kimlik sızmasın)
+ *   - test_attacker_chain_bidirectional [30]: H1 claim/msg3 sızıntısı,
+ *     H2/H3 saldırı matrisi iki yönde, ardından iki yönde temiz TEXT +
+ *     FILE happy-path (metadata + chunk + BLAKE2b).
  *   Adım 4 (AD bağlama + fail-closed decode/fatal handler + boş payload)
  *   sonrası 12 test yeşile döner; fatal cleanup reconnect testini de yeşile
- *   çevirir → 25/29; kalan 4 = [19] + 3 handshake hard-cut testi (Adım 4.5/5).
+ *   çevirir. Güncel: 30/30 (tüm event-frame sözleşmeleri yeşil;
+ *   Step 5 kırmızıları test_file_transfer.c'de ayrı tutulur).
  */
 
 #include "common.h"
@@ -67,6 +71,11 @@
 static struct app_state st;
 static struct noise_session *g_sess_i = NULL;  /* sender (encrypt) */
 static int g_sv[2] = {-1, -1};
+
+/* Uzun saldırgan zinciri: iki gerçek peer (p0/p1) ve iki bağımsız
+ * loopback Noise çifti. p0'ın göndericisi g_sess_i, p1'inki g_sess_b. */
+static struct noise_session *g_sess_b = NULL;
+static int g_sv_b[2] = {-1, -1};
 
 /* Loopback Noise XX: initiator stack, responder sodium_malloc. Split
  * her hs'yi tüketir (zeroize) — çağrı iki complete hs ister. */
@@ -455,6 +464,426 @@ static int run_hs_reject_case(const uint8_t *payload, size_t payload_len,
                   (ps->recv_pos == 0);
     fixture_teardown();
     return 0;
+}
+
+/* Pozitif H1 kontrolü: doğrulanmış claim'den sonra msg3 gerçekten
+ * yazılmalı ve initiator TOFU onayına geçmeli. */
+static int run_hs_accept_case(const uint8_t *payload, size_t payload_len,
+                              const char *connect_target,
+                              const uint8_t responder_pub[NOX_KEY_LEN],
+                              const uint8_t responder_priv[NOX_KEY_LEN],
+                              int *msg3_bytes, int *state_tofu)
+{
+    *msg3_bytes = -1;
+    *state_tofu = 0;
+
+    if (setup_hs_initiator_msg2(payload, payload_len, connect_target,
+                                responder_pub, responder_priv) != 0) {
+        fixture_teardown();
+        return -1;
+    }
+
+    struct peer_session *ps = &st.peers[0];
+    process_peer_frames(ps, &st, ps->fd);
+
+    *msg3_bytes = socket_pending_bytes(g_sv[1]);
+    *state_tofu = (ps->state == ST_TOFU_PENDING) &&
+                  (ps->hs != NULL) && (ps->fd >= 0);
+    fixture_teardown();
+    return 0;
+}
+
+/* ================================================================
+ * UZUN SALDIRGAN ZİNCİRİ YARDIMCILARI
+ *
+ * İki peer'lı fixture: p0 ve p1'in her biri kendi socketpair'i ve
+ * kendi Noise çiftiyle ACTIVE. Saldırı bir peer'ı öldürürken diğerinin
+ * bütün durumu (fd/session/rx_seq/recv_pos) değişmemeli.
+ * ================================================================ */
+
+static int setup_dual_active(void)
+{
+    if (fixture_base() != 0)
+        return -1;
+    if (attach_session() != 0)
+        return -1;
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return -1;
+    g_sv_b[0] = sv[0];
+    g_sv_b[1] = sv[1];
+
+    struct peer_session *p1 = &st.peers[1];
+    p1->fd = sv[0];
+    p1->state = ST_ACTIVE;
+    clock_gettime(CLOCK_MONOTONIC, &p1->last_active);
+
+    p1->session = sodium_malloc(sizeof(struct noise_session));
+    g_sess_b = sodium_malloc(sizeof(struct noise_session));
+    if (!p1->session || !g_sess_b ||
+        make_split_pair(g_sess_b, p1->session) != 0)
+        return -1;
+
+    p1->peer_verified = true;
+    p1->queue_flushed = true;
+    p1->rx_seq = 0;
+    p1->tx_seq = 0;
+    st.active_peer_idx = 0;   /* p0 aktif; p1 yalnız izolasyon kanıtı */
+    return 0;
+}
+
+static void dual_teardown(void)
+{
+    struct peer_session *p1 = &st.peers[1];
+    free_peer_rx_pt(p1);
+    if (p1->session) {
+        sodium_memzero(p1->session, sizeof(*p1->session));
+        sodium_free(p1->session);
+        p1->session = NULL;
+    }
+    if (g_sess_b) {
+        sodium_memzero(g_sess_b, sizeof(*g_sess_b));
+        sodium_free(g_sess_b);
+        g_sess_b = NULL;
+    }
+    if (g_sv_b[0] >= 0)
+        close(g_sv_b[0]);   /* fatal cleanup kapattıysa EBADF — zararsız */
+    if (g_sv_b[1] >= 0)
+        close(g_sv_b[1]);
+    g_sv_b[0] = g_sv_b[1] = -1;
+    fixture_teardown();
+}
+
+/* Karşı yönde temiz bir TEXT teslim et: saldırıdan önce canlılık
+ * kanıtı, saldırıdan sonra da "diğer peer etkilenmedi" ölçümü. */
+static int deliver_text(struct noise_session *sender, struct peer_session *rx,
+                        uint32_t seq, const char *msg)
+{
+    uint8_t ct[128];
+    size_t len = strlen(msg);
+    uint32_t n = enc_frame(sender, NOX_MSG_TEXT, seq,
+                           (const uint8_t *)msg, len, ct);
+    if (n == 0 || n > sizeof(ct))
+        return -1;
+    frame_put(rx, NOX_MSG_TEXT, seq, ct, n);
+    process_peer_frames(rx, &st, rx->fd);
+    return 0;
+}
+
+typedef enum {
+    CHAIN_ATK_TYPE_FLIP,
+    CHAIN_ATK_SEQ_SKIP,
+    CHAIN_ATK_MAC_BIT,
+    CHAIN_ATK_LEN_GROW,
+    CHAIN_ATK_EMPTY,
+    CHAIN_ATK_KEYLESS,
+    CHAIN_ATK_FORGED,
+    CHAIN_ATK_COUNT
+} chain_attack_t;
+
+static const char *chain_attack_name(chain_attack_t kind)
+{
+    switch (kind) {
+    case CHAIN_ATK_TYPE_FLIP: return "type-flip";
+    case CHAIN_ATK_SEQ_SKIP:  return "seq-skip";
+    case CHAIN_ATK_MAC_BIT:   return "mac-bit";
+    case CHAIN_ATK_LEN_GROW:  return "len-grow";
+    case CHAIN_ATK_EMPTY:     return "empty-payload";
+    case CHAIN_ATK_KEYLESS:   return "keyless-transport";
+    case CHAIN_ATK_FORGED:    return "forged-probe";
+    case CHAIN_ATK_COUNT:
+    default:                  return "?";
+    }
+}
+
+static int inject_chain_attack(struct noise_session *sender,
+                               struct peer_session *victim,
+                               chain_attack_t kind)
+{
+    uint8_t ct[128];
+    uint32_t n = 0;
+
+    switch (kind) {
+    case CHAIN_ATK_TYPE_FLIP:
+        /* AD'li şifreleme TEXT der; tel üzerinde FILE gösterilir. */
+        n = enc_frame(sender, NOX_MSG_TEXT, 0,
+                      (const uint8_t *)"tip", 3, ct);
+        if (n == 0) return -1;
+        frame_put(victim, NOX_MSG_FILE, 0, ct, n);
+        break;
+
+    case CHAIN_ATK_SEQ_SKIP:
+        /* Nonce 0, header seq 1 → AD doğrulaması seq'i bağlar. */
+        n = enc_frame(sender, NOX_MSG_TEXT, 0,
+                      (const uint8_t *)"seq", 3, ct);
+        if (n == 0) return -1;
+        frame_put(victim, NOX_MSG_TEXT, 1, ct, n);
+        break;
+
+    case CHAIN_ATK_MAC_BIT:
+        n = enc_frame(sender, NOX_MSG_TEXT, 0,
+                      (const uint8_t *)"mac", 3, ct);
+        if (n == 0) return -1;
+        ct[n - 1] ^= 0x01;
+        frame_put(victim, NOX_MSG_TEXT, 0, ct, n);
+        break;
+
+    case CHAIN_ATK_LEN_GROW: {
+        n = enc_frame(sender, NOX_MSG_TEXT, 0,
+                      (const uint8_t *)"len", 3, ct);
+        if (n == 0) return -1;
+        struct frame_header fh = {
+            .magic = NOX_FRAME_MAGIC,
+            .type = NOX_MSG_TEXT,
+            .seq = 0,
+            .len = n + 8,
+        };
+        frame_header_encode(&fh, victim->recv_buf);
+        memcpy(victim->recv_buf + FRAME_HEADER_WIRE_SIZE, ct, n);
+        randombytes_buf(victim->recv_buf + FRAME_HEADER_WIRE_SIZE + n, 8);
+        victim->recv_pos = FRAME_HEADER_WIRE_SIZE + n + 8;
+        break;
+    }
+
+    case CHAIN_ATK_EMPTY:
+        n = enc_frame(sender, NOX_MSG_TEXT, 0, NULL, 0, ct);
+        if (n != NOX_MAC_LEN) return -1;
+        frame_put(victim, NOX_MSG_TEXT, 0, ct, n);
+        break;
+
+    case CHAIN_ATK_KEYLESS:
+        victim->session->rx.has_key = false;
+        n = enc_frame(sender, NOX_MSG_TEXT, 0,
+                      (const uint8_t *)"keyless", 7, ct);
+        if (n == 0) return -1;
+        frame_put(victim, NOX_MSG_TEXT, 0, ct, n);
+        break;
+
+    case CHAIN_ATK_FORGED:
+        randombytes_buf(ct, 32);
+        frame_put(victim, NOX_MSG_TEXT, 0, ct, 32);
+        break;
+
+    case CHAIN_ATK_COUNT:
+    default:
+        return -1;
+    }
+
+    process_peer_frames(victim, &st, victim->fd);
+    return 0;
+}
+
+/* Saldırıyı iki yönde de koştur: victim 0 iken A→B, victim 1 iken
+ * B→A hedeflenir. Diğer peer'a önce temiz bir frame gönderilir;
+ * saldırı sonrası onun rx_seq/fd/session'ı aynen durmalı. */
+static int run_chain_attack_case(chain_attack_t kind, int victim_idx,
+                                 int *victim_clean, int *bystander_clean,
+                                 uint32_t *bystander_rx_before)
+{
+    *victim_clean = 0;
+    *bystander_clean = 0;
+    *bystander_rx_before = 0;
+
+    if (setup_dual_active() != 0) {
+        dual_teardown();
+        return -1;
+    }
+
+    struct peer_session *victim = &st.peers[victim_idx];
+    struct peer_session *other = &st.peers[1 - victim_idx];
+    struct noise_session *victim_sender = (victim_idx == 0) ? g_sess_i : g_sess_b;
+    struct noise_session *other_sender = (victim_idx == 0) ? g_sess_b : g_sess_i;
+
+    if (deliver_text(other_sender, other, 0, "isolation-canary") != 0) {
+        dual_teardown();
+        return -1;
+    }
+    uint32_t other_rx = other->rx_seq;
+    int other_ok = (other->state == ST_ACTIVE) && (other_rx == 1) &&
+                   (other->recv_pos == 0);
+
+    if (inject_chain_attack(victim_sender, victim, kind) != 0) {
+        dual_teardown();
+        return -1;
+    }
+
+    *victim_clean = (victim->state == ST_IDLE) &&
+                    (victim->session == NULL) &&
+                    (victim->fd == -1) &&
+                    (victim->rx_seq == 0) &&
+                    (victim->tx_seq == 0) &&
+                    (victim->recv_pos == 0) &&
+                    (victim->pending_msg == NULL) &&
+                    buf_is_zero(victim->recv_buf, sizeof(victim->recv_buf));
+
+    *bystander_clean = other_ok &&
+                       (other->state == ST_ACTIVE) &&
+                       (other->session != NULL) &&
+                       (other->fd >= 0) &&
+                       (other->rx_seq == other_rx) &&
+                       (other->recv_pos == 0);
+    *bystander_rx_before = other_rx;
+
+    dual_teardown();
+    return 0;
+}
+
+/* ================================================================
+ * FILE HAPPY-PATH (Step 5 normal akış) YARDIMCILARI
+ *
+ * Gerçek metadata biçimi: "METADATA\0"(9) + ad(256) + boyut(8) +
+ * BLAKE2b(32) = 305 byte. Hash, sender'ın yaptığı gibi 8-byte
+ * big-endian boyut + dosya içeriği üzerinden hesaplanır.
+ * ================================================================ */
+
+static void put_be64(uint8_t out[8], uint64_t v)
+{
+    out[0] = (uint8_t)(v >> 56);
+    out[1] = (uint8_t)(v >> 48);
+    out[2] = (uint8_t)(v >> 40);
+    out[3] = (uint8_t)(v >> 32);
+    out[4] = (uint8_t)(v >> 24);
+    out[5] = (uint8_t)(v >> 16);
+    out[6] = (uint8_t)(v >> 8);
+    out[7] = (uint8_t)(v);
+}
+
+static int build_chain_metadata(uint8_t meta[305], const char *name,
+                               const uint8_t *data, size_t len)
+{
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len >= 256)
+        return -1;
+
+    memset(meta, 0, 305);
+    memcpy(meta, "METADATA", 9);
+    memcpy(meta + 9, name, name_len);
+
+    uint8_t size_buf[8];
+    put_be64(size_buf, (uint64_t)len);
+    memcpy(meta + 265, size_buf, sizeof(size_buf));
+
+    crypto_generichash_state hash;
+    if (crypto_generichash_init(&hash, NULL, 0, 32) != 0)
+        return -1;
+    if (crypto_generichash_update(&hash, size_buf, sizeof(size_buf)) != 0 ||
+        crypto_generichash_update(&hash, data, len) != 0 ||
+        crypto_generichash_final(&hash, meta + 273, 32) != 0)
+        return -1;
+    return 0;
+}
+
+static int deliver_chain_file(struct noise_session *sender,
+                              struct peer_session *rx, const char *name,
+                              const uint8_t *data, size_t len)
+{
+    uint8_t meta[305];
+    uint8_t ct[4096 + NOX_MAC_LEN];
+    uint32_t seq = rx->rx_seq;
+
+    if (build_chain_metadata(meta, name, data, len) != 0)
+        return -1;
+
+    uint32_t n = enc_frame(sender, NOX_MSG_FILE, seq, meta, sizeof(meta), ct);
+    if (n != sizeof(meta) + NOX_MAC_LEN)
+        return -1;
+    frame_put(rx, NOX_MSG_FILE, seq, ct, n);
+    seq++;
+    process_peer_frames(rx, &st, rx->fd);
+
+    if (rx->state != ST_FILE_RX || !rx->rx_file.active ||
+        rx->rx_seq != seq)
+        return -1;
+
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 1024)
+            chunk = 1024;
+        n = enc_frame(sender, NOX_MSG_FILE, seq, data + off, chunk, ct);
+        if (n != (uint32_t)(chunk + NOX_MAC_LEN))
+            return -1;
+        frame_put(rx, NOX_MSG_FILE, seq, ct, n);
+        seq++;
+        process_peer_frames(rx, &st, rx->fd);
+        off += chunk;
+    }
+
+    if (rx->state != ST_ACTIVE || rx->rx_file.active || rx->rx_seq != seq)
+        return -1;
+    return 0;
+}
+
+#define CHAIN_DIR "tests/.tmp_attack_chain"
+
+static int chain_open_downloads(void)
+{
+    mkdir(CHAIN_DIR, 0700);
+    (void)chmod(CHAIN_DIR, 0700);
+
+    st.downloads_dir_fd = open(CHAIN_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (st.downloads_dir_fd < 0)
+        return -1;
+
+    unlinkat(st.downloads_dir_fd, "received_chain_a.bin", 0);
+    unlinkat(st.downloads_dir_fd, "received_chain_b.bin", 0);
+    return 0;
+}
+
+static void chain_close_downloads(void)
+{
+    if (st.downloads_dir_fd >= 0) {
+        unlinkat(st.downloads_dir_fd, "received_chain_a.bin", 0);
+        unlinkat(st.downloads_dir_fd, "received_chain_b.bin", 0);
+        close(st.downloads_dir_fd);
+        st.downloads_dir_fd = -1;
+    }
+    rmdir(CHAIN_DIR);
+}
+
+static int chain_file_matches(const char *name, const uint8_t *data, size_t len)
+{
+    char local_name[300];
+    int n = snprintf(local_name, sizeof(local_name), "received_%s", name);
+    if (n < 0 || (size_t)n >= sizeof(local_name))
+        return 0;
+
+    int fd = openat(st.downloads_dir_fd, local_name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size < 0 ||
+        (uint64_t)sb.st_size != (uint64_t)len) {
+        close(fd);
+        return 0;
+    }
+
+    uint8_t buf[4096];
+    size_t off = 0;
+    int ok = 1;
+    while (off < len) {
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r <= 0) {
+            ok = 0;
+            break;
+        }
+        size_t take = (size_t)r;
+        if (take > len - off)
+            take = len - off;
+        if (memcmp(buf, data + off, take) != 0) {
+            ok = 0;
+            break;
+        }
+        off += take;
+        if ((size_t)r > take) {
+            ok = 0;   /* dosyada beklenenden fazla byte var */
+            break;
+        }
+    }
+    close(fd);
+    return ok;
 }
 
 /* ================================================================
@@ -988,12 +1417,12 @@ static int test_text_into_active_transfer_corrupts(void)
     return 0;
 }
 
-/* 19) TEXT→CTRL flip (handshake bitmiş, hs=NULL): mesaj SESSİZCE yenir.
- *     CTRL dalı ps->hs ister; hs=NULL olunca hiçbir branch'e girmez →
- *     payload free, rx_seq İLERLEMEZ, oturum yaşar. Peer'in sonraki
- *     frame'i seq k+1 taşıyacağından kopma gecikmeli ve yanıltıcı
- *     ("replay") olur. Hedef: post-handshake beklenmeyen CTRL =
- *     protokol ihlali → fail-fast kopma (hs dönemi: test 13 dokunulmaz). */
+/* 19) TEXT→CTRL flip (handshake bitmiş, hs=NULL): fail-fast kopma.
+ *     K-14: post-handshake CTRL tanımlı bir protokol mesajı değildir;
+ *     sessizce yutulursa rx_seq ilerlemez ve sonraki frame gecikmeli
+ *     "replay" gibi kopar. Artık protokol ihlali → EV_CRYPTO_FAIL.
+ *     Handshake nesnesi hâlâ dururken (msg_index >= 3) Y-2 davranışı
+ *     korunur; test 13 bunu kilitler. */
 static int test_ctrl_type_flip_eats_message(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1413,6 +1842,159 @@ static int test_msg3_not_written_on_onion_mismatch(void)
     return 0;
 }
 
+/* 30) UZUN SALDIRGAN ZİNCİRİ — H1 → H2/H3 → çift yönlü temiz akış.
+ *
+ * Tek senaryo, gerçek Noise XX + gerçek AEAD + gerçek frame dağıtımı:
+ *   1. H1: geçerli claim imzası doğrulanır; bozuk imza ve onion
+ *      mismatch msg3 yazılmadan reddedilir; geçerli claim kabul edilir.
+ *   2. H2/H3: type/seq/len/MAC/empty/keyless/forged saldırıları hem
+ *      A→B hem B→A yönünde; victim fail-closed kapanır, karşı peer'ın
+ *      fd/session/rx_seq'i bozulmaz.
+ *   3. Temiz akış: iki yönde TEXT, sonra iki yönde FILE (metadata +
+ *      parçalar + BLAKE2b doğrulaması) başarıyla tamamlanır.
+ *
+ * Step 5'in bilinçli kırmızı sözleşmeleri (metadata EAGAIN, fatal TX,
+ * TX sırasında RX) test_file_transfer.c'de ayrı tutulur; burada Step 5
+ * happy-path'i tek zincirin parçasıdır.
+ */
+static int test_attacker_chain_bidirectional(void)
+{
+    /* ---------- 1. H1: kimlik / claim / msg3 sızıntısı ---------- */
+    static struct app_state b_state;
+    memset(&b_state, 0, sizeof(b_state));
+
+    uint8_t b_seed[32];
+    for (size_t i = 0; i < sizeof(b_seed); i++)
+        b_seed[i] = (uint8_t)(0x10 + i);
+
+    uint8_t b_onion_pub[NOX_KEY_LEN];
+    uint8_t b_exp[64];
+    TEST_ASSERT(derive_tor_expanded_key(b_exp, b_onion_pub, b_seed) == NOX_OK);
+    build_v3_addr(b_onion_pub, b_state.onion_addr);
+    TEST_ASSERT(strlen(b_state.onion_addr) == NOX_ONION_LEN);
+
+    uint8_t r_pub[NOX_KEY_LEN], r_priv[NOX_KEY_LEN];
+    crypto_box_keypair(r_pub, r_priv);
+    b_state.my_onion_seed = b_seed;
+    b_state.my_static_pub = r_pub;
+
+    uint8_t claim[NOX_HS_PAYLOAD_V1_LEN];
+    TEST_ASSERT(hs_build_claim_payload(claim, &b_state) == NOX_OK);
+    TEST_ASSERT(crypto_onion_verify(claim + 1 + NOX_ONION_LEN,
+                                    b_state.onion_addr, r_pub) == NOX_OK);
+
+    /* Saldırgan imzayı bozar; adres ve dial hedefi doğru olsa bile
+     * initiator msg3'ünü yazmamalı. */
+    uint8_t bad_claim[NOX_HS_PAYLOAD_V1_LEN];
+    memcpy(bad_claim, claim, sizeof(bad_claim));
+    bad_claim[1 + NOX_ONION_LEN] ^= 0x01;
+
+    int msg3_bytes = -1;
+    int state_idle = 0;
+    TEST_ASSERT(run_hs_reject_case(bad_claim, sizeof(bad_claim),
+                                   b_state.onion_addr, r_pub, r_priv,
+                                   &msg3_bytes, &state_idle) == 0);
+    TEST_ASSERT(msg3_bytes == 0);
+    TEST_ASSERT(state_idle);
+
+    /* İmza geçerli ama dial hedefi başka onion: aktif MITM'e kimlik
+     * sızdırılmadan reddedilmeli. */
+    uint8_t a_onion_pub[NOX_KEY_LEN];
+    memset(a_onion_pub, 0xA5, sizeof(a_onion_pub));
+    char wrong_target[63];
+    build_v3_addr(a_onion_pub, wrong_target);
+    TEST_ASSERT(strcmp(wrong_target, b_state.onion_addr) != 0);
+
+    TEST_ASSERT(run_hs_reject_case(claim, sizeof(claim), wrong_target,
+                                   r_pub, r_priv,
+                                   &msg3_bytes, &state_idle) == 0);
+    TEST_ASSERT(msg3_bytes == 0);
+    TEST_ASSERT(state_idle);
+
+    /* Aynı claim doğru hedefle kabul: msg3 yazılır, TOFU'ya geçilir. */
+    int state_tofu = 0;
+    TEST_ASSERT(run_hs_accept_case(claim, sizeof(claim), b_state.onion_addr,
+                                   r_pub, r_priv,
+                                   &msg3_bytes, &state_tofu) == 0);
+    TEST_ASSERT(msg3_bytes > 0);
+    TEST_ASSERT(state_tofu);
+
+    sodium_memzero(b_seed, sizeof(b_seed));
+    sodium_memzero(b_exp, sizeof(b_exp));
+    sodium_memzero(r_priv, sizeof(r_priv));
+    sodium_memzero(claim, sizeof(claim));
+    sodium_memzero(bad_claim, sizeof(bad_claim));
+    sodium_memzero(&b_state, sizeof(b_state));
+
+    /* ---------- 2. H2/H3: iki yönlü saldırı matrisi ---------- */
+    for (int kind = 0; kind < (int)CHAIN_ATK_COUNT; kind++) {
+        for (int victim_idx = 0; victim_idx < 2; victim_idx++) {
+            int victim_clean = 0;
+            int bystander_clean = 0;
+            uint32_t bystander_rx = 0;
+
+            TEST_ASSERT(run_chain_attack_case((chain_attack_t)kind,
+                                              victim_idx,
+                                              &victim_clean,
+                                              &bystander_clean,
+                                              &bystander_rx) == 0);
+            if (!victim_clean) {
+                fprintf(stderr,
+                        "  saldırı=%s victim=%d fail-closed değil\n",
+                        chain_attack_name((chain_attack_t)kind), victim_idx);
+            }
+            if (!bystander_clean) {
+                fprintf(stderr,
+                        "  saldırı=%s victim=%d karşı peer bozuldu (rx=%u)\n",
+                        chain_attack_name((chain_attack_t)kind), victim_idx,
+                        bystander_rx);
+            }
+            TEST_ASSERT(victim_clean);
+            TEST_ASSERT(bystander_clean);
+            TEST_ASSERT(bystander_rx == 1);
+        }
+    }
+
+    /* ---------- 3. Çift yönlü temiz TEXT + FILE ---------- */
+    TEST_ASSERT(setup_dual_active() == 0);
+    TEST_ASSERT(chain_open_downloads() == 0);
+
+    struct peer_session *p0 = &st.peers[0];
+    struct peer_session *p1 = &st.peers[1];
+
+    TEST_ASSERT(deliver_text(g_sess_i, p0, 0, "A->B: temiz mesaj") == 0);
+    TEST_ASSERT(deliver_text(g_sess_b, p1, 0, "B->A: temiz mesaj") == 0);
+    TEST_ASSERT(p0->state == ST_ACTIVE && p0->rx_seq == 1);
+    TEST_ASSERT(p1->state == ST_ACTIVE && p1->rx_seq == 1);
+
+    uint8_t file_a[2500];
+    uint8_t file_b[1800];
+    for (size_t i = 0; i < sizeof(file_a); i++)
+        file_a[i] = (uint8_t)(0x41 + (i % 23));
+    for (size_t i = 0; i < sizeof(file_b); i++)
+        file_b[i] = (uint8_t)(0x80 + (i % 19));
+
+    TEST_ASSERT(deliver_chain_file(g_sess_i, p0, "chain_a.bin",
+                                   file_a, sizeof(file_a)) == 0);
+    TEST_ASSERT(p0->state == ST_ACTIVE);
+    TEST_ASSERT(p0->rx_seq == 5);   /* text + metadata + 3 chunk */
+    TEST_ASSERT(chain_file_matches("chain_a.bin", file_a, sizeof(file_a)));
+    TEST_ASSERT(p1->rx_seq == 1);
+    TEST_ASSERT(p1->state == ST_ACTIVE);
+
+    TEST_ASSERT(deliver_chain_file(g_sess_b, p1, "chain_b.bin",
+                                   file_b, sizeof(file_b)) == 0);
+    TEST_ASSERT(p1->state == ST_ACTIVE);
+    TEST_ASSERT(p1->rx_seq == 4);   /* text + metadata + 2 chunk */
+    TEST_ASSERT(chain_file_matches("chain_b.bin", file_b, sizeof(file_b)));
+    TEST_ASSERT(p0->rx_seq == 5);
+    TEST_ASSERT(p0->state == ST_ACTIVE);
+
+    chain_close_downloads();
+    dual_teardown();
+    return 0;
+}
+
 int main(void)
 {
     if (sodium_init() < 0) {
@@ -1451,6 +2033,7 @@ int main(void)
     RUN_TEST(test_handshake_payload_lengths_rejected);
     RUN_TEST(test_handshake_version_rejected);
     RUN_TEST(test_msg3_not_written_on_onion_mismatch);
+    RUN_TEST(test_attacker_chain_bidirectional);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n",
             tests_passed, tests_run);

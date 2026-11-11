@@ -328,6 +328,28 @@ static int test_system_content(void)
     return 0;
 }
 
+/* ── C5b: system — ANSI strip block_message yolunda ──────────────
+ * T-02: FE_SYSTEM de FE_MSG_IN gibi sanitize edilmeli. OSC yükü
+ * seçildi: tema renkleriyle çakışmaz, doğrudan "pwned" sızıntısını
+ * ararız. */
+static int test_system_strips_ansi(void)
+{
+    static struct app_state st;
+    char buf[512];
+
+    int saved, rfd;
+    TEST_ASSERT(capture_begin(&saved, &rfd) == 0);
+
+    ui_print_system(&st, "once\033]0;pwned\007sonra");
+
+    int n = capture_end(saved, rfd, buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+
+    TEST_ASSERT(strstr(buf, "pwned") == NULL);       /* OSC gitti */
+    TEST_ASSERT(strstr(buf, "oncesonra") != NULL);   /* içerik kaldı */
+    return 0;
+}
+
 /* ── C6: error — [!] label + içerik ────────────────────────────── */
 static int test_error_content(void)
 {
@@ -344,6 +366,29 @@ static int test_error_content(void)
 
     TEST_ASSERT(strstr(buf, "[!]") != NULL);
     TEST_ASSERT(strstr(buf, "hata oldu") != NULL);
+    return 0;
+}
+
+/* ── C6b: error — ANSI strip + linenoise dalı ────────────────────
+ * T-02: aynı sanitize politikası iki print dalında da geçerli;
+ * ln_active=true ile erken-return dalını da kilitler. */
+static int test_error_strips_ansi(void)
+{
+    static struct app_state st;
+    char buf[512];
+
+    st.ln_active = true;
+
+    int saved, rfd;
+    TEST_ASSERT(capture_begin(&saved, &rfd) == 0);
+
+    ui_print_error(&st, "hata\033[31mkirmizi\033[0m");
+
+    int n = capture_end(saved, rfd, buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+
+    TEST_ASSERT(strstr(buf, "\033[31m") == NULL);     /* CSI gitti */
+    TEST_ASSERT(strstr(buf, "hatakirmizi") != NULL);  /* içerik kaldı */
     return 0;
 }
 
@@ -477,7 +522,9 @@ int main(void)
     RUN_TEST(test_outgoing_content);
     RUN_TEST(test_incoming_strips_ansi);
     RUN_TEST(test_system_content);
+    RUN_TEST(test_system_strips_ansi);
     RUN_TEST(test_error_content);
+    RUN_TEST(test_error_strips_ansi);
     RUN_TEST(test_system_truncation);
     RUN_TEST(test_progress_zero_total);
     RUN_TEST(test_progress_renders);

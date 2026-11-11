@@ -10,6 +10,8 @@
  *   6. Remote static key doğrulama
  *   7. AD bağlama — yanlış/eksik AD → -1, nonce invariant
  *   8. AD zorunlu — NULL/boş AD → -1
+ *   9. Nonce tükenmesi — MAX reddi, MAX-1 son başarılı, wrap yok
+ *  10. Keyless fail — sıfır olmayan nonce tüketilmez
  */
 
 #include "common.h"
@@ -39,6 +41,66 @@ static void gen_static_keypair(uint8_t priv[NOX_KEY_LEN],
 {
     /* Curve25519 keypair — NaCl box API'si ile */
     crypto_box_curve25519xsalsa20poly1305_keypair(pub, priv);
+}
+
+/* Yeni transport testleri için XX dansını tek yerde tut. */
+static int make_transport_pair(struct noise_session *sa,
+                               struct noise_session *sb)
+{
+    uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
+    uint8_t b_priv[NOX_KEY_LEN], b_pub[NOX_KEY_LEN];
+    gen_static_keypair(a_priv, a_pub);
+    gen_static_keypair(b_priv, b_pub);
+
+    struct noise_handshake ha = {0}, hb = {0};
+    uint8_t buf[NOISE_MAX_HANDSHAKE_LEN];
+    uint8_t pl[64];
+    size_t len, pl_len;
+    int rc = -1;
+
+    if (handshake_init(&ha, true, a_priv, a_pub) != NOX_OK ||
+        handshake_init(&hb, false, b_priv, b_pub) != NOX_OK)
+        goto out;
+
+    len = sizeof(buf);
+    if (handshake_write(&ha, NULL, 0, buf, &len) != NOX_OK)
+        goto out;
+    pl_len = sizeof(pl);
+    if (handshake_read(&hb, buf, len, pl, sizeof(pl), &pl_len) != NOX_OK)
+        goto out;
+
+    len = sizeof(buf);
+    if (handshake_write(&hb, NULL, 0, buf, &len) != NOX_OK)
+        goto out;
+    pl_len = sizeof(pl);
+    if (handshake_read(&ha, buf, len, pl, sizeof(pl), &pl_len) != NOX_OK)
+        goto out;
+
+    len = sizeof(buf);
+    if (handshake_write(&ha, NULL, 0, buf, &len) != NOX_OK)
+        goto out;
+    pl_len = sizeof(pl);
+    if (handshake_read(&hb, buf, len, pl, sizeof(pl), &pl_len) != NOX_OK)
+        goto out;
+
+    if (!handshake_is_complete(&ha) || !handshake_is_complete(&hb))
+        goto out;
+    if (handshake_split(&ha, sa) != NOX_OK ||
+        handshake_split(&hb, sb) != NOX_OK)
+        goto out;
+
+    rc = 0;
+
+out:
+    sodium_memzero(&ha, sizeof(ha));
+    sodium_memzero(&hb, sizeof(hb));
+    sodium_memzero(a_priv, sizeof(a_priv));
+    sodium_memzero(b_priv, sizeof(b_priv));
+    if (rc != 0) {
+        sodium_memzero(sa, sizeof(*sa));
+        sodium_memzero(sb, sizeof(*sb));
+    }
+    return rc;
 }
 
 /* ================================================================
@@ -284,6 +346,84 @@ static int test_nonce_no_increment_on_fail(void)
     ssize_t r4 = noise_decrypt(&sb, AD, sizeof(AD), ct2, (size_t)ct2_len, pt);
     TEST_ASSERT(r4 == -1);
     TEST_ASSERT(atomic_load(&sb.rx.n) == n_after);
+
+    return 0;
+}
+
+/* ================================================================
+ * TEST: TX nonce tükenmesi — UINT64_MAX kullanılmaz, wrap yok
+ *
+ * MAX-1'de başarılı şifreleme sayacı MAX'a taşır; sonraki deneme
+ * fail-closed olmalı, sayacı geri sarmamalı ve çıktıya dokunmamalı.
+ * ================================================================ */
+static int test_nonce_exhaustion_encrypt(void)
+{
+    struct noise_session sa, sb;
+    TEST_ASSERT(make_transport_pair(&sa, &sb) == 0);
+
+    const uint8_t pt[] = {0xA5, 0x5A};
+    uint8_t ct[sizeof(pt) + NOX_MAC_LEN];
+    uint8_t untouched[sizeof(ct)];
+
+    /* MAX: rezervasyon reddedilmeli, nonce tüketilmemeli. */
+    atomic_store(&sa.tx.n, UINT64_MAX);
+    memset(ct, 0xA5, sizeof(ct));
+    memcpy(untouched, ct, sizeof(ct));
+    TEST_ASSERT(noise_encrypt(&sa, AD, sizeof(AD), pt, sizeof(pt), ct) == -1);
+    TEST_ASSERT(atomic_load(&sa.tx.n) == UINT64_MAX);
+    TEST_ASSERT(sodium_memcmp(ct, untouched, sizeof(ct)) == 0);
+
+    /* MAX-1: son geçerli nonce; başarı sayacı MAX'a taşımalı. */
+    atomic_store(&sa.tx.n, UINT64_MAX - 1);
+    ssize_t ct_len = noise_encrypt(&sa, AD, sizeof(AD), pt, sizeof(pt), ct);
+    TEST_ASSERT(ct_len == (ssize_t)(sizeof(pt) + NOX_MAC_LEN));
+    TEST_ASSERT(atomic_load(&sa.tx.n) == UINT64_MAX);
+
+    /* MAX: aynı çağrı tekrar fail-closed; çıktı korunmalı. */
+    memset(ct, 0x5A, sizeof(ct));
+    memcpy(untouched, ct, sizeof(ct));
+    TEST_ASSERT(noise_encrypt(&sa, AD, sizeof(AD), pt, sizeof(pt), ct) == -1);
+    TEST_ASSERT(atomic_load(&sa.tx.n) == UINT64_MAX);
+    TEST_ASSERT(sodium_memcmp(ct, untouched, sizeof(ct)) == 0);
+
+    return 0;
+}
+
+/* ================================================================
+ * TEST: RX nonce tükenmesi — MAX-1 son başarılı decrypt
+ *
+ * MAX-1'de çözülen paket sayacı MAX'a taşır; aynı paket tekrar
+ * geldiğinde nonce tükenmiş olduğu için AEAD'e girmeden reddedilir
+ * ve sayaç değişmez.
+ * ================================================================ */
+static int test_nonce_exhaustion_decrypt(void)
+{
+    struct noise_session sa, sb;
+    TEST_ASSERT(make_transport_pair(&sa, &sb) == 0);
+
+    const uint8_t msg[] = "son-nonce";
+    uint8_t ct[sizeof(msg) + NOX_MAC_LEN];
+    uint8_t pt[sizeof(msg)];
+
+    atomic_store(&sa.tx.n, UINT64_MAX - 1);
+    ssize_t ct_len = noise_encrypt(&sa, AD, sizeof(AD),
+                                   msg, sizeof(msg), ct);
+    TEST_ASSERT(ct_len == (ssize_t)(sizeof(msg) + NOX_MAC_LEN));
+
+    atomic_store(&sb.rx.n, UINT64_MAX - 1);
+    ssize_t pt_len = noise_decrypt(&sb, AD, sizeof(AD), ct, (size_t)ct_len, pt);
+    TEST_ASSERT(pt_len == (ssize_t)sizeof(msg));
+    TEST_ASSERT(sodium_memcmp(pt, msg, sizeof(msg)) == 0);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == UINT64_MAX);
+
+    /* MAX'ta nonce yok: aynı ct reddedilmeli, çıktı ve sayaç korunmalı. */
+    uint8_t untouched[sizeof(pt)];
+    memset(pt, 0xA5, sizeof(pt));
+    memcpy(untouched, pt, sizeof(pt));
+    TEST_ASSERT(noise_decrypt(&sb, AD, sizeof(AD), ct, (size_t)ct_len,
+                              pt) == -1);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == UINT64_MAX);
+    TEST_ASSERT(sodium_memcmp(pt, untouched, sizeof(pt)) == 0);
 
     return 0;
 }
@@ -865,9 +1005,11 @@ static int test_transport_rejects_keyless_encrypt(void)
     memset(expected, 0xA5, sizeof(expected));
 
     TEST_ASSERT(!s.tx.has_key);
+    /* Sıfır olmayan nonce da fail sırasında yerinde kalmalı. */
+    atomic_store(&s.tx.n, 7);
     TEST_ASSERT(noise_encrypt(&s, AD, sizeof(AD), pt, sizeof(pt), out) == -1);
     TEST_ASSERT(sodium_memcmp(out, expected, sizeof(out)) == 0);
-    TEST_ASSERT(atomic_load(&s.tx.n) == 0);
+    TEST_ASSERT(atomic_load(&s.tx.n) == 7);
 
     return 0;
 }
@@ -884,9 +1026,11 @@ static int test_transport_rejects_keyless_decrypt(void)
     memset(expected, 0xA5, sizeof(expected));
 
     TEST_ASSERT(!s.rx.has_key);
+    /* Sıfır olmayan nonce da fail sırasında yerinde kalmalı. */
+    atomic_store(&s.rx.n, 9);
     TEST_ASSERT(noise_decrypt(&s, AD, sizeof(AD), ct, sizeof(ct), out) == -1);
     TEST_ASSERT(sodium_memcmp(out, expected, sizeof(out)) == 0);
-    TEST_ASSERT(atomic_load(&s.rx.n) == 0);
+    TEST_ASSERT(atomic_load(&s.rx.n) == 9);
 
     return 0;
 }
@@ -912,6 +1056,8 @@ int main(void)
     RUN_TEST(test_transport_rejects_keyless_encrypt);
     RUN_TEST(test_transport_rejects_keyless_decrypt);
     RUN_TEST(test_nonce_no_increment_on_fail);
+    RUN_TEST(test_nonce_exhaustion_encrypt);
+    RUN_TEST(test_nonce_exhaustion_decrypt);
     RUN_TEST(test_double_split);
     RUN_TEST(test_remote_static_key);
     RUN_TEST(test_wrong_order);

@@ -265,6 +265,7 @@ const char *nox_strerror(nox_err_t err)
     case NOX_ERR_PEER:     return "peer kimliği doğrulanamadı";
     case NOX_ERR_ONION:    return "onion kimlik doğrulama hatası";
     case NOX_ERR_QUOTA:    return "dosya boyutu/kota sınırı aşıldı";
+    case NOX_ERR_AGAIN:    return "kaynak meşgul — tekrar deneyin";
     default:                          return "bilinmeyen hata kodu";
     }
 }

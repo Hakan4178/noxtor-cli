@@ -195,8 +195,14 @@ static const struct {
   { .num = SCMP_SYS(fchownat),          .name = "fchownat",          .stage = 3 },
 
   /* Stage 3 — event loop bunları kullanmıyor: exfil/privilege
-   * syscall'ları. Stage 3 ana process'e özel — Tor çocuğu etkilenmez. */
-  { .num = SCMP_SYS(sendto),            .name = "sendto",            .stage = 3 },
+   * syscall'ları. Stage 3 ana process'e özel — Tor çocuğu etkilenmez.
+   *
+   * BİLİNÇLİ İSTİSNA — sendto:
+   * glibc send() sarmalayıcısı sendto(fd, buf, len, flags, NULL, 0)
+   * kullanır. Stage 3'te sendto'yu KILL etmek frame_queue_flush()'ı ilk
+   * TX'te öldürür; bu yüzden şimdilik serbest bırakıldı.
+   * TODO(IPC-SENDTO): IPC (AF_UNIX SOCK_DGRAM / keyfi hedefli sendto)
+   * gelince tekrar değerlendirilecek. */
   { .num = SCMP_SYS(mknod),             .name = "mknod",             .stage = 3 },
   { .num = SCMP_SYS(mknodat),           .name = "mknodat",           .stage = 3 },
   { .num = SCMP_SYS(modify_ldt),        .name = "modify_ldt",        .stage = 3 },

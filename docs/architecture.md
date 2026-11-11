@@ -1,6 +1,9 @@
 # noxtor-cli Mimari Dokümanı
 
 > Kapsamlı sistem mimarisi: RX/TX yolları, durum makinesi, kripto katmanı, güvenlik savunma katmanları, test kapsamı.
+>
+> **Son güncelleme:** 28 Ekim 2026 · branch `feat/h2-ad-binding` (`b004ae9` + çalışma ağacı).
+> **Not:** Satır referansları yaklaşıktır; güncel konum için sembol adlarını kullanın.
 
 ---
 
@@ -36,7 +39,8 @@ noxtor-cli, Tor üzerinden anonim mesajlaşma uygulaması. Çoklu peer bağlant�
 │  PIN → Argon2id → master_key → subkeys → ChaChaPoly-1305  │
 ├─────────────────────────────────────────────────────────────┤
 │                  Security Layers                            │
-│  Seccomp (3-stage) │ Landlock LSM │ Arena (mmap+guards)    │
+│  Seccomp (3-stage) │ Landlock LSM │ Arena │ CET-SS          │
+│  SO_PEERCRED (Tor control + SOCKS)                         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,40 +48,44 @@ noxtor-cli, Tor üzerinden anonim mesajlaşma uygulaması. Çoklu peer bağlant�
 
 ## 2. Sistem Bileşenleri
 
-### 2.1 Kaynak Dosyaları (16 adet)
+### 2.1 Kaynak Dosyaları (20 adet)
 
 | Dosya | Satır | Görev |
 |-------|-------|-------|
-| `src/arena.c` | 669 | mmap tabanlı güvenli bellek havuzu |
-| `src/crypto.c` | 787 | Argon2id, Ed25519, Curve25519 dönüşümü, onion seed türetme |
-| `src/database.c` | 1043 | SQLite: kontakt, mesaj kuyruğu, geçmiş |
-| `src/event_loop.c` | 874 | Ana epoll event loop, frame işleme |
-| `src/file_transfer.c` | 748 | Dosya gönderme/alma (BLAKE2b) |
-| `src/landlock_sandbox.c` | 245 | Landlock LSM dosya erişim kontrolü |
-| `src/linenoise.c` | 2347 | linenoise secure fork — satır düzenleme (sodium allocator hook'ları) |
-| `src/log.c` | 338 | Modül bazlı loglama (TUI entegre) |
-| `src/main.c` | 1408 | Başlatma, PIN, key derivation, args |
-| `src/network.c` | 1750 | Tor spawn, SOCKS5, epoll, frame encode/decode, ADD_ONION |
-| `src/noise.c` | 962 | Noise XX protocol implementasyonu |
-| `src/seccomp.c` | 595 | 3 aşamalı seccomp-bpf loading |
-| `src/state_machine.c` | 456 | Peer durum makinesi (8 durum, 17 olay, 40 geçiş) |
-| `src/stdin_handler.c` | 1090 | Komut işleme, mesaj segmentasyonu |
-| `src/tui.c` | 797 | termbox2 tabanlı TUI (3 panel) |
-| `src/frontend.c` | 262 | Ortak frontend katmanı — `ui_print_*` sarmalayıcılar, dispatch (`frontend_emit`), `ui_strip_ansi`, `fe_now_tm` (eski adıyla ui.c) |
-| `src/fe_ansi.c` | 622 | Atomic ANSI backend — tema (`ansi_ctx`), çizim, `fe_ansi_ops` |
-| `src/fe_tui.c` | 84 | TUI backend — `fe_tui_ops` (termbox2 çizim yolları) |
+| `src/arena.c` | 744 | mmap tabanlı güvenli bellek havuzu; T-05 çift-init guard'ı |
+| `src/cet_shstk.c` | 203 | CET-SS shadow stack kilidi + fork-CP self-test (init 4b) |
+| `src/crypto.c` | 968 | Argon2id, Ed25519, Curve25519 dönüşümü, onion seed/claim |
+| `src/database.c` | 1120 | SQLite: kontakt, mesaj kuyruğu, geçmiş |
+| `src/event_loop.c` | 1184 | Ana epoll event loop, frame işleme, H2/H3 |
+| `src/file_transfer.c` | 949 | Dosya gönderme/alma (BLAKE2b) |
+| `src/frame_queue.c` | 143 | C1 sıralı TX frame kuyruğu (nonce/write sırası) |
+| `src/landlock_sandbox.c` | 250 | Landlock LSM dosya erişim kontrolü |
+| `src/linenoise.c` | 2370 | linenoise secure fork — satır düzenleme (sodium allocator hook'ları) |
+| `src/log.c` | 342 | Modül bazlı loglama (TUI entegre) |
+| `src/main.c` | 1587 | Başlatma, PIN, key derivation, args |
+| `src/network.c` | 2037 | Tor spawn, SOCKS5, epoll, frame encode/decode, ADD_ONION |
+| `src/noise.c` | 1232 | Noise XX protocol implementasyonu |
+| `src/seccomp.c` | 649 | 3 aşamalı seccomp-bpf loading |
+| `src/state_machine.c` | 527 | Peer durum makinesi (8 durum, 18 olay, 48 geçiş) |
+| `src/stdin_handler.c` | 1070 | Komut işleme, mesaj segmentasyonu |
+| `src/tui.c` | 799 | termbox2 tabanlı TUI (3 panel) |
+| `src/frontend.c` | 208 | Ortak frontend katmanı — `ui_print_*` sarmalayıcılar, dispatch (`frontend_emit`), `ui_strip_ansi`, `fe_now_tm` (eski adıyla ui.c) |
+| `src/fe_ansi.c` | 535 | Atomic ANSI backend — tema (`ansi_ctx`), çizim, `fe_ansi_ops` |
+| `src/fe_tui.c` | 69 | TUI backend — `fe_tui_ops` (termbox2 çizim yolları) |
 
-### 2.2 Header Dosyaları
+### 2.2 Header Dosyaları (22 adet)
 
 | Dosya | Görev |
 |-------|-------|
 | `include/arena.h` | Arena public API |
 | `include/asm_utils.h` | strub/asembly yardımcıları (ZeroCallUsedRegs) |
+| `include/cet_shstk.h` | CET-SS kilidi + self-test API |
 | `include/common.h` | Sabitler, hata kodları, log makroları |
 | `include/crypto.h` | Kripto API (KDF, identity, salt) |
 | `include/database.h` | SQLite DB API |
 | `include/event_loop.h` | Event loop API |
 | `include/file_transfer.h` | Dosya transfer API |
+| `include/frame_queue.h` | C1 TX frame kuyruğu API |
 | `include/landlock_sandbox.h` | Landlock API |
 | `include/linenoise.h` | linenoise secure fork API (sodium allocator hook'ları) |
 | `include/network.h` | Network API + frame sabitleri |
@@ -138,6 +146,7 @@ network.c:1724    frame_header_decode()  ← 13-byte header decode
 |-----------|-----------|-------|
 | `event_loop()` | `event_loop.c:429` | Ana döngü, epoll_wait |
 | `process_peer_frames()` | `event_loop.c:55` | Frame parsing + routing (static) |
+| `peer_proto_fatal()` | `event_loop.c` | H3: protokol ihlali → `EV_CRYPTO_FAIL` fail-closed |
 | `frame_header_decode()` | `network.c:1724` | 13-byte header → struct |
 | `recv()` | system call | Ham veri okuma |
 | `noise_decrypt()` | `noise.c:899` | ChaCha20-Poly1305 IETF AEAD decrypt |
@@ -156,21 +165,30 @@ network.c:1724    frame_header_decode()  ← 13-byte header decode
    - partial read: sadece mevcut veri kadar okunur
 3. process_peer_frames() döngüsü:
    a. recv_pos < sizeof(frame_header)? → break (yetersiz veri)
-   b. frame_header_decode() → magic, payload_len kontrolü (len == 0 veya
-      len > 4096 + 16 ise buffer sıfırlanır — A-1 fix)
+   b. frame_header_decode() → magic, tip ve payload_len kontrolü; geçersiz
+      header/boyut → peer_proto_fatal() (H3 fail-closed; sessiz resync yok)
    c. recv_pos < 13 + payload_len? → break (yarım frame)
    d. Session henüz yoksa TEXT/FILE frame'leri tüketme — recv_buf'da
       bekletilir (TOFU_PENDING sırasında drop edilmez)
-   e. payload = recv_buf + 13 (sodium_malloc kopya — swap koruması)
-    f. Frame tipine göre routing:
-       - CTRL (0x04): handshake_read() → msg_index < 3 ise
-         handshake_write() + writev() ile yanıt gönder
-       - TEXT (0x01): noise_decrypt() → pt (sodium_malloc, mlock) → ui_print_incoming() → safe_msg (malloc, no mlock, anlık) — plain koruması §4.4
-       - FILE (0x02): file_transfer_handle_rx() → pt (sodium_malloc) → hash → write
-       - ACK (0x03): alındı onayı
-   g. recv_pos -= (13 + payload_len) → kalan frame'leri işle
-   h. goto a (döngü devam)
+   e. H2: frame'in ham 13-byte header'ı memmove'dan ÖNCE `ad` kopyasına
+      alınır; decrypt bu AD ile yapılır
+   f. payload = recv_buf + 13 (sodium_malloc kopya — swap koruması)
+   g. Frame tipine göre routing:
+      - CTRL (0x04): handshake nesnesi yoksa → peer_proto_fatal
+        ("handshake dışı CTRL frame", K-14); varsa ve msg_index < 3 ise
+        handshake_read() + handshake_write(); msg_index >= 3 ise sessiz drop
+      - TEXT (0x01): noise_decrypt(ad) → pt (sodium_malloc, mlock) → ui_print_incoming() → safe_msg (malloc, no mlock, anlık) — plain koruması §4.4
+      - FILE (0x02): file_transfer_handle_rx() → pt (sodium_malloc) → hash → write
+      - ACK (0x03): alındı onayı
+   h. recv_pos -= (13 + payload_len) → kalan frame'leri işle
+   i. goto a (döngü devam)
 ```
+
+H2/H3 notu: Transport frame header'ı (magic|type|seq|len) AEAD'nin AD'sidir;
+header/AEAD doğrulaması başarısızsa bağlantı fail-closed kapatılır
+(`peer_proto_fatal` → `EV_CRYPTO_FAIL`). Handshake CTRL frame'lerinin header'ı
+transport AEAD dışında kalır; handshake mesajları kendi Noise şifrelemesiyle
+korunur.
 
 ---
 
@@ -223,10 +241,11 @@ stdin_handler.c:383  process_line()         ← komut routing
 | `send_segmented_message()` | `stdin_handler.c:262` | Uzun mesajı chunk'lara böl |
 | `send_segmented_message_to()` | `stdin_handler.c:267` | Belirli peer'a segmentli gönder |
 | `get_next_chunk_size()` | `stdin_handler.c:34` | UTF-8 güvenli chunk noktası bul |
-| `noise_encrypt()` | `noise.c:892` | ChaCha20-Poly1305 IETF AEAD encrypt |
+| `noise_encrypt()` | `noise.c:892` | ChaCha20-Poly1305 IETF AEAD encrypt (H2 AD zorunlu) |
 | `frame_header_encode()` | `network.c:1708` | struct → 13-byte wire format |
+| `frame_ad()` | `network.c` | H2 AD üreticisi: header → 13-byte wire |
 | `write_full()` | `network.c:95` | EINTR retry ile tam yazma |
-| `socks5_connect()` | `network.c:1500` | Tor SOCKS5 bağlantısı |
+| `socks5_connect()` | `network.c:1500` | Tor SOCKS5 bağlantısı + `SO_PEERCRED` doğrulaması |
 | `file_transfer_start()` | `file_transfer.c:104` | Dosya transferini başlat |
 | `file_transfer_handle_tx()` | `file_transfer.c:334` | 4KB chunk gönderimi |
 
@@ -249,15 +268,37 @@ stdin_handler.c:383  process_line()         ← komut routing
 └──────────────────────────────────────────┘
 ```
 
-### 4.3 Atomic Gönderim (writev)
+### 4.3 Gönderim (writev) ve Kısmi Yazma
+
+`writev()` header + ciphertext'i tek çağrıda yazmayı dener; ancak AF_UNIX
+`SOCK_STREAM`'de kısa yazma/EAGAIN olabilir. TEXT C1 kuyruğunda hazır frame
+`send()` ile yazılır; aşağıdaki iovec örneği CTRL/FILE/METADATA gibi writev
+kullanan yollar içindir.
+
+- **TEXT (C1 kuyruğu):** frame şifrelenip `tx_frames` slotuna commit edilir;
+  kısmi/EAGAIN'de kalan baytlar EPOLLOUT ile sürer. Kuyruk doluysa mesaj nonce
+  tüketmeden `pending_msg`'e ertelenir; ikinci mesaj net ret alır. Tek mesaj
+  4 slotu aşarsa (>16 KB) `pending_msg_off` ile parçalı ilerler: yalnız commit
+  edilmiş önek kadar offset ilerler, kalan frame'ler kuyruk boşaldıkça eklenir.
+  Kalıcı write hatası/0 dönüş → oturum fail-closed.
+
+> **C1 sınırı (DB kuyruğu):** `db_process_queue` satırı, frame yalnız RAM
+> kuyruğuna alındıktan sonra siler. Oturum bu arada düşerse mesaj kaybolur;
+> kalıcı in-flight işareti C2/C3'ün konusudur. `db_retry_pending` yalnız aynı
+> oturumdaki kuyruk doluluğu/DB hatası için yeniden deneme sağlar; bayrak tam
+> başarıda temizlenir.
+- **CTRL (handshake):** tek `writev`; kısa yazma → `EV_HANDSHAKE_ERROR` ve
+  bağlantı fail-closed kapatılır.
+- **FILE:** frame `tx_buf`'a alınır; EPOLLOUT ile kalan baytlar tamamlanır.
+- **METADATA:** tek `writev`; kısmi yazma K-28 olarak açıktır.
 
 ```
 struct iovec iov[2];
-iov[0].iov_base = header;    // 13 byte
+iov[0].iov_base = header;      // 13 byte
 iov[0].iov_len  = 13;
-iov[1].iov_base = ciphertext; // payload + MAC
+iov[1].iov_base = ciphertext;  // payload + MAC
 iov[1].iov_len  = payload_len + NOX_MAC_LEN;
-writev(peer_fd, iov, 2);     // kernel atomik garantisi (AF_UNIX)
+writev(peer_fd, iov, 2);       // kısmi yazma olabilir — yukarıdaki kurallar
 ```
 
 ### 4.4 Plain Mesaj Yaşam Döngüsü ve Koruma (şeffaf)
@@ -317,9 +358,10 @@ EV_RATE_LIMIT          // Rate limit aşıldı
 EV_SEQ_MISMATCH        // Beklenmeyen sequence number
 EV_ARENA_FAIL          // Arena allocation başarısız
 EV_TOR_DIED            // Tor process öldü
+EV_CRYPTO_FAIL         // AEAD/protokol hatası — fail-closed kopma
 ```
 
-### 5.3 Geçiş Tablosu (40 geçiş — `transitions[]`, state_machine.c:122)
+### 5.3 Geçiş Tablosu (48 geçiş — `transitions[]`, state_machine.c:122)
 
 Gerçek geçiş tablosu kaynak koddan (`src/state_machine.c:122-188`):
 
@@ -364,6 +406,14 @@ Gerçek geçiş tablosu kaynak koddan (`src/state_machine.c:122-188`):
 { ST_FILE_RX,        EV_TOR_DIED,           ST_IDLE,           action_cleanup      }
 { ST_HANDSHAKE_INIT, EV_RATE_LIMIT,         ST_IDLE,           action_cleanup      }
 { ST_HANDSHAKE_RESP, EV_RATE_LIMIT,         ST_IDLE,           action_cleanup      }
+{ ST_IDLE,           EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
+{ ST_CONNECTING,     EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
+{ ST_HANDSHAKE_INIT, EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
+{ ST_HANDSHAKE_RESP, EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
+{ ST_TOFU_PENDING,   EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
+{ ST_ACTIVE,         EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
+{ ST_FILE_TX,        EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
+{ ST_FILE_RX,        EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      }
 ```
 
 Not: `ST_IDLE + EV_PEER_DISCONNECTED` geçişi tanımlı değildir (ST_IDLE'da zaten bağlantı yok); geçersiz geçişler `NOX_WARN("SM: geçersiz geçiş ...")` ile yok sayılır.
@@ -440,6 +490,9 @@ crypto_kdf_derive_from_key (BLAKE2b)
   └─ onion_seed (32 byte)        ← NOX_SUBKEY_ONION_SEED = 4
 ```
 
+`onion_seed` ayrıca H-1/H-2 handshake claim imzası için Ed25519 seed olarak
+kullanılır; onion adresi ↔ static key bağı bu imzayla kurulur.
+
 Onion adresi artık diskteki `onion.key` dosyasından değil, master_key'den
 deterministik türetiliyor (`crypto_derive_onion_seed`, D3 — disk YOK):
 seed → `derive_tor_expanded_key` → Tor `ADD_ONION ED25519-V3:<b64>` KeyBlob.
@@ -469,20 +522,25 @@ Session established:
   session->tx: CipherState (gönderme)
   session->rx: CipherState (alma)
 
-noise_encrypt(session, plaintext):
+noise_encrypt(session, ad, ad_len, plaintext):
   ChaCha20-Poly1305 IETF AEAD (crypto_aead_chacha20poly1305_ietf)
   nonce: atomic counter (UINT64_MAX taşmasında session yenilenmeli)
          12 byte'a encode_nonce() ile kodlanır
   key: session->tx.k
-  AD: boş
+  AD: frame header'ın ham 13 byte'ı (magic|type|seq|len) — H2, zorunlu
+      NULL/0 → -1 (fail-closed)
   → ciphertext + 16 byte MAC
 
-noise_decrypt(session, ciphertext):
+noise_decrypt(session, ad, ad_len, ciphertext):
   ChaCha20-Poly1305 IETF AEAD decrypt
   nonce: atomic counter
   key: session->rx.k
-  → plaintext veya ERROR
+  AD: şifrelemedeki header kopyasının AYNISI — H2
+  → plaintext veya ERROR (AD/MAC uyuşmazlığı → -1)
 ```
+
+H2: header AEAD kapsamına girer; type/seq/len üzerinde oynama tag'i bozar.
+**Wire breaking:** eski build'lerle uyumsuz, iki taraf aynı anda güncellenmeli.
 
 ### 6.4 Kripto Fonksiyonlar
 
@@ -497,8 +555,17 @@ noise_decrypt(session, ciphertext):
 | `crypto_generate_identity()` | `crypto.c:495` | Ed25519 keypair üret + şifrele |
 | `crypto_load_identity()` | `crypto.c:633` | identity.key çöz ve yükle (secretbox) |
 | `crypto_ed25519_to_curve25519()` | `crypto.c:722` | Ed25519 → Curve25519 dönüştür |
+| `crypto_onion_pubkey()` | `crypto.c` | Onion adresinden Ed25519 pub + checksum doğrula |
+| `crypto_onion_sign()` | `crypto.c` | Onion seed'iyle handshake claim'ini imzala |
+| `crypto_onion_verify()` | `crypto.c` | Peer claim imzasını doğrula (H-1) |
 | `cipher_encrypt()` | `noise.c:79` | ChaCha20-Poly1305 IETF AEAD encrypt |
 | `cipher_decrypt()` | `noise.c:112` | ChaCha20-Poly1305 IETF AEAD decrypt |
+
+ServiceID ↔ static pub bağı (H-1/H-2): `crypto_onion_pubkey()` adresten
+Ed25519 pub'ı çıkarır ve onion checksum'ını doğrular; `crypto_onion_sign()`
+onion seed'iyle claim'i imzalar; `crypto_onion_verify()` peer claim'ini
+doğrular. Böylece self-asserted onion iddiası yerine kriptografik bağ
+kurulur.
 
 ---
 
@@ -518,13 +585,22 @@ Msg1 (Responder → Initiator):
   ee (DH: re_re)
   s (static key, 32 byte, encrypted)
   es (DH: re_si)
-  payload: boş
+  payload: 127 byte claim [ver(1)|onion(62)|sig(64)] — responder
 
 Msg2 (Initiator → Responder):
   se (DH: si_re)
   s (static key, 32 byte, encrypted)
-  payload: boş
+  payload: 127 byte claim [ver(1)|onion(62)|sig(64)] — initiator
 ```
+
+H-1/H-2 claim:
+
+```
+sig = Ed25519_Sign(onion_seed, "noxtor-bind-v1" || onion || my_static_pub)
+```
+
+Doğrulayan taraf pubkey'i onion adresinden çıkarır; böylece onion adresi ↔
+static key bağı kriptografik olarak doğrulanır.
 
 ### 7.2 SymmetricState İşlemleri
 
@@ -552,8 +628,10 @@ Split():  (tx, rx) = HKDF(ck, "")
 | `handshake_read()` | `noise.c:809` | Gelen handshake mesajını oku |
 | `handshake_is_complete()` | `noise.c:851` | Handshake tamamlandı mı? |
 | `handshake_split()` | `noise.c:857` | Session'a dönüştür |
-| `noise_encrypt()` | `noise.c:892` | Transport encrypt |
-| `noise_decrypt()` | `noise.c:899` | Transport decrypt |
+| `hs_build_claim_payload()` | `event_loop.c` | H-1/H-2 claim üret + imzala |
+| `verify_peer_claim()` | `event_loop.c` | Peer claim'ini doğrula (static) |
+| `noise_encrypt()` | `noise.c:892` | Transport encrypt (H2 AD zorunlu) |
+| `noise_decrypt()` | `noise.c:899` | Transport decrypt (H2 AD zorunlu) |
 | `symmetric_init()` | `noise.c:155` | SymmetricState başlat |
 | `symmetric_mix_hash()` | `noise.c:179` | MixHash |
 | `symmetric_mix_key()` | `noise.c:337` | MixKey (HKDF) |
@@ -625,8 +703,13 @@ file_transfer_handle_rx()                [file_transfer.c:510]
 | `O_NOFOLLOW` | Symlink izleme engeli |
 | `openat()` | TOCTOU koruması: fd-based erişim |
 | `verify_downloads_dir_fd()` | Downloads dizini symlink değil, UID eşleşmesi |
+| `NOX_MAX_FILE_SIZE` | Tek dosya 100 GiB kotası; aşım → `NOX_ERR_QUOTA` |
+| `file_transfer_chunk_expired()` | Chunk stall timeout'u (saat enjekte edilebilir) |
 | BLAKE2b hash | Dosya bütünlük doğrulaması |
 | `file_transfer_cleanup()` | Kısmi dosyaları sil |
+
+METADATA tek `writev` ile gönderilir; kısmi/EAGAIN durumunda akış desync'i
+riski K-28 olarak açıktır (chunk yolu `tx_buf` + EPOLLOUT ile korunur).
 
 ### 8.4 Dosya Transferi Fonksiyonlar
 
@@ -635,6 +718,8 @@ file_transfer_handle_rx()                [file_transfer.c:510]
 | `file_transfer_start()` | `file_transfer.c:104` | TX başlat |
 | `file_transfer_handle_tx()` | `file_transfer.c:334` | TX chunk gönder |
 | `file_transfer_handle_rx()` | `file_transfer.c:510` | RX frame işle |
+| `file_transfer_check_quota()` | `file_transfer.c` | Tek dosya boyut kotası |
+| `file_transfer_chunk_expired()` | `file_transfer.c` | Chunk stall timeout predikati |
 | `file_transfer_cleanup()` | `file_transfer.c:718` | Temizlik |
 | `sanitize_filename()` | `file_transfer.c:29` | Dosya adı temizleme |
 | `verify_downloads_dir_fd()` | `file_transfer.c:83` | Downloads dizin doğrulama (fd tabanlı) |
@@ -701,9 +786,13 @@ backend'de: varsayılan `fe_ansi_ops` (statik registration), TUI aktifse
 | `render_progress()` | `fe_ansi.c:523` | İlerleme çubuğu (static; FE_PROGRESS render) |
 | `ui_print_incoming()` | `frontend.c:149` | Filtre + fe_event + dispatch |
 | `ui_print_outgoing()` | `frontend.c:160` | Giden mesaj → dispatch |
-| `ui_print_system()` | `frontend.c:171` | Sistem mesajı → dispatch |
-| `ui_print_error()` | `frontend.c:188` | Hata mesajı → dispatch |
+| `ui_print_system()` | `frontend.c:171` | Sistem mesajı → dispatch (T-02 strip) |
+| `ui_print_error()` | `frontend.c:188` | Hata mesajı → dispatch (T-02 strip) |
 | `ui_print_progress()` | `frontend.c:207` | Dosya transfer ilerleme → dispatch |
+
+T-02: FE_SYSTEM/FE_ERROR yolları da `atomic_message` ile aynı `ui_strip_ansi`
+temizliğinden geçer; ESC/C0 (TAB/LF/CR hariç) terminal injection'ını engeller.
+CR/LF ve bidi ayrı açık kalemdir (K-33). `test_frontend` 19/19.
 
 ---
 
@@ -717,6 +806,7 @@ backend'de: varsayılan `fe_ansi_ops` (statik registration), TUI aktifse
 │  • Arena honeypot canaries (key'ler arası sahte keyler) │
 │  • sodium_memzero() ile hassas veri sıfırlama           │
 │  • PR_SET_DUMPABLE=0 (core dump engeli)                 │
+│  • K-14: handshake dışı CTRL → fail-fast kapatma        │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 6: Kripto Güvenliği                               │
 │  • Argon2id (memory-hard KDF)                           │
@@ -729,6 +819,7 @@ backend'de: varsayılan `fe_ansi_ops` (statik registration), TUI aktifse
 │  • MADV_DONTFORK (fork'ta kopyalanma)                   │
 │  • MADV_DONTDUMP (core dump'ta gizleme)                 │
 │  • Canary: arena bütünlük kontrolü                      │
+│  • T-05: çift arena_init → NOX_ERR_STATE (fail-closed)  │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 4: Dosya Güvenliği                                │
 │  • Landlock LSM:RW: erişilebilir dizinler beyaz liste   │
@@ -741,8 +832,10 @@ backend'de: varsayılan `fe_ansi_ops` (statik registration), TUI aktifse
 │ Layer 3: Ağ Güvenliği                                  │
 │  • AF_UNIX socket (AF_INET engelli)                     │
 │  • Tor SOCKS5 proxy üzerinden iletişim                  │
+│  • SO_PEERCRED: Tor control + SOCKS peer PID/UID        │
+│    çekirdekten doğrulanır (bulgu 2.1/2.1b)              │
 │  • Seccomp stage 3: AF_INET, AF_INET6, TCP, UDP engelli│
-│  • writev() atomic gönderim (AF_UNIX kernel garantisi)  │
+│  • writev: TEXT kuyruk/EPOLLOUT, CTRL fail-closed       │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 2: Sistem Çağrısı Kısıtlamaları                  │
 │  • Seccomp stage 1 (constructor, main.c:141):          │
@@ -761,6 +854,7 @@ backend'de: varsayılan `fe_ansi_ops` (statik registration), TUI aktifse
 │    W^X (mprotect/mmap PROT_EXEC), SysV IPC, memfd      │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 1: Process İzolasyonu                             │
+│  • CET-SS: shadow stack kilidi + fork-CP self-test      │
 │  • TSYNC: 32-bit seccomp bypass engeli                  │
 │  • NO_NEW_PRIVS: setuid escalation engeli               │
 │  • PR_SET_DUMPABLE=0: /proc/PID/mem engeli              │
@@ -810,7 +904,9 @@ Stage 3 (event loop başı, event_loop.c:481):
   chmod, fchmod, fchmodat, chown, fchown, fchownat,
   fchmodat2                                    ← H-6 bypass engeli
   + H-6 exfil/privilege engelleri:
-    sendto, mknod, mknodat, modify_ldt, iopl, ioperm, syslog
+    mknod, mknodat, modify_ldt, iopl, ioperm, syslog
+  + bilinçli istisna: sendto serbest (glibc send() sendto(NULL) kullanır;
+    IPC gelince TODO(IPC-SENDTO) ile tekrar değerlendirilecek)
     pkey_mprotect, pkey_alloc, pkey_free       ← W^X bypass engeli
     name_to_handle_at, pidfd_getfd, memfd_secret, vmsplice
     mount_setattr, splice, memfd_create
@@ -861,28 +957,69 @@ Canary kontrolü: `arena_check_canary()` her allocation öncesi çalışır;
 mlock (MAP_LOCKED kaldırıldı — tek gerçek mlock, prefault garantisi zayıf
 olduğu için ideal), MADV_DONTFORK + MADV_DONTDUMP, destroy'da sodium_memzero.
 
+T-05 çift-init guard'ı: `arena_init()` zaten başlatılmış bir arena için
+`NOX_ERR_STATE` döner; canlı mapping'e, canary'ye veya mlock'lu sayfalara
+dokunmaz. Böylece ikinci init yolu eski anahtarları sıfırlayıp yeni bir
+mapping kurmaz (fail-closed). `test_arena` 24/24.
+
 ---
 
 ## 11. Test Kapsamı
 
-### 11.1 Unit Testler (90/90 — `make test`)
+### 11.1 Unit Testler (33 süit — 424/425, `make test`)
 
 | Test Dosyası | Test Sayısı | Kapsadığı Fonksiyonlar |
 |--------------|-------------|------------------------|
-| `test_arena.c` | 14 | arena_init, arena_alloc, arena_alloc_canary, arena_destroy, canary check |
-| `test_crypto.c` | 10 | Argon2id, subkey derivation, salt, identity roundtrip, Ed25519→Curve25519 |
+| `test_ansi_strip.c` | 16 | ANSI/OSC/DCS strip, C0 filtreleme |
+| `test_arena.c` | 24 | arena_init (T-05 çift-init), alloc, canary, destroy |
+| `test_cet_shstk.c` | 3 | CET-SS kilidi, fork-CP self-test sonuçları |
+| `test_chunk_size.c` | 8 | UTF-8 güvenli chunk noktası |
+| `test_crypto.c` | 10 | Argon2id, subkey, salt, identity roundtrip, Ed25519→Curve25519 |
 | `test_database.c` | 5 | DB open/close, contacts, wrong key, queue, history |
-| `test_landlock_rights.c` | 12 | Landlock hak maskeleme (birim 12 + entegrasyon) |
-| `test_network.c` | 7 | Frame encode/decode, listener create, UTF-8 chunking |
-| `test_noise.c` | 9 | Null safety, loopback handshake, transport roundtrip, MAC tamper, spec vectors |
-| `test_onion_derive.c` | 7 | Onion seed determinizmi, subkey ayrımı, expanded key format, sabit vektörler |
-| `test_pin.c` | 12 | PIN validation (min, max, empty, null, control chars, UTF-8, spaces) |
-| `test_seccomp_stage3.c` | 14 | AF_INET, AF_INET6, clone, DNS, connect, AF_NETLINK, AF_UNIX, prctl, W^X |
+| `test_event_frames.c` | 30 | Frame parsing/routing, H2/H3, K-14 CTRL fail-fast |
+| `test_file_transfer.c` | 13 | TX/RX, kota, chunk timeout, METADATA kısa yazma — **12/13** (K-28/C2 bekliyor) |
+| `test_frame_queue.c` | 6 | TX kuyruğu sıra/seq, kısmi yazma, fatal teardown |
+| `test_frame_queue_edges.c` | 8 | Ring wrap, reserve/commit atomikliği, kısmi yazım, fatal teardown |
+| `test_c1_text_paths.c` | 10 | TEXT kuyruklama, segmented AEAD sırası, pending offset/EAGAIN, EPOLLOUT liveness |
+| `test_frontend.c` | 19 | Dispatch, FE_SYSTEM/FE_ERROR strip, TUI no-op |
+| `test_landlock_rights.c` | 12 | Landlock hak maskeleme (birim + entegrasyon) |
+| `test_log.c` | 1 | Modül log seviyesi |
+| `test_mdwe.c` | 3 | MDWE prctl politikası |
+| `test_net_cleanup.c` | 9 | Soket/peer temizliği |
+| `test_net_io.c` | 28 | Parçalı okuma, EINTR, read/write timeout, slow-loris, EPIPE/SIGPIPE |
+| `test_network.c` | 10 | Frame encode/decode, listener, UTF-8 chunking |
+| `test_noise.c` | 17 | Handshake, transport roundtrip, MAC/AD tamper, spec vectors |
+| `test_onion_bind.c` | 13 | Onion↔static key claim üret/doğrula (H-1/H-2) |
+| `test_onion_derive.c` | 7 | Onion seed determinizmi, expanded key format |
+| `test_pin.c` | 12 | PIN validation (min/max/null/control/UTF-8) |
+| `test_seccomp_stage1.c` | 15 | Stage 1 kural seti |
+| `test_seccomp_stage2.c` | 41 | Stage 2 kural seti + clone/prctl özel kuralları |
+| `test_seccomp_stage3.c` | 41 | AF_INET/INET6, clone, DNS, W^X, AF_NETLINK |
+| `test_sm_cleanup.c` | 15 | Durum makinesi cleanup yolları |
+| `test_socks_peer.c` | 3 | SOCKS `SO_PEERCRED` doğrulaması |
+| `test_stdin.c` | 16 | Komut ayrıştırma, segmentasyon |
+| `test_time_expiry.c` | 6 | Zaman aşımı predikatları |
+| `test_tofu_epoch.c` | 9 | TOFU epoch/anahtar değişimi |
+| `test_tor_peer.c` | 4 | Tor control `SO_PEERCRED` doğrulaması |
+| `test_tx_order.c` | 2 | TX kuyruk sırası / nonce sırası |
+| `test_wire_hardening.c` | 9 | Wire format sertleştirmesi |
 
 Ayrıca: `test_onion_derive.sh` — onion e2e: determinizm + canlı Tor
 `ADD_ONION` ServiceID eşleşmesi (`make test` sonunda koşar).
 `test_seccomp.c` (make seccomp-test) — tüm seccomp kural dizisinin
 canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
+
+**Bilinen kırmızı (1):**
+- `test_file_transfer` 12/13 — `test_tx_metadata_short_write_disconnects`
+  METADATA kısa yazmada eski "kop" sözleşmesini bekliyor; kod ise nonce'u
+  tüketip kanalı canlı tutuyor. Kalıcı çözüm TX kuyruğu (C2) olduğu için test
+  bilinçli kırmızı; kuyruk gelince "kısmi yazmada kopma yok, sonraki frame
+  doğru" sözleşmesine yeniden yazılacak.
+
+`test_seccomp_stage3` 41/41 — `sendto` bilinçli istisna (glibc `send()`
+uyumu; `TODO(IPC-SENDTO)`).
+
+`make test` bu nedenle exit 2 döner; diğer 32 süit yeşildir.
 
 ### 11.2 Formal Doğrulama (CBMC + ESBMC + ProVerif)
 
@@ -919,8 +1056,12 @@ canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
 
 ```bash
 # Unit testler
-make test                    # 90/90, ASan+UBSan altında (9 suite + onion e2e)
+make test                    # 33 süit, 424/425 — ASan+UBSan
+                             # (bilinen kırmızı: test_file_transfer 12/13)
 make seccomp-test            # Seccomp canlı kural testi
+
+# Tek süit
+./tests/test_net_io          # örn. ağ G/Ç sertleştirmesi (28/28)
 
 # Formal doğrulama
 ./tests/formal-verify.sh     # Tümü (CBMC + ESBMC)
@@ -943,11 +1084,13 @@ noxtor-cli/
 ├── include/
 │   ├── arena.h              # Arena API
 │   ├── asm_utils.h          # strub/asembly yardımcıları
+│   ├── cet_shstk.h          # CET-SS kilidi + self-test API
 │   ├── common.h             # Sabitler, hata kodları
 │   ├── crypto.h             # Kripto API
 │   ├── database.h           # DB API
 │   ├── event_loop.h         # Event loop API
 │   ├── file_transfer.h      # Dosya transfer API
+│   ├── frame_queue.h        # C1 TX frame kuyruğu API
 │   ├── landlock_sandbox.h   # Landlock API
 │   ├── linenoise.h           # linenoise secure fork API
 │   ├── network.h            # Network API + frame sabitleri
@@ -963,10 +1106,12 @@ noxtor-cli/
 │   └── fe_tui.h             # TUI backend ops
 ├── src/
 │   ├── arena.c              # mmap + guard pages + canary
+│   ├── cet_shstk.c          # CET-SS shadow stack kilidi + self-test
 │   ├── crypto.c             # Argon2id + Ed25519 + Curve25519
 │   ├── database.c           # SQLite + encryption
 │   ├── event_loop.c         # epoll + frame processing
 │   ├── file_transfer.c      # BLAKE2b + streaming
+│   ├── frame_queue.c        # C1 sıralı TX frame kuyruğu
 │   ├── landlock_sandbox.c   # Landlock LSM
 │   ├── linenoise.c           # secure fork — satır düzenleme (sodium alloc)
 │   ├── log.c                # Module-based logging
@@ -974,7 +1119,7 @@ noxtor-cli/
 │   ├── network.c            # Tor + SOCKS5 + frame codec
 │   ├── noise.c              # Noise XX protocol
 │   ├── seccomp.c            # 3-stage seccomp
-│   ├── state_machine.c      # 8 states, 17 events, 40 transitions
+│   ├── state_machine.c      # 8 states, 18 events, 48 transitions
 │   ├── stdin_handler.c      # Command processing
 │   ├── tui.c                # termbox2 TUI
 │   ├── frontend.c           # Ortak frontend katmanı (dispatch)
@@ -993,17 +1138,41 @@ noxtor-cli/
 │   ├── fuzz_noise_differential_noise_star.c # noise_star differential
 │   ├── formal-verify.sh     # Dual formal verification script
 │   ├── proverif/            # ProVerif modeli (XX.noise.active.pv, ...)
-│   ├── test_arena.c         # Arena unit tests (14)
+│   ├── test_ansi_strip.c    # ANSI/C0 strip (16)
+│   ├── test_arena.c         # Arena unit tests (24; T-05 çift-init)
+│   ├── test_cet_shstk.c     # CET-SS kilidi + self-test (3)
+│   ├── test_chunk_size.c    # UTF-8 chunk noktası (8)
 │   ├── test_crypto.c        # Crypto unit tests (10)
 │   ├── test_database.c      # Database unit tests (5)
-│   ├── test_landlock_rights.c # Landlock rights tests (12)
-│   ├── test_network.c       # Network unit tests (7)
-│   ├── test_noise.c         # Noise unit tests (9)
+│   ├── test_event_frames.c  # Frame/H2/H3/K-14 (30)
+│   ├── test_file_transfer.c # Dosya transferi (13; 12/13 — K-28/C2)
+│   ├── test_frame_queue.c   # C1 TX kuyruğu (6)
+│   ├── test_frame_queue_edges.c # C1 ring/atomiklik/kısmi yazım (8)
+│   ├── test_c1_text_paths.c # C1 TEXT/pending/EPOLLOUT (10)
+│   ├── test_frontend.c      # Frontend dispatch + T-02 strip (19)
+│   ├── test_landlock_rights.c # Landlock rights (12)
+│   ├── test_log.c           # Log seviyesi (1)
+│   ├── test_mdwe.c          # MDWE politikası (3)
+│   ├── test_net_cleanup.c   # Soket/peer temizliği (9)
+│   ├── test_net_io.c        # Ağ G/Ç timeout/EINTR/EPIPE (28)
+│   ├── test_network.c       # Network unit tests (10)
+│   ├── test_noise.c         # Noise unit tests (17)
+│   ├── test_onion_bind.c    # Onion↔static key claim (13)
 │   ├── test_onion_derive.c  # Onion türetme unit tests (7)
 │   ├── test_onion_derive.sh # Onion e2e (determinizm + canlı Tor ADD_ONION)
 │   ├── test_pin.c           # PIN unit tests (12)
 │   ├── test_seccomp.c       # Seccomp live tests (make seccomp-test)
-│   └── test_seccomp_stage3.c # Seccomp stage-3 tests (14)
+│   ├── test_seccomp_stage1.c # Stage 1 (15)
+│   ├── test_seccomp_stage2.c # Stage 2 (41)
+│   ├── test_seccomp_stage3.c # Stage 3 (41)
+│   ├── test_sm_cleanup.c    # Durum makinesi cleanup (15)
+│   ├── test_socks_peer.c    # SOCKS SO_PEERCRED (3)
+│   ├── test_stdin.c         # Komut/segmentasyon (16)
+│   ├── test_time_expiry.c   # Zaman aşımı (6)
+│   ├── test_tofu_epoch.c    # TOFU epoch (9)
+│   ├── test_tor_peer.c      # Tor control SO_PEERCRED (4)
+│   ├── test_tx_order.c      # TX/nonce sırası (2)
+│   └── test_wire_hardening.c # Wire format sertleştirme (9)
 ├── fuzz/
 │   ├── fuzz_arena.c
 │   ├── fuzz_ctrl.c

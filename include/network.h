@@ -160,9 +160,17 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size,
 
 nox_err_t ctrl_send_command(int fd, const char *cmd);
 
-/* I/O helpers — EINTR + partial read/write koruması */
+/* I/O helpers — EINTR + partial read/write koruması.
+ *
+ * _timeout varyantları toplam monotonic deadline'ı dışarıdan alır;
+ * timeout_ms her parça okuma/yazmada sıfırlanmaz. Üretim sarmalayıcıları
+ * NOX_READ_TIMEOUT_MS kullanır. Testler küçük timeout ile gerçek deadline
+ * yolunu sınayabilsin diye açıldı. */
 nox_err_t write_full(int fd, const void *buf, size_t len);
 nox_err_t read_full(int fd, void *buf, size_t len);
+nox_err_t write_full_timeout(int fd, const void *buf, size_t len,
+                             int timeout_ms);
+nox_err_t read_full_timeout(int fd, void *buf, size_t len, int timeout_ms);
 
 /* ================================================================
  * UNIT TEST ERİŞİMİ — production akışında da kullanılan iç

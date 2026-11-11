@@ -190,6 +190,31 @@ struct file_tx_state {
 };
 
 /* ================================================================
+ * C1: TX FRAME KUYRUĞU — şifrelenmiş wire frame'ler
+ *
+ * Nonce sırası = şifreleme sırası = soket yazma sırası invariant'ı.
+ * Slotlar tam bir frame tutar: [13-byte header][ciphertext].
+ * Kuyruk doluysa şifreleme YAPILMAZ (nonce tüketilmez); frame atlanmaz.
+ * ================================================================ */
+#define FRAME_QUEUE_SLOTS 4U
+
+struct frame_queue_slot {
+    uint8_t  buf[TX_BUF_CAPACITY];
+    uint16_t len;                 /* toplam frame uzunluğu */
+    uint16_t off;                 /* yazılan byte sayısı   */
+};
+
+struct frame_queue {
+    struct frame_queue_slot slots[FRAME_QUEUE_SLOTS];
+    uint8_t head;                 /* ilk dolu slot         */
+    uint8_t tail;                 /* ilk boş slot          */
+    uint8_t count;                /* dolu slot sayısı      */
+};
+
+NOX_STATIC_ASSERT(TX_BUF_CAPACITY <= UINT16_MAX,
+                  "TX_BUF_CAPACITY frame_queue len alanina sigmali");
+
+/* ================================================================
  * PEER OTURUMU — Tek bir peer bağlantısının tüm durumu
  *
  * Faz 6.3: Tek onion modeli ile çoklu peer desteği.
@@ -254,8 +279,19 @@ struct peer_session {
      * Bir FILE chunk'ı tx_buf'ta yarım yazılmışken doğrudan TEXT gönderimi
      * wire sırasını (dolayısıyla nonce sırasını) bozar. Bu slot tam
      * plaintext kopyasını tutar; sodium_free cleanup'ta zeroize eder.
-     * NULL = boş slot. Sahibi peer_session'dır. */
+     * NULL = boş slot. Sahibi peer_session'dır.
+     * pending_msg_off: kuyruğa commit edilmiş (nonce tüketmiş) önek
+     * uzunluğu. Kuyruktan büyük mesajlar parçalı ilerler; offset asla
+     * geri alınmaz, böylece duplikasyon/kayıp olmaz. */
     char *pending_msg;
+    size_t pending_msg_off;
+
+    /* ── C1: şifrelenmiş TX frame kuyruğu ── */
+    struct frame_queue tx_frames;
+
+    /* DB kuyruğu AGAIN ile durduysa, TX kuyruğu boşalınca aynı
+     * oturumda devam etmek için işaret. */
+    nox_hardbool_t db_retry_pending;
 
     /* ── Okunmamış mesaj sayacı ── */
     uint32_t unread_count;
