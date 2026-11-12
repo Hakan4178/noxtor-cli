@@ -155,23 +155,6 @@ struct queue_flush_ctx {
   struct peer_session *ps;
 };
 
-/* Adım 4.5: FILE chunk'ı tx_buf'ta yarım beklerken transport'a yazma
- * yapılmamalı. Bu predikat tüm transport gönderim yollarının ortak
- * giriş guard'ıdır. */
-bool ps_tx_pending(const struct peer_session *ps) {
-  return ps && ps->tx_file.active && ps->tx_file.tx_len > 0;
-}
-
-/* Slot dolu / gönderim sırası beklemede: sessiz düşürme yok, net ret. */
-static nox_err_t tx_busy(struct app_state *state, const char *what) {
-  NOX_WARN(LOG_MOD_NET, "%s: önceki gönderim bekliyor — yeni mesaj alınmadı",
-           what);
-  if (state)
-    ui_print_error(state,
-                   "Önceki mesaj gönderiliyor — yeni mesaj alınmadı.");
-  return NOX_ERR_STATE;
-}
-
 /* Bir frame'i doğrudan kuyruk slotuna şifreler ve commit eder.
  * Çağıran, kuyrukta yer olduğunu ÖNCEDEN doğrulamalıdır; rezervasyon
  * başarısız olursa nonce harcanmadan NOX_ERR_AGAIN döner. */
@@ -246,12 +229,12 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
   if (!text)
     return NOX_ERR_PROTO;
 
-  /* DB kuyruğu kalıcıdır; burada pending_msg'e alıp NOX_OK dönmek
+  /* DB kuyruğu kalıcıdır; kuyrukta yer yokken NOX_OK dönmek
    * db_process_queue'nin satırı hemen silmesine yol açar. Net ret ile
    * kayıt korunur ve sıra bozulmaz; kuyruk bir sonraki flush'ta denenir. */
-  if (ps_tx_pending(ps) || ps->pending_msg) {
+  if (frame_queue_free(ps) == 0) {
     ps->db_retry_pending = true;
-    return tx_busy(state, "send_queued_callback");
+    return NOX_ERR_AGAIN;
   }
 
   size_t pt_len = strlen(text) + 1;
@@ -350,88 +333,6 @@ static nox_err_t send_segmented_message_now(struct app_state *state,
   return NOX_OK;
 }
 
-/* Ertelenen TEXT'i tek slotta sakla. Slot dolunca net ret; kuyruk yok.
- * Ertelenen mesaj kuyruk doluluğu yüzünden hiç frame üretmediyse
- * EPOLLOUT sinyali doğmaz; drain'in başlaması için ilgiyi burada kur. */
-static nox_err_t tx_defer_message(struct app_state *state,
-                                  struct peer_session *ps,
-                                  const char *msg) {
-  if (ps->pending_msg)
-    return tx_busy(state, "send_segmented_message_to");
-
-  size_t len = strlen(msg);
-  char *copy = sodium_malloc(len + 1);
-  if (!copy)
-    return NOX_ERR_ALLOC;
-  memcpy(copy, msg, len + 1);
-  ps->pending_msg = copy;
-  ps->pending_msg_off = 0;
-
-  NOX_INFO(LOG_MOD_NET,
-           "TEXT ertelendi: gönderim yolu meşgul (%zu byte, slot tek)", len);
-  if (state && state->epoll_fd >= 0 && ps->fd >= 0 &&
-      epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN | EPOLLOUT) != NOX_OK) {
-    /* Drain başlatılamaz: mesajı sessizce asılı bırakma, net ret ver. */
-    sodium_free(ps->pending_msg);
-    ps->pending_msg = NULL;
-    ps->pending_msg_off = 0;
-    return NOX_ERR_NET;
-  }
-  return NOX_OK;
-}
-
-/* Ertelenen TEXT'i kuyruk kapasitesi kadar parçalayarak ilerletir.
- * pending_msg_off yalnız commit edilmiş (nonce tüketmiş) parçalar için
- * ilerler; böylece kuyruktan büyük tek mesajlar da kaybolmadan ve
- * duplike edilmeden tamamlanır. EAGAIN'de offset/pending korunur,
- * EPOLLOUT kuyruk tarafından açık tutulur. */
-static nox_err_t flush_pending_msg(struct app_state *state,
-                                   struct peer_session *ps) {
-  size_t total_len = strlen(ps->pending_msg);
-  char *chunk = sodium_malloc(NOX_MAX_MSG_LEN + 1); /* NUL için +1 */
-  if (!chunk)
-    return NOX_ERR_ALLOC;
-
-  nox_err_t err = NOX_OK;
-  while (ps->pending_msg_off < total_len) {
-    /* Kuyruk dolu: önce boşalt; EAGAIN ise EPOLLOUT devralır. */
-    if (frame_queue_free(ps) == 0) {
-      err = frame_queue_flush(state, ps);
-      if (err != NOX_OK)
-        break;
-      continue;
-    }
-
-    size_t off = ps->pending_msg_off;
-    size_t chunk_len = nox_next_chunk_size(ps->pending_msg, off, total_len);
-    if (chunk_len == 0) {
-      err = NOX_ERR_PROTO;
-      break;
-    }
-
-    memcpy(chunk, ps->pending_msg + off, chunk_len);
-    chunk[chunk_len] = '\0';
-
-    err = enqueue_frame(state, ps, NOX_MSG_TEXT, chunk, chunk_len + 1);
-    if (err != NOX_OK)
-      break;
-    ps->pending_msg_off = off + chunk_len;
-  }
-
-  if (err == NOX_OK)
-    err = frame_queue_flush(state, ps);
-
-  sodium_memzero(chunk, NOX_MAX_MSG_LEN + 1);
-  sodium_free(chunk);
-
-  if (err == NOX_OK) {
-    sodium_free(ps->pending_msg); /* sodium_free zeroize eder */
-    ps->pending_msg = NULL;
-    ps->pending_msg_off = 0;
-  }
-  return err;
-}
-
 nox_err_t send_segmented_message_to(struct app_state *state,
                                     struct peer_session *ps,
                                     const char *msg) {
@@ -442,35 +343,17 @@ nox_err_t send_segmented_message_to(struct app_state *state,
   if (msg[0] == '\0')
     return NOX_OK;
 
-  /* Slot doluysa sırayı korumak için yeni mesajı kabul etme. */
-  if (ps->pending_msg)
-    return tx_busy(state, "send_segmented_message_to");
-
-  /* FILE chunk'ı tx_buf'ta yarım bekliyorsa nonce/wire sırası bozulur:
-   * TEXT'i hemen yazma, tek slotta ertele. */
-  if (ps_tx_pending(ps))
-    return tx_defer_message(state, ps, msg);
-
+  /* C2/Q1: tek kuyruk. Mesaj ya tamamen sığar ya da hiç şifrelenmez.
+   * Sessiz düşürme yok; kuyruk dolarsa çağıran net hata gösterir. */
   nox_err_t err = send_segmented_message_now(state, ps, msg);
-  /* Kuyrukta yer yoksa hiçbir frame şifrelenmedi; mesajı kaybetme. */
-  if (err == NOX_ERR_AGAIN)
-    return tx_defer_message(state, ps, msg);
+  if (err == NOX_ERR_AGAIN) {
+    NOX_WARN(LOG_MOD_NET,
+             "TEXT kuyruğa alınamadı: boş slot yok (mesaj korunmadı)");
+    if (state)
+      ui_print_error(state,
+                     "Gönderim kuyruğu dolu — lütfen kısa süre sonra tekrar deneyin.");
+  }
   return err;
-}
-
-nox_err_t peer_tx_flush_pending(struct app_state *state,
-                                struct peer_session *ps) {
-  if (!ps || !ps->pending_msg)
-    return NOX_OK;
-  if (ps->fd < 0 || !ps->session)
-    return NOX_ERR_NET;
-  if (ps_tx_pending(ps))
-    return NOX_OK; /* chunk hâlâ bekliyor; sıra bozulmaz */
-
-  /* Parçalı ilerletme: mesaj kuyruk kapasitesinden büyük olabilir
-   * (>16 KB). Offset commit noktasını izler; kısmi yazımda kalan
-   * frame'ler kuyrukta kalır ve EPOLLOUT ile devam eder. */
-  return flush_pending_msg(state, ps);
 }
 
 /* Uzun bir mesajı güvenli chunk'lara ayırıp SQLite veritabanı kuyruğuna yazar
@@ -630,7 +513,7 @@ void process_line(struct app_state *state, const char *line) {
       }
       nox_err_t err = send_segmented_message(state, msg);
       if (err == NOX_OK) ui_print_outgoing(state, msg);
-      else ui_print_error(state, "Şifreleme/Gönderim hatası");
+      else if (err != NOX_ERR_AGAIN) ui_print_error(state, "Şifreleme/Gönderim hatası");
       return;
     }
     /* 1b. Bilinen komutlar — tek tablo, session bağımsız */
@@ -694,7 +577,7 @@ void process_line(struct app_state *state, const char *line) {
       if (target_ps && target_ps->session && target_ps->fd >= 0) {
         nox_err_t err = send_segmented_message_to(state, target_ps, msg_start);
         if (err == NOX_OK) ui_print_outgoing(state, msg_start);
-        else ui_print_error(state, "Şifreleme/Gönderim hatası");
+        else if (err != NOX_ERR_AGAIN) ui_print_error(state, "Şifreleme/Gönderim hatası");
       } else {
         if (state->ghost_mode) { ui_print_error(state, "ghost mod aktif — çevrimdışı mesaj kuyruğa alınamaz"); return; }
         nox_err_t err = queue_segmented_message(onion, msg_start);
@@ -872,7 +755,7 @@ void process_line(struct app_state *state, const char *line) {
     if (line[0] == '\0') return;
     nox_err_t err = send_segmented_message(state, line);
     if (err == NOX_OK) ui_print_outgoing(state, line);
-    else ui_print_error(state, "Şifreleme/Gönderim hatası");
+    else if (err != NOX_ERR_AGAIN) ui_print_error(state, "Şifreleme/Gönderim hatası");
     return;
   }
 

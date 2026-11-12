@@ -49,21 +49,15 @@ struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
     return NULL;
 }
 
-/* Kuyruk boşken ertelenen TEXT'i ve durmuş DB kuyruğunu sürdürür.
+/* Kuyruk boşken durmuş DB kuyruğunu sürdürür.
  * EPOLLOUT handler'ı ve 2 sn'lik bakım turu aynı yolu kullanır; böylece
- * yalnız pending/db_retry bayrağı kaldığında iş asılı kalmaz.
+ * yalnız db_retry bayrağı kaldığında iş asılı kalmaz.
  * Dönüş false = oturum kapandı. */
 static bool peer_tx_resume(struct app_state *state,
                            struct peer_session *ps)
 {
-    if (!frame_queue_empty(ps) || ps_tx_pending(ps))
+    if (!frame_queue_empty(ps))
         return ps->fd >= 0;
-
-    if (ps->pending_msg) {
-        (void)peer_tx_flush_pending(state, ps);
-        if (ps->fd < 0)
-            return false;
-    }
 
     if (ps->db_retry_pending && frame_queue_empty(ps) &&
         !ps->tx_file.active) {
@@ -83,9 +77,9 @@ static bool peer_tx_resume(struct app_state *state,
 /* ================================================================
  * EPOLLOUT — TX sırası tek noktadan yürür
  *
- * Kural: kuyruk doluyken FILE chunk'ı şifrelenmez. Aksi halde yeni
- * chunk, bekleyen TEXT'in önüne geçer; alıcı nonce sırasını kaybeder.
- * Dönüş false = oturum kapandı (çağıran EPOLLIN'e devam etmemeli).
+ * Kural: önce kuyruk boşaltılır, sonra boş slotlar dosyadan doldurulur.
+ * Enqueue sırası = nonce sırası = yazma sırası. Dönüş false = oturum
+ * kapandı (çağıran EPOLLIN'e devam etmemeli).
  * ================================================================ */
 static bool handle_peer_tx_ready(struct app_state *state,
                                  struct peer_session *ps)
@@ -93,15 +87,20 @@ static bool handle_peer_tx_ready(struct app_state *state,
     /* Önce kuyruk: enqueue sırası = nonce sırası = yazma sırası. */
     if (!frame_queue_empty(ps)) {
         (void)frame_queue_flush(state, ps);
-    } else if (ps->tx_file.active) {
-        file_transfer_handle_tx(state, ps);
     }
 
     if (ps->fd < 0)
         return false;
 
-    /* Kuyruk boşaldıysa ertelenen TEXT'i ve durmuş DB kuyruğunu aynı
-     * oturumda sürdür. FILE chunk'ı bekliyorsa dokunma. */
+    /* Kuyrukta boş slot varsa FILE chunk'larını üret. Kuyruk doluyken
+     * şifreleme yapılmaz; nonce tüketilmez. */
+    if (ps->tx_file.active && frame_queue_free(ps) > 0)
+        file_transfer_handle_tx(state, ps);
+
+    if (ps->fd < 0)
+        return false;
+
+    /* Kuyruk boşaldıysa durmuş DB kuyruğunu aynı oturumda sürdür. */
     if (!peer_tx_resume(state, ps))
         return false;
 
@@ -500,7 +499,6 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
               ps->rx_seq = 0;
               ps->queue_flushed = false;
               frame_queue_reset(ps);
-              ps->pending_msg_off = 0;
               ps->db_retry_pending = false;
               ps->peer_verified = true; /* H-1 FIX: doğrulanmış peer — kuyruk flush serbest */
               ps->tofu_was_zero_key = false;
@@ -760,12 +758,71 @@ void event_loop(struct app_state *state) {
 
   /* ── Landlock sandbox — open/openat/creat'i kısıtla ──────────────
    * Landlock ÖNCE yüklenmeli (seccomp'tan önce).
-   * Sadece downloads dizini okunabilir/yazılabilir.
+   * Sadece downloads dizini okunabilir/yazılabilir; ABI >= 9'da
+   * pathname Unix connect'ler de kısıtlanır (F1).
    * Kernel 5.13+ gerektirir, desteklemiyorsa hata döner.
    * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez. */
   if (state->config_dir_fd >= 0 && state->downloads_dir_fd >= 0) {
+    int ll_abi = landlock_abi_version();
+    int socks_fd = -1;
+
+    /* F3: tor_data fd zorunlu — dar silme kuralının anchor'ı yoksa
+     * sandbox eksik kurulur; sessizce devam etme. */
+    if (state->tor_data_fd < 0) {
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock: tor_data fd yok (torrc üretimi başarısız?)");
+      ui_print_error(state,
+          "Tor veri dizini doğrulanamadı; dosya sistemi sandbox'ı "
+          "kurulamıyor. Uygulama kapatılıyor.");
+      state->running = false;
+      return;
+    }
+
+    /* F1: opsiyonel strict politika — ABI < 9'da sandbox'ın eksik
+     * kalmasını kabul etme. Varsayılan politika görünür uyarıdır. */
+    if (state->require_landlock_resolve_unix && ll_abi < 9) {
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock: RESOLVE_UNIX için ABI >= 9 gerekli (abi=%d)",
+                ll_abi);
+      ui_print_error(state,
+          "Landlock ABI >= 9 (Linux 7.1+) gerekli: "
+          "--require-landlock-resolve-unix ile çıkılıyor.");
+      state->running = false;
+      return;
+    }
+
+    if (ll_abi >= 9) {
+      /* Tor Landlock'tan önce spawn edildi; socks.sock domain dışında.
+       * Yalnız bu inode'a dosya düzeyinde istisna tanınacak. fd'yi
+       * path'e geri dönmeden doğrula ve init'e anchor olarak ver. */
+      socks_fd = landlock_open_unix_socket_fd(state->socks_path);
+      if (socks_fd < 0) {
+        NOX_ERROR(LOG_MOD_MAIN,
+                  "landlock: socks.sock açılamadı/doğrulanamadı (%s)",
+                  strerror(errno));
+        ui_print_error(state,
+            "Tor SOCKS soketi doğrulanamadı; güvenli bağlantı kurulamaz. "
+            "Uygulama kapatılıyor.");
+        state->running = false;
+        return;
+      }
+    } else if (ll_abi >= 1) {
+      NOX_WARN(LOG_MOD_MAIN,
+               "landlock: ABI v%d < 9 — pathname Unix connect kısıtlanmıyor "
+               "(F1 açık)", ll_abi);
+      ui_print_error(state,
+          "⚠ Landlock ABI < 9: pathname Unix soket bağlantıları "
+          "kısıtlanamıyor (F1 açık). Tam koruma için Linux 7.1+ gerekir.");
+    }
+
     nox_err_t ll_err = landlock_sandbox_init(state->config_dir_fd,
-                                             state->downloads_dir_fd);
+                                             state->downloads_dir_fd,
+                                             state->tor_data_fd,
+                                             socks_fd);
+    if (socks_fd >= 0) {
+      close(socks_fd);
+      socks_fd = -1;
+    }
 
     if (ll_err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
       if (!state->allow_unsandboxed_fs) {
@@ -1064,15 +1121,16 @@ void event_loop(struct app_state *state) {
       if (has_frames) ui_line_resume(state);
     }
 
-    /* ── C1: ertelenen TX işlerini EPOLLOUT'a bağımlı olmadan sürdür ──
-     * epoll_wait 2 sn timeout'lu; yalnız pending_msg/db_retry_pending
-     * kaldığında bile iş asılı kalmaz. Kalıcı DB/alloc hatası busy-loop
-     * üretmez: deneme en erken bir sonraki turda yapılır. */
+    /* ── C1/C2: TX işlerini EPOLLOUT'a bağımlı olmadan sürdür ──
+     * epoll_wait 2 sn timeout'lu; kuyruk/transfer/db_retry kaldığında bile
+     * iş asılı kalmaz. Kalıcı DB/alloc hatası busy-loop üretmez: deneme
+     * en erken bir sonraki turda yapılır. */
     for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
       struct peer_session *ps = &state->peers[pi];
       if (ps->session && ps->fd >= 0 &&
-          (ps->pending_msg || ps->db_retry_pending)) {
-        (void)peer_tx_resume(state, ps);
+          (!frame_queue_empty(ps) || ps->tx_file.active ||
+           ps->db_retry_pending)) {
+        (void)handle_peer_tx_ready(state, ps);
       }
     }
 

@@ -145,7 +145,7 @@ enum tor_transport_type {
     TRANSPORT_OBFS4
 };
 
-/* CRIT-1: tx_buf için güvenli kapasite sabiti */
+/* CRIT-1: tek frame (header + max payload + MAC) için güvenli kapasite */
 #define TX_BUF_CAPACITY (13 + 4096 + NOX_MAC_LEN)
 
 /* Recv buffer kapasitesi — frame header (13) + max payload (4096 + MAC) */
@@ -182,11 +182,9 @@ struct file_tx_state {
     /* D-1 FIX: önceden ayrılmış şifresiz tampon (stack yerine heap) */
     uint8_t *plain_buf;
 
-    /* Kısmi yazım için frame tamponu — boyut TX_BUF_CAPACITY ile sabit */
-    uint8_t  tx_buf[TX_BUF_CAPACITY];
-    size_t   tx_len;              /* mevcut frame'in toplam boyutu */
-    size_t   tx_offset;           /* şimdiye dek yazılan byte */
-    size_t   current_chunk_size;  /* mevcut şifrelenmemiş dosya boyutu */
+    /* C2: frame'ler doğrudan ortak TX kuyruğuna commit edilir; bu struct
+     * yalnız kaynak dosya ve ilerleme sayaçlarını tutar. sent_bytes
+     * commit anında artar (sokete yazılmayı beklemez). */
 };
 
 /* ================================================================
@@ -275,18 +273,9 @@ struct peer_session {
     struct file_rx_state rx_file;
     struct file_tx_state tx_file;
 
-    /* ── Adım 4.5: gönderim sırası — tek slot ertelenen TEXT ──
-     * Bir FILE chunk'ı tx_buf'ta yarım yazılmışken doğrudan TEXT gönderimi
-     * wire sırasını (dolayısıyla nonce sırasını) bozar. Bu slot tam
-     * plaintext kopyasını tutar; sodium_free cleanup'ta zeroize eder.
-     * NULL = boş slot. Sahibi peer_session'dır.
-     * pending_msg_off: kuyruğa commit edilmiş (nonce tüketmiş) önek
-     * uzunluğu. Kuyruktan büyük mesajlar parçalı ilerler; offset asla
-     * geri alınmaz, böylece duplikasyon/kayıp olmaz. */
-    char *pending_msg;
-    size_t pending_msg_off;
-
-    /* ── C1: şifrelenmiş TX frame kuyruğu ── */
+    /* ── C1/C2: şifrelenmiş TX frame kuyruğu ──
+     * METADATA, FILE chunk'ları ve TEXT aynı kuyruğu paylaşır. Sıra
+     * tek invariant'tır: encrypt → commit → socket write. */
     struct frame_queue tx_frames;
 
     /* DB kuyruğu AGAIN ile durduysa, TX kuyruğu boşalınca aynı
@@ -344,6 +333,7 @@ struct app_state {
     char     onion_addr[NOX_ONION_LEN + 1]; /* kendi .onion adresimiz */
     char     torrc_path[NOX_PATH_MAX];   /* torrc dosya yolu         */
     char     tor_data_dir[NOX_PATH_MAX]; /* tor veri dizini           */
+    int      tor_data_fd;        /* O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC — F3: dar Landlock silme kuralı */
 
     /* Network */
     int      epoll_fd;           /* epoll instance                   */
@@ -367,6 +357,7 @@ struct app_state {
     nox_hardbool_t first_run;    /* hardened: ilk çalıştırma mı      */
     nox_hardbool_t ghost_mode;   /* hardened: --ghost SQLite yok     */
     nox_hardbool_t allow_unsandboxed_fs; /* hardened: Landlock bypass */
+    nox_hardbool_t require_landlock_resolve_unix; /* F1: ABI<9'da fail-closed */
     nox_hardbool_t queue_flushed;/* hardened: kuyruk gönderildi      */
     size_t   prompt_display_len; /* prompt'un terminal karakter genişliği */
 

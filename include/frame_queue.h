@@ -61,4 +61,14 @@ nox_err_t frame_queue_flush(struct app_state *state, struct peer_session *ps);
 /* Kuyruğu zeroize eder (cleanup). */
 void frame_queue_reset(struct peer_session *ps);
 
+/*
+ * frame_queue_arm_tx — peer fd'sini EPOLLIN | EPOLLOUT ilgisine geçirir.
+ *
+ * C2: FILE transferi METADATA commit'inden sonra ilk kez burada uyandırılır.
+ * epoll yoksa (birim testleri) no-op NOX_OK döner. İlgi kurulamazsa
+ * fail-closed: oturum kapatılır ve NOX_ERR_IO döner.
+ */
+nox_err_t frame_queue_arm_tx(struct app_state *state,
+                             struct peer_session *ps);
+
 #endif /* PARANOID_FRAME_QUEUE_H */

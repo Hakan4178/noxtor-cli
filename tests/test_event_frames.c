@@ -52,6 +52,7 @@
 #include "network.h"
 #include "event_loop.h"
 #include "noise.h"
+#include "frame_queue.h"
 #include "state_machine.h"
 #include "file_transfer.h"
 #include "crypto.h"
@@ -714,7 +715,9 @@ static int run_chain_attack_case(chain_attack_t kind, int victim_idx,
                     (victim->rx_seq == 0) &&
                     (victim->tx_seq == 0) &&
                     (victim->recv_pos == 0) &&
-                    (victim->pending_msg == NULL) &&
+                    frame_queue_empty(victim) &&
+                    buf_is_zero((const uint8_t *)&victim->tx_frames,
+                                sizeof(victim->tx_frames)) &&
                     buf_is_zero(victim->recv_buf, sizeof(victim->recv_buf));
 
     *bystander_clean = other_ok &&

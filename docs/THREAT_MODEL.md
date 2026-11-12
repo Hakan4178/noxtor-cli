@@ -35,7 +35,7 @@ If an assumption is false, the corresponding mitigation claim is void.
 |---|---|---|
 | A1 | **PIN entropy is user-responsible.** `crypto.c:180` derives `master_key` via Argon2id (`OPSLIMIT_MODERATE`/`MEMLIMIT_MODERATE`, 16-byte salt) — this slows brute-force but does **not** make a weak PIN strong. A 6-digit PIN (~20 bits) is crackable offline if `contacts.db` + salt file are seized; a 4-word diceware passphrase (~50 bits) or 12+ char mixed passphrase is the intended baseline. Weak PIN is a **user-risk, not a code bug** — document it as such and guide users accordingly (see guidance stub below). `[TODO: maintainer — confirm minimum PIN policy / warning UX on weak PIN]` | Seized DB decryptable offline; onion identity derivable (same `master_key` → `NOX_SUBKEY_ONION_SEED`). |
 | A2 | **libsodium, libsqlite3, libseccomp, Tor behave as documented.** No formal verification of these dependencies; supply-chain compromise is out-of-model except as noted in §4.5. | All crypto/DB/sandbox claims collapse. |
-| A3 | **Kernel ≥5.15 enforces seccomp-bpf + Landlock as implemented in `seccomp.c`/`landlock_sandbox.c`.** Older kernels fall back to degraded/no sandbox (§5.4). | Post-exploit blast radius larger (§10 in `architecture.md`). |
+| A3 | **Kernel ≥5.15 enforces seccomp-bpf + Landlock as implemented in `seccomp.c`/`landlock_sandbox.c`.** F1 (pathname Unix `connect` restriction) additionally requires Landlock ABI 9 / Linux 7.1+; ABI 1-8 gets filesystem confinement only. Older kernels fall back to degraded/no sandbox (§5.4). | Post-exploit blast radius larger; on ABI 1-8 the sandbox can still reach pathname Unix services (D-Bus, ssh-agent, gpg-agent, docker.sock). |
 | A4 | **Tor provides anonymity; Noxtor adds no extra padding/cover traffic.** Message size/timing at Noxtor layer is visible to the guard as Tor cell volume/timing (§4.4). | Metadata minimization (§2) is aspirational until padding is added. |
 | A5 | **Device is clean at launch.** No pre-existing implant reading `argv`/env/PIN keystrokes, and `main.c:141` early-constructor hardening (`PR_SET_DUMPABLE`, `RLIMIT_CORE`, seccomp stage 1) runs before attacker-controlled code in the same process. A tiny `execve → constructor` window remains — treated as residual, not in-scope. `[TODO: verify constructor ordering vs. `LD_PRELOAD` / early ptrace]` | PIN/keystroke exfiltration before hardening. |
 | A6 | **Secure arena (`arena.c`) is mlock'd / `MADV_DONTDUMP` where available, and `sodium_memzero` + `strub` scrub keys on failure paths.** Swap-out and core-dump leakage are mitigated, not proven absent on all kernels. | Forensic RAM/swap recovery (see §4.3). |
@@ -591,11 +591,20 @@ wanting maximum isolation should use a Linux TTY directly.
 
 ### 5.4 Legacy kernels (< 5.13 Landlock / < 5.15 full hardening)
 No fallback path that preserves the same guarantees exists for older
-kernels. **Current behavior (fail-open with warning, not fail-closed):**
-Landlock requires 5.13+ (ABI v1). On older kernels `landlock_sandbox_init`
-returns `NOX_ERR_LANDLOCK_UNSUPPORTED` (`landlock_sandbox.c:76`) and file
-writes are **not** restricted to `downloads/` — a warning is logged and the
-process continues with seccomp alone. Seccomp TSYNC has a best-effort
+kernels. **Current behavior: fail-closed by default.** Landlock requires
+5.13+ (ABI v1). On older kernels `landlock_sandbox_init` returns
+`NOX_ERR_LANDLOCK_UNSUPPORTED`; the event loop exits unless the user
+explicitly passes `--allow-unsandboxed-fs`, in which case file writes are
+**not** restricted to `downloads/` and a visible warning is shown before
+continuing with seccomp alone.
+
+**F1 (pathname Unix `connect`) requires ABI 9 / Linux 7.1+.** ABI 1-8 still
+gets filesystem confinement, but `connect()` to pathname Unix sockets
+(D-Bus, ssh-agent, gpg-agent, docker.sock) is not restricted; a visible
+warning is shown. `--require-landlock-resolve-unix` makes this fail-closed.
+On ABI 9+, only Tor's `socks.sock` inode gets a `RESOLVE_UNIX` exception;
+`control.sock`, `listen.sock`, and all other pathname sockets remain
+unreachable from inside the sandbox. Seccomp TSYNC has a best-effort
 fallback (`seccomp.c:257` — 32-bit compat removal if `TSYNC` unsupported).
 CET/FORTIFY behavior is toolchain-dependent. Users on <5.15 should assume
 reduced sandboxing; reference hardening is verified only on the reference

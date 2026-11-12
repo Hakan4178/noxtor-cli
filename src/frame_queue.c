@@ -141,3 +141,21 @@ void frame_queue_reset(struct peer_session *ps) {
     return;
   sodium_memzero(&ps->tx_frames, sizeof(ps->tx_frames));
 }
+
+nox_err_t frame_queue_arm_tx(struct app_state *state,
+                             struct peer_session *ps) {
+  if (!ps || ps->fd < 0)
+    return NOX_ERR_NET;
+  if (!state || state->epoll_fd < 0)
+    return NOX_OK; /* birim testi: epoll yok */
+
+  if (epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN | EPOLLOUT) != NOX_OK) {
+    NOX_WARN(LOG_MOD_NET,
+             "EPOLLOUT ilgisi kurulamadı — oturum kapatılıyor");
+    ui_print_error(state,
+                   "Soket olay ilgisi kurulamadı — oturum kapatılıyor.");
+    (void)sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
+    return NOX_ERR_IO;
+  }
+  return NOX_OK;
+}

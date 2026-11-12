@@ -654,6 +654,10 @@ static void cleanup(struct app_state *state) {
     close(state->downloads_dir_fd);
     state->downloads_dir_fd = -1;
   }
+  if (state->tor_data_fd >= 0) {
+    close(state->tor_data_fd);
+    state->tor_data_fd = -1;
+  }
   if (state->config_dir_fd >= 0) {
     close(state->config_dir_fd);
     state->config_dir_fd = -1;
@@ -786,6 +790,7 @@ int main(int argc, char *argv[]) {
     state.peer_fd = -1;
     state.config_dir_fd = -1;
     state.downloads_dir_fd = -1;
+    state.tor_data_fd = -1;
     state.running = true;
     state.peer_state = ST_IDLE;
     state.active_peer_idx = -1;
@@ -799,15 +804,19 @@ int main(int argc, char *argv[]) {
     /* ── 0. Komut satırı argümanları ───────────────────── */
     bool ghost_mode = false;
     bool allow_unsandboxed_fs = false;
+    bool require_landlock_resolve_unix = false;
     for (int i = 1; i < argc; i++) {
       if (strcmp(argv[i], "--ghost") == 0 || strcmp(argv[i], "-ghost") == 0) {
         ghost_mode = true;
       } else if (strcmp(argv[i], "--allow-unsandboxed-fs") == 0) {
         allow_unsandboxed_fs = true;
+      } else if (strcmp(argv[i], "--require-landlock-resolve-unix") == 0) {
+        require_landlock_resolve_unix = true;
       }
     }
     state.ghost_mode = ghost_mode;
     state.allow_unsandboxed_fs = allow_unsandboxed_fs;
+    state.require_landlock_resolve_unix = require_landlock_resolve_unix;
 
     if (argc >= 2 && strcmp(argv[1], "--full_cleankeys") == 0) {
       /*

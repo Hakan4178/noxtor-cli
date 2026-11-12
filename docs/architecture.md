@@ -222,14 +222,14 @@ stdin_handler.c:383  process_line()         ← komut routing
   │                    ↓
   │               writev() ile atomic gönderme
   │
-  └─ /file ────→ file_transfer.c:104 file_transfer_start()
+  └─ /file ────→ file_transfer.c:227 file_transfer_start()
                        ↓
                   BLAKE2b hash hesapla
-                  METADATA frame gönder
-                  EPOLLOUT aktif et
+                  METADATA'yı kuyruğa commit et
+                  frame_queue_arm_tx() → EPOLLOUT
                        ↓
-                  file_transfer.c:334 file_transfer_handle_tx()
-                  (4KB chunk'lar halinde gönderim)
+                  file_transfer.c:471 file_transfer_handle_tx()
+                  (4KB chunk'ları kuyruğa doldurur)
 ```
 
 ### 4.1 TX Anahtar Fonksiyonlar
@@ -246,8 +246,8 @@ stdin_handler.c:383  process_line()         ← komut routing
 | `frame_ad()` | `network.c` | H2 AD üreticisi: header → 13-byte wire |
 | `write_full()` | `network.c:95` | EINTR retry ile tam yazma |
 | `socks5_connect()` | `network.c:1500` | Tor SOCKS5 bağlantısı + `SO_PEERCRED` doğrulaması |
-| `file_transfer_start()` | `file_transfer.c:104` | Dosya transferini başlat |
-| `file_transfer_handle_tx()` | `file_transfer.c:334` | 4KB chunk gönderimi |
+| `file_transfer_start()` | `file_transfer.c:227` | Dosya transferini başlat (METADATA kuyruğa) |
+| `file_transfer_handle_tx()` | `file_transfer.c:471` | 4KB chunk'ları TX kuyruğuna doldur |
 
 ### 4.2 TX Frame Yapısı
 
@@ -268,29 +268,36 @@ stdin_handler.c:383  process_line()         ← komut routing
 └──────────────────────────────────────────┘
 ```
 
-### 4.3 Gönderim (writev) ve Kısmi Yazma
+### 4.3 Gönderim (tek TX kuyruğu) ve Kısmi Yazma
 
-`writev()` header + ciphertext'i tek çağrıda yazmayı dener; ancak AF_UNIX
-`SOCK_STREAM`'de kısa yazma/EAGAIN olabilir. TEXT C1 kuyruğunda hazır frame
-`send()` ile yazılır; aşağıdaki iovec örneği CTRL/FILE/METADATA gibi writev
-kullanan yollar içindir.
+TEXT, METADATA ve FILE chunk'ları aynı `tx_frames` kuyruğunu kullanır:
+frame önce `frame_queue_reserve()` ile şifrelenip `frame_queue_commit()` ile
+sıraya alınır; sokete yazım `frame_queue_flush()` / `send()` ile yapılır.
+AF_UNIX `SOCK_STREAM`'de kısa yazma/EAGAIN normaldir; kalan baytlar slotun
+`off` alanı korunarak EPOLLOUT ile sürer.
 
-- **TEXT (C1 kuyruğu):** frame şifrelenip `tx_frames` slotuna commit edilir;
-  kısmi/EAGAIN'de kalan baytlar EPOLLOUT ile sürer. Kuyruk doluysa mesaj nonce
-  tüketmeden `pending_msg`'e ertelenir; ikinci mesaj net ret alır. Tek mesaj
-  4 slotu aşarsa (>16 KB) `pending_msg_off` ile parçalı ilerler: yalnız commit
-  edilmiş önek kadar offset ilerler, kalan frame'ler kuyruk boşaldıkça eklenir.
-  Kalıcı write hatası/0 dönüş → oturum fail-closed.
+- **TEXT:** mesaj önce atomik preflight'tan geçer; gereken frame sayısı boş
+  slotlardan fazlaysa nonce tüketilmeden `NOX_ERR_AGAIN` döner. Mesajın
+  parçaları aynı kuyruğa sırayla commit edilir; kuyruk yetmediği için yarım
+  mesaj bırakılmaz.
+- **METADATA ve FILE chunk:** `file_transfer_start()` METADATA'yı, kuyruk
+  doldurucu `file_transfer_handle_tx()` ise 4096 B'lik chunk'ları aynı
+  kuyruğa ekler. FILE TX aktifken gelen TEXT de kuyruğa girer; wire sırası
+  commit sırasına eşittir. Kuyrukta boş slot yoksa nonce tüketilmeden
+  `NOX_ERR_AGAIN` döner.
+- **Kalıcı hata:** sıfır dönüş veya `EAGAIN` dışı yazma hatası oturumu
+  fail-closed kapatır. Şifrelenmiş frame düşürülemez; nonce rollback yoktur.
+- **CTRL (handshake):** kuyruk kurulmadan önce tek `writev`; kısa yazma →
+  `EV_HANDSHAKE_ERROR` ve bağlantı fail-closed kapatılır.
 
-> **C1 sınırı (DB kuyruğu):** `db_process_queue` satırı, frame yalnız RAM
+> **DB kuyruğu sınırı:** `db_process_queue` satırı, frame yalnız RAM
 > kuyruğuna alındıktan sonra siler. Oturum bu arada düşerse mesaj kaybolur;
-> kalıcı in-flight işareti C2/C3'ün konusudur. `db_retry_pending` yalnız aynı
+> kalıcı in-flight işareti C3'ün konusudur. `db_retry_pending` yalnız aynı
 > oturumdaki kuyruk doluluğu/DB hatası için yeniden deneme sağlar; bayrak tam
 > başarıda temizlenir.
-- **CTRL (handshake):** tek `writev`; kısa yazma → `EV_HANDSHAKE_ERROR` ve
-  bağlantı fail-closed kapatılır.
-- **FILE:** frame `tx_buf`'a alınır; EPOLLOUT ile kalan baytlar tamamlanır.
-- **METADATA:** tek `writev`; kısmi yazma K-28 olarak açıktır.
+
+Handshake dışında `writev` kullanılmaz; aşağıdaki iovec örneği yalnız
+handshake/CTRL yolu içindir.
 
 ```
 struct iovec iov[2];
@@ -298,7 +305,7 @@ iov[0].iov_base = header;      // 13 byte
 iov[0].iov_len  = 13;
 iov[1].iov_base = ciphertext;  // payload + MAC
 iov[1].iov_len  = payload_len + NOX_MAC_LEN;
-writev(peer_fd, iov, 2);       // kısmi yazma olabilir — yukarıdaki kurallar
+writev(peer_fd, iov, 2);       // yalnız handshake; kısa yazma fail-closed
 ```
 
 ### 4.4 Plain Mesaj Yaşam Döngüsü ve Koruma (şeffaf)
@@ -306,7 +313,7 @@ writev(peer_fd, iov, 2);       // kısmi yazma olabilir — yukarıdaki kurallar
 ```
 ln_buf (sodium_malloc, mlock+guard, 4097) ─┐
 tui input_buf (.bss, 4096, no mlock) ──────┤
-stdin_buf (sodium_malloc, 64KB) ───────────┤→ chunk (sodium_malloc, 4097, mlock) → cipher_encrypt(k/n) → tx_buf (.bss, ciphertext) → noise_decrypt → pt (sodium_malloc, mlock) → safe_msg (malloc, no mlock, anlık) / tui chat_lines (strdup/malloc, no mlock, kalıcı)
+stdin_buf (sodium_malloc, 64KB) ───────────┤→ chunk (sodium_malloc, 4097, mlock) → noise_encrypt(k/n) → frame_queue slot (şifreli frame, .bss) → send() → noise_decrypt → pt (sodium_malloc, mlock) → safe_msg (malloc, no mlock, anlık) / tui chat_lines (strdup/malloc, no mlock, kalıcı)
 PIN (sodium_malloc, 130) → master/db/session/static (arena, tek mlock+outer guard+canary) → onion_seed/meta/dh_out (stack, no mlock, sodium_memzero)
 file plain_buf (sodium_malloc, 4096, mlock) → immediate sodium_memzero(4096) after encrypt
 ```
@@ -315,7 +322,7 @@ file plain_buf (sodium_malloc, 4096, mlock) → immediate sodium_memzero(4096) a
 |-------|-------------------|-----|-------|------|------|
 | PIN→subkey | `pin_buf:main.c:916` → `master_key:main.c:1055 arena` | sodium→arena | ✓ (tek mlock) | `sodium_memzero+free` / `arena_destroy` | sn → full |
 | Girdi | `ln_buf:stdin_handler.c:682` `chunk:283` `pt:event_loop.c:374` | sodium_malloc | ✓ per-alloc guard | `sodium_free` auto | satır |
-| Dosya | `plain_buf:file_transfer.c:262` | sodium_malloc | ✓ | `sodium_memzero(4096):426` | chunk |
+| Dosya | `plain_buf:file_transfer.c:403` | sodium_malloc | ✓ | `sodium_memzero(4096):517` | chunk |
 | Stack kopya | `salt:main.c:1042` `meta[305]:file_transfer.c:275` `dh_out:noise.c:658` | stack | ✗ | `sodium_memzero` manuel | µs |
 | UI kalıcı | `chat_lines:tui.c:429 strdup` `safe_msg:fe_ansi.c:404 malloc` | malloc/.bss | ✗ | `sodium_memzero+free` (anlık) / `free` wipe’suz (kalıcı) | kalıcı (scrollback 512) |
 
@@ -648,24 +655,29 @@ Split():  (tx, rx) = HKDF(ck, "")
 ```
 /file /path/to/file
   ↓
-file_transfer_start()                    [file_transfer.c:104]
+file_transfer_start()                    [file_transfer.c:227]
   ├─ open(filepath, O_RDONLY)
   ├─ fstat() → dosya boyutu
   ├─ BLAKE2b hash hesapla (boyut dahil)
-  ├─ METADATA frame gönder:
+  ├─ boş kuyruk slotu yoksa → NOX_ERR_AGAIN (nonce tüketilmez)
+  ├─ METADATA frame'ini kuyruğa commit et:
   │    type=FILE, subtype=METADATA
   │    payload: filename_len(1) + filename + filesize(8) + hash(32)
-  └─ EPOLLOUT aktif et
+  └─ frame_queue_arm_tx() → EPOLLOUT
   ↓
-file_transfer_handle_tx()                [file_transfer.c:334]
-  ├─ read(fd, chunk, 4096)
-  ├─ noise_encrypt(chunk)
-  ├─ frame_header_encode() + writev()
-  └─ devam ederse EPOLLOUT tekrar tetiklenir
+file_transfer_handle_tx()                [file_transfer.c:471]
+  ├─ boş slot kadar read(fd, chunk, 4096)
+  ├─ noise_encrypt(chunk) + frame_queue_commit()
+  ├─ sent_bytes'i commit sonrası artır
+  └─ kuyruk dolduysa dur; EPOLLOUT ile devam
+  ↓
+frame_queue_flush()                      [event_loop.c EPOLLOUT]
+  ├─ kısmi yazım → slot.off korunur, NOX_ERR_AGAIN
+  └─ sıfır/kalıcı hata → EV_PEER_DISCONNECTED (nonce rollback yok)
   ↓
 Tamamlandı:
-  ├─ EOF → son frame gönder
-  ├─ EPOLLOUT deaktif et
+  ├─ sent_bytes == total_size VE kuyruk boş
+  ├─ transfer kaynaklarını bırak
   └─ State: ST_FILE_TX → ST_ACTIVE
 ```
 
@@ -708,23 +720,25 @@ file_transfer_handle_rx()                [file_transfer.c:510]
 | BLAKE2b hash | Dosya bütünlük doğrulaması |
 | `file_transfer_cleanup()` | Kısmi dosyaları sil |
 
-METADATA tek `writev` ile gönderilir; kısmi/EAGAIN durumunda akış desync'i
-riski K-28 olarak açıktır (chunk yolu `tx_buf` + EPOLLOUT ile korunur).
+METADATA ve FILE chunk'ları ortak `frame_queue` üzerinden gönderilir; kısmi
+yazımda slot `off` alanı korunur, EPOLLOUT ile devam edilir. Kalıcı yazma
+hatası oturumu fail-closed kapatır. K-28/T-03 kapanmıştır (T-03 regresyonu
+`test_tx_metadata_partial_no_disconnect`).
 
 ### 8.4 Dosya Transferi Fonksiyonlar
 
 | Fonksiyon | Dosya:Satr | Görev |
 |-----------|-----------|-------|
-| `file_transfer_start()` | `file_transfer.c:104` | TX başlat |
-| `file_transfer_handle_tx()` | `file_transfer.c:334` | TX chunk gönder |
-| `file_transfer_handle_rx()` | `file_transfer.c:510` | RX frame işle |
-| `file_transfer_check_quota()` | `file_transfer.c` | Tek dosya boyut kotası |
-| `file_transfer_chunk_expired()` | `file_transfer.c` | Chunk stall timeout predikati |
-| `file_transfer_cleanup()` | `file_transfer.c:718` | Temizlik |
-| `sanitize_filename()` | `file_transfer.c:29` | Dosya adı temizleme |
-| `verify_downloads_dir_fd()` | `file_transfer.c:83` | Downloads dizin doğrulama (fd tabanlı) |
-| `open_recv_file()` | `file_transfer.c:460` | Güvenli dosya açma |
-| `write_to_file()` | `file_transfer.c:443` | Kısmi yazma yardımı |
+| `file_transfer_start()` | `file_transfer.c:227` | TX başlat, METADATA'yı kuyruğa al |
+| `file_transfer_handle_tx()` | `file_transfer.c:471` | TX kuyruğunu chunk'larla doldur |
+| `file_transfer_handle_rx()` | `file_transfer.c:632` | RX frame işle |
+| `file_transfer_check_quota()` | `file_transfer.c:30` | Tek dosya boyut kotası |
+| `file_transfer_chunk_expired()` | `file_transfer.c:874` | Chunk stall timeout predikati |
+| `file_transfer_cleanup()` | `file_transfer.c:886` | Temizlik |
+| `sanitize_filename()` | `file_transfer.c:44` | Dosya adı temizleme |
+| `verify_downloads_dir_fd()` | `file_transfer.c:99` | Downloads dizin doğrulama (fd tabanlı) |
+| `open_recv_file()` | `file_transfer.c:568` | Güvenli dosya açma |
+| `write_to_file()` | `file_transfer.c:550` | Kısmi yazma yardımı |
 
 ---
 
@@ -824,6 +838,8 @@ CR/LF ve bidi ayrı açık kalemdir (K-33). `test_frontend` 19/19.
 │ Layer 4: Dosya Güvenliği                                │
 │  • Landlock LSM:RW: erişilebilir dizinler beyaz liste   │
 │    (available=ABI detectable, active=restrict_self sonrası — is_available usable değil) │
+│  • F1/ABI≥9: pathname Unix connect kısıtlı; yalnız     │
+│    Tor socks.sock inode'una RESOLVE_UNIX istisnası      │
 │  • config RO: identity.key/salt event loop’ta okunabilir (şeffaf, bilerek — şifreli, HS sonrası RAM-only) │
 │  • O_NOFOLLOW: symlink izleme engeli                    │
 │  • O_EXCL: yarış koşulu koruması                        │
@@ -966,7 +982,7 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 
 ## 11. Test Kapsamı
 
-### 11.1 Unit Testler (33 süit — 424/425, `make test`)
+### 11.1 Unit Testler (33 süit — 437/437, `make test`)
 
 | Test Dosyası | Test Sayısı | Kapsadığı Fonksiyonlar |
 |--------------|-------------|------------------------|
@@ -977,12 +993,12 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 | `test_crypto.c` | 10 | Argon2id, subkey, salt, identity roundtrip, Ed25519→Curve25519 |
 | `test_database.c` | 5 | DB open/close, contacts, wrong key, queue, history |
 | `test_event_frames.c` | 30 | Frame parsing/routing, H2/H3, K-14 CTRL fail-fast |
-| `test_file_transfer.c` | 13 | TX/RX, kota, chunk timeout, METADATA kısa yazma — **12/13** (K-28/C2 bekliyor) |
+| `test_file_transfer.c` | 14 | TX/RX, kota, chunk timeout, T-03 METADATA kısmi yazım, fatal flush, 100-chunk akış/hash |
 | `test_frame_queue.c` | 6 | TX kuyruğu sıra/seq, kısmi yazma, fatal teardown |
 | `test_frame_queue_edges.c` | 8 | Ring wrap, reserve/commit atomikliği, kısmi yazım, fatal teardown |
-| `test_c1_text_paths.c` | 10 | TEXT kuyruklama, segmented AEAD sırası, pending offset/EAGAIN, EPOLLOUT liveness |
+| `test_c1_text_paths.c` | 10 | TEXT kuyruklama, segmented AEAD sırası, kuyruk dolu/AGAIN, EPOLLOUT liveness |
 | `test_frontend.c` | 19 | Dispatch, FE_SYSTEM/FE_ERROR strip, TUI no-op |
-| `test_landlock_rights.c` | 12 | Landlock hak maskeleme (birim + entegrasyon) |
+| `test_landlock_rights.c` | 22 | Landlock hak maskeleme + F1 RESOLVE_UNIX (birim + entegrasyon) |
 | `test_log.c` | 1 | Modül log seviyesi |
 | `test_mdwe.c` | 3 | MDWE prctl politikası |
 | `test_net_cleanup.c` | 9 | Soket/peer temizliği |
@@ -1001,7 +1017,7 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 | `test_time_expiry.c` | 6 | Zaman aşımı predikatları |
 | `test_tofu_epoch.c` | 9 | TOFU epoch/anahtar değişimi |
 | `test_tor_peer.c` | 4 | Tor control `SO_PEERCRED` doğrulaması |
-| `test_tx_order.c` | 2 | TX kuyruk sırası / nonce sırası |
+| `test_tx_order.c` | 3 | FILE/TEXT/METADATA wire sırası / nonce sırası |
 | `test_wire_hardening.c` | 9 | Wire format sertleştirmesi |
 
 Ayrıca: `test_onion_derive.sh` — onion e2e: determinizm + canlı Tor
@@ -1009,17 +1025,14 @@ Ayrıca: `test_onion_derive.sh` — onion e2e: determinizm + canlı Tor
 `test_seccomp.c` (make seccomp-test) — tüm seccomp kural dizisinin
 canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
 
-**Bilinen kırmızı (1):**
-- `test_file_transfer` 12/13 — `test_tx_metadata_short_write_disconnects`
-  METADATA kısa yazmada eski "kop" sözleşmesini bekliyor; kod ise nonce'u
-  tüketip kanalı canlı tutuyor. Kalıcı çözüm TX kuyruğu (C2) olduğu için test
-  bilinçli kırmızı; kuyruk gelince "kısmi yazmada kopma yok, sonraki frame
-  doğru" sözleşmesine yeniden yazılacak.
+**Bilinen kırmızı yok.** C2 ile METADATA ve FILE chunk'ları ortak TX
+kuyruğuna alındı; `test_file_transfer` 14/14, `test_tx_order` 3/3 ve tam
+`make test` 437/437 yeşildir. K-28/T-03 kapanmıştır.
 
 `test_seccomp_stage3` 41/41 — `sendto` bilinçli istisna (glibc `send()`
 uyumu; `TODO(IPC-SENDTO)`).
 
-`make test` bu nedenle exit 2 döner; diğer 32 süit yeşildir.
+`make test` bu nedenle exit 0 döner; 33 süitin tamamı yeşildir.
 
 ### 11.2 Formal Doğrulama (CBMC + ESBMC + ProVerif)
 
@@ -1056,8 +1069,8 @@ uyumu; `TODO(IPC-SENDTO)`).
 
 ```bash
 # Unit testler
-make test                    # 33 süit, 424/425 — ASan+UBSan
-                             # (bilinen kırmızı: test_file_transfer 12/13)
+make test                    # 33 süit, 437/437 — ASan+UBSan
+                             # (kırmızı yok; C2/T-03 kapandı)
 make seccomp-test            # Seccomp canlı kural testi
 
 # Tek süit
@@ -1145,12 +1158,12 @@ noxtor-cli/
 │   ├── test_crypto.c        # Crypto unit tests (10)
 │   ├── test_database.c      # Database unit tests (5)
 │   ├── test_event_frames.c  # Frame/H2/H3/K-14 (30)
-│   ├── test_file_transfer.c # Dosya transferi (13; 12/13 — K-28/C2)
+│   ├── test_file_transfer.c # Dosya transferi + T-03/fatal flush (14)
 │   ├── test_frame_queue.c   # C1 TX kuyruğu (6)
 │   ├── test_frame_queue_edges.c # C1 ring/atomiklik/kısmi yazım (8)
-│   ├── test_c1_text_paths.c # C1 TEXT/pending/EPOLLOUT (10)
+│   ├── test_c1_text_paths.c # C1 TEXT/kuyruk/EPOLLOUT (10)
 │   ├── test_frontend.c      # Frontend dispatch + T-02 strip (19)
-│   ├── test_landlock_rights.c # Landlock rights (12)
+│   ├── test_landlock_rights.c # Landlock rights + F1 (22)
 │   ├── test_log.c           # Log seviyesi (1)
 │   ├── test_mdwe.c          # MDWE politikası (3)
 │   ├── test_net_cleanup.c   # Soket/peer temizliği (9)
@@ -1171,7 +1184,7 @@ noxtor-cli/
 │   ├── test_time_expiry.c   # Zaman aşımı (6)
 │   ├── test_tofu_epoch.c    # TOFU epoch (9)
 │   ├── test_tor_peer.c      # Tor control SO_PEERCRED (4)
-│   ├── test_tx_order.c      # TX/nonce sırası (2)
+│   ├── test_tx_order.c      # FILE/TEXT/METADATA TX sırası (3)
 │   └── test_wire_hardening.c # Wire format sertleştirme (9)
 ├── fuzz/
 │   ├── fuzz_arena.c

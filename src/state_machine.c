@@ -325,12 +325,6 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
         sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
         ps->tx_file.fd = -1;
     }
-    /* Adım 4.5: ertelenen TEXT tek slotu — sodium_free zeroize eder. */
-    if (ps->pending_msg) {
-        sodium_free(ps->pending_msg);
-        ps->pending_msg = NULL;
-    }
-    ps->pending_msg_off = 0;
 
     /* 6. Recv buffer sıfırlama */
     sodium_memzero(ps->recv_buf, sizeof(ps->recv_buf));
@@ -470,7 +464,6 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
     ps->rx_seq = 0;
     ps->queue_flushed = false;
     frame_queue_reset(ps);
-    ps->pending_msg_off = 0;
     ps->db_retry_pending = false;
     /* H-1 FIX: TOFU ile kurulan oturum doğrulanmamış sayılır — kuyruk
      * sızıntısını önlemek için peer_verified=false bırakılır. İlk
