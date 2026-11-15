@@ -142,8 +142,8 @@ static struct peer_session *find_peer_by_name_or_onion(struct app_state *state,
 }
 
 /* B FIX: ANSI kaçış temizliği artık frontend.c'de tek kaynak
- * (ui_strip_ansi, test_ansi_strip korpusuyla kilitli) — buradaki
- * static kopya silindi, drift'e kapalı. */
+ * (ui_strip_ansi / ui_strip_input, test_ansi_strip korpusuyla kilitli)
+ * — buradaki static kopya silindi, drift'e kapalı. */
 
 /* ================================================================
  * MESAJ GÖNDERME VE KUYRUK YARDIMCILARI
@@ -231,7 +231,8 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
 
   /* DB kuyruğu kalıcıdır; kuyrukta yer yokken NOX_OK dönmek
    * db_process_queue'nin satırı hemen silmesine yol açar. Net ret ile
-   * kayıt korunur ve sıra bozulmaz; kuyruk bir sonraki flush'ta denenir. */
+   * kayıt korunur ve sıra bozulmaz; kuyruk bir sonraki flush'ta denenir.
+   * Şifreleme de yapılmaz: nonce tüketilmez. */
   if (frame_queue_free(ps) == 0) {
     ps->db_retry_pending = true;
     return NOX_ERR_AGAIN;
@@ -244,12 +245,6 @@ nox_err_t send_queued_callback(const char *text, void *ctx) {
     NOX_WARN(LOG_MOD_MAIN,
              "queued mesaj çok uzun (%zu), atlanıyor", pt_len);
     return NOX_ERR_PROTO;
-  }
-
-  /* Kuyruk doluysa şifreleme YOK: nonce tüketilmez, satır silinmez. */
-  if (frame_queue_free(ps) == 0) {
-    ps->db_retry_pending = true;
-    return NOX_ERR_AGAIN;
   }
 
   nox_err_t err = enqueue_frame(state, ps, NOX_MSG_TEXT, text, pt_len);
@@ -683,9 +678,8 @@ void process_line(struct app_state *state, const char *line) {
       clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
       NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", target_ps->tx_seq);
       ui_print_system(state, "[*] handshake başlatıldı");
-      state->active_peer_idx = (int)target_idx;
-      /* O-1 FIX: active_peer_onion atomik set (tek thread’de atomik, yorumla belgelendi) */
-      strncpy(state->active_peer_onion, target, NOX_ONION_LEN); state->active_peer_onion[NOX_ONION_LEN]='\0';
+      /* K-23: indeks + gösterim tek noktadan atomik güncellenir. */
+      sm_set_active_peer(state, target_ps);
       return;
     }
 #pragma GCC diagnostic pop
@@ -716,15 +710,10 @@ void process_line(struct app_state *state, const char *line) {
         ui_print_error(state, "Peer aktif değil (handshake/TOFU devam ediyor olabilir): %s", arg);
         return;
       }
-      for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
-        if (&state->peers[i] == found) {
-          state->active_peer_idx = (int)i;
-          strncpy(state->active_peer_onion, found->peer_onion, NOX_ONION_LEN);
-          state->active_peer_onion[NOX_ONION_LEN] = '\0';
-          ui_print_system(state, "Aktif peer: %s (%s)", found->name[0] ? found->name : found->peer_onion, sm_state_name(found->state));
-          return;
-        }
-      }
+      sm_set_active_peer(state, found);
+      ui_print_system(state, "Aktif peer: %s (%s)",
+                      found->name[0] ? found->name : found->peer_onion,
+                      sm_state_name(found->state));
       return;
     }
 #pragma GCC diagnostic pop
@@ -957,12 +946,15 @@ if (res != NULL) {
 
     /* Echo: terminal raw mode'da echo kapalı, program kendi yazacak
      * Sadece son okunan byte'ları echo et (önceki döngüde zaten yazıldı)
-     * NOT: ui_strip_ansi'dan ÖNCE hesapla — escape temizlenince
+     * NOT: sanitizer'dan ÖNCE hesapla — escape temizlenince
      * echo_start underflow olmasın */
     size_t old_len = state->stdin_len - (size_t)r;
     {
-      /* Escape sequence temizle — ok tuşları, vb. (B FIX: tek kaynak) */
-      ui_strip_ansi(state->stdin_buf);
+      /* Escape sequence temizle — ok tuşları, vb. (B FIX: tek kaynak).
+       * ui_strip_input CR/LF'yi KORUR; satır bölme ve Enter işleme
+       * aşağıdaki memchr('\n') döngüsüne bağlıdır. Çıktı sanitizer'ı
+       * (ui_strip_ansi) burada kullanılırsa komutlar hiç çalışmaz. */
+      ui_strip_input(state->stdin_buf);
       state->stdin_len = strlen(state->stdin_buf);
 
       size_t echo_start = (state->stdin_len > old_len) ? old_len : state->stdin_len;

@@ -84,7 +84,6 @@ int main(void) {
     state.tofu_pending = false;
     state.ghost_mode = true; /* DB operasyonlarından kaçınmak için */
     state.epoll_fd = -1;
-    state.socks_port = 0;
 
     state.stdin_buf = NULL;
     state.stdin_len = 0;

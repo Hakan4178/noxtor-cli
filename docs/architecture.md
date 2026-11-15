@@ -56,18 +56,18 @@ noxtor-cli, Tor üzerinden anonim mesajlaşma uygulaması. Çoklu peer bağlant�
 | `src/cet_shstk.c` | 203 | CET-SS shadow stack kilidi + fork-CP self-test (init 4b) |
 | `src/crypto.c` | 968 | Argon2id, Ed25519, Curve25519 dönüşümü, onion seed/claim |
 | `src/database.c` | 1120 | SQLite: kontakt, mesaj kuyruğu, geçmiş |
-| `src/event_loop.c` | 1184 | Ana epoll event loop, frame işleme, H2/H3 |
-| `src/file_transfer.c` | 949 | Dosya gönderme/alma (BLAKE2b) |
-| `src/frame_queue.c` | 143 | C1 sıralı TX frame kuyruğu (nonce/write sırası) |
-| `src/landlock_sandbox.c` | 250 | Landlock LSM dosya erişim kontrolü |
+| `src/event_loop.c` | 1373 | Ana epoll event loop, frame işleme, H2/H3 |
+| `src/file_transfer.c` | 934 | Dosya gönderme/alma (BLAKE2b) |
+| `src/frame_queue.c` | 161 | C1 sıralı TX frame kuyruğu (nonce/write sırası) |
+| `src/landlock_sandbox.c` | 416 | Landlock LSM dosya erişim kontrolü; F1/F3 daraltmaları |
 | `src/linenoise.c` | 2370 | linenoise secure fork — satır düzenleme (sodium allocator hook'ları) |
-| `src/log.c` | 342 | Modül bazlı loglama (TUI entegre) |
-| `src/main.c` | 1587 | Başlatma, PIN, key derivation, args |
-| `src/network.c` | 2037 | Tor spawn, SOCKS5, epoll, frame encode/decode, ADD_ONION |
+| `src/log.c` | 343 | Modül bazlı loglama (TUI entegre) |
+| `src/main.c` | 1596 | Başlatma, PIN, key derivation, args |
+| `src/network.c` | 2030 | Tor spawn, SOCKS5, epoll, frame encode/decode, ADD_ONION |
 | `src/noise.c` | 1232 | Noise XX protocol implementasyonu |
-| `src/seccomp.c` | 649 | 3 aşamalı seccomp-bpf loading |
-| `src/state_machine.c` | 527 | Peer durum makinesi (8 durum, 18 olay, 48 geçiş) |
-| `src/stdin_handler.c` | 1070 | Komut işleme, mesaj segmentasyonu |
+| `src/seccomp.c` | 655 | 3 aşamalı seccomp-bpf loading |
+| `src/state_machine.c` | 522 | Peer durum makinesi (8 durum, 18 olay, 48 geçiş) |
+| `src/stdin_handler.c` | 1032 | Komut işleme, mesaj segmentasyonu |
 | `src/tui.c` | 799 | termbox2 tabanlı TUI (3 panel) |
 | `src/frontend.c` | 208 | Ortak frontend katmanı — `ui_print_*` sarmalayıcılar, dispatch (`frontend_emit`), `ui_strip_ansi`, `fe_now_tm` (eski adıyla ui.c) |
 | `src/fe_ansi.c` | 535 | Atomic ANSI backend — tema (`ansi_ctx`), çizim, `fe_ansi_ops` |
@@ -109,11 +109,11 @@ Tor'dan veri gelişi → ekrana mesaj display. Tam yol:
 ```
 Tor daemon
   ↓ (Tor SOCKS5 → AF_UNIX socket)
-event_loop.c:429  event_loop()           ← epoll_wait()
+event_loop.c:792  event_loop()           ← epoll_wait()
   ↓
-event_loop.c:842  peer_fd ready          ← EPOLLIN (epoll_wait sonrası)
+event_loop.c:1308 peer_fd ready          ← EPOLLIN (epoll_wait sonrası)
   ↓
-event_loop.c:55   process_peer_frames()  ← frame parsing döngüsü
+event_loop.c:316  process_peer_frames()  ← frame parsing döngüsü
   ↓
 network.c:1724    frame_header_decode()  ← 13-byte header decode
   ↓
@@ -144,9 +144,10 @@ network.c:1724    frame_header_decode()  ← 13-byte header decode
 
 | Fonksiyon | Dosya:Satır | Görev |
 |-----------|-----------|-------|
-| `event_loop()` | `event_loop.c:429` | Ana döngü, epoll_wait |
-| `process_peer_frames()` | `event_loop.c:55` | Frame parsing + routing (static) |
+| `event_loop()` | `event_loop.c:792` | Ana döngü, epoll_wait |
+| `process_peer_frames()` | `event_loop.c:316` | Frame parsing + routing (static) |
 | `peer_proto_fatal()` | `event_loop.c` | H3: protokol ihlali → `EV_CRYPTO_FAIL` fail-closed |
+| `frame_trickle_expired()` | `event_loop.c:144` | B1: yarım frame/trickle deadline predikati |
 | `frame_header_decode()` | `network.c:1724` | 13-byte header → struct |
 | `recv()` | system call | Ham veri okuma |
 | `noise_decrypt()` | `noise.c:899` | ChaCha20-Poly1305 IETF AEAD decrypt |
@@ -507,6 +508,18 @@ seed → `derive_tor_expanded_key` → Tor `ADD_ONION ED25519-V3:<b64>` KeyBlob.
 beklediği `[clamped_scalar||prefix]` formatı expanded key türetmeyle üretilir
 (ayrıntı: `docs/onion-key-derived-plan.md`).
 
+**F2 — control fd yaşam döngüsü (2026-11-15):** Her iki HS yolu
+`ADD_ONION ... Flags=Detach` kullanır. HS kurulumu ve seed↔adres
+doğrulamasından sonra, `epoll`/event loop'a girmeden önce
+`tor_close_control_fd()` çağrılır; fd `shutdown(SHUT_RDWR)` + `close` ile
+kapatılır ve `state->tor_ctrl_fd = -1` olur. Detached HS Tor süreci
+boyunca yaşar. Torrc'de `__OwningControllerProcess <pid>` bulunur; bu,
+`PDEATHSIG` yanında orphan Tor'a karşı ikinci savunmadır. `TAKEOWNERSHIP`
+gönderilmez (gönderilirse fd kapanınca Tor da kapanırdı). Böylece
+Landlock/seccomp sonrası dönemde authenticate edilmiş Tor kontrol
+yeteniği kalmaz; shutdown HS sonrası `terminate_and_reap()` ve
+PDEATHSIG üzerinden yürür.
+
 ### 6.2 Identity Key Çözümü
 
 ```
@@ -840,6 +853,10 @@ CR/LF ve bidi ayrı açık kalemdir (K-33). `test_frontend` 19/19.
 │    (available=ABI detectable, active=restrict_self sonrası — is_available usable değil) │
 │  • F1/ABI≥9: pathname Unix connect kısıtlı; yalnız     │
 │    Tor socks.sock inode'una RESOLVE_UNIX istisnası      │
+│  • F3: config yalnız READ_FILE|READ_DIR; silme yalnız  │
+│    tor_data_<pid> (REMOVE_FILE|REMOVE_DIR); torrc orada │
+│  • F2: Tor control fd HS + seed↔adres doğrulaması sonrası│
+│    kapatılır; HS Flags=Detach ile yaşar                 │
 │  • config RO: identity.key/salt event loop’ta okunabilir (şeffaf, bilerek — şifreli, HS sonrası RAM-only) │
 │  • O_NOFOLLOW: symlink izleme engeli                    │
 │  • O_EXCL: yarış koşulu koruması                        │
@@ -865,8 +882,8 @@ CR/LF ve bidi ayrı açık kalemdir (K-33). `test_frontend` 19/19.
 │    unshare, setns, reboot + fs api + clone (thread     │
 │    filter) + prctl (8 tehlikeli option) + raw socket   │
 │  • Seccomp stage 3 (event loop başı, event_loop.c:481):│
-│    symlink/link/chmod/chown, clone, socket(AF_INET,    │
-│    AF_INET6, AF_XDP, AF_ALG, AF_VSOCK, AF_NETLINK),    │
+│    symlink/link/chmod/chown, clone, socket() allowlist:│
+│    domain != AF_UNIX → KILL (tüm aile sınıfı),         │
 │    W^X (mprotect/mmap PROT_EXEC), SysV IPC, memfd      │
 ├─────────────────────────────────────────────────────────┤
 │ Layer 1: Process İzolasyonu                             │
@@ -876,6 +893,39 @@ CR/LF ve bidi ayrı açık kalemdir (K-33). `test_frontend` 19/19.
 │  • PR_SET_DUMPABLE=0: /proc/PID/mem engeli              │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**Landlock maskeleme semantiği (LL-03):** `nox_ll_compute_rule_rights`
+içindeki `wanted & handled` yalnızca `allowed_access ⊆ handled_access_fs`
+invariant'ını sağlar ve `landlock_add_rule` EINVAL'ini önler. Bu bir
+kısıtlama garantisi değildir: `handled` dışındaki bir hak Landlock
+tarafından uygulanmaz. Örneğin ABI<3'te `TRUNCATE` kural maskesinden
+düşer, ama truncate hiç kısıtlanmaz; sandbox öncesi açılmış fd'ler de
+(F4) geriye dönük kapsanmaz. Ayrıntı: `src/landlock_sandbox.c` ve
+`include/landlock_sandbox.h` yorumları; `test_landlock_rights` **24/24**.
+
+**F1 ABI notu:** Pathname Unix `connect` kısıtı yalnız Landlock ABI ≥ 9
+(Linux 7.1+) ile etkindir. ABI < 9'da dosya sistemi sınırlaması çalışır,
+ancak pathname Unix soketlerine `connect` kısıtlanamaz; uygulama görünür
+uyarı basar. `--require-landlock-resolve-unix` bu durumda fail-closed
+yapar.
+
+**Gelecek yerel Unix IPC için not (13 Kasım 2026, upstream doğrulama turu):**
+ABI ≥ 9'da `RESOLVE_UNIX` istisna listesi **yalnız Tor'un `socks.sock`
+inode'unu** kapsar (`src/landlock_sandbox.c`). Yeni bir **yerel pathname
+Unix soketi** (ör. frontend/GTK IPC) eklenecekse aynı kural listesine
+girmezse bağlantı `EACCES` ile reddedilir → istisna listesinin genişletilmesi
+gerekir. Peer trafiği etkilenmez: karşı tarafın `listen.sock`'una Tor
+(sandbox domain dışında) bağlanır. Kayıt: `docs-priv/KONSOLIDE-BULGULAR.md`
+§18.3 (D-3).
+
+**Landlock ABI eşlemesi (upstream `landlock(7)`, man-pages 6.19):**
+ABI 1 = 5.13 · 2 = 5.19 (`REFER`) · 3 = 6.2 (`TRUNCATE`) · 4 = 6.7 (TCP) ·
+5 = 6.10 (`IOCTL_DEV`) · 6 = 6.12 (`SCOPE_*`) · 7 = 6.15 (log bayrakları) ·
+8 = **7.0** (`TSYNC`) · 9 = **7.1** (`RESOLVE_UNIX`). Kullanılan özellikler
+ABI'ye göre koşullu eklenir; ABI 9 üstü özellikler (UDP ağ hakları,
+`quiet_*`, `NO_NEW_PRIVS`, capability/namespace izinleri) **bilinçli olarak
+kullanılmıyor** — gerekçe ve güncel durum: `docs-priv/KONSOLIDE-BULGULAR.md`
+§18.5 (L-3).
 
 ### 10.2 Seccomp Aşamaları
 
@@ -932,15 +982,25 @@ Stage 3 (event loop başı, event_loop.c:481):
     shmget, shmat, shmctl, msgget, msgsnd, msgrcv, msgctl
   + özel kurallar:
     clone: tamamen KILL (event loop tek thread)
-    socket(AF_INET), socket(AF_INET6)          ← TCP/UDP tamamen yasak
-    socket(AF_XDP), socket(AF_ALG), socket(AF_VSOCK)  ← H-6 fix:
-       alternatif sızıntı yolları (raw paket / kernel crypto / VM)
-    socket(AF_NETLINK)                         ← kernel network config
+    socket() ALLOWLIST: domain != AF_UNIX → KILL   ← S-1 (13 Kasım 2026)
+       Tüm ağ ailelerini (AF_INET, AF_INET6, AF_NETLINK, AF_PACKET,
+       AF_XDP, AF_ALG, AF_VSOCK, AF_PPPOX, AF_TIPC, AF_IB, ...) tek
+       kuralla kapatır. Upstream seccomp(2) allow-list önerir: deny-list
+       her yeni aileyle güncellenmek zorundadır.
+       Önceden aile listesiyle kapatılanlar artık ayrı kural gerektirmez.
     mprotect(PROT_EXEC), mmap(PROT_EXEC)       ← W^X: çalışma zamanında
        executable bellek yaratımı KILL (JIT yok, BIND_NOW)
 
-İzinli kalanlar: AF_UNIX socket (Tor control/SOCKS/peer bağlantısı),
+İzinli kalanlar: AF_UNIX socket (Tor control/SOCKS/peer bağlantısı) —
+AF_UNIX'un SOCK_STREAM/DGRAM/SEQPACKET tüm tipleri; socketpair(AF_UNIX)
+serbest (ayrı syscall, allowlist kuralı socket()'a bakar).
 getaddrinfo yalnızca stage 3 öncesi (bootstrap sırasında).
+
+Not: allowlist yalnız stage 3'ten itibaren yürürlüktedir (kullanıcı
+kararı 2026-11-13); stage 2 aile kuralları bootstrap penceresinde erken
+kapatma için korunur. Test: test_seccomp_stage3 57/57 (14 yeni aile),
+test_seccomp_badpatch socket matrisi (allowlist ters çevrilince sapma
+görünüyor).
 ```
 
 ### 10.3 Arena Bellek Topolojisi
@@ -982,7 +1042,7 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 
 ## 11. Test Kapsamı
 
-### 11.1 Unit Testler (33 süit — 437/437, `make test`)
+### 11.1 Unit Testler (33 süit — 460/460, `make test`; B2a baseline 444/444)
 
 | Test Dosyası | Test Sayısı | Kapsadığı Fonksiyonlar |
 |--------------|-------------|------------------------|
@@ -992,25 +1052,25 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 | `test_chunk_size.c` | 8 | UTF-8 güvenli chunk noktası |
 | `test_crypto.c` | 10 | Argon2id, subkey, salt, identity roundtrip, Ed25519→Curve25519 |
 | `test_database.c` | 5 | DB open/close, contacts, wrong key, queue, history |
-| `test_event_frames.c` | 30 | Frame parsing/routing, H2/H3, K-14 CTRL fail-fast |
+| `test_event_frames.c` | 35 | Frame parsing/routing, H2/H3, K-14 CTRL fail-fast, B1 trickle/T2, B2a gerçek-handshake |
 | `test_file_transfer.c` | 14 | TX/RX, kota, chunk timeout, T-03 METADATA kısmi yazım, fatal flush, 100-chunk akış/hash |
 | `test_frame_queue.c` | 6 | TX kuyruğu sıra/seq, kısmi yazma, fatal teardown |
 | `test_frame_queue_edges.c` | 8 | Ring wrap, reserve/commit atomikliği, kısmi yazım, fatal teardown |
 | `test_c1_text_paths.c` | 10 | TEXT kuyruklama, segmented AEAD sırası, kuyruk dolu/AGAIN, EPOLLOUT liveness |
 | `test_frontend.c` | 19 | Dispatch, FE_SYSTEM/FE_ERROR strip, TUI no-op |
-| `test_landlock_rights.c` | 22 | Landlock hak maskeleme + F1 RESOLVE_UNIX (birim + entegrasyon) |
+| `test_landlock_rights.c` | 24 | Landlock hak maskeleme + F1 RESOLVE_UNIX + F3 config/tor_data (birim + entegrasyon) |
 | `test_log.c` | 1 | Modül log seviyesi |
 | `test_mdwe.c` | 3 | MDWE prctl politikası |
 | `test_net_cleanup.c` | 9 | Soket/peer temizliği |
 | `test_net_io.c` | 28 | Parçalı okuma, EINTR, read/write timeout, slow-loris, EPIPE/SIGPIPE |
-| `test_network.c` | 10 | Frame encode/decode, listener, UTF-8 chunking |
+| `test_network.c` | 11 | Frame encode/decode, listener, ADD_ONION biçim/sıra + control fd kapatma (F2) |
 | `test_noise.c` | 17 | Handshake, transport roundtrip, MAC/AD tamper, spec vectors |
 | `test_onion_bind.c` | 13 | Onion↔static key claim üret/doğrula (H-1/H-2) |
 | `test_onion_derive.c` | 7 | Onion seed determinizmi, expanded key format |
 | `test_pin.c` | 12 | PIN validation (min/max/null/control/UTF-8) |
 | `test_seccomp_stage1.c` | 15 | Stage 1 kural seti |
 | `test_seccomp_stage2.c` | 41 | Stage 2 kural seti + clone/prctl özel kuralları |
-| `test_seccomp_stage3.c` | 41 | AF_INET/INET6, clone, DNS, W^X, AF_NETLINK |
+| `test_seccomp_stage3.c` | 57 | AF_INET/INET6, clone, DNS, W^X, AF_NETLINK + **S-1 allowlist: 14 aile (AF_PPPOX, TIPC, IB, MCTP, RXRPC, LLC, IRDA, ISDN, SNA, PHONET, X25, DECnet, BRIDGE, ASH) + AF_UNIX tip varyantları** |
 | `test_sm_cleanup.c` | 15 | Durum makinesi cleanup yolları |
 | `test_socks_peer.c` | 3 | SOCKS `SO_PEERCRED` doğrulaması |
 | `test_stdin.c` | 16 | Komut ayrıştırma, segmentasyon |
@@ -1022,14 +1082,21 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 
 Ayrıca: `test_onion_derive.sh` — onion e2e: determinizm + canlı Tor
 `ADD_ONION` ServiceID eşleşmesi (`make test` sonunda koşar).
+`test_tor_detach.sh` — F2 canlı control-spec testi: `Flags=Detach`
+kalıcılığı, yanlış sıra reddi, `TAKEOWNERSHIP`/`DROPOWNERSHIP` ve
+`__OwningControllerProcess` (owning testi `make test-tor-owning`).
 `test_seccomp.c` (make seccomp-test) — tüm seccomp kural dizisinin
 canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
 
 **Bilinen kırmızı yok.** C2 ile METADATA ve FILE chunk'ları ortak TX
-kuyruğuna alındı; `test_file_transfer` 14/14, `test_tx_order` 3/3 ve tam
-`make test` 437/437 yeşildir. K-28/T-03 kapanmıştır.
+kuyruğuna alındı; `test_file_transfer` 14/14, `test_tx_order` 3/3, B1
+trickle ve B2a gerçek-handshake testleriyle `test_event_frames` 35/35 ve
+tam `make test` 460/460 (S1 seccomp test genişlemesi dahil; B2a baseline
+444/444) yeşildir. K-28/T-03, HF-1/B1 ve B2a kapanmıştır;
+B2b (iki ayrı süreç + Tor) kullanıcı kararıyla ertelendi (ayrı izleme
+kalemi).
 
-`test_seccomp_stage3` 41/41 — `sendto` bilinçli istisna (glibc `send()`
+`test_seccomp_stage3` 57/57 — `sendto` bilinçli istisna (glibc `send()`
 uyumu; `TODO(IPC-SENDTO)`).
 
 `make test` bu nedenle exit 0 döner; 33 süitin tamamı yeşildir.
@@ -1048,6 +1115,12 @@ uyumu; `TODO(IPC-SENDTO)`).
 | `validate_onion.c` (cbmc_validate_onion.c) | ✅ | VERIFICATION SUCCESSFUL |
 | Noise XX protokolü (tests/proverif/) | ProVerif | XX.noise.active.pv, XX.noise.passive.pv |
 
+**Son koşu (2026-11-13):** `formal-verify.sh stdin` **3/3** — CBMC unwind 100
+(387 property), ESBMC unwind 100 (29 property) ve ESBMC unwind 4200
+(44 property) `VERIFICATION SUCCESSFUL`. Yerel ESBMC 8.6.0 build'i
+kullanıldı (sistemdeki `/usr/local/bin/esbmc`, Boost 1.91 ABI uyuşmazlığı
+nedeniyle çalışmıyor).
+
 ### 11.3 Fuzz Testler
 
 | Fuzz Hedefi | Dosya | Kapsadığı |
@@ -1065,12 +1138,19 @@ uyumu; `TODO(IPC-SENDTO)`).
 | Differential | `tests/fuzz_noise_differential.c` | Noise-c referans kütüphane ile differential testing |
 | Differential (star) | `tests/fuzz_noise_differential_noise_star.c` | noise_star referans implementasyon |
 
+**Son koşu (2026-11-13):** 10/10 fuzz hedefi
+`make fuzz FUZZ_CC=/usr/bin/afl-clang-fast` ile derlendi. Kısa gerçek AFL++
+kampanyaları `fuzz_ctrl` 120 sn, `fuzz_stdin` 120 sn ve `fuzz_handshake`
+100 sn → **0 crash / 0 timeout**. `make differential` **1.596.243 pass /
+0 fail**. İki bayat harness bu koşuda güncellendi: `fuzz_handshake.c`
+6-arg `handshake_read`, `fuzz_stdin_events.c` kaldırılan `socks_port` alanı.
+
 ### 11.4 Çalıştırma
 
 ```bash
 # Unit testler
-make test                    # 33 süit, 437/437 — ASan+UBSan
-                             # (kırmızı yok; C2/T-03 kapandı)
+make test                    # 33 süit, 460/460 — ASan+UBSan
+                             # (kırmızı yok; C2/T-03/B1/B2a kapandı)
 make seccomp-test            # Seccomp canlı kural testi
 
 # Tek süit
@@ -1078,6 +1158,8 @@ make seccomp-test            # Seccomp canlı kural testi
 
 # Formal doğrulama
 ./tests/formal-verify.sh     # Tümü (CBMC + ESBMC)
+PATH="/home/hakan/esbmc/build/src/esbmc:$PATH" \
+  ./tests/formal-verify.sh stdin  # çalışan yerel ESBMC 8.6.0 build'i
 ./tests/formal-verify.sh arena    # Sadece arena
 ./tests/formal-verify.sh sm       # Sadece state machine
 
@@ -1086,6 +1168,7 @@ make seccomp-test            # Seccomp canlı kural testi
 
 # Fuzz testler
 make fuzz                    # Tüm fuzz hedefleri
+make fuzz FUZZ_CC=/usr/bin/afl-clang-fast  # AFL++ clang instrumentasyonu
 ```
 
 ---
@@ -1157,13 +1240,13 @@ noxtor-cli/
 │   ├── test_chunk_size.c    # UTF-8 chunk noktası (8)
 │   ├── test_crypto.c        # Crypto unit tests (10)
 │   ├── test_database.c      # Database unit tests (5)
-│   ├── test_event_frames.c  # Frame/H2/H3/K-14 (30)
+│   ├── test_event_frames.c  # Frame/H2/H3/K-14 + B1 trickle + B2a (35)
 │   ├── test_file_transfer.c # Dosya transferi + T-03/fatal flush (14)
 │   ├── test_frame_queue.c   # C1 TX kuyruğu (6)
 │   ├── test_frame_queue_edges.c # C1 ring/atomiklik/kısmi yazım (8)
 │   ├── test_c1_text_paths.c # C1 TEXT/kuyruk/EPOLLOUT (10)
 │   ├── test_frontend.c      # Frontend dispatch + T-02 strip (19)
-│   ├── test_landlock_rights.c # Landlock rights + F1 (22)
+│   ├── test_landlock_rights.c # Landlock rights + F1/F3 (24)
 │   ├── test_log.c           # Log seviyesi (1)
 │   ├── test_mdwe.c          # MDWE politikası (3)
 │   ├── test_net_cleanup.c   # Soket/peer temizliği (9)
@@ -1177,7 +1260,7 @@ noxtor-cli/
 │   ├── test_seccomp.c       # Seccomp live tests (make seccomp-test)
 │   ├── test_seccomp_stage1.c # Stage 1 (15)
 │   ├── test_seccomp_stage2.c # Stage 2 (41)
-│   ├── test_seccomp_stage3.c # Stage 3 (41)
+│   ├── test_seccomp_stage3.c # Stage 3 (57)
 │   ├── test_sm_cleanup.c    # Durum makinesi cleanup (15)
 │   ├── test_socks_peer.c    # SOCKS SO_PEERCRED (3)
 │   ├── test_stdin.c         # Komut/segmentasyon (16)
@@ -1213,7 +1296,7 @@ noxtor-cli/
 
 ```
 RX §3 — event_loop() → peer_fd EPOLLIN [event_loop.c:721]
-└─ process_peer_frames() [event_loop.c:55] (while recv_pos ≥13, payload kopya sodium_malloc)
+└─ process_peer_frames() [event_loop.c:316] (while recv_pos ≥13, payload kopya sodium_malloc)
    ├─ frame_header_decode() [network.c:1821] → NOX_ERROR → nox_log_impl [log.c:119]
    │  └─ be32 magic=0xDEADC0DE/type 1-4/len≤4112 — leaf
    ├─ CTRL (0x04) [event_loop.c:105] → handshake_read() [noise.c:920] → (msg_index<3) handshake_write() [noise.c:753] → write_msg0/1/2 → frame_header_encode [network.c:1805] → writev()

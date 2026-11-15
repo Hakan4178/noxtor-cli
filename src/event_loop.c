@@ -74,6 +74,25 @@ static bool peer_tx_resume(struct app_state *state,
     return ps->fd >= 0;
 }
 
+/* EPOLLIN/EPOLLOUT ilgisini günceller. epoll yoksa (birim testi) no-op.
+ * Hata fail-closed: oturum kapatılır, false döner. */
+static bool peer_set_interest(struct app_state *state,
+                              struct peer_session *ps, uint32_t events)
+{
+    if (state->epoll_fd < 0)
+        return true;
+
+    if (epoll_modify_fd(state->epoll_fd, ps->fd, events) != NOX_OK) {
+        NOX_WARN(LOG_MOD_NET,
+                 "EPOLL ilgisi güncellenemedi — oturum kapatılıyor");
+        ui_print_error(state,
+            "Soket olay ilgisi güncellenemedi — oturum kapatılıyor.");
+        (void)sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
+        return false;
+    }
+    return true;
+}
+
 /* ================================================================
  * EPOLLOUT — TX sırası tek noktadan yürür
  *
@@ -104,10 +123,11 @@ static bool handle_peer_tx_ready(struct app_state *state,
     if (!peer_tx_resume(state, ps))
         return false;
 
-    if (ps->tx_file.active || !frame_queue_empty(ps))
-        (void)epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN | EPOLLOUT);
-    else
-        (void)epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN);
+    uint32_t events = (ps->tx_file.active || !frame_queue_empty(ps))
+                          ? (EPOLLIN | EPOLLOUT)
+                          : EPOLLIN;
+    if (!peer_set_interest(state, ps, events))
+        return false;
 
     return ps->fd >= 0;
 }
@@ -117,6 +137,16 @@ static bool handle_peer_tx_ready(struct app_state *state,
 bool peer_recv_buf_full(const struct peer_session *ps)
 {
     return ps && ps->recv_pos >= sizeof(ps->recv_buf);
+}
+
+/* B1: yarım frame / trickle deadline predikati — saf, saat enjekte
+ * edilebilir. Caller CLOCK_MONOTONIC ile besler; NULL → false. */
+bool frame_trickle_expired(const struct timespec *frame_start,
+                           const struct timespec *now, long timeout_sec)
+{
+    if (!frame_start || !now)
+        return false;
+    return (now->tv_sec - frame_start->tv_sec) > timeout_sec;
 }
 
 /* ================================================================
@@ -333,6 +363,13 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
     }
     ps->recv_pos = remaining;
 
+    /* B1: frame sınırı — kalan baytlar yeni frame'in başıdır. İkinci
+     * frame birincinin yaşını miras almaz; trickle deadline'ı sıfırdan
+     * başlar. (Kalan 0 ise yeni frame ilk recv()'de başlayacak.) */
+    if (remaining > 0) {
+      clock_gettime(CLOCK_MONOTONIC, &ps->frame_start);
+    }
+
     /* K-14: handshake nesnesi tükendikten sonra (oturum kurulmuş) gelen
      * CTRL frame'i tanımlı bir protokol mesajı değildir. Sessizce yutmak
      * yerine fail-fast kapat; aksi halde peer rx_seq'i ilerletmeden
@@ -462,6 +499,9 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
         if (!state->ghost_mode) {
           db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key);
         }
+        /* K-33: DB'den gelen isim eski/saldırgan kontrollü olabilir;
+         * TOFU prompt'u ham fprintf ile basıldığı için burada sanitize et. */
+        ui_strip_ansi(name);
         memcpy(remote_pub, ps->hs->rs, NOX_KEY_LEN);
 
         char fp_str[NOX_KEY_LEN * 2 + 1];
@@ -513,8 +553,8 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
                * desen: session hazır olunca onion'u peer slotuna yaz. */
               snprintf(ps->peer_onion, sizeof(ps->peer_onion), "%s", peer_onion);
 
-              strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
-              state->active_peer_onion[NOX_ONION_LEN] = '\0';
+              /* K-23: aktif peer indeksi + gösterim atomik güncellenir. */
+              sm_set_active_peer(state, ps);
 
               NOX_INFO(LOG_MOD_NOISE,
                        "session kuruldu — mesajlaşma hazır");
@@ -536,6 +576,7 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
             ps->tofu_onion[NOX_ONION_LEN] = '\0';
             strncpy(ps->tofu_name, name, NOX_CONTACT_NAME_LEN);
             ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+            ui_strip_ansi(ps->tofu_name);
             memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
             /* Atomic ANSI: cursor hide → clear → print warning → prompt */
             if (tui_is_active()) {
@@ -583,6 +624,7 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
            ps->tofu_onion[NOX_ONION_LEN] = '\0';
            strncpy(ps->tofu_name, default_name, NOX_CONTACT_NAME_LEN);
            ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+           ui_strip_ansi(ps->tofu_name);
            memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
            if (tui_is_active()) {
              ui_print_system(state, "[!] TOFU: Yeni peer bağlantısı");
@@ -1016,10 +1058,16 @@ void event_loop(struct app_state *state) {
           NOX_WARN(LOG_MOD_NET, "Peer idle timeout (%lds) — slot %u disconnect", idle, pi);
           ui_print_error(state, "Bağlantı zaman aşımı — peer sessiz (idle).");
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
-        } else if (ps->recv_pos > 0 && idle > NOX_HALFFRAME_TIMEOUT_SEC &&
-                   ps->recv_pos < RECV_BUF_CAPACITY) {
-          /* Yarım frame beklemesi — M-2 ikinci yarısı */
-          NOX_WARN(LOG_MOD_NET, "Yarım frame timeout (%lds, recv_pos=%zu) — disconnect", idle, ps->recv_pos);
+        } else if (ps->recv_pos > 0 &&
+                   frame_trickle_expired(&ps->frame_start, &now,
+                                         NOX_HALFFRAME_TIMEOUT_SEC)) {
+          /* B1: yarım frame trickle — last_active taze olsa bile frame
+           * 60 sn'den uzun süredir tamamlanmadıysa slotu bırak. */
+          long frame_age = (long)(now.tv_sec - ps->frame_start.tv_sec);
+          NOX_WARN(LOG_MOD_NET,
+                   "Yarım frame trickle timeout (%lds, recv_pos=%zu) — disconnect",
+                   frame_age, ps->recv_pos);
+          ui_print_error(state, "Bağlantı zaman aşımı — frame tamamlanmadı.");
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         }
       }
@@ -1032,8 +1080,12 @@ void event_loop(struct app_state *state) {
      * Her ikisi de sm_dispatch(EV_TOR_DIED) ile state machine'i
      * tetikler → her state ST_IDLE'a düşer, temizlik yapılır. */
     {
-      static time_t last_tor_check = 0;
-      time_t now = time(NULL);
+      /* 6.1 FIX: duvar saati değil CLOCK_MONOTONIC (M-12 kalıbı) —
+       * sistem saati geriye alınırsa (NTP/sync) yedek kontrol gecikmez;
+       * kill(pid,0) yedeği de birincil SIGCHLD gibi monotonik zemine oturur. */
+      static struct timespec last_tor_check = {0, 0};
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
       bool tor_dead = false;
 
       /* SIGCHLD flag kontrolü — en hızlı yol */
@@ -1042,7 +1094,8 @@ void event_loop(struct app_state *state) {
         tor_dead = true;
       }
       /* Periyodik kill(pid, 0) — SIGCHLD yedek */
-      else if (state->tor_pid > 0 && (now - last_tor_check >= 5)) {
+      else if (state->tor_pid > 0 &&
+               (now.tv_sec - last_tor_check.tv_sec >= 5)) {
         last_tor_check = now;
         int kres = kill(state->tor_pid, 0);
         int kerr = errno; /* K-2 FIX: errno'yu hemen değişkene al —
@@ -1307,7 +1360,13 @@ void event_loop(struct app_state *state) {
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
           continue;
         }
+        bool new_frame = (ps->recv_pos == 0);
         ps->recv_pos += (size_t)r;
+        if (new_frame) {
+          /* B1: yeni frame'in ilk baytı — trickle saatini başlat.
+           * recv_pos>0 iken gelen ek baytlar saati tazelemez. */
+          clock_gettime(CLOCK_MONOTONIC, &ps->frame_start);
+        }
         clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
 
         ui_line_suspend(state);

@@ -666,8 +666,8 @@ nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
  * bilinçli olarak kaldırır. Değiştirilirse mevcut session'lar bağlanamaz.
  */
 
-   symmetric_mix_hash(&hs->ss, (const uint8_t *)"Mustafa Kemal Atatürk",
-                     strlen("Mustafa Kemal Atatürk"));
+   symmetric_mix_hash(&hs->ss, (const uint8_t *)"Live Libre or Die",
+                     strlen("Live Libre or Die"));
   NOX_DEBUG(LOG_MOD_NOISE, "handshake başlatıldı (%s)",
             initiator ? "initiator" : "responder");
 

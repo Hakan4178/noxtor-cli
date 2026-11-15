@@ -24,6 +24,9 @@
  *  10. İki chunk'lık başarılı TX: tx_seq ve nonce commit'te sırayla artar.
  *  11. 100 chunk'lık akış: küçük SO_SNDBUF + kısmi yazım; alıcı tüm
  *      frame'leri sırayla çözer ve içerik hash'i eşleşir.
+ *  12. T-04/K-29 REGRESYON: aktif RX'te 305-byte dürüst DATA chunk'ı
+ *      "METADATA" ile başlasa bile metadata sanılmamalı; uzak peer
+ *      transferi bu önekle iptal ettirememeli.
  *
  * Kurulum şablonu: tests/test_tofu_epoch.c loopback dansı + iki taraf
  * handshake_split (state_machine.c:418 kalıbı): g_sess_i sender (encrypt),
@@ -453,6 +456,7 @@ static void fixture_teardown(void)
     snprintf(path, sizeof(path), "%s/orphan.bin", TEST_DL_DIR); unlink(path);
     snprintf(path, sizeof(path), "%s/chunk.bin", TEST_DL_DIR);  unlink(path);
     snprintf(path, sizeof(path), "%s/received_evil.bin", TEST_DL_DIR); unlink(path);
+    snprintf(path, sizeof(path), "%s/metadata_prefix.bin", TEST_DL_DIR); unlink(path);
     rmdir(TEST_DL_DIR);
 }
 
@@ -585,6 +589,100 @@ static int test_rx_data_chunk_success(void)
     close(rfd);
     TEST_ASSERT(memcmp(buf, "test", 4) == 0);
 
+    fixture_teardown();
+    return 0;
+}
+
+/* 3b) T-04/K-29 REGRESYON — saldırgan gözünden:
+ *
+ * Aktif RX sırasında gelen her FILE frame'i veridir; 305 byte'lık meşru
+ * bir chunk "METADATA" ile başlayabilir. Eski sniff, payload uzunluğu ve
+ * ilk 9 byte'a bakıp bunu yeni metadata sanıyor, `rx_file.active` dalına
+ * girip transferi iptal ediyordu. Uzak peer, dosyanın 305-hizalı ilk
+ * parçasını "METADATA" ile başlatıp dürüst alımı süresiz kere bozabiliyordu.
+ *
+ * Bad patch (regresyon): sniff koşulunu `!ps->rx_file.active` guard'ından
+ * önce çalıştırmak. Bu test o durumda ilk chunk'tan sonra active=false /
+ * dosya silinmiş görür ve kırmızıya döner.
+ */
+static int test_rx_data_chunk_metadata_prefix(void)
+{
+    if (fixture_rx() != 0) { TEST_ASSERT(!"fixture"); }
+    struct peer_session *ps = &st.peers[0];
+
+    enum { TOTAL = 610, CHUNK = 305 };
+    uint8_t first[CHUNK], second[CHUNK];
+    memset(first, 0x41, sizeof(first));
+    memcpy(first, "METADATA", 9); /* tam 9 byte — NUL yok, gerçek veri */
+    memset(second, 0x42, sizeof(second));
+
+    int fd = openat(st.downloads_dir_fd, "metadata_prefix.bin",
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    TEST_ASSERT(fd >= 0);
+    ps->state = ST_FILE_RX;
+    ps->rx_file.active = true;
+    ps->rx_file.fd = fd;
+    ps->rx_file.expected_size = TOTAL;
+    ps->rx_file.received_bytes = 0;
+    snprintf(ps->rx_file.local_name, sizeof(ps->rx_file.local_name),
+             "metadata_prefix.bin");
+    snprintf(ps->rx_file.filename, sizeof(ps->rx_file.filename),
+             "metadata_prefix.bin");
+
+    /* Beklenen hash = generichash(BE64(610) || first || second); gerçek
+     * akış gibi hash_state'i init + size_hdr ile yeniden başlat. */
+    uint8_t size_hdr[8];
+    for (size_t i = 0; i < sizeof(size_hdr); i++)
+        size_hdr[i] = (uint8_t)(((uint64_t)TOTAL >> (56 - 8 * i)) & 0xFF);
+    uint8_t digest[32];
+    TEST_ASSERT(crypto_generichash_init(&ps->rx_file.hash_state,
+                                        NULL, 0, 32) == 0);
+    TEST_ASSERT(crypto_generichash_update(&ps->rx_file.hash_state,
+                                          size_hdr, 8) == 0);
+    TEST_ASSERT(crypto_generichash_update(&ps->rx_file.hash_state,
+                                          first, CHUNK) == 0);
+    TEST_ASSERT(crypto_generichash_update(&ps->rx_file.hash_state,
+                                          second, CHUNK) == 0);
+    TEST_ASSERT(crypto_generichash_final(&ps->rx_file.hash_state,
+                                         digest, 32) == 0);
+    memcpy(ps->rx_file.expected_hash, digest, sizeof(digest));
+    TEST_ASSERT(crypto_generichash_init(&ps->rx_file.hash_state,
+                                        NULL, 0, 32) == 0);
+    TEST_ASSERT(crypto_generichash_update(&ps->rx_file.hash_state,
+                                          size_hdr, 8) == 0);
+
+    /* Saldırı frame'i: tam 305 byte, "METADATA" önekli meşru veri. */
+    TEST_ASSERT(file_transfer_handle_rx(&st, ps, first, CHUNK));
+
+    /* Bad patch burada patlar: transfer iptal edilir, active=false olur. */
+    TEST_ASSERT(ps->rx_file.active == true);
+    TEST_ASSERT(ps->rx_file.fd >= 0);
+    TEST_ASSERT(ps->rx_file.received_bytes == CHUNK);
+    TEST_ASSERT(ps->state == ST_FILE_RX);
+    TEST_ASSERT(faccessat(st.downloads_dir_fd, "metadata_prefix.bin",
+                          F_OK, 0) == 0);
+
+    /* İkinci yarı: normal chunk; transfer hash doğrulamasıyla tamamlanır. */
+    TEST_ASSERT(file_transfer_handle_rx(&st, ps, second, CHUNK));
+    TEST_ASSERT(ps->rx_file.active == false);
+    TEST_ASSERT(ps->rx_file.fd == -1);
+    TEST_ASSERT(ps->state == ST_ACTIVE);
+
+    int rfd = openat(st.downloads_dir_fd, "metadata_prefix.bin",
+                     O_RDONLY | O_CLOEXEC);
+    TEST_ASSERT(rfd >= 0);
+    uint8_t got[TOTAL];
+    size_t off = 0;
+    while (off < sizeof(got)) {
+        ssize_t r = read(rfd, got + off, sizeof(got) - off);
+        TEST_ASSERT(r > 0);
+        off += (size_t)r;
+    }
+    close(rfd);
+    TEST_ASSERT(memcmp(got, first, CHUNK) == 0);
+    TEST_ASSERT(memcmp(got + CHUNK, second, CHUNK) == 0);
+
+    unlinkat(st.downloads_dir_fd, "metadata_prefix.bin", 0);
     fixture_teardown();
     return 0;
 }
@@ -768,11 +866,14 @@ static int test_tx_metadata_partial_no_disconnect(void)
     return 0;
 }
 
-/* 7) C2 fatal TX: kalıcı yazma hatası (EBADF/EPIPE), HİÇ byte yazılmadı.
+/* 7) C2 fatal TX: kalıcı yazma hatası (EBADF), HİÇ byte yazılmadı.
  * Başarılı şifreleme nonce'u tüketmiştir; rollback yasak. Frame
- * düşürülemez, bu yüzden zero-byte/kalıcı hata teardown'dır.
+ * düşürülemez, bu yüzden kalıcı hata teardown'dır.
+ *
+ * NOT: Gerçek send()==0 dalı bu testte kurulamıyor; burada EBADF
+ * üretilir. Zero-byte dalının doğrulanması K-06/K-28 borcudur.
  */
-static int test_tx_chunk_zero_byte_write_disconnects(void)
+static int test_tx_chunk_fatal_write_disconnects(void)
 {
     FT_TX_ASSERT(fixture_tx(false) == 0);
     struct peer_session *ps = &st.peers[0];
@@ -807,11 +908,12 @@ static int test_tx_chunk_zero_byte_write_disconnects(void)
     return 0;
 }
 
-/* 8) C2 fatal TX: KISMİ frame kabloda kaldıktan sonra kalıcı hata.
+/* 8) C2 fatal TX: KISMİ frame kabloda kaldıktan SONRA kalıcı hata.
  * Stream yeniden senkronize edilemez; transferle birlikte oturum kapanır.
- * (Kısmi yazım + EAGAIN teardown DEĞİLDİR; bu test kalıcı hatayı kurar.)
+ * (Kısmi yazım + EAGAIN tek başına teardown DEĞİLDİR; offset korunur.
+ * Burada alıcı kapatılarak kalıcı hata üretilir.)
  */
-static int test_tx_chunk_partial_write_disconnects(void)
+static int test_tx_chunk_partial_then_fatal_disconnects(void)
 {
     FT_TX_ASSERT(fixture_tx(true) == 0);
     struct peer_session *ps = &st.peers[0];
@@ -1205,10 +1307,11 @@ int main(void)
     RUN_TEST(test_rx_abort_unlinks_orphan);
     RUN_TEST(test_rx_decrypt_fail_inactive);
     RUN_TEST(test_rx_data_chunk_success);
+    RUN_TEST(test_rx_data_chunk_metadata_prefix);
     RUN_TEST(test_rx_chunk_timeout_returns_to_active);
     RUN_TEST(test_tx_metadata_partial_no_disconnect);
-    RUN_TEST(test_tx_chunk_zero_byte_write_disconnects);
-    RUN_TEST(test_tx_chunk_partial_write_disconnects);
+    RUN_TEST(test_tx_chunk_fatal_write_disconnects);
+    RUN_TEST(test_tx_chunk_partial_then_fatal_disconnects);
     RUN_TEST(test_rx_metadata_during_tx_rejected);
     RUN_TEST(test_start_and_complete_file_tx);
     RUN_TEST(test_tx_encrypt_without_nonce_keeps_session);

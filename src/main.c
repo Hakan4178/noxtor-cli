@@ -1566,6 +1566,12 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    /* F2: HS başarıyla kuruldu ve seed ↔ adres doğrulandı. Artık control
+     * fd'ye gerek yok; kapatarak Landlock/seccomp sonrası dönemde
+     * authenticate edilmiş Tor kontrol yeteneğini ortadan kaldır.
+     * HS Flags=Detach ile kurulduğu için servis yaşamaya devam eder. */
+    tor_close_control_fd(&state);
+
     /* ── 16. epoll event loop ─────────────────────────── */
     err = epoll_setup(&state, state.listen_fd);
     if (err != NOX_OK) {

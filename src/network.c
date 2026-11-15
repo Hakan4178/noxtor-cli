@@ -32,11 +32,41 @@
 #include <sys/prctl.h> /* A2: PR_SET_PDEATHSIG (Tor orphan koruması) */
 
 /* ── Timeout sabitleri ────────────────────────── */
-#define NOX_READ_TIMEOUT_MS       10000
+#define NOX_READ_TIMEOUT_MS       100000
 #define NOX_CTRL_TIMEOUT_MS       5000
 #define NOX_BOOTSTRAP_TIMEOUT_MAX 3600
 #define NOX_CTRL_SOCK_WAIT_SEC    30
 #define NOX_CTRL_CONNECT_RETRIES  10
+
+#ifdef DEBUG
+/* Debug-only: SOCKS5 CONNECT yanıtı için ayrı timeout.
+ * Tor'un varsayılan SocksTimeout'u 120 sn; onion circuit'i genel 10 sn
+ * read timeout'undan uzun sürebilir. Üretim davranışı değişmez. */
+static int socks5_response_timeout_ms(void) {
+  const char *env = getenv("NOX_SOCKS_TIMEOUT_MS");
+  if (env && *env) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(env, &end, 10);
+    if (errno == 0 && end && *end == '\0' && v >= 1000 && v <= 300000)
+      return (int)v;
+    NOX_WARN(LOG_MOD_NET,
+             "NOX_SOCKS_TIMEOUT_MS geçersiz (%s) — varsayılan %d ms",
+             env, NOX_READ_TIMEOUT_MS);
+  }
+  return NOX_READ_TIMEOUT_MS;
+}
+#else
+#define socks5_response_timeout_ms() NOX_READ_TIMEOUT_MS
+#endif
+
+/* Zaman ölçümü — timeout hata logunda release'te de kullanılır. */
+static long elapsed_ms(const struct timespec *start) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (long)(now.tv_sec - start->tv_sec) * 1000L +
+         (long)(now.tv_nsec - start->tv_nsec) / 1000000L;
+}
 
 /* ── EINTR-safe nanosleep ─────────────────────── */
 static void safe_nanosleep(const struct timespec *req) {
@@ -563,6 +593,26 @@ static bool path_under_dir(const char *path, const char *dir) {
   return path[dlen] == '\0' || path[dlen] == '/';
 }
 
+/* F2: torrc içerik buffer'ına __OwningControllerProcess satırını ekler.
+ * UNIT TEST ERİŞİMİ (test_network): saf biçimlendirme; generate_torrc
+ * çağırır. Hata durumunda *len değişmez. */
+nox_err_t tor_append_owning_controller_process(char *content, size_t cap,
+                                               size_t *len, int pid) {
+  if (content == NULL || len == NULL || cap == 0 || *len >= cap)
+    return NOX_ERR_CONFIG;
+  if (pid <= 0)
+    return NOX_ERR_CONFIG;
+
+  size_t remaining = cap - *len;
+  int n = snprintf(content + *len, remaining,
+                   "__OwningControllerProcess %d\n", pid);
+  if (n <= 0 || (size_t)n >= remaining)
+    return NOX_ERR_OVERFLOW;
+
+  *len += (size_t)n;
+  return NOX_OK;
+}
+
 static nox_err_t generate_torrc(struct app_state *state) {
   /* F3: tor_data fd'si tek sefer açılır ve Landlock kuralına anchor olur.
    * Yeniden çağrılırsa eski fd'yi sızdırma. */
@@ -831,6 +881,24 @@ static nox_err_t generate_torrc(struct app_state *state) {
     if (state->tor_data_fd >= 0)
       unlinkat(state->tor_data_fd, "torrc", 0);
     return NOX_ERR_CONFIG;
+  }
+
+  /* F2 A+: Control fd HS doğrulamasından sonra kapatılacak. Tor'un
+   * sahipsiz (orphan) kalmaması için PID yoklaması ekle. Tor bu satırı
+   * 15 sn'de bir denetler ve süreç yoksa kendini kapatır. TAKEOWNERSHIP
+   * GÖNDERİLMEZ; gönderilirse control fd kapanınca Tor da kapanırdı. */
+  {
+    size_t remaining = sizeof(content) - (size_t)clen;
+    int own_n = snprintf(content + clen, remaining,
+                         "__OwningControllerProcess %d\n", (int)getpid());
+    if (own_n <= 0 || (size_t)own_n >= remaining) {
+      NOX_ERROR(LOG_MOD_NET, "torrc sahiplik satırı sığmadı");
+      close(fd);
+      if (state->tor_data_fd >= 0)
+        unlinkat(state->tor_data_fd, "torrc", 0);
+      return NOX_ERR_CONFIG;
+    }
+    clen += own_n;
   }
 
   nox_err_t err = write_full(fd, content, (size_t)clen);
@@ -1450,8 +1518,9 @@ static nox_err_t parse_service_id(const char *resp,
  *   ile yaşadığı sürece imza atılamazdı. Artık seed app'de randombytes_buf
  *   ile üretilir, sadece bellekte saklanır (disk'e YOK — D3 aynen geçerli).
  * - Her açılışta FARKLI adres (eski ghost UX korunur, D6'nın amacı).
- * - Detach YOK: control connection kapanınca hizmet otomatik silinir (D5).
- * - seed_out: çağrıyanın sodium_malloc buffer'ı — SADECE BAŞARIDA yazılır.
+ * - F2: Flags=Detach — control fd HS doğrulamasından sonra kapatılsa da
+ *   hizmet Tor süreci boyunca yaşar.
+ * - seed_out: çağıranın sodium_malloc buffer'ı — SADECE BAŞARIDA yazılır.
  * - D8 eski notu (key parse/saklama kodu ölüydü) bu değişiklikle geçersiz. */
 __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
                              uint8_t seed_out[32],
@@ -1466,7 +1535,9 @@ __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *list
   uint8_t pub[32];
   uint8_t expanded_sk[64];
   char b64_key[NOX_ONION_KEY_B64_MAX + 1];
-  char cmd[256];
+  /* F2: Detach sonrası headroom için savunmacı büyütme (gerçek worst-case
+   * 246 byte; gerekçe kırılgan 9 byte headroom ve gelecekteki alanlar). */
+  char cmd[NOX_PATH_MAX + 128];
   char resp[512];
   int n;
   nox_err_t err = NOX_ERR_TOR;
@@ -1506,7 +1577,7 @@ __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *list
    *    CRLF injection: listen_path kontrolü fonksiyon başında (NET-4),
    *    snprintf'den ÖNCE — Tor komutuna tek satır garantisi. */
   n = snprintf(cmd, sizeof(cmd),
-               "ADD_ONION ED25519-V3:%s Port=%u,unix:%s\r\n",
+               "ADD_ONION ED25519-V3:%s Flags=Detach Port=%u,unix:%s\r\n",
                b64_key, NOX_VIRTUAL_PORT, listen_path);
   if (n <= 0 || (size_t)n >= sizeof(cmd)) {
     err = NOX_ERR_OVERFLOW;
@@ -1544,7 +1615,8 @@ cleanup:
 
 /* Normal mod: ADD_ONION ED25519-V3:b64 — seed'den expanded türetip gönderir.
  * Dosyadan b64 okumak YOK (D3). D4: tüm çıkış yollarında buffer'lar sıfırlanır.
- * D5: Flags=Detach YOK. D10: master_key parametre — state'ten bağımsız. */
+ * F2: Flags=Detach — HS kontrol bağlantısından bağımsız yaşar.
+ * D10: master_key parametre — state'ten bağımsız. */
 __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *listen_path,
                                   const uint8_t master_key[NOX_KEY_LEN],
                                   char *onion_out, size_t onion_len) {
@@ -1558,7 +1630,8 @@ __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *
   uint8_t pub[32];
   uint8_t expanded_sk[64];
   char b64_key[NOX_ONION_KEY_B64_MAX + 1];
-  char cmd[256];
+  /* F2: Detach sonrası headroom için savunmacı büyütme. */
+  char cmd[NOX_PATH_MAX + 128];
   char resp[512];
   int n;
   nox_err_t err = NOX_ERR_TOR;
@@ -1598,7 +1671,7 @@ __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *
 
   /* 5. ADD_ONION — CRLF injection koruması (listen_path) aynen kalır */
   n = snprintf(cmd, sizeof(cmd),
-                   "ADD_ONION ED25519-V3:%s Port=%u,unix:%s\r\n",
+                   "ADD_ONION ED25519-V3:%s Flags=Detach Port=%u,unix:%s\r\n",
                    b64_key, NOX_VIRTUAL_PORT, listen_path);
   if (n <= 0 || (size_t)n >= sizeof(cmd)) {
     err = NOX_ERR_OVERFLOW;
@@ -1629,6 +1702,48 @@ cleanup:
 /* ================================================================
  * TOR SHUTDOWN
  * ================================================================ */
+
+/* F2: HS doğrulandıktan sonra control fd'yi kapat. Detached HS Tor
+ * süreci boyunca yaşamaya devam eder; fd artık gerekli değildir.
+ * shutdown() FIN gönderir (defense-in-depth); close() fd'yi serbest
+ * bırakır. Linux'ta close EINTR dönse bile fd kapanmıştır — yeniden
+ * denenmez. */
+void tor_close_control_fd(struct app_state *state) {
+  if (state == NULL || state->tor_ctrl_fd < 0)
+    return;
+
+  int fd = state->tor_ctrl_fd;
+  state->tor_ctrl_fd = -1;
+
+  /* Tanı: fd'nin gerçekten Tor control soketine bağlı olduğunu doğrula.
+   * getpeername() istemci tarafında sunucunun bound path'ini döndürür. */
+  struct sockaddr_un peer;
+  memset(&peer, 0, sizeof(peer));
+  socklen_t peer_len = sizeof(peer);
+  char peer_path[sizeof(peer.sun_path) + 1];
+  memset(peer_path, 0, sizeof(peer_path));
+  bool peer_ok = false;
+  if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) == 0 &&
+      peer.sun_family == AF_UNIX) {
+    memcpy(peer_path, peer.sun_path, sizeof(peer.sun_path));
+    peer_path[sizeof(peer_path) - 1] = '\0';
+    peer_ok = (peer_path[0] != '\0');
+  }
+
+  (void)shutdown(fd, SHUT_RDWR);
+  if (close(fd) != 0)
+    NOX_WARN(LOG_MOD_NET, "Tor control fd kapatma hatası (fd=%d, peer=%s): %s",
+             fd, peer_ok ? peer_path : "?", strerror(errno));
+  else if (peer_ok)
+    NOX_INFO(LOG_MOD_NET,
+             "Tor control fd kapatıldı (fd=%d, peer=%s; HS Flags=Detach, "
+             "servis yaşıyor)", fd, peer_path);
+  else
+    NOX_INFO(LOG_MOD_NET,
+             "Tor control fd kapatıldı (fd=%d; HS Flags=Detach, "
+             "servis yaşıyor)", fd);
+}
+
 void tor_shutdown(struct app_state *state) {
   if (state->tor_ctrl_fd >= 0) {
     ctrl_send_command(state->tor_ctrl_fd, "SIGNAL SHUTDOWN\r\n");
@@ -1756,6 +1871,12 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     return NOX_ERR_PEER;
   }
 
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  NOX_DEBUG(LOG_MOD_NET,
+            "SOCKS5: başlıyor onion=%s port=%u socket=%s tor_pid=%d",
+            onion_addr, (unsigned)port, socks_path, (int)expected_tor_pid);
+
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
     return NOX_ERR_NET;
@@ -1777,6 +1898,8 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     close(fd);
     return NOX_ERR_NET;
   }
+  NOX_DEBUG(LOG_MOD_NET, "SOCKS5: unix connect ok (%ld ms)",
+            elapsed_ms(&t0));
 
   /* Bulgu 2.1b: socks.sock yolu Tor AYAKTAYKEN unlink/rebind edilebilir
    * (control kanalı ayrı ve doğrulanmış olsa bile). Peer kimliği
@@ -1788,6 +1911,8 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     close(fd);
     return peer_err;
   }
+  NOX_DEBUG(LOG_MOD_NET, "SOCKS5: peer doğrulandı (%ld ms)",
+            elapsed_ms(&t0));
 
   /* Greeting */
   uint8_t greet[] = {0x05, 0x01, 0x00};
@@ -1795,10 +1920,18 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     close(fd);
     return NOX_ERR_IO;
   }
+  NOX_DEBUG(LOG_MOD_NET, "SOCKS5: greeting gönderildi (%ld ms)",
+            elapsed_ms(&t0));
 
   uint8_t gresp[2];
-  if (read_full(fd, gresp, 2) != NOX_OK || gresp[0] != 0x05 ||
-      gresp[1] != 0x00) {
+  if (read_full(fd, gresp, 2) != NOX_OK) {
+    NOX_ERROR(LOG_MOD_NET, "SOCKS5 greeting yanıtı okunamadı");
+    close(fd);
+    return NOX_ERR_NET;
+  }
+  NOX_DEBUG(LOG_MOD_NET, "SOCKS5: greeting yanıtı=%02x%02x (%ld ms)",
+            (unsigned)gresp[0], (unsigned)gresp[1], elapsed_ms(&t0));
+  if (gresp[0] != 0x05 || gresp[1] != 0x00) {
     NOX_ERROR(LOG_MOD_NET, "SOCKS5 greeting başarısız");
     close(fd);
     return NOX_ERR_NET;
@@ -1829,15 +1962,25 @@ nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
     close(fd);
     return NOX_ERR_IO;
   }
+  NOX_DEBUG(LOG_MOD_NET,
+            "SOCKS5: CONNECT isteği gönderildi (%zu byte, %ld ms); "
+            "yanıt timeout=%d ms",
+            pos, elapsed_ms(&t0), socks5_response_timeout_ms());
 
   /* SOCKS5 response: VER REP RSV ATYP [BND.ADDR] [BND.PORT] */
   uint8_t sresp[4] = {0};
-  nox_err_t io_err = read_full(fd, sresp, sizeof(sresp));
+  nox_err_t io_err = read_full_timeout(fd, sresp, sizeof(sresp),
+                                       socks5_response_timeout_ms());
   if (io_err != NOX_OK) {
-    NOX_ERROR(LOG_MOD_NET, "SOCKS5 response okunamadı");
+    NOX_ERROR(LOG_MOD_NET,
+              "SOCKS5 response okunamadı (%ld ms, timeout=%d ms)",
+              elapsed_ms(&t0), socks5_response_timeout_ms());
     close(fd);
     return NOX_ERR_NET;
   }
+  NOX_DEBUG(LOG_MOD_NET, "SOCKS5: yanıt=%02x%02x%02x%02x (%ld ms)",
+            (unsigned)sresp[0], (unsigned)sresp[1],
+            (unsigned)sresp[2], (unsigned)sresp[3], elapsed_ms(&t0));
 
   if (sresp[0] != 0x05 || sresp[1] != 0x00) {
     NOX_ERROR(LOG_MOD_NET, "SOCKS5 CONNECT başarısız (rep=0x%02x)", sresp[1]);

@@ -101,8 +101,9 @@ cd noxtor-cli && make clean && make release
   immediately after use
 - 👻 **Ghost mode** — Disable SQLite entirely; leave zero forensic trace
 - 🛡️ **Seccomp sandboxing** — Three-stage seccomp policy blocks TCP, UDP,
-  raw sockets, NETLINK, clone, and dangerous syscalls. After initialization,
-  **zero bytes leave the process via clearnet** — all network I/O is
+  raw sockets, NETLINK, clone, and dangerous syscalls. From stage 3 on,
+  `socket()` is **allow-listed**: only `AF_UNIX` may be created, every
+  other address family is killed at the kernel level — all network I/O is
   restricted to AF_UNIX (Tor control, SOCKS, peer connections only)
 - ✊️ **Censorship evasion** — obfs4 and Snowflake bridge support
 - 🧪 **Fuzz-tested parsers** — All external-input parsers individually
@@ -146,21 +147,30 @@ Please report vulnerabilities responsibly.
 
 ### Seccomp Policy (Three-Stage)
 
-Noxtor uses a three-stage seccomp blacklist policy that progressively
-restricts system calls as the process matures:
+Noxtor uses a three-stage seccomp policy that progressively restricts
+system calls as the process matures:
 
 | Stage | When | What's blocked |
 |---|---|---|
 | 1 | After key derivation | `process_vm_readv`, `ptrace`, `io_uring`, `userfaultfd`, `perf_event_open` |
-| 2 | After Tor hidden service | `fork`, `execve`, `mount`, `reboot`, raw sockets (`AF_PACKET`), dangerous `prctl` options |
-| 3 | Event loop start | `clone` (all), `socket(AF_INET)`, `socket(AF_INET6)`, `socket(AF_NETLINK)`, `symlink`, `link`, `chmod`, `chown` |
+| 2 | After Tor hidden service | `fork`, `execve`, `mount`, `reboot`, `socket(AF_INET/AF_INET6/AF_NETLINK/AF_PACKET/...)`, dangerous `prctl` options |
+| 3 | Event loop start | `clone` (all), **`socket()` allow-list: only `AF_UNIX`**, `symlink`, `link`, `chmod`, `chown` |
 
 **After stage 3:**
-- **Zero bytes leave the process via clearnet** — TCP, UDP, and raw sockets are blocked at the kernel level
+- **`socket()` is allow-listed** — any address family other than `AF_UNIX`
+  is killed at the kernel level (`SIGSYS`). This closes the whole class at
+  once instead of enumerating families (upstream `seccomp(2)` recommends an
+  allow-list over a deny-list, which must be updated for every new
+  syscall/family).
 - All network I/O is restricted to **AF_UNIX only** (Tor control, SOCKS, peer connections)
 - The process cannot create new threads or processes
 - Core dumps are impossible (`PR_SET_DUMPABLE=0`)
-- Attacker code execution cannot exfiltrate data to external C2 servers
+
+
+**Residual risk:** stage 2 closes `AF_INET`/`AF_INET6`/`AF_NETLINK`/
+`AF_PACKET`, but the allow-list itself starts at stage 3 during the Tor
+bootstrap window the remaining niche families (`AF_PPPOX`, `AF_TIPC`,
+`AF_IB`, …) are still creatable.
 
 ---
 

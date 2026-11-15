@@ -50,7 +50,9 @@
  * olmasını zorunlu tutar (ihlalde EINVAL — eski C-2 bug'ı).
  *
  * - C-1: MAKE_REG wanted'ta olmalı (yoksa downloads'da O_CREAT → EACCES)
- * - C-2: wanted'taki ABI üstü haklar (TRUNCATE vb.) otomatik elenir
+ * - C-2: wanted'taki ABI üstü haklar (TRUNCATE vb.) allowed'dan elenir;
+ *   ancak bu, o hakkın kısıtlandığı anlamına gelmez. handled'da olmayan
+ *   hak Landlock tarafından hiç kısıtlanmaz (ABI<3'te truncate gibi).
  *
  * @wanted:  uygulamanın ihtiyaç duyduğu haklar (ABI farkı gözetmeksizin)
  * @handled: ruleset'in handled_access_fs'i (ABI'ye göre hazırlanmış)

@@ -32,6 +32,8 @@
  *                    (ephemeral, seed yalnızca bellekte — claim imzası için).
  * tor_create_derived_hs: ADD_ONION ED25519-V3:<derived key> — normal mod
  *                    (master_key'den deterministik türetme, dosya YOK).
+ * tor_close_control_fd: HS doğrulandıktan sonra control fd'yi kapatır
+ *                    (F2 — HS Flags=Detach ile yaşamaya devam eder).
  * tor_shutdown: SIGNAL SHUTDOWN + waitpid + dizin temizliği.
  * ================================================================ */
 
@@ -55,9 +57,10 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec);
  * (H-1/H-2: eski NEW:ED25519-V3 Flags=DiscardPK kaldırıldı — claim imzası
  * için onion private key client'ta bulunmalı. Her açılışta farklı rastgele
  * seed → farklı adres, eski ghost UX korunur.)
- * Detach YOK: control connection kapanınca hizmet otomatik silinir (D5).
+ * F2: Flags=Detach — control fd HS doğrulamasından sonra kapatılsa da
+ * hizmet Tor süreci boyunca yaşar.
  * listen_path: AF_UNIX socket yolu (ADD_ONION unix: prefix ile)
- * seed_out: 32 byte, SADECE BAŞARIDA yazılır (çağrıyan sodium_free ile
+ * seed_out: 32 byte, SADECE BAŞARIDA yazılır (çağıran sodium_free ile
  *           temizler; hata yolunda içeriği yazılmamış olur)
  * onion_out: 63 byte (56 base32 + ".onion\0") */
 __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
@@ -82,6 +85,11 @@ nox_hardbool_t validate_onion_address(const char *addr);
 
 /* Tor process'ini düzgün kapat */
 void tor_shutdown(struct app_state *state);
+
+/* F2: HS doğrulandıktan sonra Tor control fd'sini kapatır. HS
+ * Flags=Detach ile kurulduğu için servis Tor süreci boyunca yaşar.
+ * Idempotenttir; fd zaten kapalıysa (< 0) hiçbir şey yapmaz. */
+void tor_close_control_fd(struct app_state *state);
 
 /* ================================================================
  * SOCKS5 — Tor üzerinden .onion'a bağlan

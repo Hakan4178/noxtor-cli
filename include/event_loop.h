@@ -23,6 +23,12 @@ struct peer_session *find_peer_by_fd(struct app_state *state, int fd);
  * yalnız bu yüklem true iken tıkanma disconnect'i yapılır.) */
 bool peer_recv_buf_full(const struct peer_session *ps);
 
+/* B1: yarım frame / trickle deadline predikati — saf, saat enjekte
+ * edilebilir. now - frame_start > timeout_sec. Caller CLOCK_MONOTONIC
+ * ile besler; NULL girdi → false (fail-safe). */
+bool frame_trickle_expired(const struct timespec *frame_start,
+                           const struct timespec *now, long timeout_sec);
+
 /* H-1/H-2 claim payload v1: [ver(1) | onion(62) | sig(64)] —
  * state->my_onion_seed/my_static_pub yoksa fail-closed. */
 nox_err_t hs_build_claim_payload(uint8_t pl[NOX_HS_PAYLOAD_V1_LEN],

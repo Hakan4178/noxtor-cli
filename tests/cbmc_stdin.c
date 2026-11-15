@@ -56,8 +56,8 @@ extern int    __VERIFIER_nondet_int(void);
 extern char   __VERIFIER_nondet_char(void);
 extern _Bool  __VERIFIER_nondet_bool(void);
 void __CPROVER_assume(_Bool cond) { if (!cond) __ESBMC_assume(0); }
-size_t __CPROVER_POINTER_OBJECT(const void *p) { (void)p; return 0; }
-size_t __CPROVER_POINTER_OFFSET(const void *p) { (void)p; return 0; }
+__SIZE_TYPE__ __CPROVER_POINTER_OBJECT(const void *p) { (void)p; return 0; }
+__PTRDIFF_TYPE__ __CPROVER_POINTER_OFFSET(const void *p) { (void)p; return 0; }
 #endif
 
 /* ================================================================

@@ -214,6 +214,10 @@ static void tx_finish_if_drained(struct app_state *state,
   if (!frame_queue_empty(ps))
     return;
 
+  /* Son %100 yalnız kuyruk boşalınca: commit anında değil. */
+  ui_print_progress(state, ps->tx_file.filename,
+                    ps->tx_file.total_size,
+                    ps->tx_file.total_size, true);
   ui_print_system(state, "[✓] Dosya gönderimi tamamlandı (%lu byte)",
                   (unsigned long)ps->tx_file.total_size);
   tx_file_reset(ps);
@@ -516,8 +520,18 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
     nox_err_t err = enqueue_file_frame(ps, ps->tx_file.plain_buf, (size_t)r);
     sodium_memzero(ps->tx_file.plain_buf, 4096);
 
-    if (err == NOX_ERR_AGAIN)
-      break; /* yarış yok; savunmacı: slot boşalınca devam */
+    if (err == NOX_ERR_AGAIN) {
+      /* Savunmacı: reserve/commit arasında slot kaybolduysa read()
+       * offset'i ilerlemiştir. Chunk'ı atlamamak için geri sar; geri
+       * sarılamazsa transferi iptal et (nonce tüketilmedi). */
+      if (lseek(ps->tx_file.fd, -(off_t)r, SEEK_CUR) == (off_t)-1) {
+        tx_abort_keep_session(
+            state, ps,
+            "Dosya gönderimi başarısız: okuma konumu geri alınamadı.");
+        return;
+      }
+      break;
+    }
     if (err == NOX_ERR_IO) {
       tx_fatal_teardown(
           state, ps,
@@ -531,9 +545,13 @@ void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
     }
 
     ps->tx_file.sent_bytes += (uint64_t)r;
-    ui_print_progress(state, ps->tx_file.filename,
-                      ps->tx_file.sent_bytes,
-                      ps->tx_file.total_size, true);
+    /* Son chunk'ta %100 basma: frame'ler henüz wire'a çıkmadı.
+     * Tamamlanma tx_finish_if_drained() içinde, kuyruk boşalınca. */
+    if (ps->tx_file.sent_bytes < ps->tx_file.total_size) {
+      ui_print_progress(state, ps->tx_file.filename,
+                        ps->tx_file.sent_bytes,
+                        ps->tx_file.total_size, true);
+    }
   }
 
   /* Son chunk bu turda commit edildiyse kuyruk henüz doludur; EV_FILE_DONE
@@ -649,14 +667,15 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
     }
   }
 
-  /* 7.KRITIK-ish FIX: duplicate METADATA active RX içinde data olarak yazılıyordu.
-   * Önce subtype'e bak, sonra state'e — active iken gelen METADATA abort olmalı.
-   * Wire'da subtype yok (payload sniff), v2'de header'a taşınmalı — TODO §7.1. */
-  is_metadata = (pt_len == 305 && sodium_memcmp(pt, "METADATA", 9) == 0);
+  /* T-04/K-29 FIX: sniff yalnız RX aktif DEĞİLKEN çalışır. Aktif RX'te
+   * her FILE frame'i veridir; 305 byte'lık dürüst bir chunk "METADATA" ile
+   * başlayabilir. Eski sıra (sniff → active abort) uzak peer'a tek bir
+   * 305-hizalı chunk ile transferi iptal ettirme (DoS) imkânı veriyordu.
+   * Gerçek duplicate METADATA ayrımı wire v2'de subtype ile yapılacak —
+   * TODO §7.1. Şimdilik v1'de active RX'te gelen frame daima data sayılır. */
+  is_metadata = (!ps->rx_file.active && pt_len == 305 &&
+                 sodium_memcmp(pt, "METADATA", 9) == 0);
   if (is_metadata) {
-    if (ps->rx_file.active)
-      goto rx_abort;
-
     /* TX sırasında yeni RX başlatma: mevcut state machine TX+RX'i aynı
      * anda temsil etmiyor. Geçişi reddet ve hiçbir dosya açma. */
     if (ps->state != ST_ACTIVE) {

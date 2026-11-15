@@ -18,15 +18,23 @@
  *   PROT_EXEC maskeli, pkey_*, shm* (shmat SHM_EXEC dahil), uselib;
  *   çekirdek tamamlayıcısı PR_SET_MDWE main.c'de set edilir.
  *
- * Aşama 3 (event loop başı): socket yaratma yasağı genişler.
- *   clone tamamen yasak (tek thread), kalan egzotik aileler (XDP/ALG/VSOCK,
- *   BLUETOOTH/SMC/RDS/QIPCRTR), symlink, link, chmod, chown.
+ * Aşama 3 (event loop başı): socket yaratma yasağı ALLOWLIST'e çevrilir.
+ *   socket() yalnız AF_UNIX domain'ine izin verir; AF_UNIX dışı her
+ *   domain (AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_PPPOX, AF_TIPC,
+ *   AF_IB, ...) KILL_PROCESS ile kapanır. Upstream seccomp(2) önerisi:
+ *   deny-list her yeni syscall/aile ile güncellenmek zorundadır; allow-list
+ *   sınıfı kalıcı kapatır.
+ *   Ayrıca clone tamamen yasak (tek thread), symlink, link, chmod, chown.
  *   Tüm iletişim AF_UNIX üzerinden (Tor control, SOCKS, peer).
  *
  * Kapsam notu: kurallar socket() YARATMAYI engeller; önceden açılmış
  * fd'lerin kullanımı (read/write/connect) ayrıca kısıtlanmaz. Tam liste
  * için blacklist[] + stage bloklarına bak. NO_SECCOMP=1 politikayı
  * derlemeden çıkarır (koruma yok).
+ *
+ * Not: Aşama 2'deki AF_INET/AF_INET6/AF_NETLINK/AF_PACKET aile
+ * kuralları **korunur** — allowlist yalnız aşama 3'ten itibaren
+ * yürürlüktedir; aşama 2 penceresi (Tor bootstrap) erken kapatılır.
  *
  * Mod: SCMP_ACT_KILL_PROCESS — engellenen syscall çağrılırsa TÜM process
  * SIGSYS ile öldürülür (KILL yalnızca ihlal eden thread'i öldürürdü).
@@ -73,6 +81,37 @@ static int add_socket_domain_rule(scmp_filter_ctx ctx, uint64_t domain, const ch
     return rc == 0 ? 0 : 1;
 
   NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi (rc=%d)", name, rc);
+  return -1;
+}
+
+/* ── socket() ALLOWLIST (aşama 3) ────────────────────────────────
+ * AF_UNIX dışı HER domain öldürülür. Upstream seccomp(2) (man-pages
+ * 6.19): "It is strongly recommended to use an allow-list approach
+ * whenever possible... A deny-list will have to be updated whenever a
+ * potentially dangerous system call is added."
+ *
+ * Deny-list'in kapatamadığı aile örneği (13 Kasım 2026 turu): AF_PPPOX
+ * (PPPoX) bu kernelde etkindi ve aile listesinde yoktu; TIPC, IB (RDMA),
+ * MCTP, RXRPC, LLC, IRDA, ISDN, SNA, PHONET, X25, DECnet, BRIDGE, ASH
+ * de engellenmemişti. Allowlist bu sınıfı kalıcı olarak kapatır.
+ *
+ * Type kısıtı YOK: AF_UNIX için SOCK_STREAM/DGRAM/SEQPACKET serbest
+ * (kullanıcı kararı 2026-11-13). socketpair(AF_UNIX) ayrı syscall
+ * olduğu için bu kuralla etkilenmez.
+ *
+ * Not: seccomp kuralları "en kısıtlayıcı aksiyon kazanır" ilkesiyle
+ * birleşir; aşama 2'deki aile kuralları da yüklü olduğu için AF_INET
+ * vb. her iki katmanda da kapalıdır. */
+static int add_socket_allowlist_rule(scmp_filter_ctx ctx) {
+  int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
+                            SCMP_A0(SCMP_CMP_NE, (uint64_t)AF_UNIX));
+  if (rc == 0)
+    return 0;
+  if (rc == -EDOM)
+    return 1; /* socket() bu arch'ta yok — kural anlamsız, atla */
+
+  NOX_ERROR(LOG_MOD_MAIN,
+            "seccomp: socket() allowlist kuralı eklenemedi (rc=%d)", rc);
   return -1;
 }
 
@@ -603,40 +642,25 @@ nox_err_t seccomp_policy_load(int stage) {
     if (rc_clone == 0)
       n_custom_blocked++;
 
-    /* Kalan egzotik aileler — hepsi AF_UNIX dışı. */
+    /* ── socket() ALLOWLIST: yalnız AF_UNIX ──────────────────────
+     * AF_UNIX dışı tüm domain'ler kapanır (AF_INET/AF_INET6/AF_NETLINK/
+     * AF_PACKET dahil). Önceden aile listesiyle kapatılan egzotik
+     * aileler (XDP/ALG/VSOCK/BLUETOOTH/SMC/RDS/QIPCRTR) artık allowlist
+     * tarafından kapsanır → ayrı kural gerekmez (deny-list bakım
+     * yükü kalkar). Stage-2 aile kuralları ayrı pencerede durur.
+     * Üretimde socket() çağrılarının tamamı AF_UNIX'tir. */
     {
-      static const struct { int domain; const char *name; } blocked[] = {
-        /* Alternatif sızıntı yolları — hepsi AF_UNIX dışı:
-         * AF_XDP:  raw paket I/O (driver bypass)
-         * AF_ALG:  kernel crypto API erişimi
-         * AF_VSOCK: VM/host iletişimi */
-#ifdef AF_XDP
-        { AF_XDP,   "socket(AF_XDP)" },
-#endif
-#ifdef AF_ALG
-        { AF_ALG,   "socket(AF_ALG)" },
-#endif
-#ifdef AF_VSOCK
-        { AF_VSOCK, "socket(AF_VSOCK)" },
-#endif
-        /* Kalan socket aileleri: BLUETOOTH/SMC STREAM, RDS SEQPACKET,
-         * QIPCRTR DGRAM — hepsi AF_UNIX dışı, kapalı. */
-        { AF_BLUETOOTH, "socket(AF_BLUETOOTH)" },
-        { AF_SMC,       "socket(AF_SMC)" },
-        { AF_RDS,       "socket(AF_RDS)" },
-        { AF_QIPCRTR,   "socket(AF_QIPCRTR)" },
-      };
-      for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
-        int rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
-                                  SCMP_A0(SCMP_CMP_EQ, (uint64_t)blocked[i].domain));
-        if (rc != 0 && rc != -EDOM) {
-          NOX_ERROR(LOG_MOD_MAIN, "seccomp: %s kuralı eklenemedi", blocked[i].name);
-          seccomp_release(ctx);
-          return NOX_ERR_CRYPTO;
-        }
-        if (rc == 0)
-          n_custom_blocked++;
+      int rc_allow = add_socket_allowlist_rule(ctx);
+      if (rc_allow < 0) {
+        seccomp_release(ctx);
+        return NOX_ERR_CRYPTO;
       }
+      if (rc_allow == 0)
+        n_custom_blocked++;
+      else
+        NOX_WARN(LOG_MOD_MAIN,
+                 "seccomp: socket() allowlist kuralı atlandı "
+                 "(bu arch'ta socket() yok)");
     }
 
   }

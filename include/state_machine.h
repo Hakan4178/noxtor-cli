@@ -83,6 +83,18 @@ nox_err_t sm_dispatch(struct peer_session *ps, struct app_state *state,
 nox_err_t sm_dispatch_active(struct app_state *state, peer_event_t event);
 
 /**
+ * sm_set_active_peer — Aktif peer indeksi + onion gösterimini TEK
+ * noktadan atomik günceller.
+ *
+ * K-23: Gösterim `active_peer_onion` dizesinden, yönlendirme
+ * `active_peer_idx` alanından okunuyordu; iki alanın ayrı ayrı
+ * güncellenmesi split-brain'e (UI A derken mesaj B'ye gider) yol
+ * açıyordu. Tüm aktif-peer atamaları bu yardımcıyı kullanmalıdır.
+ * Geçersiz/`state->peers` dışı işaretçi sessizce yok sayılır.
+ */
+void sm_set_active_peer(struct app_state *state, struct peer_session *ps);
+
+/**
  * sm_state_name — State enum'unu insan okunur stringe çevir (debug log).
  */
 const char *sm_state_name(peer_state_t st);

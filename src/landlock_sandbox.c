@@ -233,11 +233,17 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd,
      * haklar, ABI farkı gözetmeden tam liste olarak yazılır.
      * Gerçek allowed_access, bunun `handled` ile kesişimidir.
      *
-     * Bu tek satır (`wanted & handled`) hem C-1'i hem C-2'yi yapısal
-     * olarak imkansız hale getirir:
-     *   - C-1: MAKE_REG artık wanted'da → allowed'da da var → EACCES yok.
-     *   - C-2: TRUNCATE, handled'da yoksa (ABI<3) maskeden otomatik düşer →
-     *          allowed ⊄ handled durumu asla oluşamaz → EINVAL yok.
+     * `wanted & handled` yalnızca allowed_access'in handled_access_fs'in
+     * alt kümesi olmasını garanti eder; kernel'in EINVAL koşulunu kapatır.
+     * Bu, istenen tüm hakların kısıtlandığı anlamına gelmez:
+     *   - C-1: MAKE_REG wanted'ta → ABI uyumlu kernelde allowed'da da var →
+     *          downloads'ta O_CREAT EACCES ile engellenmez.
+     *   - C-2: TRUNCATE ABI<3'te handled'da yoktur. Bu durumda hak
+     *          allowed'dan düşer, ama Landlock TRUNCATE'i o ABI'de zaten
+     *          kısıtlayamaz. Yani "truncate güvenle reddediliyor" DEĞİL,
+     *          "truncate hiç kısıtlanmıyor" demektir. Sandbox öncesi açılmış
+     *          fd'ler de (F4) bu kapsamın dışındadır; Landlock açılış anında
+     *          etiketlenmemiş fd'lere geriye dönük uygulanmaz.
      */
     __u64 wanted =
         LANDLOCK_ACCESS_FS_READ_FILE    |
@@ -410,6 +416,11 @@ nox_hardbool_t landlock_is_active(void) {
  *     (allowed | handled) == handled
  * Bu sayede kernel'in landlock_add_rule'da uyguladığı EINVAL
  * (allowed ⊄ handled) koşulu yapısal olarak asla oluşamaz.
+ *
+ * ÖNEMLİ: Bu fonksiyon yalnızca kural maskesini ABI'ye uyarlar.
+ * @handled'da olmayan bir hak, Landlock tarafından kısıtlanamayan haktır;
+ * maskeden düşmesi o hakkın güvenli biçimde reddedildiği anlamına GELMEZ.
+ * Örn. ABI<3'te TRUNCATE handled'da yoktur → truncate hiç kısıtlanmaz.
  * ================================================================ */
 __u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled) {
     return wanted & handled;

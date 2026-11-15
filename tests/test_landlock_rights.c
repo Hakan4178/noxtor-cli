@@ -5,8 +5,9 @@
  *
  * 1) Saf fonksiyon testleri (GERÇEK KERNEL GEREKMEZ — her CI'da çalışır):
  *    nox_ll_compute_rule_rights(wanted, handled) maskesi üzerinden:
- *      - C-2: ABI 1-2'de TRUNCATE otomatik elenir (allowed ⊄ handled → EINVAL
- *             kernel hatası asla oluşamaz — subset invariant test edilir)
+ *      - C-2: ABI 1-2'de TRUNCATE allowed'dan elenir; bu yalnızca EINVAL'i
+ *             önler, truncate'in kısıtlandığı anlamına gelmez
+ *             (handled'da olmayan hak Landlock tarafından uygulanmaz)
  *      - C-1: MAKE_REG her ABI'da allowed'da kalır (downloads'da O_CREAT çalışır)
  *
  * 2) Entegrasyon testi (gerçek kernel, Landlock ABI >= 1):
@@ -70,7 +71,9 @@ static void test_abi1_truncate_excluded(void) {
     __u64 wanted = NOX_LL_BASE_RIGHTS | LANDLOCK_ACCESS_FS_TRUNCATE;
     __u64 allowed = nox_ll_compute_rule_rights(wanted, handled_abi1);
 
-    /* C-2 regresyonu: ABI < 3'te TRUNCATE allowed'a giremez */
+    /* C-2 regresyonu: ABI < 3'te TRUNCATE allowed'a giremez (EINVAL yok).
+     * Not: Bu, truncate'in kısıtlandığı anlamına gelmez; ABI<3'te Landlock
+     * TRUNCATE hakkını hiç uygulamaz, dolayısıyla truncate serbest kalır. */
     CHECK((allowed & LANDLOCK_ACCESS_FS_TRUNCATE) == 0,
           "abi1: TRUNCATE elenir (C-2)");
     /* subset invariant: allowed her zaman handled'ın alt kümesi */

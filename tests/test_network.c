@@ -23,6 +23,8 @@
 #include "crypto.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <ctype.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -128,6 +130,46 @@ static int test_buffer_is_value(const void *buf, size_t len, uint8_t value)
     return 1;
 }
 
+/* F2: Üretim kodunun ADD_ONION biçimini doğrula. Tor control-spec
+ * sırası: KeyType:KeyBlob → Flags=Detach → Port=... Sıra yanlışsa
+ * Tor 0.4.9.x "512 Bad arguments" döndürür (canlı probe T2). */
+static int fake_tor_validate_add_onion(const char *line)
+{
+    static const char prefix[] = "ADD_ONION ED25519-V3:";
+    static const char tail[] = " Flags=Detach Port=";
+
+    if (strncmp(line, prefix, sizeof(prefix) - 1) != 0)
+        return 0;
+
+    const char *key = line + sizeof(prefix) - 1;
+    const char *sp = strchr(key, ' ');
+    if (sp == NULL || (size_t)(sp - key) != NOX_ONION_KEY_B64_MAX)
+        return 0;
+    for (const char *p = key; p < sp; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '+' && *p != '/' && *p != '=')
+            return 0;
+    }
+
+    const char *rest = sp;
+    if (strncmp(rest, tail, sizeof(tail) - 1) != 0)
+        return 0;
+    rest += sizeof(tail) - 1;
+
+    if (!isdigit((unsigned char)*rest))
+        return 0;
+    while (isdigit((unsigned char)*rest))
+        rest++;
+    if (strncmp(rest, ",unix:", 6) != 0)
+        return 0;
+    rest += 6;
+    if (*rest == '\0' || *rest == '\r' || *rest == '\n')
+        return 0;
+
+    const char *crlf = strstr(rest, "\r\n");
+    return crlf != NULL && crlf[2] == '\0' &&
+           memchr(rest, '\n', (size_t)(crlf - rest)) == NULL;
+}
+
 /* Child tarafı: ADD_ONION satırını oku, uygun ServiceID yanıtını yaz. */
 static void fake_tor_child(int fd, int mode, const char *fixed_addr)
 {
@@ -148,6 +190,10 @@ static void fake_tor_child(int fd, int mode, const char *fixed_addr)
     }
     line[n] = '\0';
     if (n == 0 || line[n - 1] != '\n')
+        _exit(1);
+
+    /* F2: Flags=Detach doğru sırada mı? Tüm HS testleri bunu geçmeli. */
+    if (!fake_tor_validate_add_onion(line))
         _exit(1);
 
     char addr[NOX_ONION_LEN + 1];
@@ -531,6 +577,32 @@ static int test_service_id_foreign_pub_rejected_ghost(void)
     return 0;
 }
 
+/* ================================================================
+ * TEST: F2 control fd kapatma — idempotent, fd gerçekten kapanır
+ * ================================================================ */
+static int test_tor_close_control_fd(void)
+{
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    static struct app_state state;
+    memset(&state, 0, sizeof(state));
+    state.tor_ctrl_fd = sv[0];
+
+    tor_close_control_fd(&state);
+    TEST_ASSERT(state.tor_ctrl_fd == -1);
+    errno = 0;
+    TEST_ASSERT(fcntl(sv[0], F_GETFD) == -1);
+    TEST_ASSERT(errno == EBADF);
+
+    /* Idempotent: ikinci çağrı hata/çökme üretmemeli. */
+    tor_close_control_fd(&state);
+    TEST_ASSERT(state.tor_ctrl_fd == -1);
+
+    close(sv[1]);
+    return 0;
+}
+
 /* UTF-8 chunking testi bilinçli olarak kaldırıldı: eski kopya fonksiyon
  * (get_next_chunk_size_test) üretim kodunu DEĞİL test içindeki kopyasını
  * test ediyordu — yanıltıcı. Sözleşme artık gerçek nox_next_chunk_size
@@ -558,6 +630,7 @@ int main(void)
     RUN_TEST(test_service_id_matches_ghost_pub);
     RUN_TEST(test_service_id_foreign_pub_rejected_derived);
     RUN_TEST(test_service_id_foreign_pub_rejected_ghost);
+    RUN_TEST(test_tor_close_control_fd);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n\n",
             tests_passed, tests_run);

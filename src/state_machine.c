@@ -248,6 +248,18 @@ nox_err_t sm_dispatch_active(struct app_state *state, peer_event_t event)
     return sm_dispatch(ps, state, event);
 }
 
+void sm_set_active_peer(struct app_state *state, struct peer_session *ps)
+{
+    if (!state || !ps)
+        return;
+    if (ps < state->peers || ps >= state->peers + NOX_MAX_PEERS)
+        return;
+
+    state->active_peer_idx = (int)(ps - state->peers);
+    strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
+    state->active_peer_onion[NOX_ONION_LEN] = '\0';
+}
+
 /* ================================================================
  * ACTION: CLEANUP — Merkezi temizlik
  *
@@ -301,6 +313,7 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
     ps->tofu_was_zero_key = false;
     ps->peer_verified = false;
     sodium_memzero(&ps->last_active, sizeof(ps->last_active));
+    sodium_memzero(&ps->frame_start, sizeof(ps->frame_start));
     sodium_memzero(ps->tofu_onion, sizeof(ps->tofu_onion));
     sodium_memzero(ps->tofu_name, sizeof(ps->tofu_name));
     sodium_memzero(ps->tofu_new_key, sizeof(ps->tofu_new_key));
@@ -426,6 +439,11 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
         return NOX_ERR_PROTO;
     }
 
+    /* K-33: peer kontrollü isim rehbere/UI'ya girmeden önce CR/LF,
+     * C1 ve bidi kontrol karakterlerinden arındırılır. Aksi halde
+     * "Mallory\r\n[✓] ..." gibi adlar sahte sistem satırı üretir. */
+    ui_strip_ansi(ps->tofu_name);
+
     /* db_add_contact — rehbere kaydet */
     if (!state->ghost_mode) {
         nox_err_t db_err = db_add_contact(
@@ -470,6 +488,11 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
      * doğrulanmış SESSION_READY oturumunda peer_verified=true olacak. */
     ps->peer_verified = false;
     clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+    /* B1: TOFU onayı beklerken gelen baytlar yeni bir frame'in parçası
+     * olabilir. Onay gecikmesi trickle sayılmamalı; ACTIVE'e geçerken
+     * yarım frame saatini sıfırla. */
+    if (ps->recv_pos > 0)
+        clock_gettime(CLOCK_MONOTONIC, &ps->frame_start);
     NOX_DEBUG(LOG_MOD_NOISE,
               "session setup (TOFU): tx_seq=0 rx_seq=0 queue_flushed=false verified=0 tofu_zero=%d",
               ps->tofu_was_zero_key);
@@ -479,8 +502,8 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
     snprintf(ps->peer_onion, sizeof(ps->peer_onion), "%s", ps->tofu_onion);
     strncpy(ps->name, ps->tofu_name, NOX_CONTACT_NAME_LEN);
     ps->name[NOX_CONTACT_NAME_LEN] = '\0';
-    strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
-    state->active_peer_onion[NOX_ONION_LEN] = '\0';
+    /* K-23: indeks + gösterim aynı peer'ı işaret etmeli. */
+    sm_set_active_peer(state, ps);
 
     NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
     ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)", ps->tofu_name);

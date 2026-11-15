@@ -155,6 +155,12 @@ static int buf_is_zero(const uint8_t *buf, size_t len)
     return 1;
 }
 
+static struct timespec ts_of(long sec)
+{
+    struct timespec t = { .tv_sec = sec, .tv_nsec = 0 };
+    return t;
+}
+
 /* Temel state: slot0 ACTIVE + gerçek fd; session YOK */
 static int fixture_base(void)
 {
@@ -178,21 +184,27 @@ static int fixture_base(void)
     return 0;
 }
 
-/* Session ekle: sender (g_sess_i) ↔ receiver (ps->session) */
-static int attach_session(void)
+/* Session ekle (slot bağımsız): sender ↔ receiver */
+static int attach_session_to(struct peer_session *ps,
+                             struct noise_session **sender_out)
 {
-    struct peer_session *ps = &st.peers[0];
     ps->session = sodium_malloc(sizeof(struct noise_session));
-    g_sess_i = sodium_malloc(sizeof(struct noise_session));
-    if (!ps->session || !g_sess_i)
+    *sender_out = sodium_malloc(sizeof(struct noise_session));
+    if (!ps->session || !*sender_out)
         return -1;
-    if (make_split_pair(g_sess_i, ps->session) != 0)
+    if (make_split_pair(*sender_out, ps->session) != 0)
         return -1;
     ps->peer_verified = true;   /* doğrulanmış — kuyruk flush serbest */
     ps->queue_flushed = true;   /* kuyruk işini bu test kapsamaz */
     ps->rx_seq = 0;
     ps->tx_seq = 0;
     return 0;
+}
+
+/* Session ekle: sender (g_sess_i) ↔ receiver (ps->session) */
+static int attach_session(void)
+{
+    return attach_session_to(&st.peers[0], &g_sess_i);
 }
 
 static void fixture_teardown(void)
@@ -361,12 +373,19 @@ static int socket_pending_bytes(int fd)
     return total;
 }
 
-/* responder_pub/priv verilirse onları kullanır; NULL ise üretir. */
+/* responder_pub/priv verilirse onları kullanır; NULL ise üretir.
+ * hs_out verilirse responder handshake'i (msg3 okunmamış) çağırana
+ * bırakılır; B2 testi msg3'ü okuyup responder tarafını da split eder.
+ * NULL verilirse responder handshake burada güvenle silinir. */
 static int setup_hs_initiator_msg2(const uint8_t *payload, size_t payload_len,
                                    const char *connect_target,
                                    const uint8_t responder_pub[NOX_KEY_LEN],
-                                   const uint8_t responder_priv[NOX_KEY_LEN])
+                                   const uint8_t responder_priv[NOX_KEY_LEN],
+                                   struct noise_handshake **hs_out)
 {
+    if (hs_out)
+        *hs_out = NULL;
+
     if (fixture_base() != 0)
         return -1;
 
@@ -412,9 +431,8 @@ static int setup_hs_initiator_msg2(const uint8_t *payload, size_t payload_len,
     if (!ps->hs)
         return -1;
 
-    struct noise_handshake hr;
-    if (handshake_init(ps->hs, true, i_priv, i_pub) != NOX_OK ||
-        handshake_init(&hr, false, r_priv, r_pub) != NOX_OK)
+    struct noise_handshake *hr = sodium_malloc(sizeof(*hr));
+    if (!hr)
         return -1;
 
     uint8_t msg[NOISE_MAX_HANDSHAKE_LEN];
@@ -422,21 +440,35 @@ static int setup_hs_initiator_msg2(const uint8_t *payload, size_t payload_len,
     uint8_t pl_out[NOX_HS_PAYLOAD_V1_LEN];
     size_t pl_len = sizeof(pl_out);
 
+    int rc = -1;
+    if (handshake_init(ps->hs, true, i_priv, i_pub) != NOX_OK ||
+        handshake_init(hr, false, r_priv, r_pub) != NOX_OK)
+        goto out;
+
     if (handshake_write(ps->hs, NULL, 0, msg, &len) != NOX_OK ||
-        handshake_read(&hr, msg, len, pl_out, sizeof(pl_out),
+        handshake_read(hr, msg, len, pl_out, sizeof(pl_out),
                        &pl_len) != NOX_OK)
-        return -1;
+        goto out;
 
     len = sizeof(msg);
-    if (handshake_write(&hr, payload, payload_len, msg, &len) != NOX_OK)
-        return -1;
+    if (handshake_write(hr, payload, payload_len, msg, &len) != NOX_OK)
+        goto out;
 
     frame_put(ps, NOX_MSG_CTRL, 0, msg, (uint32_t)len);
+    if (hs_out) {
+        *hs_out = hr;
+        hr = NULL;
+    }
+    rc = 0;
 
+out:
     sodium_memzero(i_priv, sizeof(i_priv));
     sodium_memzero(r_priv_local, sizeof(r_priv_local));
-    sodium_memzero(&hr, sizeof(hr));
-    return 0;
+    if (hr) {
+        sodium_memzero(hr, sizeof(*hr));
+        sodium_free(hr);
+    }
+    return rc;
 }
 
 /* Bir red senaryosu koş: msg3 yazılmamalı ve slot cleanup olmalı. */
@@ -450,7 +482,7 @@ static int run_hs_reject_case(const uint8_t *payload, size_t payload_len,
     *state_idle = 0;
 
     if (setup_hs_initiator_msg2(payload, payload_len, connect_target,
-                                responder_pub, responder_priv) != 0) {
+                                responder_pub, responder_priv, NULL) != 0) {
         fixture_teardown();
         return -1;
     }
@@ -479,7 +511,7 @@ static int run_hs_accept_case(const uint8_t *payload, size_t payload_len,
     *state_tofu = 0;
 
     if (setup_hs_initiator_msg2(payload, payload_len, connect_target,
-                                responder_pub, responder_priv) != 0) {
+                                responder_pub, responder_priv, NULL) != 0) {
         fixture_teardown();
         return -1;
     }
@@ -492,6 +524,134 @@ static int run_hs_accept_case(const uint8_t *payload, size_t payload_len,
                   (ps->hs != NULL) && (ps->fd >= 0);
     fixture_teardown();
     return 0;
+}
+
+/* ================================================================
+ * B2 — GERÇEK HANDSHAKE SONRASI CTRL POLİTİKASI
+ *
+ * [19] split oturumla çalışır; buradaki fixture gerçek Noise XX
+ * msg1/msg2/msg3 akışını tamamlar, TOFU onayını (ghost mod) geçer ve
+ * `state == ST_ACTIVE && session != NULL && hs == NULL` durumunu kurar.
+ * Karşı tarafın transport anahtarı da aynı handshake'ten split edilir;
+ * böylece "geç CTRL" gerçek AEAD ile üretilir.
+ * ================================================================ */
+
+static struct noise_handshake *g_b2_hs_r = NULL;  /* responder handshake */
+static struct noise_session   *g_b2_sender = NULL; /* responder→peer TX */
+
+/* fd'den bir tam frame oku (yalnız msg3 için; başlık + payload). */
+static int read_peer_frame(int fd, uint8_t *out, size_t cap, size_t *out_len)
+{
+    uint8_t hdr[FRAME_HEADER_WIRE_SIZE];
+    size_t off = 0;
+
+    while (off < sizeof(hdr)) {
+        ssize_t n = recv(fd, hdr + off, sizeof(hdr) - off, 0);
+        if (n <= 0)
+            return -1;
+        off += (size_t)n;
+    }
+
+    struct frame_header fh;
+    if (frame_header_decode(hdr, &fh) != NOX_OK)
+        return -1;
+    if (fh.len == 0 || fh.len > cap)
+        return -1;
+
+    off = 0;
+    while (off < fh.len) {
+        ssize_t n = recv(fd, out + off, fh.len - off, 0);
+        if (n <= 0)
+            return -1;
+        off += (size_t)n;
+    }
+    *out_len = fh.len;
+    return 0;
+}
+
+/* Gerçek handshake → TOFU onayı → ACTIVE. Ghost mod: DB'ye dokunmaz,
+ * yalnız kullanıcı kararını (action_tofu_accept) determinstik uygular. */
+static int setup_post_handshake_active(void)
+{
+    static struct app_state b_state;
+    static uint8_t b_seed[32];
+    static uint8_t b_onion_pub[NOX_KEY_LEN];
+    static uint8_t b_exp[64];
+    static uint8_t r_pub[NOX_KEY_LEN];
+    static uint8_t r_priv[NOX_KEY_LEN];
+    static uint8_t claim[NOX_HS_PAYLOAD_V1_LEN];
+    static uint8_t msg3[NOISE_MAX_HANDSHAKE_LEN];
+
+    memset(&b_state, 0, sizeof(b_state));
+    for (size_t i = 0; i < sizeof(b_seed); i++)
+        b_seed[i] = (uint8_t)(0x50 + i);
+
+    if (derive_tor_expanded_key(b_exp, b_onion_pub, b_seed) != NOX_OK)
+        return -1;
+    build_v3_addr(b_onion_pub, b_state.onion_addr);
+    crypto_box_keypair(r_pub, r_priv);
+    b_state.my_onion_seed = b_seed;
+    b_state.my_static_pub = r_pub;
+    if (hs_build_claim_payload(claim, &b_state) != NOX_OK)
+        return -1;
+
+    if (setup_hs_initiator_msg2(claim, sizeof(claim), b_state.onion_addr,
+                                r_pub, r_priv, &g_b2_hs_r) != 0)
+        return -1;
+
+    st.ghost_mode = true;
+
+    struct peer_session *ps = &st.peers[0];
+    process_peer_frames(ps, &st, ps->fd);
+    if (ps->state != ST_TOFU_PENDING || ps->hs == NULL || ps->session != NULL)
+        return -1;
+
+    if (sm_dispatch(ps, &st, EV_TOFU_ACCEPTED) != NOX_OK)
+        return -1;
+    if (ps->state != ST_ACTIVE || ps->hs != NULL || ps->session == NULL)
+        return -1;
+
+    /* Responder msg3'ü okur, kendi handshake'ini tamamlar ve split eder:
+     * testin ürettiği ciphertext peer'ın gerçek RX anahtarıyla açılır. */
+    size_t msg3_len = 0;
+    if (read_peer_frame(g_sv[1], msg3, sizeof(msg3), &msg3_len) != 0)
+        return -1;
+    {
+        uint8_t pl[NOX_HS_PAYLOAD_V1_LEN];
+        size_t pl_len = sizeof(pl);
+        if (handshake_read(g_b2_hs_r, msg3, msg3_len, pl, sizeof(pl),
+                           &pl_len) != NOX_OK)
+            return -1;
+    }
+
+    g_b2_sender = sodium_malloc(sizeof(*g_b2_sender));
+    if (!g_b2_sender)
+        return -1;
+    if (handshake_split(g_b2_hs_r, g_b2_sender) != NOX_OK)
+        return -1;
+
+    sodium_memzero(b_seed, sizeof(b_seed));
+    sodium_memzero(b_exp, sizeof(b_exp));
+    sodium_memzero(r_priv, sizeof(r_priv));
+    sodium_memzero(claim, sizeof(claim));
+    sodium_memzero(msg3, sizeof(msg3));
+    memset(&b_state, 0, sizeof(b_state));
+    return 0;
+}
+
+static void post_hs_teardown(void)
+{
+    if (g_b2_sender) {
+        sodium_memzero(g_b2_sender, sizeof(*g_b2_sender));
+        sodium_free(g_b2_sender);
+        g_b2_sender = NULL;
+    }
+    if (g_b2_hs_r) {
+        sodium_memzero(g_b2_hs_r, sizeof(*g_b2_hs_r));
+        sodium_free(g_b2_hs_r);
+        g_b2_hs_r = NULL;
+    }
+    fixture_teardown();
 }
 
 /* ================================================================
@@ -1191,6 +1351,89 @@ static int test_partial_frame_buffered(void)
     return 0;
 }
 
+/* 11b) B1: yarım frame + trickle deadline.
+ *     last_active her recv'de tazelendiği için eski M-2 kontrolü
+ *     (idle üzerinden) dakikada 1 bayt gönderen peer'ı asla
+ *     yakalayamıyordu. Yeni sözleşme: frame'in yaşı ayrı sayılır;
+ *     delta==timeout sınırında canlı, timeout+1'de ölü. */
+static int test_partial_frame_trickle_expires(void)
+{
+    struct timespec start = ts_of(1000);
+    struct timespec at_limit = ts_of(1000 + NOX_HALFFRAME_TIMEOUT_SEC);
+    struct timespec past = ts_of(1000 + NOX_HALFFRAME_TIMEOUT_SEC + 1);
+
+    TEST_ASSERT(!frame_trickle_expired(&start, &at_limit,
+                                       NOX_HALFFRAME_TIMEOUT_SEC));
+    TEST_ASSERT(frame_trickle_expired(&start, &past,
+                                      NOX_HALFFRAME_TIMEOUT_SEC));
+    TEST_ASSERT(!frame_trickle_expired(NULL, &past,
+                                       NOX_HALFFRAME_TIMEOUT_SEC));
+    TEST_ASSERT(!frame_trickle_expired(&start, NULL,
+                                       NOX_HALFFRAME_TIMEOUT_SEC));
+    /* Geri sıçrama (monotonda imkânsız; predikat yine de güvenli) */
+    TEST_ASSERT(!frame_trickle_expired(&past, &start,
+                                       NOX_HALFFRAME_TIMEOUT_SEC));
+
+    /* Asıl trickle senaryosu: last_active taze, frame yaşlı. */
+    TEST_ASSERT(fixture_base() == 0);
+    struct peer_session *ps = &st.peers[0];
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ps->recv_pos = 1;                 /* yarım header */
+    ps->last_active = now;            /* trickle: recv taze görünüyor */
+    ps->frame_start = ts_of(now.tv_sec - NOX_HALFFRAME_TIMEOUT_SEC - 1);
+    TEST_ASSERT(frame_trickle_expired(&ps->frame_start, &now,
+                                      NOX_HALFFRAME_TIMEOUT_SEC));
+
+    ps->frame_start = ts_of(now.tv_sec - NOX_HALFFRAME_TIMEOUT_SEC);
+    TEST_ASSERT(!frame_trickle_expired(&ps->frame_start, &now,
+                                       NOX_HALFFRAME_TIMEOUT_SEC));
+    fixture_teardown();
+    return 0;
+}
+
+/* 11c) B1 T2: yavaş tamamlanan 1. frame'in yaşı 2. frame'e miras
+ *      kalmaz. Frame sınırında kalan baytlar için saat sıfırdan başlar. */
+static int test_frame_boundary_restarts_trickle_clock(void)
+{
+    TEST_ASSERT(fixture_base() == 0);
+    TEST_ASSERT(attach_session() == 0);
+    struct peer_session *ps = &st.peers[0];
+
+    uint8_t ct[64];
+    uint32_t n = enc_text(0, "ilk", ct);
+    TEST_ASSERT(n == strlen("ilk") + NOX_MAC_LEN);
+    frame_put(ps, NOX_MSG_TEXT, 0, ct, n);
+    size_t first_len = ps->recv_pos;
+
+    /* 2. frame'in yalnız ilk 7 byte'ı (yarım header) buffer'da. */
+    struct frame_header fh2 = {
+        .magic = NOX_FRAME_MAGIC,
+        .type = NOX_MSG_TEXT,
+        .seq = 1,
+        .len = (uint32_t)(strlen("ikinci") + NOX_MAC_LEN),
+    };
+    uint8_t wire2[FRAME_HEADER_WIRE_SIZE];
+    frame_header_encode(&fh2, wire2);
+    memcpy(ps->recv_buf + first_len, wire2, 7);
+    ps->recv_pos = first_len + 7;
+
+    /* 1. frame çok eskiden başlamış gibi görünsün. */
+    ps->frame_start = ts_of(1000);
+
+    struct timespec before;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    process_peer_frames(ps, &st, ps->fd);
+
+    TEST_ASSERT(ps->rx_seq == 1);          /* 1. frame tüketildi */
+    TEST_ASSERT(ps->recv_pos == 7);        /* 2. frame yarım bekliyor */
+    TEST_ASSERT(ps->frame_start.tv_sec >= before.tv_sec);
+    TEST_ASSERT(!frame_trickle_expired(&ps->frame_start, &before,
+                                       NOX_HALFFRAME_TIMEOUT_SEC));
+    fixture_teardown();
+    return 0;
+}
+
 /* 11) İki frame tek buffer'da → ikisi de işlenir, slide bozulmaz (M-3) */
 static int test_two_frames_single_buffer(void)
 {
@@ -1208,7 +1451,7 @@ static int test_two_frames_single_buffer(void)
     size_t first = ps->recv_pos;
 
     /* ikinci frame'i birincinin hemen ardına koy */
-    struct peer_session tmp;                 /* encode yardımcı sadece buffer'a yazar */
+    static struct peer_session tmp;          /* encode yardımcı sadece buffer'a yazar */
     memset(&tmp, 0, sizeof(tmp));
     frame_put(&tmp, NOX_MSG_TEXT, 1, ct2, n2);
     TEST_ASSERT(first + tmp.recv_pos <= sizeof(ps->recv_buf));
@@ -1444,6 +1687,162 @@ static int test_ctrl_type_flip_eats_message(void)
     return 0;
 }
 
+/* 19b) B2: GERÇEK handshake → ACTIVE (session != NULL, hs == NULL).
+ *      Bu noktadan sonra CTRL tanımlı değildir; fail-fast beklenir.
+ *      [19] split oturumla çalışırken bu test gerçek XX + TOFU split
+ *      yolunu kullanır. */
+static int test_post_handshake_ctrl_fails_closed(void)
+{
+    if (setup_post_handshake_active() != 0) {
+        post_hs_teardown();
+        TEST_ASSERT(0 && "gerçek handshake ACTIVE'e ulaşamadı");
+    }
+
+    struct peer_session *ps = &st.peers[0];
+    TEST_ASSERT(ps->state == ST_ACTIVE);
+    TEST_ASSERT(ps->session != NULL);
+    TEST_ASSERT(ps->hs == NULL);
+
+    uint8_t ct[64];
+    const char *msg = "late-ctrl";
+    uint32_t n = enc_frame(g_b2_sender, NOX_MSG_CTRL, 0,
+                           (const uint8_t *)msg, strlen(msg), ct);
+    TEST_ASSERT(n == strlen(msg) + NOX_MAC_LEN);
+    frame_put(ps, NOX_MSG_CTRL, 0, ct, n);
+    process_peer_frames(ps, &st, ps->fd);
+
+    /* fd kapandıysa karşı uç EOF görmeli — yalnız iç state değil,
+     * soket sözleşmesi de kanıtlanır. recv burada bloklamaz. */
+    int eof = 0;
+    if (ps->fd == -1) {
+        uint8_t b;
+        ssize_t r = recv(g_sv[1], &b, 1, 0);
+        eof = (r == 0);
+    }
+
+    TEST_ASSERT(ps->state == ST_IDLE);
+    TEST_ASSERT(ps->session == NULL);
+    TEST_ASSERT(ps->hs == NULL);
+    TEST_ASSERT(ps->fd == -1);
+    TEST_ASSERT(ps->rx_seq == 0);
+    TEST_ASSERT(ps->tx_seq == 0);
+    TEST_ASSERT(ps->recv_pos == 0);
+    TEST_ASSERT(frame_queue_empty(ps));
+    TEST_ASSERT(buf_is_zero(ps->recv_buf, sizeof(ps->recv_buf)));
+    TEST_ASSERT(eof);
+
+    post_hs_teardown();
+    return 0;
+}
+
+/* 19c) B2 kontrolü: handshake sonrası normal TEXT yanlış pozitif
+ *      üretmemeli. Aynı oturumda iki TEXT alınır; ardından gelen CTRL
+ *      yine fail-fast olmalı (geç CTRL, canlı trafikten sonra). */
+static int test_post_handshake_text_then_ctrl(void)
+{
+    if (setup_post_handshake_active() != 0) {
+        post_hs_teardown();
+        TEST_ASSERT(0 && "gerçek handshake ACTIVE'e ulaşamadı");
+    }
+
+    struct peer_session *ps = &st.peers[0];
+    TEST_ASSERT(deliver_text(g_b2_sender, ps, 0, "bir") == 0);
+    TEST_ASSERT(deliver_text(g_b2_sender, ps, 1, "iki") == 0);
+
+    TEST_ASSERT(ps->state == ST_ACTIVE);
+    TEST_ASSERT(ps->session != NULL);
+    TEST_ASSERT(ps->hs == NULL);
+    TEST_ASSERT(ps->rx_seq == 2);
+    TEST_ASSERT(ps->recv_pos == 0);
+
+    uint8_t ct[64];
+    uint32_t n = enc_frame(g_b2_sender, NOX_MSG_CTRL, 2,
+                           (const uint8_t *)"ctrl", 4, ct);
+    TEST_ASSERT(n == 4 + NOX_MAC_LEN);
+    frame_put(ps, NOX_MSG_CTRL, 2, ct, n);
+    process_peer_frames(ps, &st, ps->fd);
+
+    TEST_ASSERT(ps->state == ST_IDLE);
+    TEST_ASSERT(ps->session == NULL);
+    TEST_ASSERT(ps->hs == NULL);
+    TEST_ASSERT(ps->fd == -1);
+    TEST_ASSERT(ps->rx_seq == 0);
+
+    post_hs_teardown();
+    return 0;
+}
+
+/* 19d) B2 izolasyon: geç CTRL yalnız hedef peer'ı kapatmalı. p0
+ *      gerçek handshake ile ACTIVE; p1 bağımsız split oturum. p0'ın
+ *      CTRL'i sonrası p1'in session/rx_seq'i bozulmamalı ve p1 yeni
+ *      TEXT kabul etmeye devam etmeli. */
+static int test_post_handshake_ctrl_isolates_peer(void)
+{
+    if (setup_post_handshake_active() != 0) {
+        post_hs_teardown();
+        TEST_ASSERT(0 && "gerçek handshake ACTIVE'e ulaşamadı");
+    }
+
+    struct peer_session *p0 = &st.peers[0];
+    int sv1[2];
+    int sv_ok = (socketpair(AF_UNIX, SOCK_STREAM, 0, sv1) == 0);
+    TEST_ASSERT(sv_ok);   /* hata yolu başarısız testte kabul edilir */
+
+    struct peer_session *p1 = &st.peers[1];
+    p1->fd = sv1[0];
+    p1->state = ST_ACTIVE;
+    clock_gettime(CLOCK_MONOTONIC, &p1->last_active);
+
+    struct noise_session *sess1_i = NULL;
+    int attach_ok = (attach_session_to(p1, &sess1_i) == 0);
+    TEST_ASSERT(attach_ok);
+
+    TEST_ASSERT(deliver_text(sess1_i, p1, 0, "canary") == 0);
+    TEST_ASSERT(p1->rx_seq == 1);
+
+    uint8_t ct[64];
+    uint32_t n = enc_frame(g_b2_sender, NOX_MSG_CTRL, 0,
+                           (const uint8_t *)"late", 4, ct);
+    TEST_ASSERT(n == 4 + NOX_MAC_LEN);
+    frame_put(p0, NOX_MSG_CTRL, 0, ct, n);
+    process_peer_frames(p0, &st, p0->fd);
+
+    int p0_closed = (p0->state == ST_IDLE) &&
+                    (p0->session == NULL) &&
+                    (p0->fd == -1);
+    int p1_intact = (p1->state == ST_ACTIVE) &&
+                    (p1->session != NULL) &&
+                    (p1->fd >= 0) &&
+                    (p1->rx_seq == 1) &&
+                    (p1->recv_pos == 0);
+
+    /* p1 hâlâ canlı: sonraki TEXT kabul edilmeli. */
+    int p1_alive = (deliver_text(sess1_i, p1, 1, "hala-canli") == 0) &&
+                   (p1->state == ST_ACTIVE) &&
+                   (p1->rx_seq == 2);
+
+    free_peer_rx_pt(p1);
+    if (p1->session) {
+        sodium_memzero(p1->session, sizeof(*p1->session));
+        sodium_free(p1->session);
+        p1->session = NULL;
+    }
+    if (sess1_i) {
+        sodium_memzero(sess1_i, sizeof(*sess1_i));
+        sodium_free(sess1_i);
+    }
+    close(sv1[0]);
+    close(sv1[1]);
+    p1->fd = -1;
+
+    post_hs_teardown();
+
+    TEST_ASSERT(p0_closed);
+    TEST_ASSERT(p1_intact);
+    TEST_ASSERT(p1_alive);
+    return 0;
+}
+
 /* 20) Cut&paste splice: eski ciphertext + yeni seq.
  *     Saldırgan daha önce akan frame 0'ın ct'sini saklar; frame 1
  *     geldiğinde header seq=1 yazıp eski ct'yi iliştirir. Seq check
@@ -1539,7 +1938,7 @@ static int test_probe_storm_first_fail_disconnect(void)
     NOX_STATIC_ASSERT(3 * (FRAME_HEADER_WIRE_SIZE + 32) <= RECV_BUF_CAPACITY,
                       "üç probe frame recv_buf'a sığmalı");
 
-    struct peer_session tmp;
+    static struct peer_session tmp;
     memset(&tmp, 0, sizeof(tmp));
     size_t off = 0;
     for (int i = 0; i < 3; i++) {
@@ -2017,6 +2416,8 @@ int main(void)
     RUN_TEST(test_len_tamper_disconnects);
     RUN_TEST(test_header_junk_disconnects);
     RUN_TEST(test_partial_frame_buffered);
+    RUN_TEST(test_partial_frame_trickle_expires);
+    RUN_TEST(test_frame_boundary_restarts_trickle_clock);
     RUN_TEST(test_two_frames_single_buffer);
     RUN_TEST(test_text_without_session_waits);
     RUN_TEST(test_ctrl_after_handshake_dropped);
@@ -2026,6 +2427,9 @@ int main(void)
     RUN_TEST(test_file_type_flip_shows_garbage);
     RUN_TEST(test_text_into_active_transfer_corrupts);
     RUN_TEST(test_ctrl_type_flip_eats_message);
+    RUN_TEST(test_post_handshake_ctrl_fails_closed);
+    RUN_TEST(test_post_handshake_text_then_ctrl);
+    RUN_TEST(test_post_handshake_ctrl_isolates_peer);
     RUN_TEST(test_old_ciphertext_splice);
     RUN_TEST(test_len_grow_tamper);
     RUN_TEST(test_probe_storm_first_fail_disconnect);

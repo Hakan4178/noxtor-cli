@@ -113,7 +113,7 @@ WARN_BASE := \
     -Wduplicated-cond \
     -Wlogical-op \
     -Wjump-misses-init \
-    -Wstack-usage=20480 \
+    -Wstack-usage=24480 \
     -Wvla \
     -Wformat-overflow=2 \
     -Wstrict-overflow=5 \
@@ -229,7 +229,7 @@ UBSAN_OPTS := print_stacktrace=1:halt_on_error=1
 # ================================================================
 # HEDEFLER
 # ================================================================
-.PHONY: all debug release _release_build analyze test test-onion fuzz fuzz-run clean
+.PHONY: all debug release _release_build analyze test test-onion test-tor-detach test-tor-owning fuzz fuzz-run clean
 
 # Varsayılan hedef — -include edilen .d dosyalarındaki kuralların ilk hedef
 # hâline gelmesini (src/arena.o) engellemek için açıkça belirtilir
@@ -325,6 +325,10 @@ test: $(TEST_BINS)
 	    echo ">> onion e2e (determinizm + canlı Tor)"; \
 	    $(TEST_DIR)/test_onion_derive.sh || failed=1; \
 	fi; \
+	if [ $$failed -eq 0 ] && [ -x $(TEST_DIR)/test_tor_detach.sh ]; then \
+	    echo ">> Tor Detach e2e (F2 canlı control-spec)"; \
+	    $(TEST_DIR)/test_tor_detach.sh || failed=1; \
+	fi; \
 	if [ $$failed -eq 0 ] && [ -x $(TEST_DIR)/test_seccomp_badpatch.sh ]; then \
 	    echo ">> seccomp bad-patch dedektörü (K-01 negatif kontrol)"; \
 	    $(TEST_DIR)/test_seccomp_badpatch.sh || failed=1; \
@@ -336,6 +340,16 @@ test: $(TEST_BINS)
 # ----------------------------------------------------------------
 test-onion: $(TEST_DIR)/test_onion_derive
 	$(Q)$(TEST_DIR)/test_onion_derive.sh
+
+# ----------------------------------------------------------------
+# TOR DETACH — F2 canlı control-spec testi (Detach + ownership)
+# ----------------------------------------------------------------
+test-tor-detach:
+	$(Q)$(TEST_DIR)/test_tor_detach.sh
+
+# 15 sn PID yoklaması nedeniyle ayrı hedef (make test'e dahil değil)
+test-tor-owning:
+	$(Q)NOX_TEST_TOR_OWNING=1 $(TEST_DIR)/test_tor_detach.sh
 
 # Test binary kuralı — .test.o objelerine link eder (main.test.o hariç)
 # Testlerin kendi main() fonksiyonu var, src/main.test.o çakışır

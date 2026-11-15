@@ -259,6 +259,13 @@ struct peer_session {
     uint8_t  recv_buf[RECV_BUF_CAPACITY];
     size_t   recv_pos;
 
+    /* ── B1: yarım frame trickle deadline ──
+     * Geçerli frame'in ilk baytının geldiği an (CLOCK_MONOTONIC).
+     * recv() her veri getirdiğinde DEĞİL, yalnız yeni frame başlarken
+     * tazelenir; böylece last_active tazelemesi trickle deadline'ını
+     * maskelemez. Frame sınırında kalan baytlar için yeniden başlar. */
+    struct timespec frame_start;
+
     /* ── H2/H3: RX plaintext çalışma tamponu ──
      * Tek sahibi peer'dir; tek serbest noktası action_cleanup'tır.
      * TEXT ve FILE aynı tamponu kullanır. Kural: kullan → sıfırla →

@@ -49,10 +49,17 @@ void ui_print_system(struct app_state *state, const char *fmt, ...)
 void ui_print_error(struct app_state *state, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-/* ANSI escape temizleyici: CSI/OSC/DCS/bare-ESC, C0 drop (\t\n\r
- * hariç), DEL drop; UTF-8 continuation korunur; OSC/DCS tarama 256
- * ile sınırlı. Korpus: tests/test_ansi_strip.c */
+/* ANSI escape + satır/yon temizleyici (çıktı): CSI/OSC/DCS/bare-ESC;
+ * C0/DEL, C1 ve bidi kontrol kodları drop; CR/LF boşluğa çevrilir
+ * (peer metni sahte terminal satırı üretemez); \t ve UTF-8 continuation
+ * korunur; OSC/DCS tarama 256 ile sınırlı.
+ * Korpus: tests/test_ansi_strip.c */
 void ui_strip_ansi(char *str);
+
+/* Girdi varyantı: aynı ESC/C0/C1/bidi temizliği, CR/LF KORUNUR.
+ * stdin_handler satırları '\n' ile böler; burada EOL düşürülürse Enter
+ * işlenmez. Çıktı için ui_strip_ansi kullanılmalıdır. */
+void ui_strip_input(char *str);
 
 /* Prompt / satır sahipliği */
 

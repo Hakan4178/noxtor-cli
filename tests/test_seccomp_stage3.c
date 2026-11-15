@@ -7,11 +7,19 @@
  * Her test ayrı child process'te çalışır:
  *   1. socket(AF_INET/AF_INET6) tüm tipler (K-03: +BT/SMC/RDS/QIPCRTR)
  *                                          → SIGSYS beklenir
- *   2. clone() → SIGSYS; clone3 → ENOSYS (fallback yaşar)
- *   3. getaddrinfo/connect                → SIGSYS beklenir
- *   4. symlink/link/chmod/chown/shmat (SHM_EXEC dahil) → SIGSYS
+ *   2. S-1 allowlist: AF_UNIX dışı HER domain (AF_PPPOX, AF_TIPC, AF_IB,
+ *      AF_MCTP, AF_RXRPC, AF_LLC, AF_IRDA, AF_ISDN, AF_SNA, AF_PHONET,
+ *      AF_X25, AF_DECnet, AF_BRIDGE, AF_ASH dahil) → SIGSYS
+ *   3. clone() → SIGSYS; clone3 → ENOSYS (fallback yaşar)
+ *   4. getaddrinfo/connect                → SIGSYS beklenir
+ *   5. symlink/link/chmod/chown/shmat (SHM_EXEC dahil) → SIGSYS
  *      sendto → serbest (glibc send uyumu; TODO(IPC-SENDTO))
- *   5. AF_UNIX/socketpair/mmap RW serbest → yaşaması beklenir
+ *   6. AF_UNIX/socketpair/mmap RW serbest → yaşaması beklenir
+ *      (AF_UNIX'un SOCK_STREAM/DGRAM/SEQPACKET tüm tipleri serbest)
+ *
+ * NOT: Seccomp filtresi syscall'den önce çalıştığı için kernel'in aile
+ * desteği (EAFNOSUPPORT vb.) sonucu DEĞİŞTİRMEZ — aile desteklenmese
+ * bile SIGSYS beklenir. "Atla" yolu yoktur: filtreye ulaşmak = regresyon.
  *
  * Build:
  *   make test                    (src .test.o'ları ile link edilir)
@@ -146,6 +154,46 @@ static void test_af_unix_should_work(void) {
     close(fd);
     _exit(0);  /* BAŞARILI: AF_UNIX serbest */
   }
+  _exit(1);
+}
+
+/* ── S-1: socket() allowlist — AF_UNIX dışı her domain kapalı ──────
+ * Aile listesi (deny-list) kapatmadığı, ağ taşıyabilen aileler:
+ * AF_PPPOX (PPPoX — 13 Kasım 2026 turunda bu kernelde ETKİN olduğu
+ * ölçüldü), AF_TIPC, AF_IB (RDMA), AF_MCTP, AF_RXRPC, AF_LLC, AF_IRDA,
+ * AF_ISDN, AF_SNA, AF_PHONET, AF_X25, AF_DECnet, AF_BRIDGE, AF_ASH.
+ *
+ * Allowlist kuralı: socket(domain != AF_UNIX) → KILL_PROCESS.
+ * Seccomp filtresi syscall'den ÖNCE çalışır → aile kernel'de desteklenmese
+ * bile SIGSYS beklenir. Bu yüzden kernel hatasına (EAFNOSUPPORT vb.)
+ * "atla" yolu YOKTUR: filtreye ulaşmak = regresyon = FAIL. */
+
+/* Test edilecek domain — child fork sonrası bu değeri miras alır */
+static int g_af_domain;
+
+static void test_af_family_blocked(void) {
+  if (apply_stage3() < 0) _exit(2);
+  /* Hangi tip denense filtre aynı anda tetiklenir; kernel ailesi
+   * desteklemese bile SIGSYS beklenir. */
+  int fd = socket(g_af_domain, SOCK_STREAM, 0);
+  if (fd >= 0) close(fd);
+  /* Buraya ulaşmak = allowlist kuralı çalışmadı → FAIL */
+  _exit(1);
+}
+
+/* ── AF_UNIX'un tüm tipleri serbest (allowlist type kısıtı yok) ── */
+
+static void test_af_unix_dgram(void) {
+  if (apply_stage3() < 0) _exit(2);
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd >= 0) { close(fd); _exit(0); }
+  _exit(1);
+}
+
+static void test_af_unix_seqpacket(void) {
+  if (apply_stage3() < 0) _exit(2);
+  int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+  if (fd >= 0) { close(fd); _exit(0); }
   _exit(1);
 }
 
@@ -349,6 +397,73 @@ static void test_af_xdp(void) {
 #define AF_SMC 43
 #endif
 
+/* ── S-1 allowlist testi: daha önce aile listesinde OLMAYAN, ağ
+ * taşıyabilen aileler. glibc sabitleri taşımayabilir; kernel uapi
+ * değerleriyle tamamla (asm-generic/socket.h). */
+#ifndef AF_PPPOX
+#define NOX_AF_PPPOX 24
+#else
+#define NOX_AF_PPPOX AF_PPPOX
+#endif
+#ifndef AF_TIPC
+#define NOX_AF_TIPC 30
+#else
+#define NOX_AF_TIPC AF_TIPC
+#endif
+#ifndef AF_IB
+#define NOX_AF_IB 27
+#else
+#define NOX_AF_IB AF_IB
+#endif
+#ifndef AF_MCTP
+#define NOX_AF_MCTP 45
+#else
+#define NOX_AF_MCTP AF_MCTP
+#endif
+#ifndef AF_RXRPC
+#define NOX_AF_RXRPC 33
+#else
+#define NOX_AF_RXRPC AF_RXRPC
+#endif
+#ifndef AF_LLC
+#define NOX_AF_LLC 26
+#else
+#define NOX_AF_LLC AF_LLC
+#endif
+#ifndef AF_IRDA
+#define NOX_AF_IRDA 23
+#else
+#define NOX_AF_IRDA AF_IRDA
+#endif
+#ifndef AF_ISDN
+#define NOX_AF_ISDN 34
+#else
+#define NOX_AF_ISDN AF_ISDN
+#endif
+#ifndef AF_SNA
+#define NOX_AF_SNA 22
+#else
+#define NOX_AF_SNA AF_SNA
+#endif
+#ifndef AF_PHONET
+#define NOX_AF_PHONET 35
+#else
+#define NOX_AF_PHONET AF_PHONET
+#endif
+#ifndef AF_X25
+#define NOX_AF_X25 9
+#else
+#define NOX_AF_X25 AF_X25
+#endif
+#ifndef AF_DECnet
+#define NOX_AF_DECNET 12
+#else
+#define NOX_AF_DECNET AF_DECnet
+#endif
+/* AF_BRIDGE(7) ve AF_ASH(18) glibc'de yok */
+#define NOX_AF_BRIDGE 7
+#define NOX_AF_ASH 18
+
 static void test_af_bluetooth(void) {
   if (apply_stage3() < 0) _exit(2);
   int fd = socket(AF_BLUETOOTH, SOCK_STREAM, 0);  /* probe8: STREAM açıktı */
@@ -507,6 +622,7 @@ static void test_nanosleep_zero(void) {
 
 /* ── Ana test çalıştırıcı ── */
 
+/* run_test dönüş kodu: 1 = PASS, 0 = FAIL */
 static int run_test(const char *name __attribute__((unused)), const char *desc, void (*fn)(void), int should_die) {
   printf("  %-38s ", desc);
 
@@ -551,75 +667,106 @@ static int run_test(const char *name __attribute__((unused)), const char *desc, 
   }
 }
 
+/* Sayaç yönetimi */
+static int g_passed = 0;
+static int g_total = 0;
+
+static void run(const char *desc, void (*fn)(void), int should_die) {
+  int r = run_test(NULL, desc, fn, should_die);
+  g_total++;
+  g_passed += r;
+}
+
+/* AF ailesi testi — domaini fork öncesi ata */
+static void run_af_family(const char *desc, int domain) {
+  g_af_domain = domain;
+  run(desc, test_af_family_blocked, 1);
+}
+
 int main(void) {
   printf("=== Seccomp Stage 3 Testi (gerçek politika) ===\n");
-  printf("TCP/UDP/clone/DNS/fs/W^X engelleme doğrulaması\n");
+  printf("TCP/UDP/clone/DNS/fs/W^X + socket() allowlist doğrulaması\n");
   printf("Her test ayrı child process'te çalışır\n\n");
 
-  int passed = 0;
-  int total = 0;
-
   /* Engellenmesi gerekenler (SIGSYS beklenir) */
-  total++; passed += run_test("tcp_v4",  "socket(AF_INET, SOCK_STREAM)  ", test_tcp_v4, 1);
-  total++; passed += run_test("tcp_v6",  "socket(AF_INET6, SOCK_STREAM) ", test_tcp_v6,  1);
-  total++; passed += run_test("udp_v4",  "socket(AF_INET, SOCK_DGRAM)   ", test_udp_v4,  1);
-  total++; passed += run_test("clone",   "clone()                        ", test_clone,   1);
-  total++; passed += run_test("dns",     "getaddrinfo(google.com)         ", test_getaddrinfo, 1);
-  total++; passed += run_test("connect", "connect(AF_INET, 8.8.8.8:80)  ", test_connect_tcp_direct, 1);
-  total++; passed += run_test("netlink", "socket(AF_NETLINK, ROUTE)     ", test_netlink, 1);
+  run("socket(AF_INET, SOCK_STREAM)  ", test_tcp_v4,  1);
+  run("socket(AF_INET6, SOCK_STREAM) ", test_tcp_v6,  1);
+  run("socket(AF_INET, SOCK_DGRAM)   ", test_udp_v4,  1);
+  run("clone()                        ", test_clone,   1);
+  run("getaddrinfo(google.com)         ", test_getaddrinfo, 1);
+  run("connect(AF_INET, 8.8.8.8:80)  ", test_connect_tcp_direct, 1);
+  run("socket(AF_NETLINK, ROUTE)     ", test_netlink, 1);
 
   /* Serbest olması gerekenler */
-  total++; passed += run_test("af_unix", "socket(AF_UNIX, SOCK_STREAM)   ", test_af_unix_should_work, 0);
+  run("socket(AF_UNIX, SOCK_STREAM)   ", test_af_unix_should_work, 0);
+  run("socket(AF_UNIX, SOCK_DGRAM)    ", test_af_unix_dgram, 0);
+  run("socket(AF_UNIX, SOCK_SEQPACKET)", test_af_unix_seqpacket, 0);
 
   /* prctl option filtreleme */
-  total++; passed += run_test("prctl_dump", "prctl(PR_SET_DUMPABLE)         ", test_prctl_dumpable_kill, 1);
-  total++; passed += run_test("prctl_ptr",  "prctl(PR_SET_PTRACER)          ", test_prctl_ptracer_kill, 1);
-  total++; passed += run_test("prctl_nnp",  "prctl(PR_SET_NO_NEW_PRIVS)     ", test_prctl_nonewprivs_allow, 0);
+  run("prctl(PR_SET_DUMPABLE)         ", test_prctl_dumpable_kill, 1);
+  run("prctl(PR_SET_PTRACER)          ", test_prctl_ptracer_kill, 1);
+  run("prctl(PR_SET_NO_NEW_PRIVS)     ", test_prctl_nonewprivs_allow, 0);
 
   /* W^X: executable bellek yaratma */
-  total++; passed += run_test("mprotect_exec", "mprotect(PROT_READ|PROT_EXEC)   ", test_mprotect_exec, 1);
-  total++; passed += run_test("mmap_exec",     "mmap(PROT_READ|WRITE|EXEC)      ", test_mmap_exec, 1);
-  total++; passed += run_test("mmap_rw",       "mmap(PROT_READ|WRITE) serbest   ", test_mmap_rw_allow, 0);
-  total++; passed += run_test("shm_exec",      "shmat(SHM_EXEC)                 ", test_shmat_shm_exec, 1);
-  total++; passed += run_test("shm_plain",     "shmat(plain, yasak)             ", test_shmat_plain, 1);
+  run("mprotect(PROT_READ|PROT_EXEC)   ", test_mprotect_exec, 1);
+  run("mmap(PROT_READ|WRITE|EXEC)      ", test_mmap_exec, 1);
+  run("mmap(PROT_READ|WRITE) serbest   ", test_mmap_rw_allow, 0);
+  run("shmat(SHM_EXEC)                 ", test_shmat_shm_exec, 1);
+  run("shmat(plain, yasak)             ", test_shmat_plain, 1);
 
   /* fs/kanal ek testleri */
-  total++; passed += run_test("symlink",  "symlink()                      ", test_symlink, 1);
-  total++; passed += run_test("link",     "link()                         ", test_link, 1);
-  total++; passed += run_test("chmod",    "chmod()                        ", test_chmod, 1);
-  total++; passed += run_test("chown",    "chown()                        ", test_chown, 1);
-  total++; passed += run_test("sendto",   "sendto(AF_UNIX) serbest        ", test_sendto, 0);
-  total++; passed += run_test("spair",    "socketpair(AF_UNIX) serbest    ", test_socketpair_allow, 0);
-  total++; passed += run_test("mprot_rw", "mprotect(READ|WRITE) serbest   ", test_mprotect_rw_allow, 0);
-  total++; passed += run_test("clone3",   "clone3 → ENOSYS (fallback)     ", test_clone3_enosys, 0);
+  run("symlink()                      ", test_symlink, 1);
+  run("link()                         ", test_link, 1);
+  run("chmod()                        ", test_chmod, 1);
+  run("chown()                        ", test_chown, 1);
+  run("sendto(AF_UNIX) serbest        ", test_sendto, 0);
+  run("socketpair(AF_UNIX) serbest    ", test_socketpair_allow, 0);
+  run("mprotect(READ|WRITE) serbest   ", test_mprotect_rw_allow, 0);
+  run("clone3 → ENOSYS (fallback)     ", test_clone3_enosys, 0);
 #ifdef AF_ALG
-  total++; passed += run_test("af_alg",   "socket(AF_ALG)                 ", test_af_alg, 1);
+  run("socket(AF_ALG)                 ", test_af_alg, 1);
 #endif
 #ifdef AF_VSOCK
-  total++; passed += run_test("af_vsock", "socket(AF_VSOCK)               ", test_af_vsock, 1);
+  run("socket(AF_VSOCK)               ", test_af_vsock, 1);
 #endif
 #ifdef AF_XDP
-  total++; passed += run_test("af_xdp",   "socket(AF_XDP)                 ", test_af_xdp, 1);
+  run("socket(AF_XDP)                 ", test_af_xdp, 1);
 #endif
 
   /* K-03: eksik AF aileleri (denetim probe8/9 — kapatıldı) */
-  total++; passed += run_test("af_bt",  "socket(AF_BLUETOOTH, STREAM)   ", test_af_bluetooth, 1);
-  total++; passed += run_test("af_smc", "socket(AF_SMC, STREAM)         ", test_af_smc, 1);
-  total++; passed += run_test("af_rds", "socket(AF_RDS, SEQPACKET)      ", test_af_rds, 1);
-  total++; passed += run_test("af_qip", "socket(AF_QIPCRTR, DGRAM)      ", test_af_qipcrtr, 1);
+  run("socket(AF_BLUETOOTH, STREAM)   ", test_af_bluetooth, 1);
+  run("socket(AF_SMC, STREAM)         ", test_af_smc, 1);
+  run("socket(AF_RDS, SEQPACKET)      ", test_af_rds, 1);
+  run("socket(AF_QIPCRTR, DGRAM)      ", test_af_qipcrtr, 1);
+
+  /* ── S-1: allowlist — daha önce engellenmeyen ağ taşıyabilen aileler ── */
+  run_af_family("socket(AF_PPPOX)                ", NOX_AF_PPPOX);
+  run_af_family("socket(AF_TIPC)                ", NOX_AF_TIPC);
+  run_af_family("socket(AF_IB)                  ", NOX_AF_IB);
+  run_af_family("socket(AF_MCTP)                ", NOX_AF_MCTP);
+  run_af_family("socket(AF_RXRPC)               ", NOX_AF_RXRPC);
+  run_af_family("socket(AF_LLC)                 ", NOX_AF_LLC);
+  run_af_family("socket(AF_IRDA)                ", NOX_AF_IRDA);
+  run_af_family("socket(AF_ISDN)                ", NOX_AF_ISDN);
+  run_af_family("socket(AF_SNA)                 ", NOX_AF_SNA);
+  run_af_family("socket(AF_PHONET)              ", NOX_AF_PHONET);
+  run_af_family("socket(AF_X25)                 ", NOX_AF_X25);
+  run_af_family("socket(AF_DECnet)              ", NOX_AF_DECNET);
+  run_af_family("socket(AF_BRIDGE)              ", NOX_AF_BRIDGE);
+  run_af_family("socket(AF_ASH)                 ", NOX_AF_ASH);
 
   /* Stage 3 — gerçek event-loop syscall'ları (yaşaması beklenir) */
-  total++; passed += run_test("ep1",     "epoll_create1() serbest        ", test_epoll_create1, 0);
-  total++; passed += run_test("eptl",    "epoll_ctl(ADD) serbest         ", test_epoll_ctl, 0);
-  total++; passed += run_test("epw",     "epoll_wait(timeout=0) serbest  ", test_epoll_wait, 0);
-  total++; passed += run_test("poll",    "poll(timeout=0) serbest        ", test_poll_timeout, 0);
-  total++; passed += run_test("fcntl",   "fcntl(F_GETFL) serbest         ", test_fcntl_getfl, 0);
-  total++; passed += run_test("acc4",    "accept4(AF_UNIX, nonblock)     ", test_accept4, 0);
-  total++; passed += run_test("read",    "read(pipe) serbest             ", test_read_pipe, 0);
-  total++; passed += run_test("write",   "write(pipe) serbest            ", test_write_pipe, 0);
-  total++; passed += run_test("clock",   "clock_gettime(MONOTONIC)       ", test_clock_gettime, 0);
-  total++; passed += run_test("nsleep",  "nanosleep(0) serbest           ", test_nanosleep_zero, 0);
+  run("epoll_create1() serbest        ", test_epoll_create1, 0);
+  run("epoll_ctl(ADD) serbest         ", test_epoll_ctl, 0);
+  run("epoll_wait(timeout=0) serbest  ", test_epoll_wait, 0);
+  run("poll(timeout=0) serbest        ", test_poll_timeout, 0);
+  run("fcntl(F_GETFL) serbest         ", test_fcntl_getfl, 0);
+  run("accept4(AF_UNIX, nonblock)     ", test_accept4, 0);
+  run("read(pipe) serbest             ", test_read_pipe, 0);
+  run("write(pipe) serbest            ", test_write_pipe, 0);
+  run("clock_gettime(MONOTONIC)       ", test_clock_gettime, 0);
+  run("nanosleep(0) serbest           ", test_nanosleep_zero, 0);
 
-  printf("\nSonuç: %d/%d test başarılı\n", passed, total);
-  return (passed == total) ? 0 : 1;
+  printf("\nSonuç: %d/%d test başarılı\n", g_passed, g_total);
+  return (g_passed == g_total) ? 0 : 1;
 }
