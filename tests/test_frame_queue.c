@@ -1,12 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_frame_queue.c — C1: TX frame kuyruğu sözleşmesi
- *
- * Kapsam:
- *   - FIFO sırası: enqueue sırası = soket yazma sırası = tx_seq sırası
- *   - Kuyruk dolu → rezervasyon yok (nonce tüketilmeden AGAIN)
- *   - Kısmi yazım → offset ilerler, AGAIN; drain sonrası devam
- *   - Zero-byte/kalıcı yazma hatası → oturum teardown
- *   - reset/cleanup ciphertext'i zeroize eder
+ * test_frame_queue.c — TX frame kuyruğu: FIFO/seq sırası, dolu kuyrukta
+ * rezervasyon yok, kısmi yazım/AGAIN, fatal teardown, reset zeroize.
  */
 
 #include "common.h"
@@ -24,29 +18,11 @@
 #include <sodium.h>
 
 #include "test_common.h"
+#include "test_protocol_support.h"
 
 static struct app_state st;
 static int g_rx_fd = -1;
 static int g_epfd = -1;
-
-static void fixture_teardown(void)
-{
-    struct peer_session *ps = &st.peers[0];
-
-    if (ps->fd >= 0) {
-        close(ps->fd);
-        ps->fd = -1;
-    }
-    if (g_rx_fd >= 0) {
-        close(g_rx_fd);
-        g_rx_fd = -1;
-    }
-    if (g_epfd >= 0) {
-        close(g_epfd);
-        g_epfd = -1;
-    }
-    sodium_memzero(&st, sizeof(st));
-}
 
 static int fixture_setup(void)
 {
@@ -90,21 +66,6 @@ static int commit_pattern(struct peer_session *ps, uint8_t tag, size_t len)
     return frame_queue_commit(ps, len) == NOX_OK ? 0 : -1;
 }
 
-static int read_exact(int fd, void *buf, size_t len)
-{
-    uint8_t *p = buf;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = read(fd, p + got, len - got);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return -1;
-        got += (size_t)n;
-    }
-    return 0;
-}
-
 static size_t drain_available(int fd, uint8_t *buf, size_t cap)
 {
     size_t got = 0;
@@ -123,7 +84,7 @@ static size_t drain_available(int fd, uint8_t *buf, size_t cap)
 
 #define FQ_ASSERT(cond) do {                                            \
     if (!(cond)) {                                                      \
-        fixture_teardown();                                             \
+        nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);                                             \
         TEST_ASSERT(cond);                                              \
     }                                                                   \
 } while (0)
@@ -151,7 +112,7 @@ static int test_order_and_seq(void)
     FQ_ASSERT(frame_queue_free(ps) == FRAME_QUEUE_SLOTS);
 
     uint8_t got[600];
-    FQ_ASSERT(read_exact(g_rx_fd, got, sizeof(got)) == 0);
+    FQ_ASSERT(nox_test_read_exact(g_rx_fd, got, sizeof(got)) == 0);
     for (size_t i = 0; i < 100; i++)
         FQ_ASSERT(got[i] == 'A');
     for (size_t i = 100; i < 300; i++)
@@ -159,7 +120,7 @@ static int test_order_and_seq(void)
     for (size_t i = 300; i < 600; i++)
         FQ_ASSERT(got[i] == 'C');
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
@@ -178,7 +139,7 @@ static int test_full_queue_rejects(void)
     FQ_ASSERT(frame_queue_commit(ps, 16) == NOX_ERR_OVERFLOW);
     FQ_ASSERT(ps->tx_seq == FRAME_QUEUE_SLOTS);
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
@@ -211,7 +172,7 @@ static int test_partial_write_resumes(void)
 
     /* Ön dolguyu tüket; kalan baytlar frame'in yazılmış kısmıdır. */
     uint8_t skip[1024];
-    FQ_ASSERT(read_exact(g_rx_fd, skip, sizeof(skip)) == 0);
+    FQ_ASSERT(nox_test_read_exact(g_rx_fd, skip, sizeof(skip)) == 0);
 
     uint8_t got[TX_BUF_CAPACITY];
     size_t got_len = drain_available(g_rx_fd, got, sizeof(got));
@@ -230,7 +191,7 @@ static int test_partial_write_resumes(void)
     for (size_t i = 0; i < sizeof(got); i++)
         FQ_ASSERT(got[i] == 'X');
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
@@ -251,7 +212,7 @@ static int test_fatal_write_teardown(void)
     FQ_ASSERT(ps->tx_seq == 0);
     TEST_ASSERT_MEM_ZERO(&ps->tx_frames, sizeof(ps->tx_frames));
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
@@ -270,7 +231,7 @@ static int test_reset_zeroizes(void)
     FQ_ASSERT(frame_queue_free(ps) == FRAME_QUEUE_SLOTS);
     TEST_ASSERT_MEM_ZERO(&ps->tx_frames, sizeof(ps->tx_frames));
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
@@ -293,7 +254,7 @@ static int test_null_and_bounds(void)
     FQ_ASSERT(frame_queue_count(ps) == 0);
     FQ_ASSERT(ps->tx_seq == 0);
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
