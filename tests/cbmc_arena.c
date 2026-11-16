@@ -794,7 +794,8 @@ static void test_arena_alloc_canary_overflow(void) {
  *  güvenli mi" sorularını tek zincirde doğrular.
  * ================================================================ */
 static void test_arena_init_bridge(void) {
-    struct secure_arena a;
+    /* API sözleşmesi: arena_init sıfırlanmış struct bekler (T-05). */
+    struct secure_arena a = {0};
     size_t size = __VERIFIER_nondet_size_t();
     /* Küçük aralık: arena_init nondet mmap/mprotect path'lerinde
      * yüksek unwind derinliği gerektirir. */

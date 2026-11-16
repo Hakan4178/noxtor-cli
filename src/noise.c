@@ -4,27 +4,25 @@
  * Referans: https://noiseprotocol.org/noise.html (Rev 34)
  *
  * Katmanlar (aşağıdan yukarı):
- *   1. CipherState  — ChaChaPoly-1305 AEAD + 64-bit nonce
+ *   1. CipherState  — ChaCha20-Poly1305 AEAD + 64-bit nonce
  *   2. SymmetricState — HKDF(BLAKE2b) + MixKey/MixHash
  *   3. HandshakeState — XX pattern: →e / ←e,ee,s,es / →s,se
  *   4. Transport     — Session-level encrypt/decrypt
  *
  * Testler:
- *   tests/test_noise.c — 9 unit test (loopback handshake, transport roundtrip,
- *       mac tamper, remote static key, wrong order, null safety, onion payload,
- *       spec vectors, spec vectors payloads)
+ *   tests/test_noise.c — 17 unit test (handshake, transport, AD binding,
+ *       nonce exhaustion/invariance, keyless fail-closed, split, spec vectors)
  *   tests/fuzz_noise_differential.c — Differential fuzzing vs noise-c referansı
  *       (13 hedefli test + 105 key × 12 prologue × 4 pattern × 10 payload brute-force,
  *       error behavior, parametre boyut doğrulaması)
  *   tests/fuzz_noise_differential_noise_star.c — noise-star formal verify referansı
  *       ile differential fuzzing
- *   tests/cbmc_noise_easy.c — ESBMC formal verification (12 kolay fonksiyon,
+ *   tests/cbmc_noise_easy.c — ESBMC harness (easy functions,
  *       overflow/memory-leak check)
  *
- * NOTE:ONLY SINGLE THREAD. THIS CODE IS NOT THREAD-SAFE. NOISE STATE MUST BE USED BY A SINGLE THREAD.
- * 
- * FREEZE FOR FIX AND FEATURES Sep 13 2026
- *
+ * THREADING: single-thread only. The atomics make the nonce counter's
+ * read-modify-write indivisible, but they do not make the rest of the
+ * Noise state safe for concurrent use.
  */
 
 #include "noise.h"
@@ -66,7 +64,7 @@ NOX_STATIC_ASSERT(RECV_BUF_CAPACITY == 13U + NOISE_MAX_PAYLOAD_LEN,
                    "RECV_BUF must equal header + max payload");
 
 /* ================================================================
- * 1. CIPHER STATE — ChaChaPoly-1305 AEAD
+ * 1. CIPHER STATE — ChaCha20-Poly1305 AEAD
  *
  * Noise spec Section 5.1:
  *   k: 32 byte key (veya empty)
@@ -109,21 +107,21 @@ static void encode_nonce(uint8_t nonce_out[12], uint64_t n) {
  *
  * INVARIANT:
  *   UINT64_MAX is never used as an AEAD nonce.
- *   A successful encryption consumes exactly one nonce value.
+ *   A successful keyed encryption consumes exactly one nonce.
+ *   Once reserved, a nonce is never rolled back; no rewind API exists.
+ *   If AEAD fails after a reservation, that nonce stays consumed.
  *
  * FAILURE PROPERTY:
- *   Once the counter reaches UINT64_MAX, encryption fails closed.
- *   No ciphertext is produced with a reused or exhausted nonce.
+ *   At UINT64_MAX the counter is pinned and encryption fails closed;
+ *   no AEAD call is made with a reused or exhausted nonce.
+ *
+ * COUNTER RESERVATION:
+ *   atomic_fetch_add reserves the nonce before AEAD. A returned
+ *   UINT64_MAX is refused and the counter is pinned to UINT64_MAX.
  *
  * VERIFICATION:
- *   Unit tests at counter boundary,
- *   state-transition tests,
- *   concurrency tests,
- *   fuzzing of counter state.
- *
- * Current: atomic_fetch_add returns old value if current_n == UINT64_MAX
- * the nonce is never used (fetch_add returns before increment),
- * immediate fail-closed.
+ *   Nonce progression (unit/differential fuzz), decrypt-failure nonce
+ *   invariance, and the CBMC counter model.
  */
  
 __attribute__((strub)) 
@@ -145,9 +143,9 @@ ssize_t cipher_encrypt(struct noise_cipher_state *cs, const uint8_t *ad,
     return (ssize_t)pt_len;
   }
 
-  /* atomic_fetch_add eski değeri döndürüp artırır.
-   * current_n == UINT64_MAX → counter taştı (UINT64_MAX nonce'u asla
-   * kullanılmaz, çünkü fetch_add önce döndürür sonra artırır). */
+  /* Reserve the nonce before AEAD. A returned UINT64_MAX is refused;
+   * the counter is pinned and encryption fails closed. If AEAD fails
+   * after this point, the nonce stays consumed (no rollback). */
   uint64_t current_n = atomic_fetch_add(&cs->n, 1);
   if (current_n >= UINT64_MAX) {
     atomic_store(&cs->n, UINT64_MAX);
@@ -203,8 +201,8 @@ ssize_t cipher_decrypt(struct noise_cipher_state *cs, const uint8_t *ad,
    *   Invalid ciphertexts cannot desynchronize the Noise nonce state.
    *
    * VERIFICATION:
-   *   Unit tests, malformed-ciphertext fuzzing,
-   *   state-transition tests, differential testing.
+   *   Unit/differential malformed-ciphertext tests; nonce invariance on
+   *   authentication failure; CBMC counter model.
    */
   uint64_t current_n = atomic_load(&cs->n);
   if (current_n >= UINT64_MAX) {
@@ -496,18 +494,19 @@ ssize_t symmetric_decrypt_and_hash(struct noise_symmetric_state *ss,
 
   /*
    * FAILURE POLICY:
-   *   Authentication failure permanently invalidates the transcript.
+   *   A cipher_decrypt failure permanently invalidates the transcript.
    *
    *   This is stronger than the Noise specification requirement:
    *   failed decryption MUST NOT MixHash() unauthenticated ciphertext.
    *
    * SECURITY RATIONALE:
-   *   hs->failed prevents further protocol use, while clearing h prevents
-   *   accidental reuse or disclosure of the transcript after failure.
+   *   The caller (handshake_read) marks hs->failed and wipes key
+   *   material; this function clears h so the failed transcript cannot
+   *   be reused.
    *
    * INVARIANT:
-   *   Once authentication fails, the handshake transcript is no longer
-   *   considered valid or usable.
+   *   Once a decrypt fails, the handshake transcript is no longer valid
+   *   or usable.
    */
   if (result < 0) {
     sodium_memzero(ss->h, NOISE_HASHLEN);
@@ -605,7 +604,7 @@ nox_err_t symmetric_split(struct noise_symmetric_state *ss,
  * ASSUMPTION: libsodium X25519 returns failure for rejected inputs
  *   (crypto_scalarmult_curve25519 returns -1 on low-order/invalid points).
  * INVARIANT: noise_dh() never returns NOX_OK with all-zero shared secret
- *   (contributory check :484, RFC 7748 §6).
+ *   (contributory check below, RFC 7748 §6).
  * VERIFICATION: unit tests (test_noise), differential fuzzing (noise-c ref),
  *   reference implementation cross-check, formal checks where feasible (cbmc_noise).
  */
@@ -667,8 +666,8 @@ nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
  * bilinçli olarak kaldırır. Değiştirilirse mevcut session'lar bağlanamaz.
  */
 
-   symmetric_mix_hash(&hs->ss, (const uint8_t *)"Mustafa Kemal Atatürk",
-                     strlen("Mustafa Kemal Atatürk"));
+   symmetric_mix_hash(&hs->ss, (const uint8_t *)"Live Libre or Die",
+                     strlen("Live Libre or Die"));
   NOX_DEBUG(LOG_MOD_NOISE, "handshake başlatıldı (%s)",
             initiator ? "initiator" : "responder");
 
@@ -1072,9 +1071,16 @@ nox_err_t handshake_split(struct noise_handshake *hs,
                           struct noise_session *session) {
   if (!hs || !session)
     return NOX_ERR_PROTO;
-  if (hs->split_done || hs->failed)
+  /* İkinci split mevcut session'ı bozmamalı. */
+  if (hs->split_done)
     return NOX_ERR_STATE;
-  if (!handshake_is_complete(hs))
+  /* sodium_malloc 0xdb ile doldurur; hardbool(0) için 0xdb geçersiz
+   * temsil (false=0, true=0xff) olduğundan ilk okuma trap eder,
+   * hardbool'suz derlemede ise true okunup guard atlanır. Her iki
+   * durumda da session'ı split öncesi deterministik olarak sıfırla.
+   * Başarılı split cipher_init_key ile tx/rx'i yeniden kurar. */
+  sodium_memzero(session, sizeof(*session));
+  if (hs->failed || !handshake_is_complete(hs))
     return NOX_ERR_STATE;
 
   nox_err_t err;
@@ -1121,22 +1127,40 @@ nox_err_t handshake_split(struct noise_handshake *hs,
 // Real attack surface in practice: local plaintext (transport, strub)
 __attribute__((strub))
 __attribute__((optimize("harden-control-flow-redundancy")))
-ssize_t noise_encrypt(struct noise_session *session, const uint8_t *plaintext,
-                      size_t pt_len, uint8_t *out) {
+ssize_t noise_encrypt(struct noise_session *session, const uint8_t *ad,
+                      size_t ad_len, const uint8_t *plaintext, size_t pt_len,
+                      uint8_t *out) {
   if (!session || !out)
+    return -1;
+  /* Transport keyless fail-closed (H2/P0): cipher_encrypt'in handshake
+   * pass-through'u transport sınırına sızmamalı. Sıfırlanmış/yarım split
+   * session'da AD'siz düz metin yazılmasını engeller. */
+  if (!session->tx.has_key)
+    return -1;
+  /* H2: AD zorunlu — header AEAD kapsamı dışında kalırsa seq/type/len
+   * değiştirilebilir. Boş AD eski kırılgan sözleşmedir; kabul edilmez. */
+  if (!ad || ad_len == 0)
     return -1;
   if (pt_len > NOX_MAX_MSG_LEN)
     return -1;
   if (pt_len > 0 && !plaintext)
     return -1;
-  return cipher_encrypt(&session->tx, NULL, 0, plaintext, pt_len, out);
+  return cipher_encrypt(&session->tx, ad, ad_len, plaintext, pt_len, out);
 }
 
 // Real attack surface in practice: untrusted ciphertext (AEAD, nonce invariant)
 __attribute__((strub))
-ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ciphertext,
-                      size_t ct_len, uint8_t *out) {
+ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ad,
+                      size_t ad_len, const uint8_t *ciphertext, size_t ct_len,
+                      uint8_t *out) {
   if (!session || !out)
+    return -1;
+  /* Transport keyless fail-closed (H2/P0): cipher_decrypt'in handshake
+   * pass-through'u 16B+ her girdiyi doğrulanmış plaintext gibi kabul
+   * etmemeli. Sıfırlanmış/yarım split session'ı reddet. */
+  if (!session->rx.has_key)
+    return -1;
+  if (!ad || ad_len == 0)
     return -1;
   if (ct_len > NOISE_MAX_PAYLOAD_LEN)
     return -1;
@@ -1144,7 +1168,7 @@ ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ciphertext,
     return -1;
   if (ct_len > 0 && !ciphertext)
     return -1;
-  return cipher_decrypt(&session->rx, NULL, 0, ciphertext, ct_len, out);
+  return cipher_decrypt(&session->rx, ad, ad_len, ciphertext, ct_len, out);
 }
 
 /* ================================================================

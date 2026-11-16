@@ -1,13 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_crypto.c — Crypto modül birim testleri
- *
- * Testler:
- *   1. Argon2id key derivation (PIN → master_key)
- *   2. Subkey derivation (master_key → db, unlock, session)
- *   3. Salt yönetimi (üret, kaydet, oku)
- *   4. Identity key üret + yükle (secretbox round-trip)
- *   5. Yanlış PIN ile identity yükleme → NOX_ERR_AUTH
- *   6. Subkey'lerin birbirinden farklı olduğunu doğrula
+ * test_crypto.c — Argon2id, subkey, salt, identity, yanlış PIN ve
+ * subkey ayrımı sözleşmeleri.
  */
 
 #include "common.h"
@@ -50,9 +43,7 @@ static int open_test_dir_fd(void)
     return open(TEST_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 }
 
-/* ================================================================
- * TEST: Argon2id key derivation
- * ================================================================ */
+/* Argon2id key derivation */
 static int test_argon2id_derive(void)
 {
     uint8_t master_key[NOX_KEY_LEN] = {0};
@@ -89,9 +80,7 @@ static int test_argon2id_derive(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Subkey derivation — farklılık kontrolü
- * ================================================================ */
+/* Subkey derivation — farklılık kontrolü */
 static int test_subkey_derive(void)
 {
     /* Sahte master_key */
@@ -129,9 +118,7 @@ static int test_subkey_derive(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Salt yönetimi — üret, kaydet, tekrar oku
- * ================================================================ */
+/* Salt yönetimi — üret, kaydet, tekrar oku */
 static int test_salt_management(void)
 {
     setup_test_dir();
@@ -159,9 +146,7 @@ static int test_salt_management(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Identity key round-trip — üret + yükle
- * ================================================================ */
+/* Identity key round-trip — üret + yükle */
 static int test_identity_roundtrip(void)
 {
     setup_test_dir();
@@ -206,9 +191,7 @@ static int test_identity_roundtrip(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Yanlış PIN → NOX_ERR_AUTH
- * ================================================================ */
+/* Yanlış PIN → NOX_ERR_AUTH */
 static int test_identity_wrong_pin(void)
 {
     setup_test_dir();
@@ -240,9 +223,7 @@ static int test_identity_wrong_pin(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: NULL parametre güvenliği
- * ================================================================ */
+/* NULL parametre güvenliği */
 static int test_null_safety(void)
 {
     char short_pin[] = "x";
@@ -270,11 +251,8 @@ static int test_null_safety(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Tam zincir — PIN → salt → master → subkeys → identity
- *
- * Aynı PIN ile ilk çalıştırma + ikinci çalıştırma simülasyonu.
- * ================================================================ */
+/* Tam zincir: aynı PIN ile ilk + ikinci çalıştırma
+ * (PIN→salt→master→subkeys→identity). */
 static int test_full_chain(void)
 {
     setup_test_dir();
@@ -341,14 +319,8 @@ static int test_full_chain(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Salt var ama identity.key yok
- *
- * Senaryo: İlk çalıştırma yarıda kesildi.
- *          salt üretildi ama identity.key yazılamadı.
- *          Sonraki çalıştırmada salt tekrar okunmalı,
- *          identity.key yeniden üretilmeli.
- * ================================================================ */
+/* Salt var, identity.key yok (ilk çalıştırma yarıda kesildi): salt tekrar
+ * okunmalı, identity.key yeniden üretilmeli. */
 static int test_salt_exists_no_identity(void)
 {
     setup_test_dir();
@@ -395,14 +367,9 @@ static int test_salt_exists_no_identity(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Bozuk salt dosyası → H-4 FIX: yeniden ÜRETİLMEMELİ (abort)
- *
- * salt dosyası 16 byte yerine 5 byte → bozuk sayılır,
- * crypto_load_or_create_salt artık NOX_ERR_IO dönmeli (sessiz
- * yeniden üretim tüm şifreli veriyi erişilemez kılardı). Kullanıcı
- * bozuk dosyayı silerse bir sonraki çağrıda yeni salt üretilir.
- * ================================================================ */
+/* Bozuk salt (16 yerine 5 byte) → H-4: NOX_ERR_IO, sessiz yeniden üretim
+ * YOK (tüm şifreli veri erişilemez olurdu). Kullanıcı silerse sonraki
+ * çağrı yeni salt üretir. */
 static int test_corrupt_salt_recovery(void)
 {
     setup_test_dir();
@@ -448,12 +415,8 @@ static int test_corrupt_salt_recovery(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Tam zincir yanlış PIN → NOX_ERR_AUTH
- *
- * Farklı PIN → farklı master_key → farklı unlock_key
- * → secretbox_open başarısız → NOX_ERR_AUTH
- * ================================================================ */
+/* Tam zincir yanlış PIN: farklı master_key → farklı unlock_key →
+ * secretbox_open fail → NOX_ERR_AUTH. */
 static int test_full_chain_wrong_pin(void)
 {
     setup_test_dir();
@@ -516,9 +479,6 @@ static int test_full_chain_wrong_pin(void)
     return 0;
 }
 
-/* ================================================================
- * MAIN
- * ================================================================ */
 int main(void)
 {
     if (sodium_init() < 0) {

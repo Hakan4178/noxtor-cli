@@ -20,6 +20,8 @@
 #define __AFL_INIT()
 #endif
 
+/* H2: transport AD — fuzz girdisinden türetilir (13 byte wire header) */
+
 int main(void) {
   __AFL_INIT();
 
@@ -47,6 +49,9 @@ int main(void) {
     if (n < 5)
       continue;
 
+    uint8_t ad[13] = {0};
+    memcpy(ad, buf, (size_t)(n < (ssize_t)sizeof(ad) ? n : (ssize_t)sizeof(ad)));
+
     bool initiator = (buf[0] & 0x01) ? true : false;
     int msg_index = buf[1] % 3;
 
@@ -63,7 +68,8 @@ int main(void) {
 
     uint8_t payload_out[2048];
     size_t pl_len = sizeof(payload_out);
-    handshake_read(&hs, buf + 2, (size_t)(n - 2), payload_out, &pl_len);
+    handshake_read(&hs, buf + 2, (size_t)(n - 2), payload_out,
+                   sizeof(payload_out), &pl_len);
 
     /* Transport nonce oracle: fail'de n artmamali */
     {
@@ -76,21 +82,21 @@ int main(void) {
       if (handshake_init(&ha, true, a_priv, a_pub) != NOX_OK) continue;
       if (handshake_init(&hb, false, b_priv, b_pub) != NOX_OK) continue;
       uint8_t tmp[512]; size_t tlen; uint8_t pl2[64]; size_t pll;
-      tlen = sizeof(tmp); handshake_write(&ha, NULL, 0, tmp, &tlen); pll=sizeof(pl2); handshake_read(&hb, tmp, tlen, pl2, &pll);
-      tlen = sizeof(tmp); handshake_write(&hb, NULL, 0, tmp, &tlen); pll=sizeof(pl2); handshake_read(&ha, tmp, tlen, pl2, &pll);
-      tlen = sizeof(tmp); handshake_write(&ha, NULL, 0, tmp, &tlen); pll=sizeof(pl2); handshake_read(&hb, tmp, tlen, pl2, &pll);
+      tlen = sizeof(tmp); handshake_write(&ha, NULL, 0, tmp, &tlen); pll=sizeof(pl2); handshake_read(&hb, tmp, tlen, pl2, sizeof(pl2), &pll);
+      tlen = sizeof(tmp); handshake_write(&hb, NULL, 0, tmp, &tlen); pll=sizeof(pl2); handshake_read(&ha, tmp, tlen, pl2, sizeof(pl2), &pll);
+      tlen = sizeof(tmp); handshake_write(&ha, NULL, 0, tmp, &tlen); pll=sizeof(pl2); handshake_read(&hb, tmp, tlen, pl2, sizeof(pl2), &pll);
       struct noise_session sa, sb;
       if (handshake_split(&ha, &sa) != NOX_OK) continue;
       if (handshake_split(&hb, &sb) != NOX_OK) continue;
       uint8_t msg[] = "fuzz";
-      uint8_t ct[64]; ssize_t cl = noise_encrypt(&sa, msg, sizeof(msg), ct);
+      uint8_t ct[64]; ssize_t cl = noise_encrypt(&sa, ad, sizeof(ad), msg, sizeof(msg), ct);
       if (cl <= 0) continue;
       uint64_t nb = atomic_load(&sb.rx.n);
       uint8_t bad[64]; memcpy(bad, ct, (size_t)cl); bad[0] ^= 1;
-      uint8_t pt[64]; ssize_t r1 = noise_decrypt(&sb, bad, (size_t)cl, pt);
+      uint8_t pt[64]; ssize_t r1 = noise_decrypt(&sb, ad, sizeof(ad), bad, (size_t)cl, pt);
       if (r1 != -1) abort();
       if (atomic_load(&sb.rx.n) != nb) abort();
-      ssize_t r2 = noise_decrypt(&sb, ct, (size_t)cl, pt);
+      ssize_t r2 = noise_decrypt(&sb, ad, sizeof(ad), ct, (size_t)cl, pt);
       if (r2 != (ssize_t)sizeof(msg)) abort();
       if (atomic_load(&sb.rx.n) != nb + 1) abort();
     }

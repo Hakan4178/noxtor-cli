@@ -1,22 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_stdin.c — stdin_handler process_line + tofu_user_response birim testi
- *
- * Kapsam (karma derinlik — negatif iskelet + success yolları):
- *   1-3.   Komut tablosu: /quit|/exit, bilinmeyen slash, session'sız mesaj
- *   4-5.   TOFU ekranı: düz mesaj ve //kaçış bloklanır (C2 yan etkisi)
- *   6.     TOFU çoklu bekleyen + "y" → hiçbirine karar verilmez
- *   7-8.   tofu_user_response (GTK callback yolu): accept fail-closed,
- *          reject → ST_IDLE + pencere kapandı
- *   9-11.  /connect doğrulamaları: self, geçersiz onion, duplicate
- *          (socks5_connect'e hiç düşmez — hs_attempt_count==0 kanıtı)
- *   12.    /msg geçersiz onion — db'ye dokunmadan ret
- *   13.    /msg ghost çevrimdışı — kuyruk yok (ghost mod, db kanıtı)
- *   14.    queue_segmented_message success + M-14 rollback (db ile)
- *   15.    /add success (db round-trip) + kontrol-karakterli isim ret
- *   16.    /switch|/disconnect|/status hata yolları
- *
- * Not: ui_print_* stderr'e yazar (test çıktısı görünür) — davranış değil,
- * state geçişleri assert edilir.
+ * test_stdin.c — process_line + tofu_user_response.
+ * Komutlar, TOFU çoklu bekleyen, /connect doğrulamaları, /msg, /add,
+ * segmentasyon/M-14 rollback; state geçişleri assert edilir.
  */
 
 #include "common.h"
@@ -33,26 +18,14 @@
 #include <unistd.h>
 #include <sodium.h>
 #include "test_common.h"
+#include "test_protocol_support.h"
 
 
-/* ================================================================
- * FIXTURE
- * ================================================================ */
 static struct app_state st;
 
 /* validate_onion_input uyumlu: 56 karakter [a-z2-7] + ".onion" */
 static const char *VALID_ONION =
     "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
-
-static void fixture_reset(void)
-{
-    memset(&st, 0, sizeof(st));
-    st.active_peer_idx  = -1;
-    st.epoll_fd         = -1;
-    st.downloads_dir_fd = -1;
-    for (unsigned i = 0; i < NOX_MAX_PEERS; i++)
-        st.peers[i].fd = -1;
-}
 
 /* Aynı slota prompt'a sokar (event_loop EV_HANDSHAKE_DONE yolunun karşılığı) */
 static nox_err_t prompt_slot(unsigned slot, uint8_t fill)
@@ -88,14 +61,11 @@ static void cleanup_db_dir(void)
     rmdir(TEST_DB_DIR);
 }
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
 /* 1) /quit ve /exit → running=false */
 static int test_quit_commands(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     st.running = true;
     process_line(&st, "/quit");
     TEST_ASSERT(st.running == false);
@@ -109,7 +79,7 @@ static int test_quit_commands(void)
 /* 2) Bilinmeyen slash komutu → hata, state'e dokunma, asla mesaja düşmez */
 static int test_unknown_slash_command(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     st.running = true;
     process_line(&st, "/bogus_command");
     TEST_ASSERT(st.running == true);
@@ -120,7 +90,7 @@ static int test_unknown_slash_command(void)
 /* 3) Session yokken düz mesaj → "bağlantı yok" hatası, gönderim yok */
 static int test_plain_message_no_session(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     process_line(&st, "selam");
     TEST_ASSERT(st.peers[0].state == ST_IDLE);      /* hiçbir slot oynamadı */
     TEST_ASSERT(st.active_peer_idx == -1);
@@ -131,7 +101,7 @@ static int test_plain_message_no_session(void)
  *    prompt'daki karar bozulmaz) */
 static int test_tofu_blocks_plain_text(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     TEST_ASSERT(prompt_slot(0, 0xA1) == NOX_OK);
 
     process_line(&st, "onaylanmamış mesaj");
@@ -144,7 +114,7 @@ static int test_tofu_blocks_plain_text(void)
 /* 5) TOFU beklerken //kaçış da bloklanır */
 static int test_tofu_blocks_slash_escape(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     TEST_ASSERT(prompt_slot(0, 0xA1) == NOX_OK);
 
     process_line(&st, "//hello");
@@ -157,7 +127,7 @@ static int test_tofu_blocks_slash_escape(void)
 /* 6) Çoklu bekleyen + "y" → hiçbir slot onaylanmaz (ret) */
 static int test_tofu_multi_pending_yes_rejected(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     TEST_ASSERT(prompt_slot(0, 0xA1) == NOX_OK);
     TEST_ASSERT(prompt_slot(1, 0xB2) == NOX_OK);
 
@@ -173,7 +143,7 @@ static int test_tofu_multi_pending_yes_rejected(void)
  *    (process_line "y" ile aynı karar noktası — API doğrudan çağrılır) */
 static int test_api_accept_fail_closed(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     TEST_ASSERT(prompt_slot(0, 0xA1) == NOX_OK);
     /* ps->hs NULL — bilinçli */
 
@@ -187,7 +157,7 @@ static int test_api_accept_fail_closed(void)
 /* 8) GTK callback yolu: reject → ST_IDLE + pencere kapandı */
 static int test_api_reject(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     TEST_ASSERT(prompt_slot(0, 0xA1) == NOX_OK);
 
     tofu_user_response(&st, false);
@@ -200,7 +170,7 @@ static int test_api_reject(void)
 /* 9) /connect kendi adresine → ret, slot tahsis edilmez */
 static int test_connect_self_rejected(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     snprintf(st.onion_addr, sizeof(st.onion_addr), "%s", VALID_ONION);
 
     char cmd[128];
@@ -216,7 +186,7 @@ static int test_connect_self_rejected(void)
 /* 10) /connect geçersiz onion → ret */
 static int test_connect_invalid_onion(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     process_line(&st, "/connect not-an-onion.onion");
     process_line(&st, "/connect uppercaseAAAA.onion"); /* uppercase yasak */
 
@@ -231,7 +201,7 @@ static int test_connect_invalid_onion(void)
  *    (kanıt: hs_attempt_count==0 ve yeni slot boş) */
 static int test_connect_duplicate_rejected(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
     TEST_ASSERT(devnull >= 0);
     st.peers[0].fd = devnull;
@@ -255,7 +225,7 @@ static int test_connect_duplicate_rejected(void)
 /* 12) /msg geçersiz onion → ret, db'ye dokunulmaz */
 static int test_msg_invalid_onion(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     process_line(&st, "/msg short hello");
     TEST_ASSERT(st.peers[0].state == ST_IDLE);
     return 0;
@@ -271,7 +241,7 @@ static nox_err_t queue_count_cb(const char *text, void *ctx)
 
 static int test_msg_ghost_offline_blocked(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     st.ghost_mode = true;
     mkdir(TEST_DB_DIR, 0700);
     TEST_ASSERT(db_init_test() == NOX_OK);
@@ -300,7 +270,7 @@ static int test_msg_ghost_offline_blocked(void)
 /* 14) queue_segmented_message: success + çok-chunk + M-14 rollback (db) */
 static int test_queue_segmented_and_rollback(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     mkdir(TEST_DB_DIR, 0700);
     TEST_ASSERT(db_init_test() == NOX_OK);
 
@@ -323,7 +293,7 @@ static int test_queue_segmented_and_rollback(void)
 /* 15) /add success (db round-trip) + kontrol-karakterli isim ret */
 static int test_add_contact_success_and_reject(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     mkdir(TEST_DB_DIR, 0700);
     TEST_ASSERT(db_init_test() == NOX_OK);
 
@@ -354,7 +324,7 @@ static int test_add_contact_success_and_reject(void)
  *     değiştirmez (sadece crash değil, davranış da kilitlenir) */
 static int test_switch_disconnect_status_errors(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     st.ghost_mode = true;   /* find_peer db'ye düşmesin */
     st.running = true;      /* quit OLMAYAN komutlar running'e dokunmaz */
 

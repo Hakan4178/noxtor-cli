@@ -179,6 +179,16 @@ static void early_hardening_init(void) {
     (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
     _exit(1);
   }
+#ifdef PR_SET_NO_NEW_PRIVS
+  /* Seccomp stage 1 constructor'ı kendi içinde de set eder; constructor
+   * sırası garanti olmadığı için burada da koşulsuz uygulanır. NO_SECCOMP
+   * (ör. Android profili) build'inde tek garanti burasıdır. */
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    const char msg[] = "FATAL: PR_SET_NO_NEW_PRIVS başarısız\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+  }
+#endif
   struct rlimit core_zero = {0, 0};
   if (setrlimit(RLIMIT_CORE, &core_zero) != 0) {
     const char msg[] = "FATAL: RLIMIT_CORE sıfırlanamadı\n";
@@ -654,6 +664,10 @@ static void cleanup(struct app_state *state) {
     close(state->downloads_dir_fd);
     state->downloads_dir_fd = -1;
   }
+  if (state->tor_data_fd >= 0) {
+    close(state->tor_data_fd);
+    state->tor_data_fd = -1;
+  }
   if (state->config_dir_fd >= 0) {
     close(state->config_dir_fd);
     state->config_dir_fd = -1;
@@ -786,6 +800,7 @@ int main(int argc, char *argv[]) {
     state.peer_fd = -1;
     state.config_dir_fd = -1;
     state.downloads_dir_fd = -1;
+    state.tor_data_fd = -1;
     state.running = true;
     state.peer_state = ST_IDLE;
     state.active_peer_idx = -1;
@@ -799,15 +814,19 @@ int main(int argc, char *argv[]) {
     /* ── 0. Komut satırı argümanları ───────────────────── */
     bool ghost_mode = false;
     bool allow_unsandboxed_fs = false;
+    bool require_landlock_resolve_unix = false;
     for (int i = 1; i < argc; i++) {
       if (strcmp(argv[i], "--ghost") == 0 || strcmp(argv[i], "-ghost") == 0) {
         ghost_mode = true;
       } else if (strcmp(argv[i], "--allow-unsandboxed-fs") == 0) {
         allow_unsandboxed_fs = true;
+      } else if (strcmp(argv[i], "--require-landlock-resolve-unix") == 0) {
+        require_landlock_resolve_unix = true;
       }
     }
     state.ghost_mode = ghost_mode;
     state.allow_unsandboxed_fs = allow_unsandboxed_fs;
+    state.require_landlock_resolve_unix = require_landlock_resolve_unix;
 
     if (argc >= 2 && strcmp(argv[1], "--full_cleankeys") == 0) {
       /*
@@ -916,6 +935,12 @@ int main(int argc, char *argv[]) {
     /* ── 1. Log sistemi ────────────────────────────────── */
     NOX_INFO(LOG_MOD_MAIN, "%s v%s başlatılıyor", PARANOID_APP_NAME,
              PARANOID_VERSION);
+#if defined(NOX_PLATFORM_ANDROID)
+    /* DİKKAT — Android profili sertleştirme kaybı, açılışta bir kez görünür. */
+    NOX_WARN(LOG_MOD_HARD,
+             "DİKKAT: Android build x86 CET-SS/IBT kilidi ve Landlock ve uygulama seccomp YOK"
+             "Strub/hardbool gibi GCC sertleştirmeleri olmayabilir");
+#endif
 
      /* ── tzset() — en başta, sandbox'tan ÖNCE ──────────────────
      * localtime_r() ilk çağrısında /etc/localtime'i açabilir. Bu, Landlock
@@ -923,7 +948,7 @@ int main(int argc, char *argv[]) {
      * düşebilir veya EACCES alabilir. tzset() erken çağrılırsa zaman dilimi
      * önceden çözümlenir ve sonraki sandbox kısıtlamalarından etkilenmez.
      * İlk localtime_r çağrısı step 1'deki log sistemi — bu yüzden ondan
-     * önce gelmeli. (Faz 1, commit 2) */
+     * önce gelmeli. */
     tzset();
 
     /* ── 2. Signal handler'lar ─────────────────────────── */
@@ -939,12 +964,17 @@ int main(int argc, char *argv[]) {
     NOX_INFO(LOG_MOD_MAIN, "libsodium başlatıldı");
 
     /* ── 4. CPU yetenek kontrolü ───────────────────────── */
+#if defined(NOX_NO_X86_ASM)
+    NOX_INFO(LOG_MOD_HARD,
+             "android: CET/IBT x86 asm devre dışı. Donanım sorgusu atlandı");
+#else
     NOX_INFO(LOG_MOD_HARD, "shadow stack (CET-SS): %s",
              cpu_has_shstk() ? "destekleniyor" : "desteklenmiyor");
     NOX_INFO(LOG_MOD_HARD, "IBT (CET-IBT): %s",
              cpu_has_ibt() ? "destekleniyor" : "desteklenmiyor");
+#endif
 
-#ifdef NDEBUG
+#if defined(NDEBUG) && !defined(NOX_NO_X86_ASM)
     /* ── 4b. CET-SS kilidi + self-test ──────────────────────
      * Adım 4'ün raporundan hemen sonra, PIN'den ÖNCE (5/6):
      * self-test fork() yapar — key materyali henüz yok.
@@ -1332,13 +1362,47 @@ int main(int argc, char *argv[]) {
       uint8_t ct[64 + NOX_MAC_LEN];
       uint8_t pt[64];
 
-      ssize_t ct_len = noise_encrypt(&sa, (const uint8_t *)test_msg,
+      /* H2: transport AD zorunlu — demo'da gerçek 13 byte wire header */
+      struct frame_header demo_fh = {
+          .magic = NOX_FRAME_MAGIC,
+          .type = NOX_MSG_TEXT,
+          .seq = 0,
+          .len = (uint32_t)(strlen(test_msg) + 1 + NOX_MAC_LEN),
+      };
+      uint8_t demo_ad[FRAME_HEADER_WIRE_SIZE];
+      frame_ad(&demo_fh, demo_ad);
+
+      ssize_t ct_len = noise_encrypt(&sa, demo_ad, sizeof(demo_ad),
+                                     (const uint8_t *)test_msg,
                                      strlen(test_msg) + 1, ct);
       NOX_INFO(LOG_MOD_NOISE, "şifrelendi: %zd byte", ct_len);
 
-      ssize_t pt_len = noise_decrypt(&sb, ct, (size_t)ct_len, pt);
-      NOX_INFO(LOG_MOD_NOISE, "çözüldü: \"%s\" (%zd byte)", (const char *)pt,
-               pt_len);
+      /* H2 negatif: yanlış AD tag fail etmeli ve nonce'u ilerletmemeli;
+       * ardından doğru AD ile aynı ct açılabilmeli. */
+      if (ct_len > 0) {
+        uint8_t bad_ad[FRAME_HEADER_WIRE_SIZE];
+        memcpy(bad_ad, demo_ad, sizeof(bad_ad));
+        bad_ad[sizeof(bad_ad) - 1] ^= 0x01;
+        ssize_t bad_len = noise_decrypt(&sb, bad_ad, sizeof(bad_ad), ct,
+                                        (size_t)ct_len, pt);
+        if (bad_len != -1)
+          NOX_ERROR(LOG_MOD_NOISE,
+                    "H2 negatif test BAŞARISIZ: yanlış AD kabul edildi");
+        else
+          NOX_INFO(LOG_MOD_NOISE,
+                   "H2 negatif test: yanlış AD reddedildi (tag fail)");
+
+        ssize_t pt_len = noise_decrypt(&sb, demo_ad, sizeof(demo_ad), ct,
+                                       (size_t)ct_len, pt);
+        if (pt_len > 0)
+          NOX_INFO(LOG_MOD_NOISE, "çözüldü: \"%s\" (%zd byte)",
+                   (const char *)pt, pt_len);
+        else
+          NOX_ERROR(LOG_MOD_NOISE,
+                    "H2 pozitif test BAŞARISIZ: doğru AD reddedildi");
+      } else {
+        NOX_ERROR(LOG_MOD_NOISE, "transport encrypt BAŞARISIZ: %zd", ct_len);
+      }
 
       /* Temizle */
       sodium_memzero(&sa, sizeof(sa));
@@ -1387,14 +1451,24 @@ int main(int argc, char *argv[]) {
      * Eski kernel (EINVAL): geç — seccomp W^X yine aktif. */
     if (prctl(PR_SET_MDWE, (unsigned long)PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) == 0) {
       NOX_INFO(LOG_MOD_MAIN,
-               "W^X: PR_SET_MDWE aktif (çekirdek düzeyi exec-gain engeli)");
+               "W^X: PR_SET_MDWE aktif (kernel ≥6.3)");
     } else {
+#if defined(NO_SECCOMP)
       NOX_INFO(LOG_MOD_MAIN,
-               "W^X: PR_SET_MDWE yok (kernel <6.3? — errno=%d) — seccomp W^X devrede",
-               errno);
+               "W^X: PR_SET_MDWE yok (kernel <6.3? — errno=%d) — "
+               "seccomp W^X devre dışı", errno);
+#else
+      NOX_INFO(LOG_MOD_MAIN,
+               "W^X: PR_SET_MDWE yok (kernel <6.3? — errno=%d) — "
+               "seccomp W^X devrede", errno);
+#endif
     }
 
-#ifndef NO_SECCOMP
+#if defined(NOX_PLATFORM_ANDROID)
+    NOX_INFO(LOG_MOD_MAIN,
+             "android: seccomp stage 2 atlandı — Android kernel/zygote "
+             "seccomp'u kullanılıyor");
+#elif !defined(NO_SECCOMP)
     if (seccomp_policy_load(2) != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
       cleanup(&state);
@@ -1522,6 +1596,12 @@ int main(int argc, char *argv[]) {
         NOX_INFO(LOG_MOD_MAIN, "onion seed ↔ adres tutarlılığı doğrulandı");
       }
     }
+
+    /* F2: HS başarıyla kuruldu ve seed ↔ adres doğrulandı. Artık control
+     * fd'ye gerek yok; kapatarak Landlock/seccomp sonrası dönemde
+     * authenticate edilmiş Tor kontrol yeteneğini ortadan kaldır.
+     * HS Flags=Detach ile kurulduğu için servis yaşamaya devam eder. */
+    tor_close_control_fd(&state);
 
     /* ── 16. epoll event loop ─────────────────────────── */
     err = epoll_setup(&state, state.listen_fd);

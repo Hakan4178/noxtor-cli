@@ -1,19 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_onion_derive.c — Onion seed / Tor expanded key birim testleri
- *
- * Kapsam (docs/onion-key-derived-plan.md §5):
- *   1. Determinizm: aynı master_key → aynı onion_seed / expanded / pub
- *   2. Ayrım: master_key değişince seed/adres değişmeli (D1-D3)
- *   3. KRİTİK format: expanded = [clamped_scalar(32) || prefix(32)]
- *      — RFC 8032 §5.1.5 clamp doğrulaması (3. tur kriptograf düzeltmesi)
- *   4. pub == scalarmult_ed25519_base(clamped_scalar) — Tor'un scalar'dan
- *      türeteceği pub ile birebir aynı (plan "pub GÜVENİLİR" iddiası)
- *   5. Sabit vektörler (bağımsız Python/nacl doğrulamasıyla üretildi)
- *   6. NULL güvenlik
- *
- * Ayrıca .sh harness'i için:
- *   --emit-key  : expanded key'in base64'ünü basar (ADD_ONION e2e için)
- *   --emit-addr : v3 onion adresini basar (determinizm .sh karşılaştırması)
+ * test_onion_derive.c — onion seed/expanded key türetimi.
+ * Determinizm, master_key ayrımı, RFC 8032 clamp, pub=scalar*G,
+ * sabit vektörler; .sh için --emit-key/--emit-addr.
  */
 
 #include "common.h"
@@ -25,15 +13,8 @@
 #include <sodium.h>
 
 
-/* ================================================================
- * SABİT TEST VEKTÖRLERİ
- *
- * master_key = 0x00..0x1f (mk) ve 0x01..0x20 (mk2).
- * Vektörler bağımsız kaynaklarla üretildi ve üç yoldan doğrulandı:
- *   - libsodium crypto_kdf (ctypes)  → seed
- *   - hashlib SHA-512 + RFC 8032 clamp → expanded
- *   - nacl scalarmult_ed25519_base  → pub
- * ================================================================ */
+/* Sabit vektörler: mk=0x00..1f, mk2=0x01..20; libsodium kdf (seed),
+ * SHA-512+RFC8032 clamp (expanded), nacl scalarmult (pub) ile doğrulandı. */
 static const uint8_t MK1[32] = {
     0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
     0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
@@ -85,9 +66,7 @@ static const uint8_t VEC_PUB2[32] = {
 #include "test_common.h"
 
 
-/* ================================================================
- * TEST: Determinizm — aynı master_key → aynı seed/expanded/pub
- * ================================================================ */
+/* Determinizm — aynı master_key → aynı seed/expanded/pub */
 static int test_determinism(void)
 {
     uint8_t seed_a[32], seed_b[32];
@@ -106,9 +85,7 @@ static int test_determinism(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: master_key ayrımı — farklı master → farklı seed ve pub
- * ================================================================ */
+/* master_key ayrımı — farklı master → farklı seed ve pub */
 static int test_master_key_separation(void)
 {
     uint8_t seed1[32], seed2[32];
@@ -127,15 +104,9 @@ static int test_master_key_separation(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: KRİTİK — expanded format = [clamped_scalar || prefix]
- *
- * RFC 8032 §5.1.5 / Tor ed25519_secret_key_from_seed uyumu:
- *   h = SHA-512(seed)
- *   h[0]  &= 248  (alt 3 bit temizlenir)
- *   h[31] &= 63   (üst 2 bit temizlenir)
- *   h[31] |= 64   (5. bit set edilir)
- * ================================================================ */
+/* Expanded = [clamped_scalar || prefix], RFC 8032 §5.1.5 / Tor
+ * ed25519_secret_key_from_seed: h=SHA-512(seed); h[0]&=248; h[31]&=63;
+ * h[31]|=64. */
 static int test_expanded_format_clamp(void)
 {
     uint8_t seed[32];
@@ -158,13 +129,9 @@ static int test_expanded_format_clamp(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: pub == scalarmult_ed25519_base(clamped_scalar)
- *
- * Planın "pub GÜVENİLİR" iddiası: libsodium pk, Tor'un scalar'dan
- * türeteceği public key ile birebir aynı olmalı. Bu olmadan
- * ADD_ONION ServiceID ile pub'tan hesaplanan adres eşleşmez.
- * ================================================================ */
+/* pub == scalarmult_ed25519_base(clamped_scalar): libsodium pk, Tor'un
+ * scalar'dan türeteceği public key ile aynı olmalı; yoksa ADD_ONION
+ * ServiceID ile pub'tan hesaplanan adres eşleşmez. */
 static int test_pub_equals_scalarmult(void)
 {
     uint8_t seed[32];
@@ -180,10 +147,7 @@ static int test_pub_equals_scalarmult(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Sabit vektörler — MK1/MK2 beklenen değerleri üretmeli
- * (vektörler Python/nacl ile bağımsız üretildi + doğrulandı)
- * ================================================================ */
+/* MK1/MK2 beklenen değerleri üretmeli (Python/nacl ile bağımsız doğrulandı). */
 static int test_fixed_vectors(void)
 {
     uint8_t seed[32], exp[64], pub[32];
@@ -204,9 +168,7 @@ static int test_fixed_vectors(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: subkey ayrımı — onion seed, db/identity/session'dan farklı
- * ================================================================ */
+/* subkey ayrımı — onion seed, db/identity/session'dan farklı */
 static int test_subkey_separation(void)
 {
     uint8_t db[32], unlock[32], session[32], seed[32];
@@ -221,9 +183,7 @@ static int test_subkey_separation(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: NULL güvenlik
- * ================================================================ */
+/* NULL güvenlik */
 static int test_null_safety(void)
 {
     uint8_t buf[64];
@@ -238,13 +198,8 @@ static int test_null_safety(void)
     return 0;
 }
 
-/* ================================================================
- * V3 ADRES HELPER — .sh harness'i için (--emit-addr)
- *
- * v3 onion adresi: base32(pub(32) || checksum(2) || 0x03)
- * checksum = SHA3-256(".onion checksum" || pub || 0x03)[0:2]
- * (base32: test_common.h → nox_test_base32_encode)
- * ================================================================ */
+/* v3 adres helper (--emit-addr): base32(pub(32)||checksum(2)||0x03);
+ * checksum = SHA3-256(".onion checksum"||pub||0x03)[0:2]. */
 static int derive_v3_address(const uint8_t pub[32], char *addr_out)
 {
     uint8_t checksum[32];
@@ -280,9 +235,7 @@ static int derive_v3_address(const uint8_t pub[32], char *addr_out)
     return 0;
 }
 
-/* ================================================================
- * EMIT MODLARI — .sh harness entegrasyonu
- * ================================================================ */
+/* EMIT MODLARI — .sh harness entegrasyonu */
 static int emit_key(const uint8_t mk[32])
 {
     uint8_t seed[32], exp[64], pub[32];
@@ -310,9 +263,6 @@ static int emit_addr(const uint8_t mk[32])
     return 0;
 }
 
-/* ================================================================
- * MAIN
- * ================================================================ */
 int main(int argc, char **argv)
 {
     if (sodium_init() < 0) {

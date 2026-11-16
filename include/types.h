@@ -145,7 +145,7 @@ enum tor_transport_type {
     TRANSPORT_OBFS4
 };
 
-/* CRIT-1: tx_buf için güvenli kapasite sabiti */
+/* CRIT-1: tek frame (header + max payload + MAC) için güvenli kapasite */
 #define TX_BUF_CAPACITY (13 + 4096 + NOX_MAC_LEN)
 
 /* Recv buffer kapasitesi — frame header (13) + max payload (4096 + MAC) */
@@ -182,12 +182,35 @@ struct file_tx_state {
     /* D-1 FIX: önceden ayrılmış şifresiz tampon (stack yerine heap) */
     uint8_t *plain_buf;
 
-    /* Kısmi yazım için frame tamponu — boyut TX_BUF_CAPACITY ile sabit */
-    uint8_t  tx_buf[TX_BUF_CAPACITY];
-    size_t   tx_len;              /* mevcut frame'in toplam boyutu */
-    size_t   tx_offset;           /* şimdiye dek yazılan byte */
-    size_t   current_chunk_size;  /* mevcut şifrelenmemiş dosya boyutu */
+    /* C2: frame'ler doğrudan ortak TX kuyruğuna commit edilir; bu struct
+     * yalnız kaynak dosya ve ilerleme sayaçlarını tutar. sent_bytes
+     * commit anında artar (sokete yazılmayı beklemez). */
 };
+
+/* ================================================================
+ * C1: TX FRAME KUYRUĞU — şifrelenmiş wire frame'ler
+ *
+ * Nonce sırası = şifreleme sırası = soket yazma sırası invariant'ı.
+ * Slotlar tam bir frame tutar: [13-byte header][ciphertext].
+ * Kuyruk doluysa şifreleme YAPILMAZ (nonce tüketilmez); frame atlanmaz.
+ * ================================================================ */
+#define FRAME_QUEUE_SLOTS 4U
+
+struct frame_queue_slot {
+    uint8_t  buf[TX_BUF_CAPACITY];
+    uint16_t len;                 /* toplam frame uzunluğu */
+    uint16_t off;                 /* yazılan byte sayısı   */
+};
+
+struct frame_queue {
+    struct frame_queue_slot slots[FRAME_QUEUE_SLOTS];
+    uint8_t head;                 /* ilk dolu slot         */
+    uint8_t tail;                 /* ilk boş slot          */
+    uint8_t count;                /* dolu slot sayısı      */
+};
+
+NOX_STATIC_ASSERT(TX_BUF_CAPACITY <= UINT16_MAX,
+                  "TX_BUF_CAPACITY frame_queue len alanina sigmali");
 
 /* ================================================================
  * PEER OTURUMU — Tek bir peer bağlantısının tüm durumu
@@ -236,12 +259,35 @@ struct peer_session {
     uint8_t  recv_buf[RECV_BUF_CAPACITY];
     size_t   recv_pos;
 
+    /* ── B1: yarım frame trickle deadline ──
+     * Geçerli frame'in ilk baytının geldiği an (CLOCK_MONOTONIC).
+     * recv() her veri getirdiğinde DEĞİL, yalnız yeni frame başlarken
+     * tazelenir; böylece last_active tazelemesi trickle deadline'ını
+     * maskelemez. Frame sınırında kalan baytlar için yeniden başlar. */
+    struct timespec frame_start;
+
+    /* ── H2/H3: RX plaintext çalışma tamponu ──
+     * Tek sahibi peer'dir; tek serbest noktası action_cleanup'tır.
+     * TEXT ve FILE aynı tamponu kullanır. Kural: kullan → sıfırla →
+     * dispatch (dispatch action_cleanup'ı tetikleyebilir).
+     * Boyut: NOX_MAX_MSG_LEN + 1 (NUL için). Lazy sodium_malloc. */
+    uint8_t *rx_pt_buf;
+
     /* ── M-2 FIX: idle timeout için son aktivite ── */
     struct timespec last_active;
 
     /* ── Dosya transfer ── */
     struct file_rx_state rx_file;
     struct file_tx_state tx_file;
+
+    /* ── C1/C2: şifrelenmiş TX frame kuyruğu ──
+     * METADATA, FILE chunk'ları ve TEXT aynı kuyruğu paylaşır. Sıra
+     * tek invariant'tır: encrypt → commit → socket write. */
+    struct frame_queue tx_frames;
+
+    /* DB kuyruğu AGAIN ile durduysa, TX kuyruğu boşalınca aynı
+     * oturumda devam etmek için işaret. */
+    nox_hardbool_t db_retry_pending;
 
     /* ── Okunmamış mesaj sayacı ── */
     uint32_t unread_count;
@@ -294,6 +340,7 @@ struct app_state {
     char     onion_addr[NOX_ONION_LEN + 1]; /* kendi .onion adresimiz */
     char     torrc_path[NOX_PATH_MAX];   /* torrc dosya yolu         */
     char     tor_data_dir[NOX_PATH_MAX]; /* tor veri dizini           */
+    int      tor_data_fd;        /* O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC — F3: dar Landlock silme kuralı */
 
     /* Network */
     int      epoll_fd;           /* epoll instance                   */
@@ -317,6 +364,7 @@ struct app_state {
     nox_hardbool_t first_run;    /* hardened: ilk çalıştırma mı      */
     nox_hardbool_t ghost_mode;   /* hardened: --ghost SQLite yok     */
     nox_hardbool_t allow_unsandboxed_fs; /* hardened: Landlock bypass */
+    nox_hardbool_t require_landlock_resolve_unix; /* F1: ABI<9'da fail-closed */
     nox_hardbool_t queue_flushed;/* hardened: kuyruk gönderildi      */
     size_t   prompt_display_len; /* prompt'un terminal karakter genişliği */
 

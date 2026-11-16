@@ -342,16 +342,20 @@ nox_err_t handshake_read(struct noise_handshake *hs, const uint8_t *msg,
   return err;
 }
 
-ssize_t noise_encrypt(struct noise_session *session, const uint8_t *plaintext,
-                      size_t pt_len, uint8_t *out) {
+ssize_t noise_encrypt(struct noise_session *session, const uint8_t *ad,
+                      size_t ad_len, const uint8_t *plaintext, size_t pt_len,
+                      uint8_t *out) {
   if (!session || !out) return -1;
-  return cipher_encrypt(&session->tx, NULL, 0, plaintext, pt_len, out);
+  if (!ad || ad_len == 0) return -1;   /* H2: AD zorunlu */
+  return cipher_encrypt(&session->tx, ad, ad_len, plaintext, pt_len, out);
 }
 
-ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ciphertext,
-                      size_t ct_len, uint8_t *out) {
+ssize_t noise_decrypt(struct noise_session *session, const uint8_t *ad,
+                      size_t ad_len, const uint8_t *ciphertext, size_t ct_len,
+                      uint8_t *out) {
   if (!session || !out) return -1;
-  return cipher_decrypt(&session->rx, NULL, 0, ciphertext, ct_len, out);
+  if (!ad || ad_len == 0) return -1;   /* H2: AD zorunlu */
+  return cipher_decrypt(&session->rx, ad, ad_len, ciphertext, ct_len, out);
 }
 
 /* ================================================================
@@ -446,17 +450,23 @@ static void test_handshake_read_bad_state(void) {
 }
 
 static void test_noise_encrypt_null(void) {
-  uint8_t pt[16] = {0}, ct[32];
-  assert(noise_encrypt(NULL, pt, 16, ct) == -1);
+  uint8_t pt[16] = {0}, ct[32], ad[13] = {0};
+  assert(noise_encrypt(NULL, ad, sizeof(ad), pt, 16, ct) == -1);
   struct noise_session s = {0};
-  assert(noise_encrypt(&s, pt, 16, NULL) == -1);
+  assert(noise_encrypt(&s, ad, sizeof(ad), pt, 16, NULL) == -1);
+  /* H2: AD zorunlu */
+  assert(noise_encrypt(&s, NULL, 0, pt, 16, ct) == -1);
+  assert(noise_encrypt(&s, ad, 0, pt, 16, ct) == -1);
 }
 
 static void test_noise_decrypt_null(void) {
-  uint8_t ct[32] = {0}, pt[16];
-  assert(noise_decrypt(NULL, ct, 32, pt) == -1);
+  uint8_t ct[32] = {0}, pt[16], ad[13] = {0};
+  assert(noise_decrypt(NULL, ad, sizeof(ad), ct, 32, pt) == -1);
   struct noise_session s = {0};
-  assert(noise_decrypt(&s, ct, 32, NULL) == -1);
+  assert(noise_decrypt(&s, ad, sizeof(ad), ct, 32, NULL) == -1);
+  /* H2: AD zorunlu */
+  assert(noise_decrypt(&s, NULL, 0, ct, 32, pt) == -1);
+  assert(noise_decrypt(&s, ad, 0, ct, 32, pt) == -1);
 }
 
 /* ================================================================

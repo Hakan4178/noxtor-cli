@@ -4,6 +4,7 @@
 
 #include "stdin_handler.h"
 #include "file_transfer.h"
+#include "frame_queue.h"
 #include "arena.h"
 #include "common.h"
 #include "database.h"
@@ -141,8 +142,8 @@ static struct peer_session *find_peer_by_name_or_onion(struct app_state *state,
 }
 
 /* B FIX: ANSI kaçış temizliği artık frontend.c'de tek kaynak
- * (ui_strip_ansi, test_ansi_strip korpusuyla kilitli) — buradaki
- * static kopya silindi, drift'e kapalı. */
+ * (ui_strip_ansi / ui_strip_input, test_ansi_strip korpusuyla kilitli)
+ * — buradaki static kopya silindi, drift'e kapalı. */
 
 /* ================================================================
  * MESAJ GÖNDERME VE KUYRUK YARDIMCILARI
@@ -154,148 +155,200 @@ struct queue_flush_ctx {
   struct peer_session *ps;
 };
 
+/* Bir frame'i doğrudan kuyruk slotuna şifreler ve commit eder.
+ * Çağıran, kuyrukta yer olduğunu ÖNCEDEN doğrulamalıdır; rezervasyon
+ * başarısız olursa nonce harcanmadan NOX_ERR_AGAIN döner. */
+static nox_err_t enqueue_frame(struct app_state *state,
+                               struct peer_session *ps, uint8_t type,
+                               const void *pt, size_t pt_len) {
+  if (!ps || !ps->session || ps->fd < 0)
+    return NOX_ERR_NET;
+  if (pt_len > NOX_MAX_MSG_LEN)
+    return NOX_ERR_PROTO;
+
+  uint8_t *slot = frame_queue_reserve(ps);
+  if (!slot)
+    return NOX_ERR_AGAIN;
+
+  /* H2: Header şifrelemeden ÖNCE kurulur; 13 byte ham wire kopyası AD olur. */
+  struct frame_header fh = {
+      .magic = NOX_FRAME_MAGIC,
+      .type = type,
+      .seq = ps->tx_seq,
+      .len = (uint32_t)(pt_len + NOX_MAC_LEN),
+  };
+  frame_ad(&fh, slot);
+
+  /* noise_encrypt nonce'u AEAD'den önce rezerve eder. Başarısız olsa
+   * bile rezervasyon geri alınamaz; tüketim varsa frame üretilemez ve
+   * sıra kapanmaz → tek güvenli çıkış oturumu kapatmaktır. */
+  uint64_t nonce_before = atomic_load(&ps->session->tx.n);
+  ssize_t ct_len = noise_encrypt(ps->session, slot, FRAME_HEADER_WIRE_SIZE,
+                                 (const uint8_t *)pt, pt_len,
+                                 slot + FRAME_HEADER_WIRE_SIZE);
+  if (ct_len != (ssize_t)fh.len) {
+    uint64_t nonce_after = atomic_load(&ps->session->tx.n);
+    bool nonce_consumed =
+        (nonce_after != nonce_before) || (nonce_before == UINT64_MAX);
+    if (nonce_consumed) {
+      if (state) {
+        ui_print_error(state,
+            "Mesaj şifrelenemedi (nonce tüketildi) — oturum kapatılıyor.");
+        (void)sm_dispatch(ps, state, EV_CRYPTO_FAIL);
+      }
+      return NOX_ERR_IO;
+    }
+    return NOX_ERR_CRYPTO;
+  }
+
+  nox_err_t err =
+      frame_queue_commit(ps, FRAME_HEADER_WIRE_SIZE + (size_t)ct_len);
+  if (err != NOX_OK) {
+    /* Nonce tüketildi ama frame commit edilemedi: boşluk kapatılamaz. */
+    if (state) {
+      ui_print_error(state,
+          "Frame kuyruğa alınamadı — oturum kapatılıyor.");
+      (void)sm_dispatch(ps, state, EV_CRYPTO_FAIL);
+    }
+    return NOX_ERR_IO;
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+  return NOX_OK;
+}
+
 nox_err_t send_queued_callback(const char *text, void *ctx) {
   struct queue_flush_ctx *qctx = (struct queue_flush_ctx *)ctx;
+  if (!qctx || !qctx->state || !qctx->ps)
+    return NOX_ERR_NET;
+
   struct app_state *state = qctx->state;
   struct peer_session *ps = qctx->ps;
-  if (!state || !ps || ps->fd < 0 || !ps->session)
+  if (ps->fd < 0 || !ps->session)
     return NOX_ERR_NET;
+  if (!text)
+    return NOX_ERR_PROTO;
+
+  /* DB kuyruğu kalıcıdır; kuyrukta yer yokken NOX_OK dönmek
+   * db_process_queue'nin satırı hemen silmesine yol açar. Net ret ile
+   * kayıt korunur ve sıra bozulmaz; kuyruk bir sonraki flush'ta denenir.
+   * Şifreleme de yapılmaz: nonce tüketilmez. */
+  if (frame_queue_free(ps) == 0) {
+    ps->db_retry_pending = true;
+    return NOX_ERR_AGAIN;
+  }
 
   size_t pt_len = strlen(text) + 1;
 
   /* Boyut kontrolü */
-  if (pt_len > 4096) {
+  if (pt_len > NOX_MAX_MSG_LEN) {
     NOX_WARN(LOG_MOD_MAIN,
              "queued mesaj çok uzun (%zu), atlanıyor", pt_len);
     return NOX_ERR_PROTO;
   }
 
-  /* sodium_malloc — swap koruması */
-  uint8_t *payload = sodium_malloc(4096 + NOX_MAC_LEN);
-  if (!payload) return NOX_ERR_ALLOC;
+  nox_err_t err = enqueue_frame(state, ps, NOX_MSG_TEXT, text, pt_len);
+  if (err != NOX_OK)
+    return err;
 
-  ssize_t ct_len = noise_encrypt(ps->session,
-                                 (const uint8_t *)text,
-                                 pt_len, payload);
-  if (ct_len < 0) {
-    sodium_free(payload);
-    return NOX_ERR_CRYPTO;
-  }
+  err = frame_queue_flush(state, ps);
+  if (err == NOX_ERR_IO)
+    return NOX_ERR_IO;
 
-  struct frame_header fh = {
-      .magic = NOX_FRAME_MAGIC,
-      .type = NOX_MSG_TEXT,
-      .seq = ps->tx_seq,
-      .len = (uint32_t)ct_len,
-  };
-  uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-  frame_header_encode(&fh, wire);
-
-  struct iovec iov[2] = {
-      { .iov_base = (void *)wire,   .iov_len = FRAME_HEADER_WIRE_SIZE },
-      { .iov_base = (void *)payload, .iov_len = (size_t)ct_len },
-  };
-  ssize_t written = writev(ps->fd, iov, 2);
-
-  nox_err_t err = NOX_OK;
-  if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
-    /* Y-1/M-1 FIX: writev kısmi/EAGAIN desenkronizasyonu — peer'da yarım
-     * frame kalır, sonraki frame aynı seq ile karışır → MAC fail → kalıcı
-     * desenkron. Tam buffering (file_transfer gibi EPOLLOUT kuyruğu)
-     * ideal çözüm; kısa vadede bağlantıyı kopararak desenkronu önle —
-     * seq 0'dan yeniden başlar. */
-    if (written < 0) {
-      NOX_WARN(LOG_MOD_NET, "writev hatası (queued): %s", strerror(errno));
-    } else {
-      NOX_WARN(LOG_MOD_NET, "writev kısmi (%zd/%zu) — peer disconnect",
-               written, FRAME_HEADER_WIRE_SIZE + (size_t)ct_len);
-    }
-    sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
-    err = NOX_ERR_IO;
-  } else {
-    ps->tx_seq++;
-    clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
-  }
-
-  sodium_free(payload);   /* her durumda, otomatik sıfırlar */
-  return err;
+  /* Kısmi yazım (AGAIN) kabul: frame RAM kuyruğunda, EPOLLOUT sürecek.
+   * C1 sınırı: oturum bu arada düşerse frame kaybolur; satır silinmiş
+   * olur. Kalıcı in-flight işareti C2/C3'ün konusudur. */
+  return NOX_OK;
 }
-
 /* Uzun bir mesajı güvenli chunk'lara ayırıp sırayla şifreleyerek sokete yazar */
 nox_err_t send_segmented_message(struct app_state *state, const char *msg) {
   struct peer_session *ps = ACTIVE_PEER(state);
   return send_segmented_message_to(state, ps, msg);
 }
 
-nox_err_t send_segmented_message_to(struct app_state *state,
-                                    struct peer_session *ps,
-                                    const char *msg) {
-  (void)state;
+static nox_err_t send_segmented_message_now(struct app_state *state,
+                                            struct peer_session *ps,
+                                            const char *msg) {
   if (!ps || !ps->session || ps->fd < 0)
     return NOX_ERR_NET;
+  if (!msg)
+    return NOX_ERR_PROTO;
 
   size_t total_len = strlen(msg);
-  size_t offset = 0;
+  if (total_len == 0)
+    return NOX_OK;
 
-  uint8_t *ct    = sodium_malloc(4096 + NOX_MAC_LEN);
-  char    *chunk = sodium_malloc(4096 + 1);   /* NUL için +1 */
-  if (!ct || !chunk) {
-    sodium_free(ct);
-    sodium_free(chunk);
-    return NOX_ERR_ALLOC;
+  /* Atomik preflight: kaç frame gerektiğini önce say. Sığmıyorsa HİÇ
+   * şifreleme yapma; nonce tüketilmeden AGAIN dön. Böylece yarım mesaj
+   * kuyruğa girip geri kalanı kaybolmaz. */
+  size_t needed = 0;
+  for (size_t off = 0; off < total_len;) {
+    size_t n = nox_next_chunk_size(msg, off, total_len);
+    if (n == 0)
+      return NOX_ERR_PROTO;
+    needed++;
+    off += n;
   }
+  if (needed > (size_t)frame_queue_free(ps))
+    return NOX_ERR_AGAIN;
 
+  char *chunk = sodium_malloc(NOX_MAX_MSG_LEN + 1); /* NUL için +1 */
+  if (!chunk)
+    return NOX_ERR_ALLOC;
+
+  size_t offset = 0;
+  nox_err_t err = NOX_OK;
   while (offset < total_len) {
     size_t chunk_len = nox_next_chunk_size(msg, offset, total_len);
     memcpy(chunk, msg + offset, chunk_len);
     chunk[chunk_len] = '\0';
 
-    size_t pt_len = chunk_len + 1;
-    ssize_t ct_len =
-        noise_encrypt(ps->session, (const uint8_t *)chunk, pt_len, ct);
-    if (ct_len < 0) {
-      sodium_free(chunk);
-      sodium_free(ct);
-      return NOX_ERR_CRYPTO;
+    err = enqueue_frame(state, ps, NOX_MSG_TEXT, chunk, chunk_len + 1);
+    if (err != NOX_OK) {
+      /* Preflight sonrası AGAIN imkânsızdır; oluşursa mesajın bir
+       * kısmı kuyrukta demektir — tekrar denemek duplikasyon üretir. */
+      if (err == NOX_ERR_AGAIN)
+        err = NOX_ERR_STATE;
+      break;
     }
-
-    struct frame_header fh = {
-        .magic = NOX_FRAME_MAGIC,
-        .type = NOX_MSG_TEXT,
-        .seq = ps->tx_seq,
-        .len = (uint32_t)ct_len,
-    };
-    uint8_t wire[FRAME_HEADER_WIRE_SIZE];
-    frame_header_encode(&fh, wire);
-
-    struct iovec iov[2] = {
-        { .iov_base = (void *)wire, .iov_len = FRAME_HEADER_WIRE_SIZE },
-        { .iov_base = (void *)ct,   .iov_len = (size_t)ct_len },
-    };
-    ssize_t written = writev(ps->fd, iov, 2);
-    if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)ct_len)) {
-      if (written < 0) {
-        NOX_WARN(LOG_MOD_NET, "writev hatası (segmented): %s", strerror(errno));
-      } else {
-        NOX_WARN(LOG_MOD_NET, "writev kısmi (%zd/%zu) — peer disconnect",
-                 written, FRAME_HEADER_WIRE_SIZE + (size_t)ct_len);
-      }
-      sodium_memzero(chunk, 4096 + 1);
-      sodium_free(chunk);
-      sodium_free(ct);
-      /* Y-1 FIX: yukarıdaki gerekçeyle bağlantıyı kopar */
-      sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
-      return NOX_ERR_IO;
-    }
-    ps->tx_seq++;
-    clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
-
     offset += chunk_len;
   }
 
+  sodium_memzero(chunk, NOX_MAX_MSG_LEN + 1);
   sodium_free(chunk);
-  sodium_free(ct);
+
+  if (err != NOX_OK)
+    return err;
+
+  err = frame_queue_flush(state, ps);
+  if (err == NOX_ERR_IO)
+    return NOX_ERR_IO;
+
+  /* Kısmi yazımda kalan frame'ler kuyrukta; EPOLLOUT sürecek. */
   return NOX_OK;
+}
+
+nox_err_t send_segmented_message_to(struct app_state *state,
+                                    struct peer_session *ps,
+                                    const char *msg) {
+  if (!ps || !ps->session || ps->fd < 0)
+    return NOX_ERR_NET;
+  if (!msg)
+    return NOX_ERR_PROTO;
+  if (msg[0] == '\0')
+    return NOX_OK;
+
+  /* C2/Q1: tek kuyruk. Mesaj ya tamamen sığar ya da hiç şifrelenmez.
+   * Sessiz düşürme yok; kuyruk dolarsa çağıran net hata gösterir. */
+  nox_err_t err = send_segmented_message_now(state, ps, msg);
+  if (err == NOX_ERR_AGAIN) {
+    NOX_WARN(LOG_MOD_NET,
+             "TEXT kuyruğa alınamadı: boş slot yok (mesaj korunmadı)");
+    if (state)
+      ui_print_error(state,
+                     "Gönderim kuyruğu dolu — lütfen kısa süre sonra tekrar deneyin.");
+  }
+  return err;
 }
 
 /* Uzun bir mesajı güvenli chunk'lara ayırıp SQLite veritabanı kuyruğuna yazar
@@ -455,7 +508,7 @@ void process_line(struct app_state *state, const char *line) {
       }
       nox_err_t err = send_segmented_message(state, msg);
       if (err == NOX_OK) ui_print_outgoing(state, msg);
-      else ui_print_error(state, "Şifreleme/Gönderim hatası");
+      else if (err != NOX_ERR_AGAIN) ui_print_error(state, "Şifreleme/Gönderim hatası");
       return;
     }
     /* 1b. Bilinen komutlar — tek tablo, session bağımsız */
@@ -519,7 +572,7 @@ void process_line(struct app_state *state, const char *line) {
       if (target_ps && target_ps->session && target_ps->fd >= 0) {
         nox_err_t err = send_segmented_message_to(state, target_ps, msg_start);
         if (err == NOX_OK) ui_print_outgoing(state, msg_start);
-        else ui_print_error(state, "Şifreleme/Gönderim hatası");
+        else if (err != NOX_ERR_AGAIN) ui_print_error(state, "Şifreleme/Gönderim hatası");
       } else {
         if (state->ghost_mode) { ui_print_error(state, "ghost mod aktif — çevrimdışı mesaj kuyruğa alınamaz"); return; }
         nox_err_t err = queue_segmented_message(onion, msg_start);
@@ -554,7 +607,9 @@ void process_line(struct app_state *state, const char *line) {
       NOX_INFO(LOG_MOD_MAIN, "bağlanılıyor: %s", target);
       state->hs_attempt_count++;
       int peer_fd = -1;
-      nox_err_t err = socks5_connect(target, NOX_VIRTUAL_PORT, state->socks_path, &peer_fd);
+      nox_err_t err = socks5_connect(target, NOX_VIRTUAL_PORT,
+                                     state->socks_path, state->tor_pid,
+                                     &peer_fd);
       if (err != NOX_OK) { ui_print_error(state, "bağlantı başarısız"); return; }
       target_ps->fd = peer_fd;
       snprintf(target_ps->peer_onion, sizeof(target_ps->peer_onion), "%s", target);
@@ -623,9 +678,8 @@ void process_line(struct app_state *state, const char *line) {
       clock_gettime(CLOCK_MONOTONIC, &target_ps->last_active);
       NOX_INFO(LOG_MOD_NOISE, "handshake msg0 gönderildi (tx_seq→%u)", target_ps->tx_seq);
       ui_print_system(state, "[*] handshake başlatıldı");
-      state->active_peer_idx = (int)target_idx;
-      /* O-1 FIX: active_peer_onion atomik set (tek thread’de atomik, yorumla belgelendi) */
-      strncpy(state->active_peer_onion, target, NOX_ONION_LEN); state->active_peer_onion[NOX_ONION_LEN]='\0';
+      /* K-23: indeks + gösterim tek noktadan atomik güncellenir. */
+      sm_set_active_peer(state, target_ps);
       return;
     }
 #pragma GCC diagnostic pop
@@ -656,15 +710,10 @@ void process_line(struct app_state *state, const char *line) {
         ui_print_error(state, "Peer aktif değil (handshake/TOFU devam ediyor olabilir): %s", arg);
         return;
       }
-      for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
-        if (&state->peers[i] == found) {
-          state->active_peer_idx = (int)i;
-          strncpy(state->active_peer_onion, found->peer_onion, NOX_ONION_LEN);
-          state->active_peer_onion[NOX_ONION_LEN] = '\0';
-          ui_print_system(state, "Aktif peer: %s (%s)", found->name[0] ? found->name : found->peer_onion, sm_state_name(found->state));
-          return;
-        }
-      }
+      sm_set_active_peer(state, found);
+      ui_print_system(state, "Aktif peer: %s (%s)",
+                      found->name[0] ? found->name : found->peer_onion,
+                      sm_state_name(found->state));
       return;
     }
 #pragma GCC diagnostic pop
@@ -695,7 +744,7 @@ void process_line(struct app_state *state, const char *line) {
     if (line[0] == '\0') return;
     nox_err_t err = send_segmented_message(state, line);
     if (err == NOX_OK) ui_print_outgoing(state, line);
-    else ui_print_error(state, "Şifreleme/Gönderim hatası");
+    else if (err != NOX_ERR_AGAIN) ui_print_error(state, "Şifreleme/Gönderim hatası");
     return;
   }
 
@@ -897,12 +946,15 @@ if (res != NULL) {
 
     /* Echo: terminal raw mode'da echo kapalı, program kendi yazacak
      * Sadece son okunan byte'ları echo et (önceki döngüde zaten yazıldı)
-     * NOT: ui_strip_ansi'dan ÖNCE hesapla — escape temizlenince
+     * NOT: sanitizer'dan ÖNCE hesapla — escape temizlenince
      * echo_start underflow olmasın */
     size_t old_len = state->stdin_len - (size_t)r;
     {
-      /* Escape sequence temizle — ok tuşları, vb. (B FIX: tek kaynak) */
-      ui_strip_ansi(state->stdin_buf);
+      /* Escape sequence temizle — ok tuşları, vb. (B FIX: tek kaynak).
+       * ui_strip_input CR/LF'yi KORUR; satır bölme ve Enter işleme
+       * aşağıdaki memchr('\n') döngüsüne bağlıdır. Çıktı sanitizer'ı
+       * (ui_strip_ansi) burada kullanılırsa komutlar hiç çalışmaz. */
+      ui_strip_input(state->stdin_buf);
       state->stdin_len = strlen(state->stdin_buf);
 
       size_t echo_start = (state->stdin_len > old_len) ? old_len : state->stdin_len;

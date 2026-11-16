@@ -33,7 +33,9 @@ void ln_edit_deinit(struct app_state *state);
 /* Uzun mesajları parçalara ayırıp peer'a gönderir */
 nox_err_t send_segmented_message(struct app_state *state, const char *msg);
 
-/* Belirli bir peer'a mesaj gönderir */
+/* Belirli bir peer'a mesaj gönderir. C2: TEXT frame'leri ortak TX
+ * kuyruğuna girer; kuyrukta yeterli boş slot yoksa NOX_ERR_AGAIN döner
+ * ve hiçbir frame şifrelenmez (nonce tüketilmez). */
 nox_err_t send_segmented_message_to(struct app_state *state,
                                     struct peer_session *ps,
                                     const char *msg);

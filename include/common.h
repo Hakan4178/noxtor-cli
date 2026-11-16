@@ -14,6 +14,35 @@
 #endif
 
 /* ================================================================
+ * PLATFORM SEÇİMİ — yalnız build sistemi tanımlar
+ *
+ * Varsayılan Linux/x86 build'de NOX_PLATFORM_ANDROID tanımsızdır.
+ * Android/arm64 hedefi (`make android release`) bunu tanımlar:
+ *   - Landlock yok  → NOX_NO_LANDLOCK
+ *   - Uygulama seccomp politikası yok → NO_SECCOMP
+ *   - x86 CET/CPUID/RDTSC asm yok → NOX_NO_X86_ASM
+ * Android'de kernel/zygote seccomp + SELinux dosya kısıtları kullanılır.
+ *
+ * `NOX_NO_X86_ASM` ayrıca doğrudan da verilebilir (gelecekteki Linux/arm64
+ * profili); Makefile Android build'inde açıkça tanımlar. `asm_utils.h`
+ * include sırasına duyarlı olmasın diye bayrak derleme komutuna da girer.
+ *
+ * __aarch64__ / __ANDROID__ otomatik algılaması bilinçli olarak YOK:
+ * aynı kaynak normal x86 build'e sızmamalı.
+ * ================================================================ */
+#if defined(NOX_PLATFORM_ANDROID)
+#  ifndef NOX_NO_LANDLOCK
+#    define NOX_NO_LANDLOCK 1
+#  endif
+#  ifndef NO_SECCOMP
+#    define NO_SECCOMP 1
+#  endif
+#  ifndef NOX_NO_X86_ASM
+#    define NOX_NO_X86_ASM 1
+#  endif
+#endif
+
+/* ================================================================
  * STANDART INCLUDE'LAR
  * ================================================================ */
 #include <stdint.h>
@@ -106,6 +135,11 @@ typedef enum {
     NOX_ERR_STATE       = -13,  /* geçersiz state geçişi             */
     NOX_ERR_NOT_FOUND   = -14,  /* aranan öğe bulunamadı             */
     NOX_ERR_LANDLOCK_UNSUPPORTED = -15,  /* sandbox kurulamadı (C-2)  */
+    NOX_ERR_TIMEOUT     = -16,  /* işlem zaman aşımı                 */
+    NOX_ERR_PEER        = -17,  /* peer kimliği doğrulanamadı        */
+    NOX_ERR_ONION       = -18,  /* onion/ServiceID doğrulama hatası  */
+    NOX_ERR_QUOTA       = -19,  /* dosya boyutu/kota sınırı          */
+    NOX_ERR_AGAIN       = -20,  /* geçici meşgul; tekrar denenebilir */
 } nox_err_t;
 
 /* Hata kodu → okunabilir string */
@@ -231,9 +265,9 @@ void nox_hexdump(log_module_t mod, const char *label,
 /* ================================================================
  * HARDENED BOOLEAN — GCC hardbool (control-flow hardening)
  *
- * split_done / failed gibi kritik sentinel'lar fault injection ile
- * 0/1 dışı değere çekilirse hardened check __builtin_trap ile yakalar.
- * GCC >=14 destekler, altı fallback bool.
+ * hardbool(0): false=0x00, true=0xff. Bu iki temsil dışındaki her
+ * değer (fault injection, uninitialized 0xdb) kullanımda __builtin_trap
+ * ile yakalanır. GCC >=14 destekler; altında fallback bool.
  * ================================================================ */
 #if defined(__GNUC__) && __GNUC__ >= 14
 typedef unsigned char __attribute__((hardbool(0))) nox_hardbool_t;

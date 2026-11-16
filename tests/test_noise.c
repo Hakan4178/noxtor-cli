@@ -1,17 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_noise.c — Noise XX handshake + transport testleri
- *
- * Testler:
- *   1. Loopback handshake — initiator ↔ responder aynı process
- *   2. Transport round-trip — şifrele/çöz
- *   3. MAC tamper — bozulmuş ciphertext reddedilmeli
- *   4. Nonce replay — aynı nonce ile iki kez şifreleme farklı çıktı
- *   5. Handshake yanlış sıra — state hatası
- *   6. Remote static key doğrulama
+ * test_noise.c — Noise XX handshake + transport.
+ * Loopback handshake, MAC/AD tamper, nonce replay/tükenmesi, yanlış sıra,
+ * remote static doğrulama, keyless fail.
  */
 
 #include "common.h"
 #include "types.h"
+#include "network.h"
 #include "noise.h"
 
 #include <stdio.h>
@@ -19,10 +14,16 @@
 #include <sodium.h>
 #include "test_common.h"
 
+/* H2: transport AD — sabit 13 byte (gerçek wire header boyu).
+ * Birim testleri başlık semantiğini taklit etmez; AD bağlamanın
+ * kendisini (domain separation) doğrular. */
+static const uint8_t AD[FRAME_HEADER_WIRE_SIZE] = {
+    0x4e, 0x4f, 0x58, 0x54, 0x45, 0x53, 0x54,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+};
 
-/* ================================================================
- * YARDIMCI — Curve25519 key pair üret
- * ================================================================ */
+
+/* Curve25519 key pair üret. */
 static void gen_static_keypair(uint8_t priv[NOX_KEY_LEN],
                                uint8_t pub[NOX_KEY_LEN])
 {
@@ -30,12 +31,68 @@ static void gen_static_keypair(uint8_t priv[NOX_KEY_LEN],
     crypto_box_curve25519xsalsa20poly1305_keypair(pub, priv);
 }
 
-/* ================================================================
- * TEST: Tam loopback handshake
- *
- * Initiator (Alice) ↔ Responder (Bob)
- * 3 mesaj sonunda her iki taraf da transport-ready olmalı.
- * ================================================================ */
+/* Yeni transport testleri için XX dansını tek yerde tut. */
+static int make_transport_pair(struct noise_session *sa,
+                               struct noise_session *sb)
+{
+    uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
+    uint8_t b_priv[NOX_KEY_LEN], b_pub[NOX_KEY_LEN];
+    gen_static_keypair(a_priv, a_pub);
+    gen_static_keypair(b_priv, b_pub);
+
+    struct noise_handshake ha = {0}, hb = {0};
+    uint8_t buf[NOISE_MAX_HANDSHAKE_LEN];
+    uint8_t pl[64];
+    size_t len, pl_len;
+    int rc = -1;
+
+    if (handshake_init(&ha, true, a_priv, a_pub) != NOX_OK ||
+        handshake_init(&hb, false, b_priv, b_pub) != NOX_OK)
+        goto out;
+
+    len = sizeof(buf);
+    if (handshake_write(&ha, NULL, 0, buf, &len) != NOX_OK)
+        goto out;
+    pl_len = sizeof(pl);
+    if (handshake_read(&hb, buf, len, pl, sizeof(pl), &pl_len) != NOX_OK)
+        goto out;
+
+    len = sizeof(buf);
+    if (handshake_write(&hb, NULL, 0, buf, &len) != NOX_OK)
+        goto out;
+    pl_len = sizeof(pl);
+    if (handshake_read(&ha, buf, len, pl, sizeof(pl), &pl_len) != NOX_OK)
+        goto out;
+
+    len = sizeof(buf);
+    if (handshake_write(&ha, NULL, 0, buf, &len) != NOX_OK)
+        goto out;
+    pl_len = sizeof(pl);
+    if (handshake_read(&hb, buf, len, pl, sizeof(pl), &pl_len) != NOX_OK)
+        goto out;
+
+    if (!handshake_is_complete(&ha) || !handshake_is_complete(&hb))
+        goto out;
+    if (handshake_split(&ha, sa) != NOX_OK ||
+        handshake_split(&hb, sb) != NOX_OK)
+        goto out;
+
+    rc = 0;
+
+out:
+    sodium_memzero(&ha, sizeof(ha));
+    sodium_memzero(&hb, sizeof(hb));
+    sodium_memzero(a_priv, sizeof(a_priv));
+    sodium_memzero(b_priv, sizeof(b_priv));
+    if (rc != 0) {
+        sodium_memzero(sa, sizeof(*sa));
+        sodium_memzero(sb, sizeof(*sb));
+    }
+    return rc;
+}
+
+/* Tam loopback handshake: Initiator ↔ Responder, 3 mesaj sonunda iki
+ * taraf da transport-ready. */
 static int test_loopback_handshake(void)
 {
     /* Key pairs */
@@ -91,9 +148,7 @@ static int test_loopback_handshake(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Transport round-trip
- * ================================================================ */
+/* Transport round-trip */
 static int test_transport_roundtrip(void)
 {
     /* Handshake yap */
@@ -136,10 +191,10 @@ static int test_transport_roundtrip(void)
     uint8_t ct[sizeof(msg) + NOX_MAC_LEN];
     uint8_t pt[sizeof(msg)];
 
-    ssize_t ct_len = noise_encrypt(&sa, msg, sizeof(msg), ct);
+    ssize_t ct_len = noise_encrypt(&sa, AD, sizeof(AD), msg, sizeof(msg), ct);
     TEST_ASSERT(ct_len == (ssize_t)(sizeof(msg) + NOX_MAC_LEN));
 
-    ssize_t pt_len = noise_decrypt(&sb, ct, (size_t)ct_len, pt);
+    ssize_t pt_len = noise_decrypt(&sb, AD, sizeof(AD), ct, (size_t)ct_len, pt);
     TEST_ASSERT(pt_len == (ssize_t)sizeof(msg));
     TEST_ASSERT(sodium_memcmp(pt, msg, sizeof(msg)) == 0);
 
@@ -148,19 +203,17 @@ static int test_transport_roundtrip(void)
     uint8_t ct2[sizeof(reply) + NOX_MAC_LEN];
     uint8_t pt2[sizeof(reply)];
 
-    ct_len = noise_encrypt(&sb, reply, sizeof(reply), ct2);
+    ct_len = noise_encrypt(&sb, AD, sizeof(AD), reply, sizeof(reply), ct2);
     TEST_ASSERT(ct_len > 0);
 
-    pt_len = noise_decrypt(&sa, ct2, (size_t)ct_len, pt2);
+    pt_len = noise_decrypt(&sa, AD, sizeof(AD), ct2, (size_t)ct_len, pt2);
     TEST_ASSERT(pt_len == (ssize_t)sizeof(reply));
     TEST_ASSERT(sodium_memcmp(pt2, reply, sizeof(reply)) == 0);
 
     return 0;
 }
 
-/* ================================================================
- * TEST: MAC tamper — bozulmuş ciphertext reddedilmeli
- * ================================================================ */
+/* MAC tamper — bozulmuş ciphertext reddedilmeli */
 static int test_mac_tamper(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -191,7 +244,7 @@ static int test_mac_tamper(void)
     /* Şifrele */
     const uint8_t msg[] = "secret";
     uint8_t ct[sizeof(msg) + NOX_MAC_LEN];
-    ssize_t ct_len = noise_encrypt(&sa, msg, sizeof(msg), ct);
+    ssize_t ct_len = noise_encrypt(&sa, AD, sizeof(AD), msg, sizeof(msg), ct);
     TEST_ASSERT(ct_len > 0);
 
     /* 1 bit boz */
@@ -199,16 +252,14 @@ static int test_mac_tamper(void)
 
     /* Çözme başarısız olmalı */
     uint8_t pt[sizeof(msg)];
-    ssize_t pt_len = noise_decrypt(&sb, ct, (size_t)ct_len, pt);
+    ssize_t pt_len = noise_decrypt(&sb, AD, sizeof(AD), ct, (size_t)ct_len, pt);
     TEST_ASSERT(pt_len == -1);
 
     return 0;
 }
 
-/* ================================================================
- * TEST: Nonce fail'de artmamalı — Noise spec §5.1
- * Sahte paket sonrası meşru paketin çözülebilmesi gerekir.
- * ================================================================ */
+/* Nonce fail'de artmamalı (Noise §5.1): sahte paket sonrası meşru paket
+ * çözülebilmeli. */
 static int test_nonce_no_increment_on_fail(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -239,8 +290,8 @@ static int test_nonce_no_increment_on_fail(void)
     const uint8_t msg2[] = "msg2";
     uint8_t ct1[sizeof(msg1) + NOX_MAC_LEN];
     uint8_t ct2[sizeof(msg2) + NOX_MAC_LEN];
-    ssize_t ct1_len = noise_encrypt(&sa, msg1, sizeof(msg1), ct1);
-    ssize_t ct2_len = noise_encrypt(&sa, msg2, sizeof(msg2), ct2);
+    ssize_t ct1_len = noise_encrypt(&sa, AD, sizeof(AD), msg1, sizeof(msg1), ct1);
+    ssize_t ct2_len = noise_encrypt(&sa, AD, sizeof(AD), msg2, sizeof(msg2), ct2);
     TEST_ASSERT(ct1_len > 0 && ct2_len > 0);
 
     /* Nonce snapshot before fail */
@@ -252,34 +303,101 @@ static int test_nonce_no_increment_on_fail(void)
     ct1_bad[0] ^= 0x01;
 
     uint8_t pt[64];
-    ssize_t r1 = noise_decrypt(&sb, ct1_bad, (size_t)ct1_len, pt);
+    ssize_t r1 = noise_decrypt(&sb, AD, sizeof(AD), ct1_bad, (size_t)ct1_len, pt);
     TEST_ASSERT(r1 == -1);
     TEST_ASSERT(atomic_load(&sb.rx.n) == n_before);
 
     /* Aynı ct1 meşru hali tekrar gelmeli — başarılı olmalı (retransmit) */
-    ssize_t r2 = noise_decrypt(&sb, ct1, (size_t)ct1_len, pt);
+    ssize_t r2 = noise_decrypt(&sb, AD, sizeof(AD), ct1, (size_t)ct1_len, pt);
     TEST_ASSERT(r2 == (ssize_t)sizeof(msg1));
     TEST_ASSERT(sodium_memcmp(pt, msg1, sizeof(msg1)) == 0);
     TEST_ASSERT(atomic_load(&sb.rx.n) == n_before + 1);
 
     /* Sonraki meşru ct2 de başarılı olmalı (nonce 1) */
-    ssize_t r3 = noise_decrypt(&sb, ct2, (size_t)ct2_len, pt);
+    ssize_t r3 = noise_decrypt(&sb, AD, sizeof(AD), ct2, (size_t)ct2_len, pt);
     TEST_ASSERT(r3 == (ssize_t)sizeof(msg2));
     TEST_ASSERT(sodium_memcmp(pt, msg2, sizeof(msg2)) == 0);
     TEST_ASSERT(atomic_load(&sb.rx.n) == n_before + 2);
 
     /* ct2 tekrarı (replay) fail etmeli ve nonce artmamalı */
     uint64_t n_after = atomic_load(&sb.rx.n);
-    ssize_t r4 = noise_decrypt(&sb, ct2, (size_t)ct2_len, pt);
+    ssize_t r4 = noise_decrypt(&sb, AD, sizeof(AD), ct2, (size_t)ct2_len, pt);
     TEST_ASSERT(r4 == -1);
     TEST_ASSERT(atomic_load(&sb.rx.n) == n_after);
 
     return 0;
 }
 
-/* ================================================================
- * TEST: Double split yasak — ikinci split fail etmeli
- * ================================================================ */
+/* TX nonce tükenmesi: MAX-1 başarılı, sayaç MAX; sonraki deneme
+ * fail-closed, sayaç geri sarmaz, çıktıya dokunmaz. */
+static int test_nonce_exhaustion_encrypt(void)
+{
+    struct noise_session sa, sb;
+    TEST_ASSERT(make_transport_pair(&sa, &sb) == 0);
+
+    const uint8_t pt[] = {0xA5, 0x5A};
+    uint8_t ct[sizeof(pt) + NOX_MAC_LEN];
+    uint8_t untouched[sizeof(ct)];
+
+    /* MAX: rezervasyon reddedilmeli, nonce tüketilmemeli. */
+    atomic_store(&sa.tx.n, UINT64_MAX);
+    memset(ct, 0xA5, sizeof(ct));
+    memcpy(untouched, ct, sizeof(ct));
+    TEST_ASSERT(noise_encrypt(&sa, AD, sizeof(AD), pt, sizeof(pt), ct) == -1);
+    TEST_ASSERT(atomic_load(&sa.tx.n) == UINT64_MAX);
+    TEST_ASSERT(sodium_memcmp(ct, untouched, sizeof(ct)) == 0);
+
+    /* MAX-1: son geçerli nonce; başarı sayacı MAX'a taşımalı. */
+    atomic_store(&sa.tx.n, UINT64_MAX - 1);
+    ssize_t ct_len = noise_encrypt(&sa, AD, sizeof(AD), pt, sizeof(pt), ct);
+    TEST_ASSERT(ct_len == (ssize_t)(sizeof(pt) + NOX_MAC_LEN));
+    TEST_ASSERT(atomic_load(&sa.tx.n) == UINT64_MAX);
+
+    /* MAX: aynı çağrı tekrar fail-closed; çıktı korunmalı. */
+    memset(ct, 0x5A, sizeof(ct));
+    memcpy(untouched, ct, sizeof(ct));
+    TEST_ASSERT(noise_encrypt(&sa, AD, sizeof(AD), pt, sizeof(pt), ct) == -1);
+    TEST_ASSERT(atomic_load(&sa.tx.n) == UINT64_MAX);
+    TEST_ASSERT(sodium_memcmp(ct, untouched, sizeof(ct)) == 0);
+
+    return 0;
+}
+
+/* RX nonce tükenmesi: MAX-1 son başarılı decrypt, sayaç MAX'a taşar;
+ * aynı paket AEAD'e girmeden reddedilir, sayaç değişmez. */
+static int test_nonce_exhaustion_decrypt(void)
+{
+    struct noise_session sa, sb;
+    TEST_ASSERT(make_transport_pair(&sa, &sb) == 0);
+
+    const uint8_t msg[] = "son-nonce";
+    uint8_t ct[sizeof(msg) + NOX_MAC_LEN];
+    uint8_t pt[sizeof(msg)];
+
+    atomic_store(&sa.tx.n, UINT64_MAX - 1);
+    ssize_t ct_len = noise_encrypt(&sa, AD, sizeof(AD),
+                                   msg, sizeof(msg), ct);
+    TEST_ASSERT(ct_len == (ssize_t)(sizeof(msg) + NOX_MAC_LEN));
+
+    atomic_store(&sb.rx.n, UINT64_MAX - 1);
+    ssize_t pt_len = noise_decrypt(&sb, AD, sizeof(AD), ct, (size_t)ct_len, pt);
+    TEST_ASSERT(pt_len == (ssize_t)sizeof(msg));
+    TEST_ASSERT(sodium_memcmp(pt, msg, sizeof(msg)) == 0);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == UINT64_MAX);
+
+    /* MAX'ta nonce yok: aynı ct reddedilmeli, çıktı ve sayaç korunmalı. */
+    uint8_t untouched[sizeof(pt)];
+    memset(pt, 0xA5, sizeof(pt));
+    memcpy(untouched, pt, sizeof(pt));
+    TEST_ASSERT(noise_decrypt(&sb, AD, sizeof(AD), ct, (size_t)ct_len,
+                              pt) == -1);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == UINT64_MAX);
+    TEST_ASSERT(sodium_memcmp(pt, untouched, sizeof(pt)) == 0);
+
+    return 0;
+}
+
+/* Double split yasak — ikinci split fail etmeli */
 static int test_double_split(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -323,9 +441,7 @@ static int test_double_split(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Remote static key doğrulama
- * ================================================================ */
+/* Remote static key doğrulama */
 static int test_remote_static_key(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -362,9 +478,7 @@ static int test_remote_static_key(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Handshake yanlış sıra → state hatası
- * ================================================================ */
+/* Handshake yanlış sıra → state hatası */
 static int test_wrong_order(void)
 {
     uint8_t priv[NOX_KEY_LEN], pub[NOX_KEY_LEN];
@@ -381,9 +495,7 @@ static int test_wrong_order(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: NULL parametre güvenliği
- * ================================================================ */
+/* NULL parametre güvenliği */
 static int test_noise_null_safety(void)
 {
     TEST_ASSERT(handshake_init(NULL, true, NULL, NULL) == NOX_ERR_PROTO);
@@ -391,15 +503,16 @@ static int test_noise_null_safety(void)
     struct noise_handshake hs;
     TEST_ASSERT(handshake_write(&hs, NULL, 0, NULL, NULL) == NOX_ERR_PROTO);
 
-    TEST_ASSERT(noise_encrypt(NULL, NULL, 0, NULL) == -1);
-    TEST_ASSERT(noise_decrypt(NULL, NULL, 0, NULL) == -1);
+    TEST_ASSERT(noise_encrypt(NULL, AD, sizeof(AD), NULL, 0, NULL) == -1);
+    TEST_ASSERT(noise_decrypt(NULL, AD, sizeof(AD), NULL, 0, NULL) == -1);
+    /* H2: AD zorunlu — NULL veya 0 uzunluk fail-closed */
+    TEST_ASSERT(noise_encrypt(NULL, NULL, 0, NULL, 0, NULL) == -1);
+    TEST_ASSERT(noise_decrypt(NULL, NULL, 0, NULL, 0, NULL) == -1);
 
     return 0;
 }
 
-/* ================================================================
- * TEST: Handshake onion payload exchange
- * ================================================================ */
+/* Handshake onion payload exchange */
 static int test_handshake_onion_payload(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -447,13 +560,8 @@ static int test_handshake_onion_payload(void)
     return 0;
 }
 
-/* ================================================================
- * ORTAK VEKTÖR ANAHTARLARI — Cacophony (Noise_XX_25519_ChaChaPoly_BLAKE2b)
- *
- * Kaynak: cacophony.txt (dissononce/tgalal)
- * Prologue: "John Galt" (0x4a6f686e2047616c74)
- * İki spec-vector testi (aşağıda) bu anahtarları paylaşır.
- * ================================================================ */
+/* Ortak Cacophony vektör anahtarları (Noise_XX_25519_ChaChaPoly_BLAKE2b,
+ * prologue "John Galt"); iki spec-vector testi paylaşır. */
 #ifdef NOISE_TEST_DETERMINISTIC
 static const uint8_t prologue[9] = {
     0x4a, 0x6f, 0x68, 0x6e, 0x20, 0x47, 0x61, 0x6c, 0x74
@@ -487,11 +595,8 @@ static const uint8_t resp_e_priv[32] = {   /* Responder ephemeral */
     0x79, 0x3d, 0x5e, 0x63, 0xda, 0x6b, 0x37, 0x5b
 };
 
-/* ================================================================
- * TEST: Cacophony spec vektörleri — Noise_XX_25519_ChaChaPoly_BLAKE2b
- *
- * Her mesajda payload var — deterministik ciphertext karşılaştırması.
- * ================================================================ */
+/* Cacophony spec vektörleri (XX_25519_ChaChaPoly_BLAKE2b): her mesajda
+ * payload, deterministik ct karşılaştırması. */
 static int test_spec_vectors(void)
 {
     /* msg0 payload: "Ludwig von Mises" */
@@ -631,14 +736,8 @@ static int test_spec_vectors(void)
     return 0;
 }
 
-/* ================================================================
- * PAYLOAD VARYASYON TESTLERİ
- *
- * Aynı Cacophony anahtarları/prologue (dosya kapsamı) ile farklı
- * payload boyutları test edilir. Byte-for-byte ciphertext
- * doğrulanmaz (beklenen değerler mevcut değil), sadece roundtrip
- * ve tamamlanma doğrulanır.
- * ================================================================ */
+/* Payload varyasyonları: aynı Cacophony anahtar/prologue ile farklı
+ * boyutlar; ciphertext byte karşılaştırması yok, roundtrip + tamamlanma. */
 static int test_spec_vectors_payloads(void)
 {
     uint8_t init_s_pub[32], resp_s_pub[32];
@@ -742,9 +841,135 @@ static int test_spec_vectors_payloads(void)
 }
 #endif /* NOISE_TEST_DETERMINISTIC */
 
-/* ================================================================
- * MAIN
- * ================================================================ */
+/* H2 — AD bağlama: yanlış AD tag fail + RX nonce İLERLEMEZ; doğru AD
+ * ile tekrar denemek başarılı olmalı. */
+static int test_ad_binding(void)
+{
+    uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
+    uint8_t b_priv[NOX_KEY_LEN], b_pub[NOX_KEY_LEN];
+    gen_static_keypair(a_priv, a_pub);
+    gen_static_keypair(b_priv, b_pub);
+
+    struct noise_handshake hs_a, hs_b;
+    handshake_init(&hs_a, true, a_priv, a_pub);
+    handshake_init(&hs_b, false, b_priv, b_pub);
+
+    uint8_t buf[NOISE_MAX_HANDSHAKE_LEN];
+    uint8_t pl[64];
+    size_t len, pl_len;
+
+    len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
+    len = sizeof(buf); handshake_write(&hs_b, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hs_a, buf, len, pl, sizeof(pl), &pl_len);
+    len = sizeof(buf); handshake_write(&hs_a, NULL, 0, buf, &len);
+    pl_len = sizeof(pl); handshake_read(&hs_b, buf, len, pl, sizeof(pl), &pl_len);
+
+    struct noise_session sa, sb;
+    handshake_split(&hs_a, &sa);
+    handshake_split(&hs_b, &sb);
+
+    const uint8_t msg[] = "ad-bound";
+    uint8_t ct[sizeof(msg) + NOX_MAC_LEN];
+    uint8_t pt[64];
+
+    ssize_t ct_len = noise_encrypt(&sa, AD, sizeof(AD), msg, sizeof(msg), ct);
+    TEST_ASSERT(ct_len == (ssize_t)(sizeof(msg) + NOX_MAC_LEN));
+
+    uint8_t ad2[FRAME_HEADER_WIRE_SIZE];
+    memcpy(ad2, AD, sizeof(ad2));
+    ad2[sizeof(ad2) - 1] ^= 0x01;
+
+    uint64_t n_before = atomic_load(&sb.rx.n);
+    TEST_ASSERT(noise_decrypt(&sb, ad2, sizeof(ad2), ct, (size_t)ct_len,
+                              pt) == -1);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_before);
+
+    /* H2: AD uzunluğu da bağlanır — kısa AD tag fail, nonce ilerlemez */
+    TEST_ASSERT(noise_decrypt(&sb, AD, sizeof(AD) - 1, ct, (size_t)ct_len,
+                              pt) == -1);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_before);
+
+    ssize_t pt_len = noise_decrypt(&sb, AD, sizeof(AD), ct, (size_t)ct_len, pt);
+    TEST_ASSERT(pt_len == (ssize_t)sizeof(msg));
+    TEST_ASSERT(sodium_memcmp(pt, msg, sizeof(msg)) == 0);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_before + 1);
+
+    /* H2: fail sonrası akış devam eder — sonraki ct de açılır */
+    const uint8_t msg2[] = "ad-bound-2";
+    uint8_t ct2[sizeof(msg2) + NOX_MAC_LEN];
+    ssize_t ct2_len = noise_encrypt(&sa, AD, sizeof(AD), msg2, sizeof(msg2), ct2);
+    TEST_ASSERT(ct2_len == (ssize_t)(sizeof(msg2) + NOX_MAC_LEN));
+    ssize_t pt2_len = noise_decrypt(&sb, AD, sizeof(AD), ct2, (size_t)ct2_len, pt);
+    TEST_ASSERT(pt2_len == (ssize_t)sizeof(msg2));
+    TEST_ASSERT(sodium_memcmp(pt, msg2, sizeof(msg2)) == 0);
+    TEST_ASSERT(atomic_load(&sb.rx.n) == n_before + 2);
+
+    return 0;
+}
+
+/* H2 — AD zorunluluğu (NULL / sıfır uzunluk fail-closed) */
+static int test_ad_required(void)
+{
+    struct noise_session s;
+    memset(&s, 0, sizeof(s));
+
+    uint8_t pt[8] = {0};
+    uint8_t ct[sizeof(pt) + NOX_MAC_LEN];
+    uint8_t ad[FRAME_HEADER_WIRE_SIZE] = {0};
+
+    TEST_ASSERT(noise_encrypt(&s, NULL, 0, pt, sizeof(pt), ct) == -1);
+    TEST_ASSERT(noise_encrypt(&s, ad, 0, pt, sizeof(pt), ct) == -1);
+    TEST_ASSERT(noise_decrypt(&s, NULL, 0, ct, sizeof(ct), pt) == -1);
+    TEST_ASSERT(noise_decrypt(&s, ad, 0, ct, sizeof(ct), pt) == -1);
+
+    return 0;
+}
+
+/* Transport keyless fail-closed (P0): tx/rx.has_key == false iken
+ * noise_* cipher_* pass-through'a düşmemeli; -1 dönmeli, çıktıya
+ * dokunmamalı. */
+static int test_transport_rejects_keyless_encrypt(void)
+{
+    struct noise_session s;
+    memset(&s, 0, sizeof(s));
+
+    const uint8_t pt[] = "x";
+    uint8_t out[64], expected[64];
+    memset(out, 0xA5, sizeof(out));
+    memset(expected, 0xA5, sizeof(expected));
+
+    TEST_ASSERT(!s.tx.has_key);
+    /* Sıfır olmayan nonce da fail sırasında yerinde kalmalı. */
+    atomic_store(&s.tx.n, 7);
+    TEST_ASSERT(noise_encrypt(&s, AD, sizeof(AD), pt, sizeof(pt), out) == -1);
+    TEST_ASSERT(sodium_memcmp(out, expected, sizeof(out)) == 0);
+    TEST_ASSERT(atomic_load(&s.tx.n) == 7);
+
+    return 0;
+}
+
+static int test_transport_rejects_keyless_decrypt(void)
+{
+    struct noise_session s;
+    memset(&s, 0, sizeof(s));
+
+    uint8_t ct[NOX_MAC_LEN + 1];
+    memset(ct, 0, sizeof(ct));
+    uint8_t out[64], expected[64];
+    memset(out, 0xA5, sizeof(out));
+    memset(expected, 0xA5, sizeof(expected));
+
+    TEST_ASSERT(!s.rx.has_key);
+    /* Sıfır olmayan nonce da fail sırasında yerinde kalmalı. */
+    atomic_store(&s.rx.n, 9);
+    TEST_ASSERT(noise_decrypt(&s, AD, sizeof(AD), ct, sizeof(ct), out) == -1);
+    TEST_ASSERT(sodium_memcmp(out, expected, sizeof(out)) == 0);
+    TEST_ASSERT(atomic_load(&s.rx.n) == 9);
+
+    return 0;
+}
+
 int main(void)
 {
     if (sodium_init() < 0) {
@@ -758,7 +983,13 @@ int main(void)
     RUN_TEST(test_loopback_handshake);
     RUN_TEST(test_transport_roundtrip);
     RUN_TEST(test_mac_tamper);
+    RUN_TEST(test_ad_binding);
+    RUN_TEST(test_ad_required);
+    RUN_TEST(test_transport_rejects_keyless_encrypt);
+    RUN_TEST(test_transport_rejects_keyless_decrypt);
     RUN_TEST(test_nonce_no_increment_on_fail);
+    RUN_TEST(test_nonce_exhaustion_encrypt);
+    RUN_TEST(test_nonce_exhaustion_decrypt);
     RUN_TEST(test_double_split);
     RUN_TEST(test_remote_static_key);
     RUN_TEST(test_wrong_order);

@@ -4,11 +4,17 @@
  * Gerçek kazanç sağlayan yerlerde kullanılır (~80 satır).
  * IBT uyumlu: indirect branch/call kullanılmaz.
  *
+ * Android/arm64 build'inde (NOX_NO_X86_ASM) x86'ya özgü RDTSC/CPUID
+ * yardımcıları derlenmez; cpu_has_shstk()/cpu_has_ibt() false döner.
+ * memory_barrier() mimari bağımsızdır ve her build'de derlenir.
+ * Bayrak build tarafından açıkça tanımlanır; otomatik arch algılaması
+ * bilinçli olarak yoktur.
+ *
  * İçerik:
  *   memory_barrier()    — explicit_bzero öncesi derleyici bariyeri
- *   rdtsc_ordered()     — mfence ile sıralı timestamp counter
- *   cpu_has_shstk()     — CPUID: shadow stack (CET) desteği
- *   cpu_has_ibt()       — CPUID: indirect branch tracking desteği
+ *   rdtsc_ordered()     — mfence ile sıralı timestamp counter (x86)
+ *   cpu_has_shstk()     — CPUID: shadow stack (CET) desteği (x86)
+ *   cpu_has_ibt()       — CPUID: indirect branch tracking desteği (x86)
  */
 
 #ifndef PARANOID_ASM_UTILS_H
@@ -28,6 +34,8 @@ static inline void memory_barrier(void)
 {
     __asm__ __volatile__("" ::: "memory");
 }
+
+#ifndef NOX_NO_X86_ASM
 
 /* ================================================================
  * RDTSC — Ordered Timestamp Counter
@@ -93,5 +101,23 @@ static inline bool cpu_has_ibt(void)
     cpuid(7, 0, &eax, &ebx, &ecx, &edx);
     return (edx >> 20) & 1U;
 }
+
+#else /* NOX_NO_X86_ASM */
+
+/* Android/arm64: x86 CPUID/RDTSC yok. Çağıranlar için güvenli, sabit
+ * "desteklenmiyor" sonucu döndürülür; gerçek donanım sorgusu yapılmaz.
+ * rdtsc_ordered()/cpuid() bilinçli olarak tanımlanmaz: bu platformda
+ * kullanılmamalıdır, çağrı derleme zamanında yakalanır. */
+static inline bool cpu_has_shstk(void)
+{
+    return false;
+}
+
+static inline bool cpu_has_ibt(void)
+{
+    return false;
+}
+
+#endif /* NOX_NO_X86_ASM */
 
 #endif /* PARANOID_ASM_UTILS_H */

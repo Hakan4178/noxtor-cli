@@ -37,6 +37,13 @@
 #include "common.h"
 #include "noise.h"
 
+/* H2: transport AD — iki implementasyona da AYNI 13 byte verilir.
+ * Böylece AD'siz bir kod yolu sessizce geçemez (MAC uyuşmaz). */
+static const uint8_t g_ad[13] = {
+    0x4e, 0x4f, 0x58, 0x44, 0x49, 0x46, 0x46,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+};
+
 /* ================================================================
  * Stub: noise.c nox_log_impl gerektirir — test'te noop
  * ================================================================ */
@@ -237,13 +244,13 @@ static int do_transport_test(const uint8_t *plain, size_t plain_len, const char 
         noise_buffer_init(b);
         if (plain_len > 0) memcpy(nc_enc, plain, plain_len);
         noise_buffer_set_inout(b, nc_enc, plain_len, sizeof(nc_enc));
-        noise_cipherstate_encrypt(g_nc_i_c1, &b);
+        noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
         nc_enc_len = b.size;
     }
 
     /* Our code: encrypt */
     uint8_t our_enc[4200];
-    ssize_t our_enc_len = noise_encrypt(&g_our_i_session, plain, plain_len, our_enc);
+    ssize_t our_enc_len = noise_encrypt(&g_our_i_session, g_ad, sizeof(g_ad), plain, plain_len, our_enc);
 
     snprintf(label, sizeof(label), "%s enc len: nc(%zu)==our(%zd)", label_prefix, nc_enc_len, our_enc_len);
     DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, label);
@@ -255,7 +262,7 @@ static int do_transport_test(const uint8_t *plain, size_t plain_len, const char 
     /* Our code: decrypt */
     if (nc_enc_len > 0) {
         uint8_t our_dec[4200];
-        ssize_t our_dec_len = noise_decrypt(&g_our_r_session, our_enc, nc_enc_len, our_dec);
+        ssize_t our_dec_len = noise_decrypt(&g_our_r_session, g_ad, sizeof(g_ad), our_enc, nc_enc_len, our_dec);
         snprintf(label, sizeof(label), "%s dec len: %zd==%zu", label_prefix, our_dec_len, plain_len);
         DIFF_ASSERT(our_dec_len == (ssize_t)plain_len, label);
         if (our_dec_len == (ssize_t)plain_len && plain_len > 0) {
@@ -386,14 +393,14 @@ static void test_happy_path(const uint8_t i_priv[32], const uint8_t i_pub[32],
         noise_buffer_init(b);
         memcpy(nc_enc, plain, plain_len);
         noise_buffer_set_inout(b, nc_enc, plain_len, sizeof(nc_enc));
-        nc_rc = noise_cipherstate_encrypt(g_nc_i_c1, &b);
+        nc_rc = noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
         DIFF_ASSERT(nc_rc == NOISE_ERROR_NONE, "nc: transport encrypt");
         nc_enc_len = b.size;
     }
 
     /* Our code */
     uint8_t our_enc[256], our_dec[256];
-    ssize_t our_enc_len = noise_encrypt(&i_sess, plain, plain_len, our_enc);
+    ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, our_enc);
     DIFF_ASSERT(our_enc_len > 0, "our: transport encrypt");
 
     /* Ciphertext karşılaştırması — EN KRİTİK TEST */
@@ -409,7 +416,7 @@ static void test_happy_path(const uint8_t i_priv[32], const uint8_t i_pub[32],
         NoiseBuffer b;
         noise_buffer_init(b);
         noise_buffer_set_input(b, nc_enc, nc_enc_len);
-        nc_rc = noise_cipherstate_decrypt(g_nc_r_c2, &b);
+        nc_rc = noise_cipherstate_decrypt_with_ad(g_nc_r_c2, g_ad, sizeof(g_ad), &b);
         DIFF_ASSERT(nc_rc == NOISE_ERROR_NONE, "nc: transport decrypt");
         if (nc_rc == NOISE_ERROR_NONE) {
             DIFF_ASSERT(b.size == plain_len, "nc: decrypt len match");
@@ -419,7 +426,7 @@ static void test_happy_path(const uint8_t i_priv[32], const uint8_t i_pub[32],
     }
 
     /* Decrypt — our code: r_sess (responder receive) */
-    ssize_t our_dec_len = noise_decrypt(&r_sess, our_enc,
+    ssize_t our_dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), our_enc,
                                         (size_t)our_enc_len, our_dec);
     DIFF_ASSERT(our_dec_len == (ssize_t)plain_len, "our: decrypt len match");
     if (our_dec_len == (ssize_t)plain_len) {
@@ -587,13 +594,13 @@ static void test_transport_multi_msg(const uint8_t i_priv[32], const uint8_t i_p
             noise_buffer_init(b);
             memcpy(nc_enc, plain, sizeof(plain));
             noise_buffer_set_inout(b, nc_enc, sizeof(plain), sizeof(nc_enc));
-            noise_cipherstate_encrypt(g_nc_i_c1, &b);
+            noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
             nc_enc_len = b.size;
         }
 
         /* Our code: encrypt */
         uint8_t our_enc[256];
-        ssize_t our_enc_len = noise_encrypt(&i_sess, plain, sizeof(plain), our_enc);
+        ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, sizeof(plain), our_enc);
 
         snprintf(label, sizeof(label), "msg%d enc len: nc(%zu)==our(%zd)", idx, nc_enc_len, our_enc_len);
         DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, label);
@@ -607,12 +614,12 @@ static void test_transport_multi_msg(const uint8_t i_priv[32], const uint8_t i_p
             NoiseBuffer b;
             noise_buffer_init(b);
             noise_buffer_set_input(b, nc_enc, nc_enc_len);
-            noise_cipherstate_decrypt(g_nc_r_c2, &b);
+            noise_cipherstate_decrypt_with_ad(g_nc_r_c2, g_ad, sizeof(g_ad), &b);
         }
 
         /* Our code: decrypt */
         uint8_t our_dec[256];
-        ssize_t our_dec_len = noise_decrypt(&r_sess, our_enc, (size_t)our_enc_len, our_dec);
+        ssize_t our_dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), our_enc, (size_t)our_enc_len, our_dec);
 
         snprintf(label, sizeof(label), "msg%d dec len: %zd==%zu", idx, our_dec_len, sizeof(plain));
         DIFF_ASSERT(our_dec_len == (ssize_t)sizeof(plain), label);
@@ -652,13 +659,13 @@ static void test_transport_payload_sizes(const uint8_t i_priv[32], const uint8_t
             noise_buffer_init(b);
             if (sz > 0) memcpy(nc_enc, plain, sz);
             noise_buffer_set_inout(b, nc_enc, sz, sizeof(nc_enc));
-            noise_cipherstate_encrypt(g_nc_i_c1, &b);
+            noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
             nc_enc_len = b.size;
         }
 
         /* Our code: encrypt */
         uint8_t our_enc[4200];
-        ssize_t our_enc_len = noise_encrypt(&i_sess, (sz > 0 ? plain : NULL), sz, our_enc);
+        ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), (sz > 0 ? plain : NULL), sz, our_enc);
 
         snprintf(label, sizeof(label), "size %zu: enc len nc(%zu)==our(%zd)", sz, nc_enc_len, our_enc_len);
         DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, label);
@@ -695,12 +702,12 @@ static void test_transport_bidirectional(const uint8_t i_priv[32], const uint8_t
             noise_buffer_init(b);
             memcpy(nc_enc, plain, plain_len);
             noise_buffer_set_inout(b, nc_enc, plain_len, sizeof(nc_enc));
-            noise_cipherstate_encrypt(g_nc_i_c1, &b);
+            noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
             nc_enc_len = b.size;
         }
 
         uint8_t our_enc[256];
-        ssize_t our_enc_len = noise_encrypt(&i_sess, plain, plain_len, our_enc);
+        ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, our_enc);
 
         snprintf(label, sizeof(label), "i→r enc len: nc(%zu)==our(%zd)", nc_enc_len, our_enc_len);
         DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, label);
@@ -709,7 +716,7 @@ static void test_transport_bidirectional(const uint8_t i_priv[32], const uint8_t
         }
 
         uint8_t our_dec[256];
-        ssize_t our_dec_len = noise_decrypt(&r_sess, our_enc, (size_t)our_enc_len, our_dec);
+        ssize_t our_dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), our_enc, (size_t)our_enc_len, our_dec);
         DIFF_ASSERT(our_dec_len == (ssize_t)plain_len, "i→r dec len match");
         if (our_dec_len == (ssize_t)plain_len) {
             DIFF_ASSERT(memcmp(our_dec, plain, plain_len) == 0, "i→r dec content match");
@@ -728,12 +735,12 @@ static void test_transport_bidirectional(const uint8_t i_priv[32], const uint8_t
             noise_buffer_init(b);
             memcpy(nc_enc, plain, plain_len);
             noise_buffer_set_inout(b, nc_enc, plain_len, sizeof(nc_enc));
-            noise_cipherstate_encrypt(g_nc_r_c1, &b);
+            noise_cipherstate_encrypt_with_ad(g_nc_r_c1, g_ad, sizeof(g_ad), &b);
             nc_enc_len = b.size;
         }
 
         uint8_t our_enc[256];
-        ssize_t our_enc_len = noise_encrypt(&r_sess, plain, plain_len, our_enc);
+        ssize_t our_enc_len = noise_encrypt(&r_sess, g_ad, sizeof(g_ad), plain, plain_len, our_enc);
 
         snprintf(label, sizeof(label), "r→i enc len: nc(%zu)==our(%zd)", nc_enc_len, our_enc_len);
         DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, label);
@@ -742,7 +749,7 @@ static void test_transport_bidirectional(const uint8_t i_priv[32], const uint8_t
         }
 
         uint8_t our_dec[256];
-        ssize_t our_dec_len = noise_decrypt(&i_sess, our_enc, (size_t)our_enc_len, our_dec);
+        ssize_t our_dec_len = noise_decrypt(&i_sess, g_ad, sizeof(g_ad), our_enc, (size_t)our_enc_len, our_dec);
         DIFF_ASSERT(our_dec_len == (ssize_t)plain_len, "r→i dec len match");
         if (our_dec_len == (ssize_t)plain_len) {
             DIFF_ASSERT(memcmp(our_dec, plain, plain_len) == 0, "r→i dec content match");
@@ -806,11 +813,11 @@ static void test_split_key_verification(const uint8_t i_priv[32], const uint8_t 
         noise_buffer_init(b);
         memcpy(nc_enc, test_plain, test_len);
         noise_buffer_set_inout(b, nc_enc, test_len, sizeof(nc_enc));
-        noise_cipherstate_encrypt(g_nc_i_c1, &b);
+        noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
         nc_enc_len = b.size;
     }
 
-    ssize_t our_enc_len = noise_encrypt(&i_sess, test_plain, test_len, our_enc);
+    ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), test_plain, test_len, our_enc);
 
     DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, "split: enc len match");
     if (nc_enc_len == (size_t)our_enc_len) {
@@ -819,7 +826,7 @@ static void test_split_key_verification(const uint8_t i_priv[32], const uint8_t 
 
     /* Cross-decrypt: noise-c encrypt → our decrypt */
     uint8_t cross_dec[256];
-    ssize_t cross_dec_len = noise_decrypt(&r_sess, nc_enc, nc_enc_len, cross_dec);
+    ssize_t cross_dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), nc_enc, nc_enc_len, cross_dec);
     DIFF_ASSERT(cross_dec_len == (ssize_t)test_len, "split: cross-decrypt len");
     if (cross_dec_len == (ssize_t)test_len) {
         DIFF_ASSERT(memcmp(cross_dec, test_plain, test_len) == 0, "split: cross-decrypt content");
@@ -862,7 +869,7 @@ static void test_handshake_hash_match(const uint8_t i_priv[32], const uint8_t i_
             noise_buffer_init(b);
             memcpy(nc_enc, test_plain, sizeof(test_plain) - 1);
             noise_buffer_set_inout(b, nc_enc, sizeof(test_plain) - 1, sizeof(nc_enc));
-            noise_cipherstate_encrypt(g_nc_i_c1, &b);
+            noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
             nc_enc_len = b.size;
         }
 
@@ -885,7 +892,7 @@ static void test_handshake_hash_match(const uint8_t i_priv[32], const uint8_t i_
         struct noise_session i_sess = {0};
         handshake_split(&g_our_i, &i_sess);
         uint8_t our_enc[256];
-        ssize_t our_enc_len = noise_encrypt(&i_sess, test_plain, sizeof(test_plain) - 1, our_enc);
+        ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), test_plain, sizeof(test_plain) - 1, our_enc);
 
         snprintf(label, sizeof(label), "after msg%zu: enc len nc(%zu)==our(%zd)", after_msg, nc_enc_len, our_enc_len);
         DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, label);
@@ -914,9 +921,9 @@ static void test_nonce_counter(const uint8_t i_priv[32], const uint8_t i_pub[32]
     uint8_t enc1[256], enc2[256], enc3[256];
     ssize_t len1, len2, len3;
 
-    len1 = noise_encrypt(&i_sess, plain, plain_len, enc1);
-    len2 = noise_encrypt(&i_sess, plain, plain_len, enc2);
-    len3 = noise_encrypt(&i_sess, plain, plain_len, enc3);
+    len1 = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, enc1);
+    len2 = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, enc2);
+    len3 = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, enc3);
 
     DIFF_ASSERT(len1 > 0, "nonce: enc1 success");
     DIFF_ASSERT(len2 > 0, "nonce: enc2 success");
@@ -935,23 +942,26 @@ static void test_nonce_counter(const uint8_t i_priv[32], const uint8_t i_pub[32]
     uint8_t dec[256];
     ssize_t dec_len;
 
-    dec_len = noise_decrypt(&r_sess, enc1, (size_t)len1, dec);
+    dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), enc1, (size_t)len1, dec);
     DIFF_ASSERT(dec_len == (ssize_t)plain_len, "nonce: dec1 len");
     if (dec_len == (ssize_t)plain_len) {
         DIFF_ASSERT(memcmp(dec, plain, plain_len) == 0, "nonce: dec1 content");
     }
 
-    dec_len = noise_decrypt(&r_sess, enc2, (size_t)len2, dec);
+    dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), enc2, (size_t)len2, dec);
     DIFF_ASSERT(dec_len == (ssize_t)plain_len, "nonce: dec2 len");
     if (dec_len == (ssize_t)plain_len) {
         DIFF_ASSERT(memcmp(dec, plain, plain_len) == 0, "nonce: dec2 content");
     }
 
-    dec_len = noise_decrypt(&r_sess, enc3, (size_t)len3, dec);
+    dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), enc3, (size_t)len3, dec);
     DIFF_ASSERT(dec_len == (ssize_t)plain_len, "nonce: dec3 len");
     if (dec_len == (ssize_t)plain_len) {
         DIFF_ASSERT(memcmp(dec, plain, plain_len) == 0, "nonce: dec3 content");
     }
+
+    /* ASan: noise-c global state'leri test sonunda serbest bırakılmalı */
+    nc_cleanup();
 }
 
 /* ================================================================
@@ -1014,10 +1024,10 @@ static void test_empty_payload_handshake(const uint8_t i_priv[32], const uint8_t
         noise_buffer_init(b);
         memcpy(nc_enc, test_plain, sizeof(test_plain) - 1);
         noise_buffer_set_inout(b, nc_enc, sizeof(test_plain) - 1, sizeof(nc_enc));
-        noise_cipherstate_encrypt(g_nc_i_c1, &b);
+        noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
         nc_enc_len = b.size;
     }
-    ssize_t our_enc_len = noise_encrypt(&i_sess, test_plain, sizeof(test_plain) - 1, our_enc);
+    ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), test_plain, sizeof(test_plain) - 1, our_enc);
 
     snprintf(label, sizeof(label), "empty split enc len: nc(%zu)==our(%zd)", nc_enc_len, our_enc_len);
     DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, label);
@@ -1100,9 +1110,9 @@ static void test_error_state_recovery(const uint8_t i_priv[32], const uint8_t i_
 
     const uint8_t test_plain[] = "recovery_test";
     uint8_t enc[256], dec[256];
-    ssize_t enc_len = noise_encrypt(&i_sess, test_plain, sizeof(test_plain) - 1, enc);
+    ssize_t enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), test_plain, sizeof(test_plain) - 1, enc);
     DIFF_ASSERT(enc_len > 0, "recovery: transport encrypt");
-    ssize_t dec_len = noise_decrypt(&r_sess, enc, (size_t)enc_len, dec);
+    ssize_t dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), enc, (size_t)enc_len, dec);
     DIFF_ASSERT(dec_len == (ssize_t)(sizeof(test_plain) - 1), "recovery: transport decrypt len");
     if (dec_len == (ssize_t)(sizeof(test_plain) - 1)) {
         DIFF_ASSERT(memcmp(dec, test_plain, sizeof(test_plain) - 1) == 0, "recovery: transport decrypt content");
@@ -1384,11 +1394,11 @@ static void run_one_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
         if (payload && payload_len > 0)
             memcpy(nc_enc, payload, payload_len);
         noise_buffer_set_inout(b, nc_enc, payload_len, ct_max);
-        nc_rc = noise_cipherstate_encrypt(g_nc_i_c1, &b);
+        nc_rc = noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
         nc_enc_len = b.size;
     }
 
-    ssize_t our_enc_len = noise_encrypt(&i_sess, payload ? payload : (const uint8_t *)"", payload_len, our_enc);
+    ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), payload ? payload : (const uint8_t *)"", payload_len, our_enc);
 
     if (nc_rc == NOISE_ERROR_NONE) {
         snprintf(errmsg, sizeof(errmsg), "%s: transport enc len %zu==%zd", label, nc_enc_len, our_enc_len);
@@ -1404,10 +1414,10 @@ static void run_one_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
         NoiseBuffer b;
         noise_buffer_init(b);
         noise_buffer_set_input(b, nc_enc, nc_enc_len);
-        nc_rc = noise_cipherstate_decrypt(g_nc_r_c2, &b);
+        nc_rc = noise_cipherstate_decrypt_with_ad(g_nc_r_c2, g_ad, sizeof(g_ad), &b);
     }
 
-    ssize_t our_dec_len = noise_decrypt(&r_sess, our_enc, (size_t)our_enc_len, our_dec);
+    ssize_t our_dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), our_enc, (size_t)our_enc_len, our_dec);
 
     if (nc_rc == NOISE_ERROR_NONE) {
         snprintf(errmsg, sizeof(errmsg), "%s: transport dec", label);
@@ -1433,11 +1443,11 @@ static void run_one_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
                 if (payload && payload_len > 0)
                     memcpy(nc_enc_r, payload, payload_len);
                 noise_buffer_set_inout(b, nc_enc_r, payload_len, ct_max_r);
-                nc_rc = noise_cipherstate_encrypt(g_nc_r_c1, &b);
+                nc_rc = noise_cipherstate_encrypt_with_ad(g_nc_r_c1, g_ad, sizeof(g_ad), &b);
                 nc_enc_len_r = b.size;
             }
 
-            ssize_t our_enc_len_r = noise_encrypt(&r_sess, payload ? payload : (const uint8_t *)"", payload_len, our_enc_r);
+            ssize_t our_enc_len_r = noise_encrypt(&r_sess, g_ad, sizeof(g_ad), payload ? payload : (const uint8_t *)"", payload_len, our_enc_r);
 
             if (nc_rc == NOISE_ERROR_NONE) {
                 snprintf(errmsg, sizeof(errmsg), "%s: r→i enc len %zu==%zd", label, nc_enc_len_r, our_enc_len_r);
@@ -1453,10 +1463,10 @@ static void run_one_test(const uint8_t i_priv[32], const uint8_t i_pub[32],
                 NoiseBuffer b;
                 noise_buffer_init(b);
                 noise_buffer_set_input(b, nc_enc_r, nc_enc_len_r);
-                nc_rc = noise_cipherstate_decrypt(g_nc_i_c2, &b);
+                nc_rc = noise_cipherstate_decrypt_with_ad(g_nc_i_c2, g_ad, sizeof(g_ad), &b);
             }
 
-            ssize_t our_dec_len_r = noise_decrypt(&i_sess, our_enc_r, (size_t)our_enc_len_r, our_dec_r);
+            ssize_t our_dec_len_r = noise_decrypt(&i_sess, g_ad, sizeof(g_ad), our_enc_r, (size_t)our_enc_len_r, our_dec_r);
 
             if (nc_rc == NOISE_ERROR_NONE) {
                 snprintf(errmsg, sizeof(errmsg), "%s: r→i dec", label);
@@ -1860,13 +1870,13 @@ static void run_multi_msg_test(const uint8_t i_priv[32], const uint8_t i_pub[32]
             noise_buffer_init(b);
             memcpy(nc_enc, plain, sizeof(plain));
             noise_buffer_set_inout(b, nc_enc, sizeof(plain), sizeof(nc_enc));
-            noise_cipherstate_encrypt(g_nc_i_c1, &b);
+            noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
             nc_enc_len = b.size;
         }
 
         /* Our encrypt */
         uint8_t our_enc[256];
-        ssize_t our_enc_len = noise_encrypt(&i_sess, plain, sizeof(plain), our_enc);
+        ssize_t our_enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, sizeof(plain), our_enc);
 
         snprintf(errmsg, sizeof(errmsg), "%s msg%d: enc len %zu==%zd", label, idx, nc_enc_len, our_enc_len);
         DIFF_ASSERT(nc_enc_len == (size_t)our_enc_len, errmsg);
@@ -1936,9 +1946,9 @@ static void run_nonce_counter_test(const uint8_t i_priv[32], const uint8_t i_pub
     uint8_t enc1[256], enc2[256], enc3[256];
     ssize_t len1, len2, len3;
 
-    len1 = noise_encrypt(&i_sess, plain, plain_len, enc1);
-    len2 = noise_encrypt(&i_sess, plain, plain_len, enc2);
-    len3 = noise_encrypt(&i_sess, plain, plain_len, enc3);
+    len1 = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, enc1);
+    len2 = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, enc2);
+    len3 = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), plain, plain_len, enc3);
 
     snprintf(errmsg, sizeof(errmsg), "%s: enc1 success", label);
     DIFF_ASSERT(len1 > 0, errmsg);
@@ -2053,10 +2063,10 @@ static void run_error_recovery_test(const uint8_t i_priv[32], const uint8_t i_pu
 
     const uint8_t test_plain[] = "recovery_test";
     uint8_t enc[256], dec[256];
-    ssize_t enc_len = noise_encrypt(&i_sess, test_plain, sizeof(test_plain) - 1, enc);
+    ssize_t enc_len = noise_encrypt(&i_sess, g_ad, sizeof(g_ad), test_plain, sizeof(test_plain) - 1, enc);
     snprintf(errmsg, sizeof(errmsg), "%s: recovery encrypt", label);
     DIFF_ASSERT(enc_len > 0, errmsg);
-    ssize_t dec_len = noise_decrypt(&r_sess, enc, (size_t)enc_len, dec);
+    ssize_t dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), enc, (size_t)enc_len, dec);
     snprintf(errmsg, sizeof(errmsg), "%s: recovery decrypt len", label);
     DIFF_ASSERT(dec_len == (ssize_t)(sizeof(test_plain) - 1), errmsg);
     if (dec_len == (ssize_t)(sizeof(test_plain) - 1)) {
@@ -2137,11 +2147,11 @@ static void run_split_cross_decrypt_test(const uint8_t i_priv[32], const uint8_t
         if (payload && payload_len > 0)
             memcpy(nc_enc, payload, payload_len);
         noise_buffer_set_inout(b, nc_enc, payload_len, ct_max);
-        noise_cipherstate_encrypt(g_nc_i_c1, &b);
+        noise_cipherstate_encrypt_with_ad(g_nc_i_c1, g_ad, sizeof(g_ad), &b);
         nc_enc_len = b.size;
     }
 
-    ssize_t our_dec_len = noise_decrypt(&r_sess, nc_enc, nc_enc_len, our_dec);
+    ssize_t our_dec_len = noise_decrypt(&r_sess, g_ad, sizeof(g_ad), nc_enc, nc_enc_len, our_dec);
 
     snprintf(errmsg, sizeof(errmsg), "%s: cross-decrypt len %zd==%zu", label, our_dec_len, payload_len);
     DIFF_ASSERT(our_dec_len == (ssize_t)payload_len, errmsg);
@@ -2278,7 +2288,10 @@ int main(void) {
     };
 
     /* Payload uzunlukları */
-    size_t payload_lens[] = {0, 1, 4, 16, 32, 100, 255, 511, 4096, 8192};
+    /* NOX_MAX_MSG_LEN=4096: 8192 bizim transport sözleşmemizin DIŞINDA
+     * (noise-c kabul eder, noxtor bilinçli olarak reddeder) — karşılaştırma
+     * yalnız desteklenen domainde yapılır. */
+    size_t payload_lens[] = {0, 1, 4, 16, 32, 100, 255, 511, 4096};
 
     int n_patterns = 4;
 
@@ -2355,7 +2368,8 @@ int main(void) {
         int n_pro = (ki < 100) ? 12 : 3;
         for (int pi = 0; pi < n_pro; pi++) {
             for (int pati = 0; pati < n_patterns; pati++) {
-                for (int li = 0; li < 10; li++) {
+                size_t n_payload_lens = sizeof(payload_lens) / sizeof(payload_lens[0]);
+                for (size_t li = 0; li < n_payload_lens; li++) {
                     size_t plen = payload_lens[li];
                     uint8_t *payload = NULL;
                     if (plen > 0) {

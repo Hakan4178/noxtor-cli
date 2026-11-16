@@ -4,6 +4,7 @@
 
 #include "file_transfer.h"
 #include "common.h"
+#include "frame_queue.h"
 #include "network.h"
 #include "noise.h"
 #include "state_machine.h"
@@ -17,14 +18,26 @@
 #include <string.h>
 #include <sys/file.h>
 #include <unistd.h>
-#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <sys/uio.h>
 
 /* ================================================================
  * YARDIMCI METOTLAR
  * ================================================================ */
+
+/* K-26: tek dosya boyutu kotası. Toplam kota/onay ayrı iştir; bu
+ * helper 100 GiB tavanını tek bir nox_err_t değerine bağlar. */
+nox_err_t file_transfer_check_quota(uint64_t size) {
+  return (size > NOX_MAX_FILE_SIZE) ? NOX_ERR_QUOTA : NOX_OK;
+}
+
+/* H3: RX plaintext tamponunu sıfırla. Dispatch sonrası ham `pt` işaretçisi
+ * kullanılamaz — cleanup rx_pt_buf'u serbest bırakıp NULL'lamış olabilir;
+ * bu yüzden sahip alan guard'la okunur (plan §2.4). */
+static void rx_pt_zero(struct peer_session *ps) {
+  if (ps->rx_pt_buf)
+    sodium_memzero(ps->rx_pt_buf, NOX_MAX_MSG_LEN + 1);
+}
 
 /* PATCH: HIGH‑2 — max_len sınırı ve null garantisi eklenmiş sanitize */
 // Real attack surface in practice: untrusted filename (path traversal)
@@ -101,6 +114,117 @@ static nox_err_t verify_downloads_dir_fd(int dir_fd) {
 }
 
 /* ================================================================
+ * TX DURUM YARDIMCILARI
+ * ================================================================ */
+
+/* Yalnızca transfer kaynaklarını bırakır; peer oturumuna dokunmaz. */
+static void tx_file_reset(struct peer_session *ps) {
+  if (ps->tx_file.fd >= 0) {
+    close(ps->tx_file.fd);
+    ps->tx_file.fd = -1;
+  }
+  if (ps->tx_file.plain_buf) {
+    sodium_free(ps->tx_file.plain_buf);
+    ps->tx_file.plain_buf = NULL;
+  }
+  sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
+  ps->tx_file.fd = -1;
+}
+
+/* ST_FILE_TX → ST_ACTIVE. EPOLLOUT ilgisi event_loop tarafından, kuyruk
+ * ve transfer durumuna göre bir sonraki turda güncellenir. */
+static void tx_state_finish(struct app_state *state, struct peer_session *ps) {
+  if (ps->state == ST_FILE_TX)
+    (void)sm_dispatch(ps, state, EV_FILE_DONE);
+}
+
+/* Yerel/hafif hata: transferi iptal et, oturumu canlı tut. */
+static void tx_abort_keep_session(struct app_state *state,
+                                  struct peer_session *ps,
+                                  const char *reason) {
+  tx_file_reset(ps);
+  tx_state_finish(state, ps);
+  if (reason)
+    ui_print_error(state, "%s", reason);
+}
+
+/* Fatal transport hatası: tüketilmiş nonce geri alınamaz; yarım/boş frame
+ * kuyruktan düşürülemez. Tek güvenli çıkış oturumu kapatmaktır. */
+static void tx_fatal_teardown(struct app_state *state, struct peer_session *ps,
+                              const char *reason) {
+  if (reason)
+    ui_print_error(state, "%s", reason);
+  (void)sm_dispatch(ps, state, EV_CRYPTO_FAIL);
+}
+
+/* C2: METADATA ve FILE chunk'larını ortak TX kuyruğuna şifreleyip commit
+ * eder. Nonce yalnız burada tüketilir; kuyruk doluysa hiç şifreleme
+ * yapılmaz. Dönüş kodları çağıranın politikasını belirler:
+ *   NOX_OK          frame kuyrukta
+ *   NOX_ERR_AGAIN   boş slot yok; nonce tüketilmedi
+ *   NOX_ERR_CRYPTO  şifreleme hatası; nonce tüketilmedi
+ *   NOX_ERR_IO      nonce tüketildi veya commit edilemedi → teardown
+ */
+static nox_err_t enqueue_file_frame(struct peer_session *ps,
+                                    const uint8_t *pt, size_t pt_len) {
+  if (!ps || !ps->session || ps->fd < 0)
+    return NOX_ERR_NET;
+  if (pt_len == 0 || pt_len > NOX_MAX_MSG_LEN)
+    return NOX_ERR_PROTO;
+
+  uint8_t *slot = frame_queue_reserve(ps);
+  if (!slot)
+    return NOX_ERR_AGAIN;
+
+  /* H2: Header şifrelemeden ÖNCE kurulur; 13 byte ham wire kopyası AD olur. */
+  struct frame_header fh = {
+      .magic = NOX_FRAME_MAGIC,
+      .type = NOX_MSG_FILE,
+      .seq = ps->tx_seq,
+      .len = (uint32_t)(pt_len + NOX_MAC_LEN),
+  };
+  frame_ad(&fh, slot);
+
+  uint64_t nonce_before = atomic_load(&ps->session->tx.n);
+  ssize_t ct_len = noise_encrypt(ps->session, slot, FRAME_HEADER_WIRE_SIZE,
+                                 pt, pt_len, slot + FRAME_HEADER_WIRE_SIZE);
+  if (ct_len != (ssize_t)fh.len) {
+    uint64_t nonce_after = atomic_load(&ps->session->tx.n);
+    bool nonce_consumed =
+        (nonce_after != nonce_before) || (nonce_before == UINT64_MAX);
+    return nonce_consumed ? NOX_ERR_IO : NOX_ERR_CRYPTO;
+  }
+
+  nox_err_t err =
+      frame_queue_commit(ps, FRAME_HEADER_WIRE_SIZE + (size_t)ct_len);
+  if (err != NOX_OK)
+    return NOX_ERR_IO; /* nonce tüketildi, frame commit edilemedi */
+
+  clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+  return NOX_OK;
+}
+
+/* Tüm byte'lar commit edildi ve kuyruk boşaldıysa transferi bitir. */
+static void tx_finish_if_drained(struct app_state *state,
+                                 struct peer_session *ps) {
+  if (!ps->tx_file.active)
+    return;
+  if (ps->tx_file.sent_bytes < ps->tx_file.total_size)
+    return;
+  if (!frame_queue_empty(ps))
+    return;
+
+  /* Son %100 yalnız kuyruk boşalınca: commit anında değil. */
+  ui_print_progress(state, ps->tx_file.filename,
+                    ps->tx_file.total_size,
+                    ps->tx_file.total_size, true);
+  ui_print_system(state, "[✓] Dosya gönderimi tamamlandı (%lu byte)",
+                  (unsigned long)ps->tx_file.total_size);
+  tx_file_reset(ps);
+  tx_state_finish(state, ps);
+}
+
+/* ================================================================
  * DOSYA TRANSFER BAŞLANGICI (TX)
  * ================================================================ */
 
@@ -122,6 +246,22 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   /* Zaten aktif bir dosya transferi var mı? */
   if (ps->tx_file.active) {
     ui_print_error(state, "Zaten aktif bir dosya transferi var.");
+    return;
+  }
+
+  /* TX yalnızca ACTIVE'den başlar. ST_FILE_RX sırasında gönderim
+   * başlatmak RX/TX durumlarını aynı anda temsil etmeye çalışırdı. */
+  if (ps->state != ST_ACTIVE) {
+    ui_print_error(state,
+                   "Dosya gönderimi şu anda başlatılamaz (aktif transfer var).");
+    return;
+  }
+
+  /* C2/Q3: METADATA tek kuyruğa girer. Kuyrukta bekleyen TEXT varsa
+   * önce onlar yazılır; METADATA yalnız boş slot yoksa reddedilir. */
+  if (frame_queue_free(ps) == 0) {
+    ui_print_error(state,
+        "Gönderim kuyruğu dolu — dosya transferini biraz sonra tekrar deneyin.");
     return;
   }
 
@@ -172,7 +312,9 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
     close(file_fd);
     return;
   }
-  if ((uint64_t)st.st_size > NOX_MAX_FILE_SIZE) {
+  nox_err_t quota_err = file_transfer_check_quota((uint64_t)st.st_size);
+  if (quota_err != NOX_OK) {
+    NOX_WARN(LOG_MOD_NET, "dosya reddedildi: %s", nox_strerror(quota_err));
     ui_print_error(state,
         "Dosya çok büyük (maksimum %llu MB)",
         (unsigned long long)(NOX_MAX_FILE_SIZE / 1024 / 1024));
@@ -272,7 +414,7 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   }
 
   /*
-   * METADATA frame gönder:
+   * METADATA frame'ini kuyruğa al:
    *   "METADATA\0" (9) + filename (256) + size (8) + hash (32) = 305 byte
    */
   uint8_t meta[305];
@@ -292,49 +434,35 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
   memcpy(meta + 273, ps->tx_file.hash, 32);
   sodium_memzero(file_hash, sizeof(file_hash));
 
-  /* Şifrele ve gönder */
-  uint8_t meta_ct[305 + NOX_MAC_LEN];
-  ssize_t meta_ct_len =
-      noise_encrypt(ps->session, meta, sizeof(meta), meta_ct);
+  nox_err_t meta_err = enqueue_file_frame(ps, meta, sizeof(meta));
   sodium_memzero(meta, sizeof(meta));
-  if (meta_ct_len < 0) {
-    ui_print_error(state, "Metadata şifreleme hatası.");
-    sodium_memzero(meta_ct, sizeof(meta_ct));
-    close(file_fd);
-    sodium_free(ps->tx_file.plain_buf);
-    sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-    ps->tx_file.fd = -1;
+
+  if (meta_err != NOX_OK) {
+    if (meta_err == NOX_ERR_IO) {
+      tx_fatal_teardown(
+          state, ps,
+          "Metadata şifreleme/gönderim hatası (nonce tüketildi).");
+    } else {
+      tx_file_reset(ps);
+      ui_print_error(state,
+          "Metadata kuyruğa alınamadı — dosya transferi başlatılamadı.");
+    }
     return;
   }
 
-  struct frame_header mfh = {
-      .magic = NOX_FRAME_MAGIC,
-      .type = NOX_MSG_FILE,
-      .seq = ps->tx_seq,
-      .len = (uint32_t)meta_ct_len,
-  };
-  uint8_t mwire[FRAME_HEADER_WIRE_SIZE];
-  frame_header_encode(&mfh, mwire);
-
-  struct iovec iov[2] = {
-      { .iov_base = (void *)mwire,   .iov_len = FRAME_HEADER_WIRE_SIZE },
-      { .iov_base = (void *)meta_ct, .iov_len = (size_t)meta_ct_len },
-  };
-  ssize_t written = writev(ps->fd, iov, 2);
-  if (written != (ssize_t)(FRAME_HEADER_WIRE_SIZE + (size_t)meta_ct_len)) {
-    ui_print_error(state, "Metadata gönderim hatası.");
-    sodium_memzero(meta_ct, sizeof(meta_ct));
-    close(file_fd);
-    sodium_free(ps->tx_file.plain_buf);
-    sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-    ps->tx_file.fd = -1;
+  /* Metadata commit edildi; artık transfer durumu ST_FILE_TX olmalı.
+   * Başarısız dispatch (beklenmez) sırayı yarım bırakacağı için oturumu
+   * fail-closed kapat. */
+  if (sm_dispatch(ps, state, EV_FILE_START) != NOX_OK) {
+    ui_print_error(state, "Dosya transferi durumu başlatılamadı.");
+    (void)sm_dispatch(ps, state, EV_CRYPTO_FAIL);
     return;
   }
-  ps->tx_seq++;
-  sodium_memzero(meta_ct, sizeof(meta_ct));
 
-  /* peer_fd'yi EPOLLIN | EPOLLOUT olarak değiştir */
-  epoll_modify_fd(state->epoll_fd, ps->fd, EPOLLIN | EPOLLOUT);
+  /* C2: kuyruğu ilk kez uyandır. Kuyruk/transfer aktif oldukça event_loop
+   * EPOLLOUT ilgisini açık tutar. */
+  if (frame_queue_arm_tx(state, ps) != NOX_OK)
+    return;
 
   ui_print_system(state, "[*] Dosya transferi başlatıldı: %s (%lu byte)",
                   safe_name, (unsigned long)ps->tx_file.total_size);
@@ -345,125 +473,90 @@ void file_transfer_start(struct app_state *state, const char *filepath) {
  * ================================================================ */
 
 void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps) {
-  int fd = ps->fd;
-  if (fd < 0 || !ps->tx_file.active) {
+  if (!ps || ps->fd < 0)
+    return;
+  if (!ps->tx_file.active)
+    return;
+  if (!ps->tx_file.plain_buf || ps->tx_file.fd < 0) {
+    tx_abort_keep_session(state, ps,
+                          "Dosya gönderimi başarısız: transfer durumu tutarsız.");
     return;
   }
 
-  /* Buffer'da kalan veri varsa önce onu gönder */
-  if (ps->tx_file.tx_len > 0) {
-    ssize_t w =
-        write(fd, ps->tx_file.tx_buf + ps->tx_file.tx_offset,
-              ps->tx_file.tx_len - ps->tx_file.tx_offset);
-    if (w > 0) {
-      ps->tx_file.tx_offset += (size_t)w;
-      clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
-      if (ps->tx_file.tx_offset == ps->tx_file.tx_len) {
-        ps->tx_seq++;
-        ps->tx_file.tx_len = 0;
-        ps->tx_file.tx_offset = 0;
-        ps->tx_file.sent_bytes += ps->tx_file.current_chunk_size;
-        ps->tx_file.current_chunk_size = 0;
+  /* Önceki turlarda tüm byte'lar commit edildi; kuyruk boşaldıysa bitir. */
+  tx_finish_if_drained(state, ps);
+  if (!ps->tx_file.active)
+    return;
 
-        if (ps->tx_file.sent_bytes >= ps->tx_file.total_size) {
-          ui_print_system(state, "[✓] Dosya gönderimi tamamlandı (%lu byte)",
-                          (unsigned long)ps->tx_file.total_size);
-          close(ps->tx_file.fd);
-          sodium_free(ps->tx_file.plain_buf);
-          sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-          ps->tx_file.fd = -1;
-          epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-        } else {
-          ui_print_progress(state, ps->tx_file.filename,
-                            ps->tx_file.sent_bytes,
-                            ps->tx_file.total_size, true);
-        }
-      }
-    } else if (w == 0 || (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-      ui_print_error(state, "Dosya gönderimi koptu (%s)", w == 0 ? "write returned 0" : strerror(errno));
-      close(ps->tx_file.fd);
-      sodium_free(ps->tx_file.plain_buf);
-      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-      ps->tx_file.fd = -1;
-      epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-    }
-  } else {
+  /* Kuyrukta boş slot kaldıkça dosyadan oku, şifrele ve commit et.
+   * sent_bytes commit anında ilerler; sokete yazılmayı beklemez. */
+  while (frame_queue_free(ps) > 0 &&
+         ps->tx_file.sent_bytes < ps->tx_file.total_size) {
     /* 3.KRITIK FIX: TX ilan edilen boyuttan fazla okumamalı.
      * total_size - sent_bytes = remaining ile sınırla; dosya transfer
-     * sırasında büyürse read 4096 dönebilir, TX 4096 sayıp success ilan
-     * ederken RX min(remaining, pt_len) ile 1000 yazar — semantik mismatch.
-     * flock LOCK_SH başka yazarı engeller ama TOCTOU/growth'e karşı
-     * remaining cap şart. */
-    size_t remaining = 0;
-    if (ps->tx_file.total_size > ps->tx_file.sent_bytes)
-      remaining = (size_t)(ps->tx_file.total_size - ps->tx_file.sent_bytes);
-    if (remaining == 0) {
-      NOX_WARN(LOG_MOD_MAIN, "TX remaining 0 ama active — desync, abort");
-      close(ps->tx_file.fd);
-      sodium_free(ps->tx_file.plain_buf);
-      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-      ps->tx_file.fd = -1;
-      epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-      return;
-    }
-    size_t to_read = remaining < 4096 ? remaining : 4096;
+     * sırasında büyürse semantik mismatch olur. flock LOCK_SH başka
+     * yazarı engeller ama TOCTOU/growth'e karşı remaining cap şart. */
+    size_t remaining =
+        (size_t)(ps->tx_file.total_size - ps->tx_file.sent_bytes);
+    size_t to_read = remaining < 4096U ? remaining : 4096U;
     ssize_t r = read(ps->tx_file.fd, ps->tx_file.plain_buf, to_read);
-    if (r > 0) {
-      ps->tx_file.current_chunk_size = (size_t)r;
-
-      size_t max_ct = (size_t)r + NOX_MAC_LEN;
-      if (FRAME_HEADER_WIRE_SIZE + max_ct > TX_BUF_CAPACITY) {
-        ui_print_error(state, "Chunk boyutu tx_buf kapasitesini aşıyor");
-      close(ps->tx_file.fd);
-      sodium_free(ps->tx_file.plain_buf);
-      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-      ps->tx_file.fd = -1;
-      epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
+    if (r < 0) {
+      if (errno == EINTR)
+        continue;
+      sodium_memzero(ps->tx_file.plain_buf, 4096);
+      tx_abort_keep_session(state, ps,
+                            "Dosya gönderimi başarısız: yerel dosya okunamadı.");
       return;
     }
-
-      ssize_t ct_len = noise_encrypt(ps->session,
-                                     ps->tx_file.plain_buf,
-                                     (size_t)r,
-                                     ps->tx_file.tx_buf + FRAME_HEADER_WIRE_SIZE);
+    if (r == 0) {
       sodium_memzero(ps->tx_file.plain_buf, 4096);
-
-      if (ct_len > 0) {
-        struct frame_header fh = {
-            .magic = NOX_FRAME_MAGIC,
-            .type = NOX_MSG_FILE,
-            .seq = ps->tx_seq,
-            .len = (uint32_t)ct_len,
-        };
-        frame_header_encode(&fh, ps->tx_file.tx_buf);
-        ps->tx_file.tx_len = FRAME_HEADER_WIRE_SIZE + (size_t)ct_len;
-        ps->tx_file.tx_offset = 0;
-      } else {
-        ui_print_error(state, "Chunk şifreleme başarısız");
-        close(ps->tx_file.fd);
-        sodium_free(ps->tx_file.plain_buf);
-        sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-        ps->tx_file.fd = -1;
-        epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-      }
-    } else if (r == 0) {
       /* M-8 FIX: Gönderim sırasında beklenenden erken EOF — dosya kısaldı.
        * Hash doğrulanamaz; busy loop'a düşmemek için transfer iptal edilir. */
-      ui_print_error(state, "Dosya gönderim sırasında kısaldı — transfer iptal");
-      close(ps->tx_file.fd);
-      sodium_free(ps->tx_file.plain_buf);
-      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-      ps->tx_file.fd = -1;
-      epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-    } else if (r < 0 && errno != EINTR) {
-      ui_print_error(state, "Yerel dosya okuma başarısız");
-      close(ps->tx_file.fd);
-      sodium_free(ps->tx_file.plain_buf);
-      sodium_memzero(&ps->tx_file, sizeof(ps->tx_file));
-      ps->tx_file.fd = -1;
-      epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
+      tx_abort_keep_session(state, ps,
+                            "Dosya gönderimi başarısız: dosya beklenenden erken bitti.");
+      return;
+    }
+
+    nox_err_t err = enqueue_file_frame(ps, ps->tx_file.plain_buf, (size_t)r);
+    sodium_memzero(ps->tx_file.plain_buf, 4096);
+
+    if (err == NOX_ERR_AGAIN) {
+      /* Savunmacı: reserve/commit arasında slot kaybolduysa read()
+       * offset'i ilerlemiştir. Chunk'ı atlamamak için geri sar; geri
+       * sarılamazsa transferi iptal et (nonce tüketilmedi). */
+      if (lseek(ps->tx_file.fd, -(off_t)r, SEEK_CUR) == (off_t)-1) {
+        tx_abort_keep_session(
+            state, ps,
+            "Dosya gönderimi başarısız: okuma konumu geri alınamadı.");
+        return;
+      }
+      break;
+    }
+    if (err == NOX_ERR_IO) {
+      tx_fatal_teardown(
+          state, ps,
+          "Dosya gönderimi başarısız: şifreleme hatası (nonce tüketildi).");
+      return;
+    }
+    if (err != NOX_OK) {
+      tx_abort_keep_session(state, ps,
+                            "Dosya gönderimi başarısız: şifreleme hatası.");
+      return;
+    }
+
+    ps->tx_file.sent_bytes += (uint64_t)r;
+    /* Son chunk'ta %100 basma: frame'ler henüz wire'a çıkmadı.
+     * Tamamlanma tx_finish_if_drained() içinde, kuyruk boşalınca. */
+    if (ps->tx_file.sent_bytes < ps->tx_file.total_size) {
+      ui_print_progress(state, ps->tx_file.filename,
+                        ps->tx_file.sent_bytes,
+                        ps->tx_file.total_size, true);
     }
   }
+
+  /* Son chunk bu turda commit edildiyse kuyruk henüz doludur; EV_FILE_DONE
+   * bir sonraki flush sonrası verilir. */
+  tx_finish_if_drained(state, ps);
 }
 
 /* ================================================================
@@ -550,41 +643,51 @@ static nox_err_t open_recv_file(struct app_state *state,
 }
 
 // Real attack surface in practice: untrusted FILE frame (METADATA+DATA, disk write)
+/* H3: `pt` çözülmüş düz metindir (event_loop, ps->rx_pt_buf). Sahiplik
+ * çağıranda; bu fonksiyon yalnız tüketir, ASLA serbest bırakmaz.
+ * pt_len == 0 → AEAD doğrulaması başarısız (eski decrypt fail yolu).
+ * Kural: kullan → sıfırla → dispatch (dispatch cleanup'ı tetikleyebilir). */
 nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
-                                         const uint8_t *payload, uint32_t len) {
-  if (len < NOX_MAC_LEN || len > 4096 + NOX_MAC_LEN) {
-    ui_print_error(state, "Gecersiz payload uzunlugu: %u", len);
+                                         uint8_t *pt, uint32_t pt_len) {
+  if (pt_len > NOX_MAX_MSG_LEN || (pt_len > 0 && !pt)) {
+    ui_print_error(state, "Gecersiz payload uzunlugu: %u", pt_len);
     return false;
   }
 
-  uint8_t *pt = sodium_malloc(len);
-  if (!pt) {
-    ui_print_error(state, "Bellek tahsisi basarisiz.");
-    return false;
-  }
-
-  ssize_t pt_len = noise_decrypt(ps->session, payload, len, pt);
   nox_hardbool_t is_metadata = 0;
-  if (pt_len <= 0) {
+  if (pt_len == 0) {
     if (ps->rx_file.active) {
       NOX_WARN(LOG_MOD_NET, "FILE decrypt fail — transfer abort, seq=%u", ps->rx_seq);
       ui_print_error(state, "Hata: Akran bağlantısında geçersiz sıra numarası algılandı (Replay Attack veya paket kaybı)!");
       goto rx_abort;
     } else {
-      NOX_WARN(LOG_MOD_NET, "FILE decrypt fail outside transfer — seq=%u len=%u", ps->rx_seq, len);
+      NOX_WARN(LOG_MOD_NET, "FILE decrypt fail outside transfer — seq=%u", ps->rx_seq);
       ui_print_error(state, "Hata: Akran bağlantısında geçersiz sıra numarası algılandı (Replay Attack veya paket kaybı)!");
-      sodium_free(pt);
       return true;
     }
   }
 
-  /* 7.KRITIK-ish FIX: duplicate METADATA active RX içinde data olarak yazılıyordu.
-   * Önce subtype'e bak, sonra state'e — active iken gelen METADATA abort olmalı.
-   * Wire'da subtype yok (payload sniff), v2'de header'a taşınmalı — TODO §7.1. */
-  is_metadata = (pt_len == 305 && sodium_memcmp(pt, "METADATA", 9) == 0);
+  /* T-04/K-29 FIX: sniff yalnız RX aktif DEĞİLKEN çalışır. Aktif RX'te
+   * her FILE frame'i veridir; 305 byte'lık dürüst bir chunk "METADATA" ile
+   * başlayabilir. Eski sıra (sniff → active abort) uzak peer'a tek bir
+   * 305-hizalı chunk ile transferi iptal ettirme (DoS) imkânı veriyordu.
+   * Gerçek duplicate METADATA ayrımı wire v2'de subtype ile yapılacak —
+   * TODO §7.1. Şimdilik v1'de active RX'te gelen frame daima data sayılır. */
+  is_metadata = (!ps->rx_file.active && pt_len == 305 &&
+                 sodium_memcmp(pt, "METADATA", 9) == 0);
   if (is_metadata) {
-    if (ps->rx_file.active)
-      goto rx_abort;
+    /* TX sırasında yeni RX başlatma: mevcut state machine TX+RX'i aynı
+     * anda temsil etmiyor. Geçişi reddet ve hiçbir dosya açma. */
+    if (ps->state != ST_ACTIVE) {
+      NOX_WARN(LOG_MOD_NET,
+               "RX METADATA reddedildi: peer state=%s (TX/RX çakışması)",
+               sm_state_name(ps->state));
+      ui_print_error(state,
+                     "Dosya alımı başlatılamadı: şu anda aktif bir gönderim var.");
+      rx_pt_zero(ps);
+      return true;
+    }
+
     /* Yeni dosya transferi (Metadata) */
     char safe_name[256];
     size_t name_len = strnlen((const char *)pt + 9, 255);
@@ -599,7 +702,11 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
         ((uint64_t)pt[271] << 8) | ((uint64_t)pt[272]);
 
     /* Dosya boyut sınırı kontrolü */
-    if (net_size == 0 || net_size > NOX_MAX_FILE_SIZE) {
+    nox_err_t quota_err = file_transfer_check_quota(net_size);
+    if (net_size == 0 || quota_err != NOX_OK) {
+      if (quota_err != NOX_OK)
+        NOX_WARN(LOG_MOD_NET, "gelen dosya reddedildi: %s",
+                 nox_strerror(quota_err));
       ui_print_error(state,
                      "Gelen dosya reddedildi: Geçersiz veya çok büyük dosya boyutu (%lu byte)",
                      (unsigned long)net_size);
@@ -622,7 +729,8 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             NOX_WARN(LOG_MOD_MAIN, "METADATA hash sıfır — sahte/bozuk frame reddedildi");
             ui_print_error(state, "Gelen METADATA reddedildi (geçersiz hash)");
             sodium_memzero(file_hash, sizeof(file_hash));
-            sodium_free(pt);
+            /* H3: return öncesi plaintext sıfırla */
+            rx_pt_zero(ps);
             return true;
           }
 
@@ -640,12 +748,14 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
             strncpy(ps->rx_file.filename, safe_name, 255);
             ps->rx_file.filename[255] = '\0';
 
+            /* H3: metadata tüketildi — dispatch öncesi sıfırla */
+            rx_pt_zero(ps);
             sm_dispatch(ps, state, EV_FILE_RX_START);
 
             if (crypto_generichash_init(&ps->rx_file.hash_state, NULL, 0, 32) != 0) {
               /* M-F3 FIX: inline temizlik unlinkat'i atliyordu — hash_init
                * OOM'unda yarim dosya kalici orphan oluyordu. rx_abort ortak
-               * temizlik: close + unlinkat + EV_FILE_DONE + pt free. */
+               * temizlik: close + unlinkat + EV_FILE_DONE (+ RX pt sıfırlama). */
               ui_print_error(state, "Hash state başlatılamadı");
               goto rx_abort;
             }
@@ -710,7 +820,7 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
       uint8_t final_hash[32];
       if (crypto_generichash_final(&ps->rx_file.hash_state, final_hash, 32) != 0) {
         NOX_ERROR(LOG_MOD_MAIN, "Hash tamamlanamadı");
-        sodium_free(pt);
+        rx_pt_zero(ps);
         unlinkat(state->downloads_dir_fd, ps->rx_file.local_name, 0);
         if (ps->rx_file.fd >= 0) { close(ps->rx_file.fd); ps->rx_file.fd = -1; }
         sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
@@ -745,6 +855,8 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
       sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
       /* A-1 FIX: fd'yi -1 yap (sodium_memzero sonrası 0 olur) */
       ps->rx_file.fd = -1;
+      /* H3: dispatch öncesi plaintext sıfırla */
+      rx_pt_zero(ps);
       sm_dispatch(ps, state, EV_FILE_DONE);
     } else {
       ui_print_progress(state, ps->rx_file.filename,
@@ -753,7 +865,8 @@ nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_sess
     }
   }
 
-  sodium_free(pt);
+  /* H3: başarılı tüketim — sıfırla, sahiplik çağıranda */
+  rx_pt_zero(ps);
   return true;
 
 rx_abort:
@@ -769,8 +882,9 @@ rx_abort:
   ui_print_error(state, "Transfer iptal edildi ve yarım kalan dosya silindi.");
   sodium_memzero(&ps->rx_file, sizeof(ps->rx_file));
   ps->rx_file.fd = -1;
+  /* H3: dispatch öncesi plaintext sıfırla */
+  rx_pt_zero(ps);
   sm_dispatch(ps, state, EV_FILE_DONE);
-  sodium_free(pt);
   return true;
 }
 

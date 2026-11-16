@@ -42,10 +42,28 @@ void fe_now_tm(time_t *ts_out, struct tm *tm_out)
         *ts_out = ts.tv_sec;
 }
 
-/* ANSI injection koruması — tek doğruluk kaynağı (eski iki static
- * kopya drift olmuştu; kanonik = limitli OSC/DCS tarama, 256 byte).
- * Faz 1b: C0/DEL kapsamı + UTF-8 doğrulama bu noktaya gelecek. */
-void ui_strip_ansi(char *str) {
+/* K-33: görünmez/yon saptırıcı kod noktaları — C1 (U+0080..U+009F),
+ * LRM/RLM (U+200E/200F), bidi embedding/override (U+202A..202E),
+ * bidi isolate (U+2066..2069) ve ALM (U+061C). Peer kontrollü metinde
+ * bunlar terminal satırı/yonü sahteleştirebilir; sessizce düşürülür.
+ * Dönüş: eşleşen UTF-8 dizisinin bayt uzunluğu (yoksa 0). */
+static size_t utf8_deceptive_cp(const unsigned char *s) {
+  if (s[0] == 0xC2 && s[1] >= 0x80 && s[1] <= 0x9F) return 2; /* C1 */
+  if (s[0] == 0xD8 && s[1] == 0x9C) return 2;                 /* U+061C ALM */
+  if (s[0] == 0xE2 && s[1] == 0x80 &&
+      ((s[2] >= 0x8E && s[2] <= 0x8F) ||
+       (s[2] >= 0xAA && s[2] <= 0xAE))) return 3;              /* LRM/RLM + bidi */
+  if (s[0] == 0xE2 && s[1] == 0x81 &&
+      s[2] >= 0xA6 && s[2] <= 0xA9) return 3;                  /* bidi isolates */
+  return 0;
+}
+
+/* Ortak sanitizer — ANSI injection koruması (tek doğruluk kaynağı;
+ * eski iki static kopya drift olmuştu, kanonik = limitli OSC/DCS tarama).
+ * C0/DEL + C1 + bidi kontrol kodları düşürülür. `keep_eol` true iken
+ * CR/LF aynen korunur (stdin satır çerçevelemesi için); false iken
+ * boşluğa çevrilir (K-33: çıktıda peer metni sahte satır üretemez). */
+static void strip_ansi_impl(char *str, bool keep_eol) {
   if (!str) return;
   char *dst = str;
   const char *src = str;
@@ -81,16 +99,41 @@ void ui_strip_ansi(char *str) {
         else
           src++;
       }
-    } else if ((unsigned char)*src < 32 && *src != '\t' && *src != '\n' && *src != '\r') {
-      /* LN-1: C0 control (except TAB/LF/CR) — drop, UTF-8 continuation korunur */
+    } else if (*src == '\r' || *src == '\n') {
+      if (keep_eol) {
+        *dst++ = *src++;
+      } else {
+        /* K-33: çıktıda CR/LF satır sahteciliği üretmesin — katla. */
+        *dst++ = ' ';
+        src++;
+      }
+    } else if ((unsigned char)*src < 32 && *src != '\t') {
+      /* LN-1: C0 control (TAB hariç) — drop, UTF-8 continuation korunur */
       src++;
     } else if ((unsigned char)*src == 0x7F) {
       src++;
     } else {
-      *dst++ = *src++;
+      size_t cp_len = utf8_deceptive_cp((const unsigned char *)src);
+      if (cp_len > 0) {
+        src += cp_len;
+      } else {
+        *dst++ = *src++;
+      }
     }
   }
   *dst = '\0';
+}
+
+/* Çıktı sanitizer'ı: CR/LF satır sahteciliğini boşluğa katlar. */
+void ui_strip_ansi(char *str) {
+  strip_ansi_impl(str, false);
+}
+
+/* Girdi sanitizer'ı: aynı ESC/C0/C1/bidi temizliği, fakat CR/LF korunur.
+ * stdin_handler satırları '\n' ile bölüp Enter'ı işler; burada CR/LF
+ * düşürülürse hiçbir komut çalışmaz (K-33 regresyonu). */
+void ui_strip_input(char *str) {
+  strip_ansi_impl(str, true);
 }
 
 /* fe_event doldur — text sahiplenilmez, scrub emit dönüşünde (caller) */

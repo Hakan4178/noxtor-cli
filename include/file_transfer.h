@@ -13,6 +13,11 @@
 #define NOX_MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL * 1024ULL)
 #endif
 
+/* Tek dosya boyutu kotası — sınır aşılırsa NOX_ERR_QUOTA döner.
+ * K-26 toplam kota/onay politikası ayrı katmandır; bu helper yalnız
+ * mevcut NOX_MAX_FILE_SIZE sınırını tek bir hata koduna bağlar. */
+nox_err_t file_transfer_check_quota(uint64_t size);
+
 /* Dosya adını temizleyerek path traversal açıklarını önler */
 void sanitize_filename(char *name, size_t max_len);
 
@@ -22,10 +27,12 @@ void file_transfer_start(struct app_state *state, const char *filepath);
 /* Peer soketi yazılabilir olduğunda (EPOLLOUT) sıradaki dosya parçasını gönderir */
 void file_transfer_handle_tx(struct app_state *state, struct peer_session *ps);
 
-/* Dosya paketlerini (Metadata veya chunk) alır, şifresini çözer ve diske yazar.
- * return: hardened true = başarıyla işlendi (veya hata sonrası temizlendi), false = kritik hata */
+/* Dosya paketlerini (Metadata veya chunk) işler ve diske yazar.
+ * pt: event_loop'un çözdüğü düz metin — sahiplik çağıranda, burada free YOK.
+ * pt_len == 0 → AEAD doğrulaması başarısız (eski decrypt fail yolu).
+ * return: hardened true = tüketildi (veya hata sonrası temizlendi), false = kritik hata */
 nox_hardbool_t file_transfer_handle_rx(struct app_state *state, struct peer_session *ps,
-                                       const uint8_t *payload, uint32_t len);
+                                       uint8_t *pt, uint32_t pt_len);
 
 /* Bağlantı koptuğunda yarım kalan transferlerin kaynaklarını temizler ve dosyaları siler */
 void file_transfer_cleanup(struct app_state *state);

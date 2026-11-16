@@ -13,6 +13,7 @@
 #include "state_machine.h"
 #include "stdin_handler.h"
 #include "file_transfer.h"
+#include "frame_queue.h"
 #include "database.h"
 #include "noise.h"
 #include "network.h"
@@ -46,6 +47,106 @@ struct peer_session *find_peer_by_fd(struct app_state *state, int fd)
             return ps;
     }
     return NULL;
+}
+
+/* Kuyruk boşken durmuş DB kuyruğunu sürdürür.
+ * EPOLLOUT handler'ı ve 2 sn'lik bakım turu aynı yolu kullanır; böylece
+ * yalnız db_retry bayrağı kaldığında iş asılı kalmaz.
+ * Dönüş false = oturum kapandı. */
+static bool peer_tx_resume(struct app_state *state,
+                           struct peer_session *ps)
+{
+    if (!frame_queue_empty(ps))
+        return ps->fd >= 0;
+
+    if (ps->db_retry_pending && frame_queue_empty(ps) &&
+        !ps->tx_file.active) {
+        struct queue_flush_ctx qctx = { .state = state, .ps = ps };
+        nox_err_t dberr = db_process_queue(ps->peer_onion,
+                                           send_queued_callback, &qctx);
+        /* Bayrağı yalnız tam başarıda temizle: DB/alloc hatasında
+         * callback hiç çağrılmamış olabilir; retry kaybolmasın.
+         * AGAIN'de callback bayrağı zaten yeniden kurar. */
+        if (dberr == NOX_OK)
+            ps->db_retry_pending = false;
+    }
+
+    return ps->fd >= 0;
+}
+
+/* EPOLLIN/EPOLLOUT ilgisini günceller. epoll yoksa (birim testi) no-op.
+ * Hata fail-closed: oturum kapatılır, false döner. */
+static bool peer_set_interest(struct app_state *state,
+                              struct peer_session *ps, uint32_t events)
+{
+    if (state->epoll_fd < 0)
+        return true;
+
+    if (epoll_modify_fd(state->epoll_fd, ps->fd, events) != NOX_OK) {
+        NOX_WARN(LOG_MOD_NET,
+                 "EPOLL ilgisi güncellenemedi — oturum kapatılıyor");
+        ui_print_error(state,
+            "Soket olay ilgisi güncellenemedi — oturum kapatılıyor.");
+        (void)sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
+        return false;
+    }
+    return true;
+}
+
+/* ================================================================
+ * EPOLLOUT — TX sırası tek noktadan yürür
+ *
+ * Kural: önce kuyruk boşaltılır, sonra boş slotlar dosyadan doldurulur.
+ * Enqueue sırası = nonce sırası = yazma sırası. Dönüş false = oturum
+ * kapandı (çağıran EPOLLIN'e devam etmemeli).
+ * ================================================================ */
+static bool handle_peer_tx_ready(struct app_state *state,
+                                 struct peer_session *ps)
+{
+    /* Önce kuyruk: enqueue sırası = nonce sırası = yazma sırası. */
+    if (!frame_queue_empty(ps)) {
+        (void)frame_queue_flush(state, ps);
+    }
+
+    if (ps->fd < 0)
+        return false;
+
+    /* Kuyrukta boş slot varsa FILE chunk'larını üret. Kuyruk doluyken
+     * şifreleme yapılmaz; nonce tüketilmez. */
+    if (ps->tx_file.active && frame_queue_free(ps) > 0)
+        file_transfer_handle_tx(state, ps);
+
+    if (ps->fd < 0)
+        return false;
+
+    /* Kuyruk boşaldıysa durmuş DB kuyruğunu aynı oturumda sürdür. */
+    if (!peer_tx_resume(state, ps))
+        return false;
+
+    uint32_t events = (ps->tx_file.active || !frame_queue_empty(ps))
+                          ? (EPOLLIN | EPOLLOUT)
+                          : EPOLLIN;
+    if (!peer_set_interest(state, ps, events))
+        return false;
+
+    return ps->fd >= 0;
+}
+
+/* K-10: doluluk kararı yalnız tamponun gerçek durumundan verilir.
+ * `recv_pos >= capacity` savunmacı: bozulmuş bir konum da "dolu" sayılır. */
+bool peer_recv_buf_full(const struct peer_session *ps)
+{
+    return ps && ps->recv_pos >= sizeof(ps->recv_buf);
+}
+
+/* B1: yarım frame / trickle deadline predikati — saf, saat enjekte
+ * edilebilir. Caller CLOCK_MONOTONIC ile besler; NULL → false. */
+bool frame_trickle_expired(const struct timespec *frame_start,
+                           const struct timespec *now, long timeout_sec)
+{
+    if (!frame_start || !now)
+        return false;
+    return (now->tv_sec - frame_start->tv_sec) > timeout_sec;
 }
 
 /* ================================================================
@@ -99,12 +200,116 @@ nox_err_t hs_build_claim_payload(uint8_t pl[NOX_HS_PAYLOAD_V1_LEN],
 }
 
 /* ================================================================
+ * Adım 13: peer claim'ini TOFU/session'a girmeden doğrula.
+ *
+ * Initiator msg2'yi okur okumaz (msg3 YAZMADAN) bu yardımcıyı çağırır;
+ * responder msg3'ü okuduktan sonra aynı yardımcıyı kullanır. Başarıda
+ * NUL-terminated onion adresi `out`a kopyalanır ve bir daha verify
+ * edilmez. Hata log/UI burada üretilir; çağıran yalnız
+ * EV_HANDSHAKE_ERROR dispatch edip payload'ı serbest bırakır.
+ * ================================================================ */
+static nox_err_t verify_peer_claim(const struct peer_session *ps,
+                                   struct app_state *state,
+                                   const uint8_t *pl, size_t pl_len,
+                                   char out[NOX_ONION_LEN + 1])
+{
+    if (!ps || !ps->hs || !pl || !out)
+        return NOX_ERR_PROTO;
+
+    /* H-1/H-2 HARD CUT: yalnızca v1 [ver|onion(62)|sig(64)] = 127B.
+     * Legacy (56+NUL / 63B) payload'ın HİÇBİR kod yolu yok — beta
+     * kararı: eski peer temiz disconnect alır. */
+    if (pl_len != NOX_HS_PAYLOAD_V1_LEN ||
+        pl[0] != NOX_HS_PAYLOAD_V1_VER) {
+        NOX_ERROR(LOG_MOD_NOISE,
+                  "Handshake payload geçersiz veya desteklenmeyen sürüm "
+                  "(len=%zu, beklenen %u)", pl_len, NOX_HS_PAYLOAD_V1_LEN);
+        if (state)
+            ui_print_error(state,
+                           "Akran geçerli bir adres iletmedi (sürüm uyuşmuyor)");
+        return NOX_ERR_PROTO;
+    }
+
+    char peer_onion[NOX_ONION_LEN + 1];
+    memcpy(peer_onion, pl + 1, NOX_ONION_LEN);
+    peer_onion[NOX_ONION_LEN] = '\0';
+
+    /* Terminal injection koruması — base32 charset dışı karakter engeli */
+    if (!validate_onion_address(peer_onion)) {
+        NOX_ERROR(LOG_MOD_NOISE, "Geçersiz onion adresi formatı (injection?)");
+        return NOX_ERR_PROTO;
+    }
+
+    /* H-1: claim ↔ onion ↔ static key imza doğrulaması.
+     * pubkey onion ADRESİNDEN çıkarılır (checksum dahil, H-2);
+     * imza peer'ın hs->rs statik anahtarı üzerinden verify edilir.
+     * Başarısız → impersonation/MITM reddi, peer'a sıfır bilgi. */
+    if (crypto_onion_verify(pl + 1 + NOX_ONION_LEN, peer_onion,
+                            ps->hs->rs) != NOX_OK) {
+        NOX_ERROR(LOG_MOD_NOISE,
+                  "H-1: claim imzası doğrulanamadı — reddedildi (%.63s)",
+                  peer_onion);
+        if (state)
+            ui_print_error(state,
+                           "Peer kimlik doğrulaması başarısız — bağlantı reddedildi");
+        return NOX_ERR_CRYPTO;
+    }
+
+    /* H-1: OUTBOUND — dial hedefi ile claim birebir aynı OLMALI.
+     * Tor zaten dial edilen onion'un key'ini transport'ta doğruladı;
+     * burada sadece claim'in o hedefle tutarlılığını garantiliyoruz.
+     * Inbound'da connect_target boş → atlanır (imza yeterli). */
+    if (ps->connect_target[0] != '\0' &&
+        strcmp(peer_onion, ps->connect_target) != 0) {
+        NOX_ERROR(LOG_MOD_NOISE,
+                  "H-1: ONION MISMATCH (MITM) — dial=%.63s claim=%.63s",
+                  ps->connect_target, peer_onion);
+        if (state)
+            ui_print_error(state,
+                "BAĞLANTI REDDEDİLDİ: onion adresi uyuşmuyor (MITM riski)");
+        return NOX_ERR_STATE;
+    }
+
+    memcpy(out, peer_onion, sizeof(peer_onion));
+    return NOX_OK;
+}
+
+/* ================================================================
+ * H2/H3: RX PLAINTEXT TAMPONU
+ *
+ * Peer başına tek tampon. Sahibi peer_session'dır; serbest bırakma
+ * yalnızca action_cleanup'ta yapılır. TEXT ve FILE çözümü aynı
+ * tamponu kullanır. Kural: kullan → sıfırla → dispatch.
+ * ================================================================ */
+static uint8_t *peer_rx_pt(struct peer_session *ps) {
+  if (!ps->rx_pt_buf)
+    ps->rx_pt_buf = sodium_malloc(NOX_MAX_MSG_LEN + 1);
+  return ps->rx_pt_buf;
+}
+
+/* H2/H3: doğrulanamayan veya protokol dışı çerçeve = görünür kopma.
+ * Nonce invariantı nedeniyle devam etmek güvenli değildir; tek kurtarma
+ * yolu oturumu merkezi cleanup ile kapatmaktır. Çağıran, bu yardımcıdan
+ * sonra peer'e dokunmadan döngüden çıkmalıdır. */
+static void peer_proto_fatal(struct peer_session *ps, struct app_state *state,
+                             const char *reason) {
+  NOX_ERROR(LOG_MOD_NET, "PROTO_FATAL: %s (state=%s seq=%u)",
+            reason, sm_state_name(ps->state), ps->rx_seq);
+  ui_print_error(state,
+                 "Hata: Akran bağlantısında protokol ihlali algılandı (%s). "
+                 "Bağlantı kapatıldı.",
+                 reason);
+  (void)sm_dispatch(ps, state, EV_CRYPTO_FAIL);
+}
+
+/* ================================================================
  * FRAME PROCESSING — recv_buf'daki frame'leri işle
  *
  * Hem EPOLLIN handler'dan hem de epoll_wait öncesi drain'den
  * çağrılır. Bu sayede TOFU_PENDING sonrası bekleyen frame'ler
  * session kurulduktan sonra işlenebilir.
  * ================================================================ */
+
 // Real attack surface in practice: untrusted network (AF_UNIX, attacker-controlled wire)
 /* UNIT TEST ERİŞİMİ (test_event_frames): socketpair/buffer izolasyonuyla
  * frame dağıtım yolu — TEXT/SEQ/MAC/CTRL/FILE davranış kilitleri. */
@@ -114,14 +319,13 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
 
     struct frame_header fh;
     if (frame_header_decode(ps->recv_buf, &fh) != NOX_OK) {
-      ps->recv_pos = 0; /* bozuk header — buffer'ı sıfırla */
+      peer_proto_fatal(ps, state, "geçersiz frame başlığı");
       break;
     }
 
-    /* A-1 FIX: Boyut sınırı kontrolü */
-    if (fh.len == 0 || fh.len > 4096 + NOX_MAC_LEN) {
-      NOX_WARN(LOG_MOD_NET, "geçersiz frame boyutu: %u", fh.len);
-      ps->recv_pos = 0;
+    /* A-1 FIX + H3: sıfır/aşırı payload doğrulanamaz; sessiz resync yok. */
+    if (fh.len == 0 || fh.len > FRAME_MAX_PAYLOAD) {
+      peer_proto_fatal(ps, state, "geçersiz frame boyutu");
       break;
     }
 
@@ -141,6 +345,11 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
     }
 
     /* Frame tamamlandı — payload'ı ayıkla */
+    /* H2: header'ın ham 13 byte'ı AEAD'ye AD olarak girer. Kopya
+     * memmove'dan ÖNCE alınır — recv_buf kaydırılınca içerik değişir. */
+    uint8_t ad[FRAME_HEADER_WIRE_SIZE];
+    memcpy(ad, ps->recv_buf, sizeof(ad));
+
     uint8_t *payload = sodium_malloc(fh.len);
     if (!payload) {
       ps->recv_pos = 0;
@@ -153,6 +362,24 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
       memmove(ps->recv_buf, ps->recv_buf + frame_total, remaining);
     }
     ps->recv_pos = remaining;
+
+    /* B1: frame sınırı — kalan baytlar yeni frame'in başıdır. İkinci
+     * frame birincinin yaşını miras almaz; trickle deadline'ı sıfırdan
+     * başlar. (Kalan 0 ise yeni frame ilk recv()'de başlayacak.) */
+    if (remaining > 0) {
+      clock_gettime(CLOCK_MONOTONIC, &ps->frame_start);
+    }
+
+    /* K-14: handshake nesnesi tükendikten sonra (oturum kurulmuş) gelen
+     * CTRL frame'i tanımlı bir protokol mesajı değildir. Sessizce yutmak
+     * yerine fail-fast kapat; aksi halde peer rx_seq'i ilerletmeden
+     * bağlantıyı canlı tutabilir. Handshake nesnesi hâlâ dururken
+     * (msg_index >= 3) eski Y-2 davranışı korunur (test 13). */
+    if (fh.type == NOX_MSG_CTRL && !ps->hs) {
+      peer_proto_fatal(ps, state, "handshake dışı CTRL frame");
+      sodium_free(payload);
+      break;
+    }
 
     /* Y-2 FIX: Handshake tamamlanmış (msg_index >= 3) bir peer'ın ek CTRL
      * frame'leri handshake_read'e giderse NOX_ERR_STATE → EV_HANDSHAKE_ERROR
@@ -177,6 +404,24 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
       }
 
       uint8_t remote_pub[NOX_KEY_LEN];
+      char peer_onion[NOX_ONION_LEN + 1];
+      sodium_memzero(peer_onion, sizeof(peer_onion));
+      bool claim_verified = false;
+
+      /* Adım 13: initiator msg2'deki responder claim'ini KENDİ msg3'ünü
+       * yazmadan önce doğrular. Aksi halde aktif MITM, msg3'ü (initiator
+       * onion + static key claim'i) alıp sonra reddedilse bile kimlik
+       * sızdırırdı. Responder msg3'ü aşağıdaki ortak yolda doğrular. */
+      if (ps->hs->initiator && ps->hs->msg_index == 2) {
+        nox_err_t claim_err =
+            verify_peer_claim(ps, state, pl, pl_len, peer_onion);
+        if (claim_err != NOX_OK) {
+          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
+          sodium_free(payload);
+          break;
+        }
+        claim_verified = true;
+      }
 
       if (ps->hs->msg_index < 3) {
         uint8_t hsbuf[NOISE_MAX_HANDSHAKE_LEN];
@@ -231,63 +476,18 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
       }
 
       if (ps->hs->msg_index >= 3) {
-        char peer_onion[NOX_ONION_LEN + 1];
-        sodium_memzero(peer_onion, sizeof(peer_onion));
-
-        /* H-1/H-2 HARD CUT: yalnızca v1 [ver|onion(62)|sig(64)] = 127B.
-         * Legacy (56+NUL / 63B) payload'ın HİÇBİR kod yolu yok — beta
-         * kararı: eski peer temiz disconnect alır. */
-        if (pl_len == NOX_HS_PAYLOAD_V1_LEN &&
-            pl[0] == NOX_HS_PAYLOAD_V1_VER) {
-          memcpy(peer_onion, pl + 1, NOX_ONION_LEN);
-          peer_onion[NOX_ONION_LEN] = '\0';
-        } else {
-          NOX_ERROR(LOG_MOD_NOISE,
-                    "Handshake payload geçersiz veya desteklenmeyen sürüm "
-                    "(len=%zu, beklenen %u)", pl_len, NOX_HS_PAYLOAD_V1_LEN);
-          ui_print_error(state, "Akran geçerli bir adres iletmedi (sürüm uyuşmuyor)");
-          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
-          sodium_free(payload);
-          continue;
-        }
-
-        /* Terminal injection koruması — base32 charset dışı karakter engeli */
-        if (!validate_onion_address(peer_onion)) {
-          NOX_ERROR(LOG_MOD_NOISE, "Geçersiz onion adresi formatı (injection?)");
-          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
-          sodium_free(payload);
-          continue;
-        }
-
-        /* H-1: claim ↔ onion ↔ static key imza doğrulaması.
-         * pubkey onion ADRESİNDEN çıkarılır (checksum dahil, H-2);
-         * imza peer'ın hs->rs statik anahtarı üzerinden verify edilir.
-         * Başarısız → impersonation/MITM reddi, peer'a sıfır bilgi. */
-        if (crypto_onion_verify(pl + 1 + NOX_ONION_LEN, peer_onion,
-                                ps->hs->rs) != NOX_OK) {
-          NOX_ERROR(LOG_MOD_NOISE,
-                    "H-1: claim imzası doğrulanamadı — reddedildi (%.63s)",
-                    peer_onion);
-          ui_print_error(state, "Peer kimlik doğrulaması başarısız — bağlantı reddedildi");
-          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
-          sodium_free(payload);
-          continue;
-        }
-
-        /* H-1: OUTBOUND — dial hedefi ile claim birebir aynı OLMALI.
-         * Tor zaten dial edilen onion'un key'ini transport'ta doğruladı;
-         * burada sadece claim'in o hedefle tutarlılığını garantiliyoruz.
-         * Inbound'da connect_target boş → atlanır (imza yeterli). */
-        if (ps->connect_target[0] != '\0' &&
-            strcmp(peer_onion, ps->connect_target) != 0) {
-          NOX_ERROR(LOG_MOD_NOISE,
-                    "H-1: ONION MISMATCH (MITM) — dial=%.63s claim=%.63s",
-                    ps->connect_target, peer_onion);
-          ui_print_error(state,
-              "BAĞLANTI REDDEDİLDİ: onion adresi uyuşmuyor (MITM riski)");
-          sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
-          sodium_free(payload);
-          continue;
+        /* Initiator yolu yukarıda doğruladı; responder yolu msg3'ü
+         * okuduktan sonra burada doğrular. Doğrulanmış adres TOFU ve
+         * session kurulumunda yeniden verify edilmez. */
+        if (!claim_verified) {
+          nox_err_t claim_err =
+              verify_peer_claim(ps, state, pl, pl_len, peer_onion);
+          if (claim_err != NOX_OK) {
+            sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
+            sodium_free(payload);
+            break;
+          }
+          claim_verified = true;
         }
 
         char name[NOX_CONTACT_NAME_LEN + 1];
@@ -299,6 +499,9 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
         if (!state->ghost_mode) {
           db_err = db_get_contact(peer_onion, name, sizeof(name), stored_key);
         }
+        /* K-33: DB'den gelen isim eski/saldırgan kontrollü olabilir;
+         * TOFU prompt'u ham fprintf ile basıldığı için burada sanitize et. */
+        ui_strip_ansi(name);
         memcpy(remote_pub, ps->hs->rs, NOX_KEY_LEN);
 
         char fp_str[NOX_KEY_LEN * 2 + 1];
@@ -320,6 +523,10 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
           if (sodium_memcmp(stored_key, remote_pub, NOX_KEY_LEN) == 0) {
             ps->session = sodium_malloc(sizeof(struct noise_session));
             if (ps->session) {
+              /* sodium_malloc 0xdb doldurur; hardbool(0)'da 0xdb trap,
+               * fallback bool'da true olur. Deterministik zero-init
+               * (handshake_split de sıfırlar). */
+              sodium_memzero(ps->session, sizeof(*ps->session));
               if (handshake_split(ps->hs, ps->session) != NOX_OK) {
                 ui_print_error(state, "session split başarısız");
                 sm_dispatch(ps, state, EV_HANDSHAKE_ERROR);
@@ -331,6 +538,8 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
               ps->tx_seq = 0;
               ps->rx_seq = 0;
               ps->queue_flushed = false;
+              frame_queue_reset(ps);
+              ps->db_retry_pending = false;
               ps->peer_verified = true; /* H-1 FIX: doğrulanmış peer — kuyruk flush serbest */
               ps->tofu_was_zero_key = false;
               clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
@@ -344,8 +553,8 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
                * desen: session hazır olunca onion'u peer slotuna yaz. */
               snprintf(ps->peer_onion, sizeof(ps->peer_onion), "%s", peer_onion);
 
-              strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
-              state->active_peer_onion[NOX_ONION_LEN] = '\0';
+              /* K-23: aktif peer indeksi + gösterim atomik güncellenir. */
+              sm_set_active_peer(state, ps);
 
               NOX_INFO(LOG_MOD_NOISE,
                        "session kuruldu — mesajlaşma hazır");
@@ -367,6 +576,7 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
             ps->tofu_onion[NOX_ONION_LEN] = '\0';
             strncpy(ps->tofu_name, name, NOX_CONTACT_NAME_LEN);
             ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+            ui_strip_ansi(ps->tofu_name);
             memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
             /* Atomic ANSI: cursor hide → clear → print warning → prompt */
             if (tui_is_active()) {
@@ -414,6 +624,7 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
            ps->tofu_onion[NOX_ONION_LEN] = '\0';
            strncpy(ps->tofu_name, default_name, NOX_CONTACT_NAME_LEN);
            ps->tofu_name[NOX_CONTACT_NAME_LEN] = '\0';
+           ui_strip_ansi(ps->tofu_name);
            memcpy(ps->tofu_new_key, remote_pub, NOX_KEY_LEN);
            if (tui_is_active()) {
              ui_print_system(state, "[!] TOFU: Yeni peer bağlantısı");
@@ -461,69 +672,114 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
       sodium_memzero(remote_pub, NOX_KEY_LEN);
     } else if ((fh.type == NOX_MSG_TEXT || fh.type == NOX_MSG_FILE) &&
                ps->session) {
-      /* Sequence Number Doğrulaması (Y1) */
-      if (fh.seq != ps->rx_seq) {
-        NOX_WARN(LOG_MOD_NET,
-                 "SEQ_MISMATCH: frame type=%u seq=%u beklenen=%u "
-                 "tx_seq=%u recv_pos=%zu",
-                 fh.type, fh.seq, ps->rx_seq,
-                 ps->tx_seq, ps->recv_pos);
-        ui_print_error(state,
-                       "Hata: Akran bağlantısında geçersiz sıra numarası "
-                       "algılandı (Replay Attack veya paket kaybı)!");
-        sm_dispatch(ps, state, EV_SEQ_MISMATCH);
+      /* H2/P0 defense-in-depth: handshake_split öncesi/yarım session'da
+       * rx.has_key yoktur; transport decrypt'e hiç girmeden kapat. */
+      if (!ps->session->rx.has_key) {
+        peer_proto_fatal(ps, state, "transport anahtarı yok");
         sodium_free(payload);
         break;
       }
 
-      if (fh.type == NOX_MSG_TEXT) {
-        /* A-1 FIX: sodium_malloc ile swap koruması */
-        size_t max_pt = fh.len; /* MAC çıkarılmadan üst sınır */
-        uint8_t *pt = sodium_malloc(max_pt + 1);
-        if (pt) {
-          ssize_t pt_len =
-              noise_decrypt(ps->session, payload, fh.len, pt);
-          /* A-1 FIX: pt_len overflow kontrolü */
-          if (pt_len > 0 && (size_t)pt_len <= max_pt) {
-            pt[pt_len] = '\0';
-            ui_print_incoming(state, (const char *)pt);
+      /* H3: peer'ın tek RX tamponuna çözülür (sodium_malloc ile swap
+       * koruması); serbest bırakma action_cleanup'a aittir. */
+      uint8_t *pt = peer_rx_pt(ps);
+      if (!pt) {
+        peer_proto_fatal(ps, state, "RX plaintext tamponu ayrılamadı");
+        sodium_free(payload);
+        break;
+      }
 
-            /* BUG-1 FIX: İlk mesaj alındı → kuyruğu gönder
-             * H-1 FIX: kuyruk sızıntısı — eğer session TOFU ile kurulduysa
-             * (peer_verified==false) ve özellikle zero_key placeholder ise,
-             * kuyruktaki mesajlar doğrulanmamış anahtara gidecek. Bu durumda
-             * otomatik flush YAPILMAZ — kullanıcıya uyarı basılır ve bir sonraki
-             * doğrulanmış SESSION_READY bağlantısında flush edilir. */
-            if (!ps->queue_flushed && !state->ghost_mode) {
-              if (!ps->peer_verified) {
-                if (ps->tofu_was_zero_key) {
-                  NOX_WARN(LOG_MOD_DB,
-                    "H-1: zero_key TOFU peer için kuyruk flush atlandı — anahtar ilk kez bağlandı, kuyruk bir sonraki doğrulanmış oturumda gönderilecek");
-                  ui_print_system(state, "[!] Kuyruktaki mesajlar bu ilk TOFU onayı için GÖNDERİLMEDİ (güvenlik). Bir sonraki doğrulanmış bağlantıda iletilecek.");
-                } else {
-                  NOX_WARN(LOG_MOD_DB,
-                    "TOFU ile kurulmuş oturum için kuyruk flush atlandı — doğrulanmamış anahtar");
-                  ui_print_system(state, "[!] Kuyruktaki mesajlar doğrulanmamış peer için bekletiliyor.");
-                }
-                ps->queue_flushed = true; /* tekrar denememek için işaretle, ama gönderme */
-              } else {
-                ps->queue_flushed = true;
-                struct queue_flush_ctx qctx = { .state = state, .ps = ps };
-                db_process_queue(ps->peer_onion,
-                                 send_queued_callback, &qctx);
-              }
+      ssize_t pt_len =
+          noise_decrypt(ps->session, ad, sizeof(ad), payload, fh.len, pt);
+      if (pt_len < 0) {
+        sodium_memzero(pt, NOX_MAX_MSG_LEN + 1);
+        peer_proto_fatal(ps, state, "AEAD doğrulaması başarısız");
+        sodium_free(payload);
+        break;
+      }
+
+      /* Savunmalı sanity: AD artık seq'i kimlikler; yine de decrypt
+       * sonrası beklenen sayaçla eşleşmeyen frame kabul edilmez. */
+      if ((uint32_t)fh.seq != ps->rx_seq) {
+        sodium_memzero(pt, NOX_MAX_MSG_LEN + 1);
+        peer_proto_fatal(ps, state, "doğrulanmış seq beklenenle uyuşmuyor");
+        sodium_free(payload);
+        break;
+      }
+
+      /* Başarılı decrypt = koşulsuz tüket (boş pt dahil). Bu, AEAD
+       * nonce'u ile AD seq'inin ayrışmasını önler; UI/empty kararından
+       * ÖNCE yapılır. */
+      ps->rx_seq++;
+
+      if (pt_len == 0) {
+        sodium_memzero(pt, NOX_MAX_MSG_LEN + 1);
+        peer_proto_fatal(ps, state, "boş TEXT/FILE payload");
+        sodium_free(payload);
+        break;
+      }
+      if ((size_t)pt_len > NOX_MAX_MSG_LEN) {
+        sodium_memzero(pt, NOX_MAX_MSG_LEN + 1);
+        peer_proto_fatal(ps, state, "plaintext boyutu sınırı aşıyor");
+        sodium_free(payload);
+        break;
+      }
+
+      size_t pt_used = (size_t)pt_len;
+      /* Yalnız non-empty geçerli payload yaşam belirtisidir; boş/fail
+       * yolları yukarıda cleanup'a gider. */
+      clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+
+      if (fh.type == NOX_MSG_TEXT) {
+        pt[pt_used] = '\0';
+        ui_print_incoming(state, (const char *)pt);
+
+        /* H3: kullan → sıfırla → dispatch. Kuyruk flush callback'i
+         * writev hatasında EV_PEER_DISCONNECTED dispatch eder ve
+         * action_cleanup tamponu serbest bırakır; metin kopyalandı. */
+        sodium_memzero(pt, NOX_MAX_MSG_LEN + 1);
+
+        /* BUG-1 FIX: İlk mesaj alındı → kuyruğu gönder
+         * H-1 FIX: kuyruk sızıntısı — eğer session TOFU ile kurulduysa
+         * (peer_verified==false) ve özellikle zero_key placeholder ise,
+         * kuyruktaki mesajlar doğrulanmamış anahtara gidecek. Bu durumda
+         * otomatik flush YAPILMAZ — kullanıcıya uyarı basılır ve bir sonraki
+         * doğrulanmış SESSION_READY bağlantısında flush edilir. */
+        if (!ps->queue_flushed && !state->ghost_mode) {
+          if (!ps->peer_verified) {
+            if (ps->tofu_was_zero_key) {
+              NOX_WARN(LOG_MOD_DB,
+                "H-1: zero_key TOFU peer için kuyruk flush atlandı — anahtar ilk kez bağlandı, kuyruk bir sonraki doğrulanmış oturumda gönderilecek");
+              ui_print_system(state, "[!] Kuyruktaki mesajlar bu ilk TOFU onayı için GÖNDERİLMEDİ (güvenlik). Bir sonraki doğrulanmış bağlantıda iletilecek.");
+            } else {
+              NOX_WARN(LOG_MOD_DB,
+                "TOFU ile kurulmuş oturum için kuyruk flush atlandı — doğrulanmamış anahtar");
+              ui_print_system(state, "[!] Kuyruktaki mesajlar doğrulanmamış peer için bekletiliyor.");
             }
-            /* EVT-1 FIX: rx_seq++ only after successful decryption */
-            ps->rx_seq++;
-            clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+            ps->queue_flushed = true; /* tekrar denememek için işaretle, ama gönderme */
+          } else {
+            ps->queue_flushed = true;
+            struct queue_flush_ctx qctx = { .state = state, .ps = ps };
+            db_process_queue(ps->peer_onion,
+                             send_queued_callback, &qctx);
           }
-          sodium_free(pt); /* otomatik sıfırlar */
         }
-      } else if (fh.type == NOX_MSG_FILE) {
-        /* EVT-1 FIX: rx_seq++ only if file processing succeeded */
-        if (file_transfer_handle_rx(state, ps, payload, fh.len)) {
-          ps->rx_seq++;
-          clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+      } else {
+        /* H3: plaintext'i event_loop çözer; handle_rx yalnız tüketir.
+         * pt_len==0 yukarıda empty-payload fatal olarak yakalandı; 0'ı
+         * "decrypt fail" diye handle_rx'e geçirme. */
+        nox_hardbool_t handled = file_transfer_handle_rx(
+            state, ps, pt, (uint32_t)pt_used);
+
+        /* Kullan → sıfırla → dispatch: handle_rx içindeki dispatch'ler
+         * tamponu serbest bırakabilir; cleanup NULL'lamışsa no-op. */
+        if (ps->rx_pt_buf)
+          sodium_memzero(ps->rx_pt_buf, NOX_MAX_MSG_LEN + 1);
+
+        if (!handled) {
+          peer_proto_fatal(ps, state, "FILE payload işlenemedi");
+          sodium_free(payload);
+          break;
         }
       }
     }
@@ -533,6 +789,150 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
 
   } /* while frame processing loop */
 }
+
+#ifndef NOX_NO_LANDLOCK
+
+static const struct nox_ll_gate_ops g_default_ll_gate_ops = {
+  .abi_version = landlock_abi_version,
+  .open_socks = landlock_open_unix_socket_fd,
+  .sandbox_init = landlock_sandbox_init,
+  .is_active = landlock_is_active,
+  .close_fd = close,
+};
+
+/* F5: Landlock ön-kontrol kapısı. Üretimde ops == NULL; testlerde
+ * fake ops enjekte edilir. false dönerse state->running=false yapılmıştır
+ * ve event_loop return etmelidir. Karar/mesaj sırası F5 öncesiyle
+ * birebir aynıdır. */
+bool event_loop_landlock_gate(struct app_state *state,
+                              const struct nox_ll_gate_ops *ops) {
+  if (!ops)
+    ops = &g_default_ll_gate_ops;
+
+  bool fds_ok = state->config_dir_fd >= 0 &&
+                state->downloads_dir_fd >= 0;
+
+  /* F3: tor_data fd zorunlu — dar silme kuralının anchor'ı yoksa
+   * sandbox eksik kurulur; sessizce devam etme. */
+  if (state->tor_data_fd < 0) {
+    NOX_FATAL(LOG_MOD_MAIN,
+              "landlock: tor_data fd yok (torrc üretimi başarısız?)");
+    ui_print_error(state,
+        "Tor veri dizini doğrulanamadı; dosya sistemi sandbox'ı "
+        "kurulamıyor. Uygulama kapatılıyor.");
+    state->running = false;
+    return false;
+  }
+
+  nox_err_t ll_err = NOX_ERR_CONFIG;
+  int ll_abi = -1;
+  int socks_fd = -1;
+
+  if (fds_ok) {
+    ll_abi = ops->abi_version();
+
+    /* F1: opsiyonel strict politika — ABI < 9'da sandbox'ın eksik
+     * kalmasını kabul etme. Varsayılan politika görünür uyarıdır. */
+    if (state->require_landlock_resolve_unix && ll_abi < 9) {
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock: RESOLVE_UNIX için ABI >= 9 gerekli (abi=%d)",
+                ll_abi);
+      ui_print_error(state,
+          "Landlock ABI >= 9 (Linux 7.1+) gerekli: "
+          "--require-landlock-resolve-unix ile çıkılıyor.");
+      state->running = false;
+      return false;
+    }
+
+    if (ll_abi >= 9) {
+      /* Tor Landlock'tan önce spawn edildi; socks.sock domain dışında.
+       * Yalnız bu inode'a dosya düzeyinde istisna tanınacak. fd'yi
+       * path'e geri dönmeden doğrula ve init'e anchor olarak ver. */
+      socks_fd = ops->open_socks(state->socks_path);
+      if (socks_fd < 0) {
+        NOX_ERROR(LOG_MOD_MAIN,
+                  "landlock: socks.sock açılamadı/doğrulanamadı (%s)",
+                  strerror(errno));
+        ui_print_error(state,
+            "Tor SOCKS soketi doğrulanamadı; güvenli bağlantı kurulamaz. "
+            "Uygulama kapatılıyor.");
+        state->running = false;
+        return false;
+      }
+    } else if (ll_abi >= 1) {
+      NOX_WARN(LOG_MOD_MAIN,
+               "landlock: ABI v%d < 9 — pathname Unix connect kısıtlanmıyor "
+               "(F1 açık)", ll_abi);
+      ui_print_error(state,
+          "⚠ Landlock ABI < 9: pathname Unix soket bağlantıları "
+          "kısıtlanamıyor (F1 açık). Tam koruma için Linux 7.1+ gerekir.");
+    }
+
+    ll_err = ops->sandbox_init(state->config_dir_fd,
+                               state->downloads_dir_fd,
+                               state->tor_data_fd,
+                               socks_fd);
+    if (socks_fd >= 0) {
+      ops->close_fd(socks_fd);
+    }
+  } else {
+    NOX_FATAL(LOG_MOD_MAIN,
+              "landlock: config/downloads fd yok (config=%d, downloads=%d)",
+              state->config_dir_fd, state->downloads_dir_fd);
+    ui_print_error(state,
+        "Yapılandırma/indirme dizini doğrulanamadı; dosya sistemi "
+        "sandbox'ı kurulamıyor. Uygulama kapatılıyor.");
+  }
+
+  /* F5: fail-closed karar matrisi — eksik fd, NOX_OK+!active ve
+   * unsupported+onaysız yolların hepsi abort eder. Bayrak yalnız
+   * NOX_ERR_LANDLOCK_UNSUPPORTED için bypass sağlar. */
+  nox_ll_fs_policy_t policy =
+      landlock_fs_policy_decide(fds_ok, ll_err,
+                                ops->is_active(),
+                                state->allow_unsandboxed_fs);
+
+  if (policy == NOX_LL_FS_RUN_UNSANDBOXED) {
+    /* Kullanıcı bilerek onayladıysa: devam et ama görünür şekilde uyar —
+     * sadece log'a değil, TUI/terminal ekranına da. */
+    NOX_WARN(LOG_MOD_MAIN,
+             "landlock devre dışı — KULLANICI ONAYIYLA sandbox'sız çalışılıyor");
+    ui_print_error(state, "Dosya sistemi sandbox'ı KAPALI "
+                          "(--allow-unsandboxed-fs ile onaylandı).");
+  } else if (policy == NOX_LL_FS_ABORT) {
+    if (!fds_ok) {
+      /* Mesaj yukarıdaki eksik-fd dalında basıldı. */
+      state->running = false;
+      return false;
+    }
+    if (ll_err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
+      /* C-2 FIX: varsayılan fail-closed — seccomp ile simetrik.
+       * Sandbox'sız çalışmak açık bayrak gerektiren bilinçli bir tercih. */
+      ui_print_error(state,
+          "Bu çekirdek Landlock desteklemiyor (Linux 5.13+ gerekli). "
+          "Dosya sistemi sandbox'ı olmadan çalışmak engellendi. "
+          "Bilinçli olarak devam etmek için --allow-unsandboxed-fs kullanın.");
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock kurulamadı — kullanıcı onayı yok, çıkılıyor");
+    } else if (ll_err == NOX_OK) {
+      /* Init başarılı dedi ama aktiflik doğrulanamıyor: invariant
+       * ihlali — uyarıyla devam etme, fail-closed. */
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock: init OK ama sandbox aktif DEĞİL — fail-closed");
+      ui_print_error(state,
+          "Dosya sistemi sandbox'ı AKTİF DEĞİL. Uygulama kapatılıyor.");
+    } else {
+      NOX_ERROR(LOG_MOD_MAIN, "landlock: yapılandırma hatası");
+      ui_print_error(state, "Sandbox yapılandırma hatası.");
+    }
+    state->running = false;
+    return false;
+  }
+
+  return true;
+}
+
+#endif /* !NOX_NO_LANDLOCK */
 
 /* ================================================================
  * EVENT LOOP — epoll tabanlı async I/O
@@ -544,59 +944,46 @@ void event_loop(struct app_state *state) {
 
   /* ── Landlock sandbox — open/openat/creat'i kısıtla ──────────────
    * Landlock ÖNCE yüklenmeli (seccomp'tan önce).
-   * Sadece downloads dizini okunabilir/yazılabilir.
+   * Sadece downloads dizini okunabilir/yazılabilir; ABI >= 9'da
+   * pathname Unix connect'ler de kısıtlanır (F1).
    * Kernel 5.13+ gerektirir, desteklemiyorsa hata döner.
-   * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez. */
-  if (state->config_dir_fd >= 0 && state->downloads_dir_fd >= 0) {
-    nox_err_t ll_err = landlock_sandbox_init(state->config_dir_fd,
-                                             state->downloads_dir_fd);
-
-    if (ll_err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
-      if (!state->allow_unsandboxed_fs) {
-        /* C-2 FIX: varsayılan fail-closed — seccomp ile simetrik.
-         * Sandbox'sız çalışmak açık bayrak gerektiren bilinçli bir tercih. */
-        ui_print_error(state,
-            "Bu çekirdek Landlock desteklemiyor (Linux 5.13+ gerekli). "
-            "Dosya sistemi sandbox'ı olmadan çalışmak engellendi. "
-            "Bilinçli olarak devam etmek için --allow-unsandboxed-fs kullanın.");
-        NOX_FATAL(LOG_MOD_MAIN,
-                  "landlock kurulamadı — kullanıcı onayı yok, çıkılıyor");
-        state->running = false;
-        return;
-      }
-      /* Kullanıcı bilerek onayladıysa: devam et ama görünür şekilde uyar —
-       * sadece log'a değil, TUI/terminal ekranına da. */
-      NOX_WARN(LOG_MOD_MAIN,
-               "landlock devre dışı — KULLANICI ONAYIYLA sandbox'sız çalışılıyor");
-      ui_print_error(state, "Dosya sistemi sandbox'ı KAPALI "
-                            "(--allow-unsandboxed-fs ile onaylandı).");
-    } else if (ll_err != NOX_OK) {
-      NOX_ERROR(LOG_MOD_MAIN, "landlock: yapılandırma hatası");
-      ui_print_error(state, "Sandbox yapılandırma hatası.");
-      state->running = false;
-      return;
-    }
-
-    /* C-2 FIX: landlock_is_active() artık ölü kod değil — sandbox
-     * gerçekten uygulanmadıysa (herhangi bir nedenle) görünür uyarı. */
-    if (!landlock_is_active()) {
-      NOX_WARN(LOG_MOD_MAIN, "landlock: sandbox aktif DEĞİL — dosya erişimi kısıtsız");
-      ui_print_error(state, "⚠ Dosya sistemi sandbox'ı AKTİF DEĞİL.");
-    }
+   * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez.
+   *
+   * Android/arm64 build'inde (NOX_PLATFORM_ANDROID → NOX_NO_LANDLOCK)
+   * Landlock yoktur; Android SELinux dosya kısıtları kullanılır. */
+#ifdef NOX_NO_LANDLOCK
+  NOX_INFO(LOG_MOD_MAIN,
+           "android: Landlock yok — SELinux dosya kısıtları kullanılıyor; "
+           "Landlock sandbox'ı atlandı");
+#else
+  if (!event_loop_landlock_gate(state, NULL)) {
+    return;
   }
+#endif
 
   /* ── Stage 3: Sıfır ağ sızıntısı garantisi ────────────────────
    * Tüm mevcut bağlantılar AF_UNIX (Tor control, SOCKS, peer).
    * Event loop tek thread — clone tamamen yasak.
    * TCP/UDP/NETLINK socket oluşturulamaz.
    * open/openat/creat seccomp tarafından engellenmez —
-   * Landlock path-based filtering sağlar (yoksa openat serbest). */
+   * Landlock path-based filtering sağlar (yoksa openat serbest).
+   *
+   * Android/arm64 build'inde (NOX_PLATFORM_ANDROID → NO_SECCOMP)
+   * uygulama seccomp politikası yüklenmez; Android kernel/zygote
+   * seccomp'u + SELinux kullanılır. Normal x86 build'inde bu dal
+   * derlenmez. */
+#ifdef NOX_PLATFORM_ANDROID
+  NOX_INFO(LOG_MOD_MAIN,
+           "android: seccomp stage 3 atlandı — Android kernel/zygote "
+           "seccomp'u kullanılıyor");
+#else
   if (seccomp_policy_load(3) != NOX_OK) {
     NOX_ERROR(LOG_MOD_MAIN, "seccomp stage 3 yüklenemedi");
     ui_print_error(state, "Güvenlik politikası yüklenemedi.");
     state->running = false;
     return;
   }
+#endif
 
   /* ── Hoşgeldiniz + Komutlar — stage 3 sonrası ────────────────
    * Hem TUI hem terminal modunda hoşgeldiniz ve komut listesi basılır.
@@ -743,10 +1130,16 @@ void event_loop(struct app_state *state) {
           NOX_WARN(LOG_MOD_NET, "Peer idle timeout (%lds) — slot %u disconnect", idle, pi);
           ui_print_error(state, "Bağlantı zaman aşımı — peer sessiz (idle).");
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
-        } else if (ps->recv_pos > 0 && idle > NOX_HALFFRAME_TIMEOUT_SEC &&
-                   ps->recv_pos < RECV_BUF_CAPACITY) {
-          /* Yarım frame beklemesi — M-2 ikinci yarısı */
-          NOX_WARN(LOG_MOD_NET, "Yarım frame timeout (%lds, recv_pos=%zu) — disconnect", idle, ps->recv_pos);
+        } else if (ps->recv_pos > 0 &&
+                   frame_trickle_expired(&ps->frame_start, &now,
+                                         NOX_HALFFRAME_TIMEOUT_SEC)) {
+          /* B1: yarım frame trickle — last_active taze olsa bile frame
+           * 60 sn'den uzun süredir tamamlanmadıysa slotu bırak. */
+          long frame_age = (long)(now.tv_sec - ps->frame_start.tv_sec);
+          NOX_WARN(LOG_MOD_NET,
+                   "Yarım frame trickle timeout (%lds, recv_pos=%zu) — disconnect",
+                   frame_age, ps->recv_pos);
+          ui_print_error(state, "Bağlantı zaman aşımı — frame tamamlanmadı.");
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         }
       }
@@ -759,8 +1152,12 @@ void event_loop(struct app_state *state) {
      * Her ikisi de sm_dispatch(EV_TOR_DIED) ile state machine'i
      * tetikler → her state ST_IDLE'a düşer, temizlik yapılır. */
     {
-      static time_t last_tor_check = 0;
-      time_t now = time(NULL);
+      /* 6.1 FIX: duvar saati değil CLOCK_MONOTONIC (M-12 kalıbı) —
+       * sistem saati geriye alınırsa (NTP/sync) yedek kontrol gecikmez;
+       * kill(pid,0) yedeği de birincil SIGCHLD gibi monotonik zemine oturur. */
+      static struct timespec last_tor_check = {0, 0};
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
       bool tor_dead = false;
 
       /* SIGCHLD flag kontrolü — en hızlı yol */
@@ -769,7 +1166,8 @@ void event_loop(struct app_state *state) {
         tor_dead = true;
       }
       /* Periyodik kill(pid, 0) — SIGCHLD yedek */
-      else if (state->tor_pid > 0 && (now - last_tor_check >= 5)) {
+      else if (state->tor_pid > 0 &&
+               (now.tv_sec - last_tor_check.tv_sec >= 5)) {
         last_tor_check = now;
         int kres = kill(state->tor_pid, 0);
         int kerr = errno; /* K-2 FIX: errno'yu hemen değişkene al —
@@ -846,6 +1244,19 @@ void event_loop(struct app_state *state) {
         }
       }
       if (has_frames) ui_line_resume(state);
+    }
+
+    /* ── C1/C2: TX işlerini EPOLLOUT'a bağımlı olmadan sürdür ──
+     * epoll_wait 2 sn timeout'lu; kuyruk/transfer/db_retry kaldığında bile
+     * iş asılı kalmaz. Kalıcı DB/alloc hatası busy-loop üretmez: deneme
+     * en erken bir sonraki turda yapılır. */
+    for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
+      struct peer_session *ps = &state->peers[pi];
+      if (ps->session && ps->fd >= 0 &&
+          (!frame_queue_empty(ps) || ps->tx_file.active ||
+           ps->db_retry_pending)) {
+        (void)handle_peer_tx_ready(state, ps);
+      }
     }
 
     int nfds = epoll_wait(state->epoll_fd, events,
@@ -953,15 +1364,12 @@ void event_loop(struct app_state *state) {
           /* State geçişi: IDLE → HANDSHAKE_RESP */
           sm_dispatch(listener_ps, state, EV_PEER_ACCEPTED);
 
-          /* Aktif peer olarak ata — eğer başka aktif peer yoksa */
-          if (state->active_peer_idx < 0) {
-            for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
-              if (&state->peers[pi] == listener_ps) {
-                state->active_peer_idx = (int)pi;
-                break;
-              }
-            }
-          }
+          /* K-23: aktif peer olarak ata — eğer başka aktif peer yoksa.
+           * İndeks + gösterim tek atomik setter'dan güncellenir; bu
+           * noktada peer_onion henüz boş olabilir, oturum kurulunca
+           * aynı setter gerçek onion ile yeniden çağrılır. */
+          if (state->active_peer_idx < 0)
+            sm_set_active_peer(state, listener_ps);
 
           NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi (slot %lu, toplam %d)",
                    (unsigned long)(listener_ps - state->peers),
@@ -978,11 +1386,8 @@ void event_loop(struct app_state *state) {
 
       /* Peer'a Veri Gönderimi (EPOLLOUT) */
       if (events[i].events & EPOLLOUT) {
-        if (ps->tx_file.active) {
-          file_transfer_handle_tx(state, ps);
-        } else {
-          epoll_modify_fd(state->epoll_fd, fd, EPOLLIN);
-        }
+        if (!handle_peer_tx_ready(state, ps))
+          continue;
       }
 
       /* Peer'dan Veri Alımı (EPOLLIN) */
@@ -993,11 +1398,15 @@ void event_loop(struct app_state *state) {
         size_t to_read = (space > (size_t)avail && avail > 0) ? (size_t)avail : space;
         if (to_read == 0) {
           /* Buffer dolu — önce tamamlanmış frame'leri processing et */
+          size_t pos_before = ps->recv_pos;
           ui_line_suspend(state);
           process_peer_frames(ps, state, fd);
           ui_line_resume(state);
-          /* Hâlâ doluysa peer tıkanmış (DoS veya kapanma) — disconnect */
-          if (ps->fd >= 0) {
+          /* K-10: drain ilerleme sağladıysa (recv_pos azaldıysa) tampon
+           * artık dolu değildir; koşulsuz koparma. Yalnız hâlâ dolu ve
+           * ilerleme yoksa peer gerçekten tıkanmıştır. */
+          if (ps->fd >= 0 && peer_recv_buf_full(ps) &&
+              ps->recv_pos == pos_before) {
             NOX_WARN(LOG_MOD_NET, "recv_buf dolu — peer tıkanmış, disconnect");
             sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
           }
@@ -1020,7 +1429,13 @@ void event_loop(struct app_state *state) {
           sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
           continue;
         }
+        bool new_frame = (ps->recv_pos == 0);
         ps->recv_pos += (size_t)r;
+        if (new_frame) {
+          /* B1: yeni frame'in ilk baytı — trickle saatini başlat.
+           * recv_pos>0 iken gelen ek baytlar saati tazelemez. */
+          clock_gettime(CLOCK_MONOTONIC, &ps->frame_start);
+        }
         clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
 
         ui_line_suspend(state);

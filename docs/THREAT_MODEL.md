@@ -35,7 +35,7 @@ If an assumption is false, the corresponding mitigation claim is void.
 |---|---|---|
 | A1 | **PIN entropy is user-responsible.** `crypto.c:180` derives `master_key` via Argon2id (`OPSLIMIT_MODERATE`/`MEMLIMIT_MODERATE`, 16-byte salt) — this slows brute-force but does **not** make a weak PIN strong. A 6-digit PIN (~20 bits) is crackable offline if `contacts.db` + salt file are seized; a 4-word diceware passphrase (~50 bits) or 12+ char mixed passphrase is the intended baseline. Weak PIN is a **user-risk, not a code bug** — document it as such and guide users accordingly (see guidance stub below). `[TODO: maintainer — confirm minimum PIN policy / warning UX on weak PIN]` | Seized DB decryptable offline; onion identity derivable (same `master_key` → `NOX_SUBKEY_ONION_SEED`). |
 | A2 | **libsodium, libsqlite3, libseccomp, Tor behave as documented.** No formal verification of these dependencies; supply-chain compromise is out-of-model except as noted in §4.5. | All crypto/DB/sandbox claims collapse. |
-| A3 | **Kernel ≥5.15 enforces seccomp-bpf + Landlock as implemented in `seccomp.c`/`landlock_sandbox.c`.** Older kernels fall back to degraded/no sandbox (§5.4). | Post-exploit blast radius larger (§10 in `architecture.md`). |
+| A3 | **Kernel ≥5.15 enforces seccomp-bpf + Landlock as implemented in `seccomp.c`/`landlock_sandbox.c` on the default Linux/x86 build.** The Android/arm64 build (`make android release`) deliberately omits both and relies on Android kernel/zygote seccomp + SELinux (§5.4); it keeps the same compiler/linker release hardening as the Linux build. F1 (pathname Unix `connect` restriction) additionally requires Landlock ABI 9 / Linux 7.1+; ABI 1-8 gets filesystem confinement only. F3 confines the config tree to `READ_FILE\|READ_DIR` and restricts deletion to the per-instance `tor_data_<pid>` directory (which also holds `torrc`). F5 aborts on missing fds, inactive sandbox, and config errors. Older kernels fall back to degraded/no sandbox (§5.4). | Post-exploit blast radius larger; on ABI 1-8 the sandbox can still reach pathname Unix services (D-Bus, ssh-agent, gpg-agent, docker.sock); on Android the app-level Landlock guarantee is absent. |
 | A4 | **Tor provides anonymity; Noxtor adds no extra padding/cover traffic.** Message size/timing at Noxtor layer is visible to the guard as Tor cell volume/timing (§4.4). | Metadata minimization (§2) is aspirational until padding is added. |
 | A5 | **Device is clean at launch.** No pre-existing implant reading `argv`/env/PIN keystrokes, and `main.c:141` early-constructor hardening (`PR_SET_DUMPABLE`, `RLIMIT_CORE`, seccomp stage 1) runs before attacker-controlled code in the same process. A tiny `execve → constructor` window remains — treated as residual, not in-scope. `[TODO: verify constructor ordering vs. `LD_PRELOAD` / early ptrace]` | PIN/keystroke exfiltration before hardening. |
 | A6 | **Secure arena (`arena.c`) is mlock'd / `MADV_DONTDUMP` where available, and `sodium_memzero` + `strub` scrub keys on failure paths.** Swap-out and core-dump leakage are mitigated, not proven absent on all kernels. | Forensic RAM/swap recovery (see §4.3). |
@@ -62,7 +62,7 @@ first row (`PIN → master_key`); compromise there cascades.
 | **A6** | **Ed25519 long-term identity** (64B secret `crypto_sign_SECRETKEYBYTES` + 32B pub, `identity.key` file `crypto.c:495/633` `secretbox` under `identity_unlock`) → **Curve25519 static** `my_static_priv/pub` (32B, `crypto.c:722` conversion) | `arena.c` (`my_static_*`), `identity.key` on disk (ciphertext) | E2E authenticity — Noise XX `s` token |
 | **A7** | **Noise XX ephemeral + handshake state** — `hs->e` priv (32B), `hs->ss.h/ck` (`noise.c:155/179/337`), `re`/`rs` | `arena.c` per-peer `ps->hs` (freed via `action_cleanup` + `strub`) | Forward secrecy, MITM resistance — zeroed on fail (`state_machine.c:240`) |
 | **A8** | **Session transport keys + nonces** — `ps->session->tx/rx` `CipherState` (`noise.c:408` `symmetric_split`), `tx_seq/rx_seq` (`event_loop.c:354`, `_Atomic` `noise.c`) — `NOX_MAX_PEERS=16` slots (`types.h`) | `arena.c` per-peer session | Per-message AEAD (ChaCha20-Poly1305) — nonce reuse = catastrophic |
-| **A9** | **Tor control auth cookie** (32B, `network.c` `fstat==32` check) + `torrc`/`tor_data_dir`/`tor.log` | Filesystem (`tor_data_dir`) + RAM `resp` buffer (`network.c` `strub`) | HS creation — if leaked, attacker can control HS |
+| **A9** | **Tor control auth cookie** (32B, `network.c` `fstat==32` check) + `torrc`/`tor_data_dir`/`tor.log` — `torrc` lives inside `tor_data_<pid>/torrc`; config tree is Landlock read-only, deletion confined to `tor_data_<pid>` | Filesystem (`tor_data_dir`) + RAM `resp` buffer (`network.c` `strub`) | HS creation — if leaked, attacker can control HS |
 | **A10** | **Contact DB / social graph** — onion addresses + display names + peer `noise_key` (`database.c:339` `db_add_contact`, `crypto_secretbox_easy` under `db_key`) | `contacts.db` (WAL mode, `secure_delete=ON`) | Who you talk to — often more sensitive than content |
 | **A11** | **Message history + offline queue** (ciphertext `nonce+XSalsa20-Poly1305`, `database.c:124`) + **queue decrypt/MAC** (`database.c` `db_process_queue`) | `contacts.db` / queue table | Past/future message confidentiality |
 | **A12** | **Downloaded files (plaintext after decrypt)** — `file_transfer.c:510` `BLAKE2b`+`O_EXCL|O_NOFOLLOW` → `downloads/` | Filesystem `downloads/` (Landlock-bounded) | File confidentiality at-rest — user-executed, see §4.7/§5.7 |
@@ -97,7 +97,7 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
 | E2 | **Wire payload** (TEXT/FILE/CTRL/ACK, `≤4096+NOX_MAC_LEN` per frame) | `event_loop.c:354` `seq` check + `noise.c:892/899` `noise_decrypt` (AEAD, `rx_seq` only on success) | Malicious peer | Decrypt oracle, silent tamper (see §4.2.6), heap disclosure |
 | E3 | **Noise handshake blobs** (XX `e`/`ee`/`es`/`se` + `s` + payload) | `noise.c:653/809` `handshake_write/read` + `symmetric_*` (`noise.c:155`/`371`) | Malicious peer (pre-auth) | Key-compromise, prologue bypass, DoS via `hs` exhaustion (`sodium_malloc` per peer) |
 | E4 | **SOCKS5 reply** (Tor → Noxtor, loopback) | `network.c:1500` `socks5_connect` (local `127.0.0.1:9050` / `socks_path`) | Local Tor / loopback MitM (not remote peer) | Peer impersonation, connection hijack |
-| E5 | **Tor control channel** (`ADD_ONION` ServiceID 56-char, `PrivateKey`, cookie 32B) | `network.c` `parse_service_id` / `validate_onion_address` / `ctrl_read_response` (cap `64` lines) | Compromised Tor / control-socket injector (S3, §4.6) | Identity hijack, peer-handshake confusion |
+| E5 | **Tor control channel** (`ADD_ONION` ServiceID 56-char, `PrivateKey`, cookie 32B) | `network.c` `parse_service_id` / `validate_onion_address` / `ctrl_read_response` (cap `64` lines) | Compromised Tor / control-socket injector (S3, §4.6) | Identity hijack, peer-handshake confusion. **F2 (2026-11-15):** HS + seed↔adres doğrulamasından sonra `tor_close_control_fd()` çağrılır; `Flags=Detach` sayesinde servis yaşar, ancak çalışma anında control kanalı yoktur |
 | E6 | **File METADATA + chunks** — METADATA = `1B len + ≤255B name + 8B LE size + 32B BLAKE2b` (`file_transfer.c:104`), DATA = 4KB chunks, `NOX_MAX_FILE_SIZE=100 GiB` (`file_transfer.h:13`), name via `sanitize_filename` (`file_transfer.c:29` whitelist+`..`→`__`) + `verify_downloads_dir_fd` (`file_transfer.c:83` 0700+UID) | Verified peer (post-TOFU) — **untrusted content** | Path traversal, symlink TOCTOU, disk exhaustion, malicious content (user-executed — see §4.7) |
 | E7 | **Downloaded file bytes** (written to `downloads/` via `openat(O_EXCL\|O_NOFOLLOW)`  `file_transfer.c:460` → `file_transfer.c:443` `write_to_file`) | Verified peer | User opens malware (Landlock limits write scope, not execution — user responsibility, §4.7) |
 | E8 | **CLI args / env / config dir** (`--ghost`, `--allow-unsandboxed-fs`, `HOME/.config/paranoidcli/salt` `NOX_PATH_MAX=512`) | `main.c:716` `argv` parsing + `crypto.c:349` `openat(dir_fd,"salt")` keep-alive | Local user / co-tenant (§5.5 shared-system) | Config injection, salt downgrade / TOCTOU (now keep-alive fd) |
@@ -106,6 +106,7 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
 
 **Verification notes (2026-08-23, code-traced):**
 - **E4/E5 routing isolation — VERIFIED:** `tor_ctrl_fd` and `ps->fd` (peer) are distinct `epoll` registrations (`event_loop.c:38` `find_peer_by_fd` vs `tor_ctrl_fd`); peer `recv` data never reaches `ctrl_read_response` / `parse_service_id` and vice-versa.
+- **E5 control-channel closure (F2, 2026-11-15) — VERIFIED:** her iki `ADD_ONION` `Flags=Detach` ile kurulur; HS + seed↔adres doğrulamasından sonra `tor_close_control_fd()` `shutdown(SHUT_RDWR)` + `close` yapar ve `tor_ctrl_fd = -1` atar. Torrc'de `__OwningControllerProcess <pid>` orphan Tor'a karşı ikinci savunmadır. `test_network` 16/16 (biçim/sıra + fd kapatma + torrc sahiplik/generate_torrc/EOF/max-path), canlı `test_tor_detach.sh` 10 PASS / owning 13/13, ürün smoke 22/22 (`docs-priv/kanit/f2-tor-detach-2026-11-13/`).
 - **E6 limits — DOCUMENTED:** filename capped to `255B` (`safe_name[256]`), sanitized via whitelist (`[^a-zA-Z0-9._-]`→`_` `file_transfer.c:51`), `..`→`__`, leading `.`→`_`, empty→`file_<hex>`; file size capped `100 GiB`; DATA chunks 4KB; METADATA+DATA both inside Noise AEAD + BLAKE2b (size-in-hash `file_transfer.c:192`).
 - **E9 TOFU binding — STILL OPEN:** whether `y/n` binds to originating `ps` or active slot is the §7 highest-priority question for `stdin_handler.c` review (next step).
 
@@ -322,7 +323,7 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
      swap)? Does Ghost Mode also suppress shell history / process-list
      evidence (argv, environment) or only the DB layer?
 
-   2. **Cleanup only happens on graceful shutdown (and `tor.log` is build-dependent).** `rm_rf(tor_data_dir)` and the torrc unlink both run inside `tor_shutdown()`, which is only reached on a clean exit path. On `SIGKILL`, an unhandled crash, or a power-loss/seizure scenario, the per-instance directory survives on disk. In **debug** builds this includes Tor's own `tor.log` (`Log notice file %s/tor.log`, `src/network.c:652` `#else` branch, timestamped) — a real forensic-recovery window: a seized device from an ungracefully-terminated session can yield a timestamped log of when a hidden service was running. In **release** builds (`-DNDEBUG`, `Makefile:192`) Tor logs to `/dev/null` (`src/network.c:652` `#ifdef NDEBUG`) and **no `tor.log` file is ever created** — the forensic window is closed in release, open in debug for post-mortem. `cleanup_stale_tor_dirs` will eventually remove the stale directory on a *future* run, but only once the owning PID is confirmed dead.
+   2. **Cleanup only happens on graceful shutdown (and `tor.log` is build-dependent).** `rm_rf(tor_data_dir)` runs inside `tor_shutdown()`, which is only reached on a clean exit path; `torrc` now lives inside `tor_data_dir` and is removed by the same `rm_rf` (no config-root unlink). On `SIGKILL`, an unhandled crash, or a power-loss/seizure scenario, the per-instance directory survives on disk. In **debug** builds this includes Tor's own `tor.log` (`Log notice file %s/tor.log`, `src/network.c:652` `#else` branch, timestamped) — a real forensic-recovery window: a seized device from an ungracefully-terminated session can yield a timestamped log of when a hidden service was running. In **release** builds (`-DNDEBUG`, `Makefile:192`) Tor logs to `/dev/null` (`src/network.c:652` `#ifdef NDEBUG`) and **no `tor.log` file is ever created** — the forensic window is closed in release, open in debug for post-mortem. `cleanup_stale_tor_dirs` will eventually remove the stale directory on a *future* run, but only once the owning PID is confirmed dead.
 
    3. **[RESOLVED — onion-key derivation, `src/crypto.c:277` + `src/network.c:1301`] Persistent hidden-service identity is no longer a plaintext `onion.key` file.** Current design deterministically derives the onion seed from `master_key` (`crypto_derive_onion_seed`, `NOX_SUBKEY_ONION_SEED=4`) and expands it via `derive_tor_expanded_key` to the Tor `ADD_ONION ED25519-V3:<b64>` KeyBlob sent over the control port. No private key is persisted to disk at rest; a seized device without the PIN yields no onion identity. See `docs/onion-key-derived-plan.md` and `docs/architecture.md` §6.1. Remaining forensic question for this section is only the ephemeral per-run Tor working directory (`tor.log` gap, #2 above) — not a long-term identity file.
 
@@ -389,6 +390,10 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
   read exactly 32 bytes) before being trusted as an auth secret;
   `ctrl_read_response` caps response length and line count
   (`MAX_RESPONSE_LINES = 64`) against a runaway/malicious control channel.
+  **F2 (2026-11-15):** the control fd is closed after HS + seed↔address
+  verification (`tor_close_control_fd`), so post-startup control-protocol
+  injection has no live fd; the HS survives via `Flags=Detach`. A
+  compromised Tor process itself remains in scope (F9).
 - **Known gap:** **[LOW–MEDIUM, hedged by `__attribute__((strub))`]**
   Private-key material read from the control channel
   (`tor_create_new_hs`'s `resp` buffer, containing `PrivateKey=ED25519-V3:...`)
@@ -591,15 +596,79 @@ wanting maximum isolation should use a Linux TTY directly.
 
 ### 5.4 Legacy kernels (< 5.13 Landlock / < 5.15 full hardening)
 No fallback path that preserves the same guarantees exists for older
-kernels. **Current behavior (fail-open with warning, not fail-closed):**
-Landlock requires 5.13+ (ABI v1). On older kernels `landlock_sandbox_init`
-returns `NOX_ERR_LANDLOCK_UNSUPPORTED` (`landlock_sandbox.c:76`) and file
-writes are **not** restricted to `downloads/` — a warning is logged and the
-process continues with seccomp alone. Seccomp TSYNC has a best-effort
+kernels. **Current behavior: fail-closed by default.** Landlock requires
+5.13+ (ABI v1). On older kernels `landlock_sandbox_init` returns
+`NOX_ERR_LANDLOCK_UNSUPPORTED`; the event loop exits unless the user
+explicitly passes `--allow-unsandboxed-fs`, in which case file writes are
+**not** restricted to `downloads/` and a visible warning is shown before
+continuing with seccomp alone.
+
+**F5 (fail-closed matrix) is enforced (2026-11-16):** missing
+`config_dir_fd`/`downloads_dir_fd`, `landlock_sandbox_init` returning
+`NOX_OK` while `landlock_is_active()` is false, and `NOX_ERR_CONFIG` or
+any unexpected init error all abort startup. `--allow-unsandboxed-fs`
+bypasses **only** `NOX_ERR_LANDLOCK_UNSUPPORTED`; it cannot override a
+configuration error or an inactive sandbox. The pure decision helper is
+covered by `tests/test_landlock_policy.c` (14/14).
+
+**Android/arm64 builds (`make android release`) do not use this path.**
+The Android build profile defines `NOX_PLATFORM_ANDROID`, which sets
+`NOX_NO_LANDLOCK`, `NO_SECCOMP` and `NOX_NO_X86_ASM`; the application
+neither installs a Landlock domain nor loads its own seccomp policy. It
+logs both skips and relies on Android's kernel/zygote seccomp and SELinux
+file restrictions. The x86-only RDTSC/CPUID helpers and CET-SS body are
+not compiled; `cpu_has_shstk()`/`cpu_has_ibt()` are constant `false` and
+`cet_ss_lock_and_verify()` returns `CET_SS_UNSUPPORTED`, so the startup
+CET self-test is skipped and no CET protection is claimed on this
+profile. Generic process hardening (`PR_SET_NO_NEW_PRIVS`,
+`PR_SET_DUMPABLE`, `RLIMIT_CORE`; `PR_SET_MDWE` best-effort) remains
+compiled and applied in this profile; `NO_SECCOMP` no longer disables
+`no_new_privs`. Compiler/linker release hardening is identical to the
+normal Linux release; only the sandbox layers and x86 asm paths are
+omitted.
+This is a weaker application-level guarantee than the Linux/x86 build
+and is an explicit platform trust assumption. The default Linux/x86
+build defines none of these macros; `__aarch64__`/`__ANDROID__`
+auto-detection is deliberately not used, so Android-specific code cannot
+leak into it. Real arm64/bionic verification has not been performed on
+this host; `make android release` here exercises the macro profile only.
+
+**F1 (pathname Unix `connect`) requires ABI 9 / Linux 7.1+.** ABI 1-8 still
+gets filesystem confinement, but `connect()` to pathname Unix sockets
+(D-Bus, ssh-agent, gpg-agent, docker.sock) is not restricted; a visible
+warning is shown. `--require-landlock-resolve-unix` makes this fail-closed.
+On ABI 9+, only Tor's `socks.sock` inode gets a `RESOLVE_UNIX` exception;
+`control.sock`, `listen.sock`, and all other pathname sockets remain
+unreachable from inside the sandbox. **Consequence for future work:** any
+future feature that needs a *local* pathname Unix socket (e.g. a frontend
+IPC socket) must add that socket to the `RESOLVE_UNIX` exception list
+(`src/landlock_sandbox.c`) or it will fail with `EACCES` on ABI 9+.
+Peer-to-peer traffic is unaffected: Tor (outside the sandbox domain)
+performs the connection to the peer's `listen.sock`.
+Seccomp TSYNC has a best-effort
 fallback (`seccomp.c:257` — 32-bit compat removal if `TSYNC` unsupported).
 CET/FORTIFY behavior is toolchain-dependent. Users on <5.15 should assume
 reduced sandboxing; reference hardening is verified only on the reference
 build environment (see §5.10).
+
+**F3 applies on every supported ABI:** the config tree is mounted read-only
+(`READ_FILE|READ_DIR`), and deletion is confined to the per-instance
+`tor_data_<pid>` directory (`READ_DIR|REMOVE_FILE|REMOVE_DIR`). `torrc` is
+created inside that directory, so no deletion right is needed at the config
+root. `rmdir(tor_data_dir)` from inside the sandbox returns `EACCES` by
+design; the empty directory is removed by `cleanup_stale_tor_dirs` on the
+next launch. SQLite WAL/SHM files may remain in the config tree until the
+next launch, where SQLite recovers them.
+
+**Masking semantics (LL-03):** `nox_ll_compute_rule_rights` intersects
+`wanted` with `handled` only to keep `allowed_access ⊆ handled_access_fs`
+and avoid `EINVAL` from `landlock_add_rule`. It is not a containment
+guarantee: a right absent from `handled` is not restricted at all. On ABI
+1-2, `TRUNCATE` is dropped from the rule mask while truncation remains
+unrestricted; descriptors opened before `restrict_self` (F4) are also
+outside the ruleset. This is why the ABI-gated warning and
+`--require-landlock-resolve-unix` strict mode are security-relevant, not
+cosmetic.
 
 ### 5.5 Multi-user / shared-system races
 Noxtor assumes a single-user Linux workstation. `config_dir` resolution and
@@ -668,7 +737,7 @@ flags section). **Reference build (TODO: fill with actual `gcc --version` /
 |---|---|
 | GCC | e.g. 13.2.0 (Ubuntu 24.04) — `_FORTIFY_SOURCE=3` needs ≥2.35 |
 | glibc | e.g. 2.39 — older glibc silently downgrades to `_FORTIFY_SOURCE=2` |
-| Kernel | e.g. 6.8 — Landlock ABI v1 (5.13+) / v3 (6.2+) feature-gated |
+| Kernel | e.g. 6.8 — Landlock ABI v4 (6.7+); higher ABIs v5 6.10, v6 6.12, v7 6.15, v8 7.0, v9 7.1 feature-gated |
 | Binutils/linker | CET `shstk` needs `ld` with `z shstk` support |
 
 CET-SS is the one hardening claim that is additionally verified **at
@@ -684,6 +753,9 @@ test faults with #CP) aborts the same way: the reported state cannot be
 reconciled with observed behavior, and no "enforced" claim is made
 without lock evidence. Locking is never attempted while shadow stack is
 inactive — locking freezes the *current* (off) status irreversibly.
+In the Android/arm64 profile the x86 CET path is not compiled at all:
+`cet_ss_lock_and_verify()` is a stub returning `CET_SS_UNSUPPORTED`, the
+CPUID query and self-test are skipped, and no CET claim is made.
 
 Until reproducible-build attestation exists, rebuilds on other toolchains
 should be treated as unverified for hardening.
@@ -775,7 +847,7 @@ Noxtor-verifiable property.
 | Handshake write-path bounds checking (`noise.c`) | Output buffer overflow on `write_msgN` | None — relies on caller sizing `out` correctly | ⚠️ safe today (fixed-size payloads), inconsistent with read-path rigor — see §4.2.10 |
 | State machine transition safety (`state_machine.c`) | Centralized, auditable connection-state handling | Static transition table + action functions | 🔴 6 of 8 actions are no-op stubs; real logic lives in `event_loop.c` unconditionally — see residual risks |
 | TOFU confirmation identity binding | Confirming trust for the correct peer, not a slot-recycled impostor | `ps->state == ST_TOFU_PENDING` gate + `if (!ps->hs)` guard | ⚠️ unconfirmed — depends on `stdin_handler.c`, see residual risks (highest-priority open question) |
-| Seccomp (3-stage) | Post-exploitation escalation | Progressive syscall blacklist; blocks clearnet exfil after stage 3 | ✅ implemented |
+| Seccomp (3-stage) | Post-exploitation escalation | Progressive syscall filtering; from stage 3 `socket()` is allow-listed to **AF_UNIX only**, so no other address family (IP, raw, netlink, PPPoX, RDMA, TIPC, …) can be created — blocks clearnet exfil after stage 3 | ✅ implemented |
 | Ghost Mode | Forensic recovery | Disables SQLite, no persistent trace | ⚠️ scope needs source verification |
 | Contact/message/queue at-rest encryption (`database.c`) | Forensic recovery when Ghost Mode is off | `crypto_secretbox_easy` (XSalsa20-Poly1305) under PIN-derived `db_key`; `PRAGMA secure_delete=ON` | ✅ confirmed — meaningfully stronger baseline than Ghost-Mode-only; WAL/SSD caveats apply (§4.3.4) |
 | DB callback locking convention (`database.c`) | Deadlock avoidance during callback-driven I/O | `db_process_queue` unlocks before callback; other 3 visitor-based functions don't | ⚠️ inconsistent, latent footgun — see residual risks |

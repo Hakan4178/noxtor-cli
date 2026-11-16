@@ -1,18 +1,7 @@
-/* ================================================================
- * test_tor_peer.c — tor_verify_peer (SO_PEERCRED) regresyon testi
- *
- * Bulgu 2.1: "control soketine connect olmak, karşıdakinin Tor olduğunu
- * kanıtlamaz." Fix, connect sonrası SO_PEERCRED ile peer PID/UID
- * doğrulaması yapar. Bu test gerçek AF_UNIX soket çiftiyle senaryoları
- * kilitler:
- *   1) gerçek dinleyici child PID'i → kabul (NOX_OK)
- *   2) yanlış PID (parent) → ret (NOX_ERR_TOR) — sahte soket taklidi
- *   3) geçersiz fd (-1) → hata (getsockopt)
- *   4) socket olmayan fd (/dev/null) → hata
- *
- * Semantik doğrulama: /tmp/opencode/peercred_probe.c
- * (müşteri tarafında SO_PEERCRED = DİNLEYEN sürecin pid/uid'i).
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_tor_peer.c — tor_verify_peer (SO_PEERCRED).
+ * Doğru child pid kabul; yanlış pid/geçersiz fd/socket olmayan fd ret.
+ */
 #define _GNU_SOURCE
 #include "common.h"
 #include "network.h"
@@ -128,12 +117,15 @@ int main(void) {
 
     /* 2) Sahte soket taklidi: peer pid'i beklenenle uyuşmuyor */
     total++;
-    if (tor_verify_peer(cfd, getpid()) != NOX_OK) {
+    nox_err_t peer_err = tor_verify_peer(cfd, getpid());
+    if (peer_err == NOX_ERR_PEER) {
       printf("[OK] yanlış PID reddedildi (beklenen=%d, gerçek peer=%d)\n",
              (int)getpid(), (int)listener);
       passed++;
     } else {
-      printf("[FAIL] yanlış PID kabul edildi — impersonation açık!\n");
+      printf("[FAIL] yanlış PID reddedilmedi (err=%d, beklenen %d) — "
+             "impersonation açık!\n",
+             (int)peer_err, (int)NOX_ERR_PEER);
     }
     close(cfd);
   } else {
@@ -141,24 +133,29 @@ int main(void) {
     printf("[FAIL] test soketine connect edilemedi\n");
   }
 
-  /* 3) Geçersiz fd */
+  /* 3) Geçersiz fd — getsockopt hatası NOX_ERR_NET olmalı */
   total++;
-  if (tor_verify_peer(-1, listener) != NOX_OK) {
-    printf("[OK] geçersiz fd reddedildi\n");
+  nox_err_t badfd_err = tor_verify_peer(-1, listener);
+  if (badfd_err == NOX_ERR_NET) {
+    printf("[OK] geçersiz fd reddedildi (NOX_ERR_NET)\n");
     passed++;
   } else {
-    printf("[FAIL] geçersiz fd kabul edildi!\n");
+    printf("[FAIL] geçersiz fd yanlış kodla döndü (err=%d, beklenen %d)\n",
+           (int)badfd_err, (int)NOX_ERR_NET);
   }
 
-  /* 4) Socket olmayan fd (getsockopt ENOTSOCK) */
+  /* 4) Socket olmayan fd (getsockopt ENOTSOCK) — NOX_ERR_NET */
   total++;
   int nfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
   if (nfd >= 0) {
-    if (tor_verify_peer(nfd, listener) != NOX_OK) {
-      printf("[OK] socket olmayan fd reddedildi\n");
+    nox_err_t notsock_err = tor_verify_peer(nfd, listener);
+    if (notsock_err == NOX_ERR_NET) {
+      printf("[OK] socket olmayan fd reddedildi (NOX_ERR_NET)\n");
       passed++;
     } else {
-      printf("[FAIL] socket olmayan fd kabul edildi!\n");
+      printf("[FAIL] socket olmayan fd yanlış kodla döndü "
+             "(err=%d, beklenen %d)\n",
+             (int)notsock_err, (int)NOX_ERR_NET);
     }
     close(nfd);
   } else {

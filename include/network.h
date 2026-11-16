@@ -32,6 +32,8 @@
  *                    (ephemeral, seed yalnızca bellekte — claim imzası için).
  * tor_create_derived_hs: ADD_ONION ED25519-V3:<derived key> — normal mod
  *                    (master_key'den deterministik türetme, dosya YOK).
+ * tor_close_control_fd: HS doğrulandıktan sonra control fd'yi kapatır
+ *                    (F2 — HS Flags=Detach ile yaşamaya devam eder).
  * tor_shutdown: SIGNAL SHUTDOWN + waitpid + dizin temizliği.
  * ================================================================ */
 
@@ -44,7 +46,7 @@ nox_err_t tor_authenticate(int ctrl_fd, const char *data_dir);
 /* Control soketi peer doğrulaması (bulgu 2.1) — SO_PEERCRED ile karşı
  * ucun beklenen Tor süreci (expected_pid) ve aynı UID olduğunu kanıtlar.
  * connect() sonrası, cookie/ADD_ONION göndermeden ÖNCE çağrılır; peer
- * kimliği bağlantı boyunca sabittir. Hata: NOX_ERR_TOR (uyuşmazlık) |
+ * kimliği bağlantı boyunca sabittir. Hata: NOX_ERR_PEER (uyuşmazlık) |
  * NOX_ERR_NET (getsockopt hatası). */
 nox_err_t tor_verify_peer(int fd, pid_t expected_pid);
 
@@ -55,9 +57,10 @@ nox_err_t tor_wait_bootstrap(int ctrl_fd, int timeout_sec);
  * (H-1/H-2: eski NEW:ED25519-V3 Flags=DiscardPK kaldırıldı — claim imzası
  * için onion private key client'ta bulunmalı. Her açılışta farklı rastgele
  * seed → farklı adres, eski ghost UX korunur.)
- * Detach YOK: control connection kapanınca hizmet otomatik silinir (D5).
+ * F2: Flags=Detach — control fd HS doğrulamasından sonra kapatılsa da
+ * hizmet Tor süreci boyunca yaşar.
  * listen_path: AF_UNIX socket yolu (ADD_ONION unix: prefix ile)
- * seed_out: 32 byte, SADECE BAŞARIDA yazılır (çağrıyan sodium_free ile
+ * seed_out: 32 byte, SADECE BAŞARIDA yazılır (çağıran sodium_free ile
  *           temizler; hata yolunda içeriği yazılmamış olur)
  * onion_out: 63 byte (56 base32 + ".onion\0") */
 __attribute__((strub)) nox_err_t tor_create_new_hs(int ctrl_fd, const char *listen_path,
@@ -75,21 +78,34 @@ __attribute__((strub)) nox_err_t tor_create_derived_hs(int ctrl_fd, const char *
 /* Onion v3 adres doğrulaması — base32 + ".onion" suffix + v3 checksum
  * (H-2 FIX: SHA3-256 checksum zorunlu — zincir crypto_onion_pubkey'te).
  * 62 karakter tam v3 .onion adresi için true döner.
- * socks5_connect (peer), parse_service_id (kendi HS) ve event_loop
- * (handshake claim) tarafından çağrılır. (hardened) */
+ * socks5_connect (peer) ve event_loop (handshake claim) tarafından
+ * çağrılır. Kendi HS yolunda parse_service_id ayrıca adresin içindeki
+ * pub'ı beklenen anahtarla sodium_memcmp eder. (hardened) */
 nox_hardbool_t validate_onion_address(const char *addr);
 
 /* Tor process'ini düzgün kapat */
 void tor_shutdown(struct app_state *state);
+
+/* F2: HS doğrulandıktan sonra Tor control fd'sini kapatır. HS
+ * Flags=Detach ile kurulduğu için servis Tor süreci boyunca yaşar.
+ * Idempotenttir; fd zaten kapalıysa (< 0) hiçbir şey yapmaz. */
+void tor_close_control_fd(struct app_state *state);
 
 /* ================================================================
  * SOCKS5 — Tor üzerinden .onion'a bağlan
  *
  * AF_UNIX SocksSocket üzerinden SOCKS5 CONNECT.
  * Onion adresi domain name olarak gönderilir (tip 0x03).
+ *
+ * expected_tor_pid: connect sonrası SO_PEERCRED doğrulaması (bulgu 2.1b).
+ * socks.sock yolu Tor AYAKTAYKEN aynı-UID saldırgan tarafından
+ * unlink/rebind edilebilir; peer spawn edilen tor_pid değilse SOCKS
+ * greeting'i BİLE gönderilmeden fail-closed dönülür.
+ * Hata: NOX_ERR_PEER (PID bilinmiyor veya peer uyuşmuyor).
  * ================================================================ */
 nox_err_t socks5_connect(const char *onion_addr, uint16_t port,
-                          const char *socks_path, int *fd_out);
+                          const char *socks_path, pid_t expected_tor_pid,
+                          int *fd_out);
 
 /* ================================================================
  * UNIX DOMAIN LISTENER — Gelen peer bağlantıları
@@ -127,6 +143,12 @@ nox_err_t epoll_modify_fd(int epoll_fd, int fd, uint32_t events);
 void frame_header_encode(const struct frame_header *hdr,
                          uint8_t *wire);
 
+/* H2: AD'li transport gönderimlerinin tek header üreticisi.
+ * frame_header_encode ile aynı 13 byte'ı üretir; receiver ham 13B'yi
+ * AD olarak korur. Transport gönderim siteleri doğrudan encode yerine
+ * bu fonksiyonu kullanır (handshake CTRL yazımları istisna). */
+void frame_ad(const struct frame_header *hdr, uint8_t *wire);
+
 /* Wire bytes'tan frame header'ı parse et */
 nox_err_t frame_header_decode(const uint8_t *wire,
                                struct frame_header *hdr);
@@ -146,9 +168,17 @@ nox_err_t ctrl_read_line(int fd, char *buf, size_t buf_size,
 
 nox_err_t ctrl_send_command(int fd, const char *cmd);
 
-/* I/O helpers — EINTR + partial read/write koruması */
+/* I/O helpers — EINTR + partial read/write koruması.
+ *
+ * _timeout varyantları toplam monotonic deadline'ı dışarıdan alır;
+ * timeout_ms her parça okuma/yazmada sıfırlanmaz. Üretim sarmalayıcıları
+ * NOX_READ_TIMEOUT_MS kullanır. Testler küçük timeout ile gerçek deadline
+ * yolunu sınayabilsin diye açıldı. */
 nox_err_t write_full(int fd, const void *buf, size_t len);
 nox_err_t read_full(int fd, void *buf, size_t len);
+nox_err_t write_full_timeout(int fd, const void *buf, size_t len,
+                             int timeout_ms);
+nox_err_t read_full_timeout(int fd, void *buf, size_t len, int timeout_ms);
 
 /* ================================================================
  * UNIT TEST ERİŞİMİ — production akışında da kullanılan iç
@@ -166,5 +196,14 @@ void cleanup_stale_tor_dirs(const char *config_dir);
 
 /* strtol + ERANGE/endptr kontrolü; geçersiz → -1. */
 long safe_parse_pid(const char *str);
+
+/* F2: torrc içerik buffer'ına "__OwningControllerProcess <pid>\n"
+ * satırını ekler; başarıda *len güncellenir, hatada değişmez. */
+nox_err_t tor_append_owning_controller_process(char *content, size_t cap,
+                                               size_t *len, int pid);
+
+/* F2: torrc dosyasını üretir (config_dir/tor_data_<pid>/torrc).
+ * UNIT TEST ERİŞİMİ: gerçek çıktıda sahiplik satırını doğrulamak için. */
+nox_err_t generate_torrc(struct app_state *state);
 
 #endif /* PARANOID_NETWORK_H */

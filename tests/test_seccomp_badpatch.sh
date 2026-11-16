@@ -20,6 +20,14 @@
 # yığında asla `ret` çalıştırmaz (yoksa yarışlı SIGSEGV: eski desen 40
 # koşuda 28 kez çöktü; ayrıntı probe.c yorumunda).
 #
+# İKİNCİ MATRİS — S-1 socket() allowlist (13 Kasım 2026):
+#   iyi kopya  : socket(AF_UNIX) yaşar, socket(AF_INET) SIGSYS,
+#                socket(AF_PPPOX) SIGSYS (kernel destekliyorsa)
+#   bad patch  : allowlist karşılaştırması ters çevrilir
+#                (SCMP_CMP_NE → SCMP_CMP_EQ) → AF_UNIX öldürülür,
+#                diğer ailelere izin verilir → sapma görünür olmalı.
+#   Bu matris kernel'e bağımlı değildir (AF_UNIX her yerde var).
+#
 # Kullanım: make test (otomatik) veya tests/test_seccomp_badpatch.sh
 # Gereksinim: cc + libseccomp (build bağımlılığı)
 
@@ -173,9 +181,94 @@ echo "-- bad patch kopyası (0x00100000 = K-01 hatası) --"
 run_expect_survived "$WORKDIR/probe_bad" 1 "fork-benzeri clone (bad patch'te serbest — regresyon)"
 run_expect_killed   "$WORKDIR/probe_bad" 2 "gerçek thread clone (bad patch'te SIGSYS — regresyon)"
 
+# ── S-1: socket() allowlist matrisi ───────────────────────────────
+cat > "$WORKDIR/probe_socket.c" <<'EOF'
+/* probe_socket.c — socket matrisi:
+ *   mode 1 = AF_INET  (kilitli olmalı → SIGSYS)
+ *   mode 2 = AF_UNIX  (serbest olmalı → yaşamalı)
+ *   mode 3 = AF_PPPOX (allowlist sayesinde kilitli → SIGSYS) */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "seccomp_policy.h"
+
+#ifndef AF_PPPOX
+#define AF_PPPOX 24
+#endif
+
+int main(int argc, char **argv) {
+  int mode = (argc > 1) ? atoi(argv[1]) : 1;
+  if (seccomp_policy_load(3) != NOX_OK) return 3;
+  int fd;
+  if (mode == 1)      fd = socket(AF_INET, SOCK_STREAM, 0);
+  else if (mode == 2) fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  else if (mode == 3) fd = socket(AF_PPPOX, SOCK_STREAM, 0);
+  else return 9;
+  if (fd >= 0) { close(fd); printf("SURVIVED mode=%d\n", mode); return 0; }
+  if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
+    printf("UNSUPPORTED mode=%d errno=%d\n", mode, errno);
+    return 5;
+  }
+  printf("ERROR mode=%d errno=%d\n", mode, errno);
+  return 4;
+}
+EOF
+
+# allowlist karşılaştırmasını ters çeviren bad patch
+sed 's/SCMP_CMP_NE/SCMP_CMP_EQ/' "$SECCOMP_C" > "$WORKDIR/seccomp_bad_socket.c"
+if cmp -s "$SECCOMP_C" "$WORKDIR/seccomp_bad_socket.c"; then
+    fail "socket bad patch uygulanamadı (sed eşleşmedi — allowlist kuralı kaldırılmış olabilir)"
+    exit 1
+fi
+
+# shellcheck disable=SC2086
+$CC -O1 -I"$WORKDIR" "$WORKDIR/probe_socket.c" "$WORKDIR/seccomp_good.c" -lseccomp -o "$WORKDIR/probe_sock_good" \
+    || { fail "socket probu (iyi politika) derlenemedi"; exit 1; }
+# shellcheck disable=SC2086
+$CC -O1 -I"$WORKDIR" "$WORKDIR/probe_socket.c" "$WORKDIR/seccomp_bad_socket.c" -lseccomp -o "$WORKDIR/probe_sock_bad" \
+    || { fail "socket probu (bad patch) derlenemedi"; exit 1; }
+
+run_expect_killed_opt() { # $1=bin $2=mode $3=etiket — kernel desteklemiyorsa SKIP
+    OUT="$("$1" "$2" 2>&1)"; RC=$?
+    if printf '%s' "$OUT" | grep -q UNSUPPORTED; then
+        echo "  [SKIP] $3 → kernel bu aileyi desteklemiyor"
+    elif [ "$RC" -ge 128 ] && ! printf '%s' "$OUT" | grep -q SURVIVED; then
+        echo "  [OK] $3 → SIGSYS (rc=$RC)"
+    else
+        fail "$3 → SIGSYS bekleniyordu (rc=$RC, out='$OUT')"
+    fi
+}
+
+run_expect_survived_opt() { # $1=bin $2=mode $3=etiket — kernel desteklemiyorsa SKIP
+    OUT="$("$1" "$2" 2>&1)"; RC=$?
+    if printf '%s' "$OUT" | grep -q UNSUPPORTED; then
+        echo "  [SKIP] $3 → kernel bu aileyi desteklemiyor"
+    elif [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q SURVIVED; then
+        echo "  [OK] $3 → yaşadı ($OUT)"
+    else
+        fail "$3 → yaşaması bekleniyordu (rc=$RC, out='$OUT')"
+    fi
+}
+
+echo "-- socket matrisi: iyi kopya (allowlist NE AF_UNIX) --"
+run_expect_killed   "$WORKDIR/probe_sock_good" 1 "socket(AF_INET) kilitli"
+run_expect_survived "$WORKDIR/probe_sock_good" 2 "socket(AF_UNIX) serbest"
+run_expect_killed_opt "$WORKDIR/probe_sock_good" 3 "socket(AF_PPPOX) kilitli"
+
+echo "-- socket matrisi: bad patch (allowlist EQ AF_UNIX → sapma) --"
+# Sapma 1: allowlist ters çevrilince AF_UNIX öldürülür (app ölür).
+run_expect_killed "$WORKDIR/probe_sock_bad" 2 "socket(AF_UNIX) bad patch'te öldürüldü — regresyon"
+# AF_INET hâlâ öldürülür: aşama-2 aile kuralı ayrıca kapatıyor (sapma DEĞİL).
+run_expect_killed "$WORKDIR/probe_sock_bad" 1 "socket(AF_INET) bad patch'te de öldürüldü (aşama-2 aile kuralı)"
+# Sapma 2: allowlist ters çevrilince S-1'in motivasyonu olan aile açılır.
+run_expect_survived_opt "$WORKDIR/probe_sock_bad" 3 "socket(AF_PPPOX) bad patch'te serbest — regresyon"
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
-    echo "=== bad patch dedektörü: BAŞARILI (clone matrisi sapmayı görüyor) ==="
+    echo "=== bad patch dedektörü: BAŞARILI (clone + socket matrisleri sapmayı görüyor) ==="
     exit 0
 else
     echo "=== bad patch dedektörü: BAŞARISIZ ==="

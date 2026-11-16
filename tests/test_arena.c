@@ -1,8 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_arena.c — Secure arena birim testleri
- *
- * ASan + UBSan altında çalıştırılır (make test).
- * Sıfır bağımlılık test framework'ü.
+ * test_arena.c — secure arena: init (T-05 çift-init), alloc, canary, destroy.
  */
 
 #include "common.h"
@@ -15,9 +12,7 @@
 #include "test_common.h"
 
 
-/* ================================================================
- * TEST: arena_init — başarılı oluşturma
- * ================================================================ */
+/* arena_init — başarılı oluşturma */
 static int test_arena_init_success(void)
 {
     struct secure_arena a = {0};
@@ -38,9 +33,7 @@ static int test_arena_init_success(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena_init — NULL pointer ile çağrılırsa hata
- * ================================================================ */
+/* arena_init — NULL pointer ile çağrılırsa hata */
 static int test_arena_init_null(void)
 {
     nox_err_t err = arena_init(NULL, 4096);
@@ -53,9 +46,52 @@ static int test_arena_init_null(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena_alloc — 16-byte alignment
- * ================================================================ */
+/* arena_init — ikinci çağrı fail-closed (T-05) */
+static int test_arena_init_twice_rejected(void)
+{
+    struct secure_arena a = {0};
+    nox_err_t err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_OK);
+
+    void  *first_base  = a.base;
+    size_t first_total = a.total_size;
+
+    /* İkinci init eski mapping'i kaybetmemeli — reddetmeli. */
+    err = arena_init(&a, 4096);
+    TEST_ASSERT(err == NOX_ERR_STATE);
+
+    /* Canlı arena bozulmamış olmalı */
+    TEST_ASSERT(a.base == first_base);
+    TEST_ASSERT(a.total_size == first_total);
+    TEST_ASSERT(arena_is_valid(&a) == true);
+
+    /* Hâlâ kullanılabilir */
+    void *p = arena_alloc(&a, NOX_KEY_LEN);
+    TEST_ASSERT(p != NULL);
+
+    arena_destroy(&a);
+    TEST_ASSERT(a.base == NULL);
+    return 0;
+}
+
+/* arena_init — destroy sonrası yeniden init serbest */
+static int test_arena_reinit_after_destroy(void)
+{
+    struct secure_arena a = {0};
+    TEST_ASSERT(arena_init(&a, 4096) == NOX_OK);
+
+    arena_destroy(&a);
+    TEST_ASSERT(a.base == NULL);
+
+    /* T-05 guard'ı meşru yeniden kullanımı engellememeli */
+    TEST_ASSERT(arena_init(&a, 4096) == NOX_OK);
+    TEST_ASSERT(arena_is_valid(&a) == true);
+
+    arena_destroy(&a);
+    return 0;
+}
+
+/* arena_alloc — 16-byte alignment */
 static int test_arena_alloc_alignment(void)
 {
     struct secure_arena a = {0};
@@ -88,19 +124,15 @@ static int test_arena_alloc_alignment(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena_alloc — taşma durumunda NULL dönüş
- * ================================================================ */
+/* arena_alloc — taşma durumunda NULL dönüş */
 static int test_arena_alloc_overflow(void)
 {
     struct secure_arena a = {0};
     nox_err_t err = arena_init(&a, 4096);
     TEST_ASSERT(err == NOX_OK);
 
-    /*
-     * page_align(4096 + 16 canary) → usable alanı sayfa hizasına
-     * yuvarlanır. Gerçek usable boyutu a.usable_size'dan öğren.
-     */
+    /* usable = page_align(4096 + 16 canary) → sayfa hizası; gerçek
+     * boyut a.usable_size'dan. */
     size_t usable = a.usable_size;
 
     /* Usable alanın çoğunu doldur — 32 byte bırak */
@@ -119,9 +151,7 @@ static int test_arena_alloc_overflow(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena_bytes_used / arena_bytes_free
- * ================================================================ */
+/* arena_bytes_used / arena_bytes_free */
 static int test_arena_usage_tracking(void)
 {
     struct secure_arena a = {0};
@@ -145,9 +175,7 @@ static int test_arena_usage_tracking(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena_alloc — NULL arena ile çağrılırsa
- * ================================================================ */
+/* arena_alloc — NULL arena ile çağrılırsa */
 static int test_arena_alloc_null(void)
 {
     void *p = arena_alloc(NULL, 32);
@@ -160,9 +188,7 @@ static int test_arena_alloc_null(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena — varsayılan 64KB boyut
- * ================================================================ */
+/* arena — varsayılan 64KB boyut */
 static int test_arena_default_size(void)
 {
     struct secure_arena a = {0};
@@ -197,13 +223,8 @@ static int test_arena_default_size(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena_destroy — temiz kapanış (crash yok + struct sıfır)
- *
- * Not: munmap sonrası arena belleğine erişim UB olduğu için
- * explicit_bzero burada kanıtlanamaz; test destroy'un crash'siz
- * tamamlandığını ve yapının sıfırlandığını doğrular.
- * ================================================================ */
+/* arena_destroy: crash yok + struct sıfır; munmap sonrası erişim UB,
+ * explicit_bzero kanıtlanamaz. */
 static int test_arena_destroy_clean_shutdown(void)
 {
     struct secure_arena a = {0};
@@ -223,9 +244,7 @@ static int test_arena_destroy_clean_shutdown(void)
     return 0;
 }
 
-/* ================================================================
- * arena_alloc_canary — honeypot allocation testleri
- * ================================================================ */
+/* arena_alloc_canary — honeypot allocation testleri */
 static int test_arena_alloc_canary_null(void)
 {
     /* NULL guard */
@@ -237,7 +256,7 @@ static int test_arena_alloc_canary_null(void)
 
 static int test_arena_alloc_canary_zero_size(void)
 {
-    struct secure_arena a;
+    struct secure_arena a = {0};
     nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
     TEST_ASSERT(err == NOX_OK);
 
@@ -251,7 +270,7 @@ static int test_arena_alloc_canary_zero_size(void)
 
 static int test_arena_alloc_canary_valid(void)
 {
-    struct secure_arena a;
+    struct secure_arena a = {0};
     nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
     TEST_ASSERT(err == NOX_OK);
 
@@ -271,7 +290,7 @@ static int test_arena_alloc_canary_valid(void)
 
 static int test_arena_alloc_canary_random(void)
 {
-    struct secure_arena a;
+    struct secure_arena a = {0};
     nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
     TEST_ASSERT(err == NOX_OK);
 
@@ -298,7 +317,7 @@ static int test_arena_alloc_canary_random(void)
 
 static int test_arena_alloc_canary_overflow(void)
 {
-    struct secure_arena a;
+    struct secure_arena a = {0};
     nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
     TEST_ASSERT(err == NOX_OK);
 
@@ -313,7 +332,7 @@ static int test_arena_alloc_canary_overflow(void)
 
 static int test_arena_alloc_canary_between_keys(void)
 {
-    struct secure_arena a;
+    struct secure_arena a = {0};
     nox_err_t err = arena_init(&a, NOX_ARENA_DEFAULT_SIZE);
     TEST_ASSERT(err == NOX_OK);
 
@@ -344,9 +363,7 @@ static int test_arena_alloc_canary_between_keys(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: arena_is_valid — yeni mapping invariant (2. bulgu fix)
- * ================================================================ */
+/* arena_is_valid — yeni mapping invariant (2. bulgu fix) */
 static int test_arena_is_valid_ok(void)
 {
     struct secure_arena a = {0};
@@ -483,9 +500,7 @@ static int test_arena_check_canary_abort_on_corrupt(void)
 }
 #endif
 
-/* ================================================================
- * MAIN — Tüm testleri çalıştır
- * ================================================================ */
+/* MAIN — Tüm testleri çalıştır */
 int main(void)
 {
     if (sodium_init() < 0) {
@@ -497,6 +512,8 @@ int main(void)
 
     RUN_TEST(test_arena_init_success);
     RUN_TEST(test_arena_init_null);
+    RUN_TEST(test_arena_init_twice_rejected);
+    RUN_TEST(test_arena_reinit_after_destroy);
     RUN_TEST(test_arena_alloc_alignment);
     RUN_TEST(test_arena_alloc_overflow);
     RUN_TEST(test_arena_usage_tracking);

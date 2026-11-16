@@ -1,16 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_ansi_strip.c — ui_strip_ansi hostile korpusu (B: iki kopya drift'i)
- *
- * B BULGUSU: strip_ansi_escape İKİ kopya hâlindeydi (frontend.c +
- * stdin_handler.c) ve drift başlamıştı: stdin kopyasında OSC/DCS tarama
- * limiti (256) vardı, frontend kopyasında yok. Tek doğruluk kaynağı:
- * ui_strip_ansi (frontend.c, limitli versiyon kanonik). Bu test korpusu
- * TEK davranışı kilitler — bir daha tek tarafa fix uygulanamaz.
- *
- * Korpus kategorileri:
- *   CSI (parametreli/sırt-sırt/aşırı uzun), OSC (BEL/ST/sonlanmamış/
- *   limit-256), DCS, bare ESC, ESC+( ), C0 drop vs \t\n\r keep, DEL,
- *   UTF-8 butunluğu (Türkçe + emoji), attacker mesaj temizliği, NULL/boş.
+ * test_ansi_strip.c — ui_strip_ansi korpusu (tek kanonik strip davranışı).
+ * Kapsam: CSI/OSC/DCS/ESC, C0/DEL/C1/bidi, çıktıda CR/LF vs stdin EOL,
+ * UTF-8 bütünlüğü. T-02 + K-33 regresyonu.
  */
 
 #include "common.h"
@@ -22,7 +13,7 @@
 #include "test_common.h"
 
 
-/* girdiyi kopyala, strip et, beklenenle karşılaştır */
+/* girdiyi kopyala, çıktı sanitizer'ından geçir, beklenenle karşılaştır */
 static int expect_stripped(const char *in, const char *want)
 {
     char buf[1024];
@@ -33,6 +24,22 @@ static int expect_stripped(const char *in, const char *want)
     if (strcmp(buf, want) != 0) {
         fprintf(stderr, "\n  strip mismatch:\n    in  = [%s]\n    got = [%s]\n"
                         "    want= [%s]\n", in, buf, want);
+        return 1;
+    }
+    return 0;
+}
+
+/* stdin yolu: ESC/C0/C1/bidi temizlenir, CR/LF KORUNUR */
+static int expect_input_stripped(const char *in, const char *want)
+{
+    char buf[1024];
+    size_t n = strlen(in);
+    if (n >= sizeof(buf)) return -1;
+    memcpy(buf, in, n + 1);
+    ui_strip_input(buf);
+    if (strcmp(buf, want) != 0) {
+        fprintf(stderr, "\n  input strip mismatch:\n    in  = [%s]\n"
+                        "    got = [%s]\n    want= [%s]\n", in, buf, want);
         return 1;
     }
     return 0;
@@ -132,12 +139,44 @@ static int test_esc_other_class(void)
     return 0;
 }
 
-/* 11) C0 drop (TAB/LF/CR hariç) + DEL drop */
+/* 11) C0 drop (TAB hariç), CR/LF tek satıra katlanır, DEL drop */
 static int test_c0_and_del(void)
 {
     TEST_ASSERT(expect_stripped("a\001\002b", "ab") == 0);
-    TEST_ASSERT(expect_stripped("a\tb\nc\rd", "a\tb\nc\rd") == 0); /* keep */
+    TEST_ASSERT(expect_stripped("a\tb\nc\rd", "a\tb c d") == 0);
+    TEST_ASSERT(expect_stripped("a\r\nb", "a  b") == 0);
     TEST_ASSERT(expect_stripped("a\177b", "ab") == 0);
+    return 0;
+}
+
+/* 11b) K-33: saldırgan CR/LF ile sahte sistem satırı üretemez */
+static int test_line_injection_neutralized(void)
+{
+    TEST_ASSERT(expect_stripped(
+        "peer\r\n[✓] Dosya alındı: /etc/shadow\r\nSen: parola?",
+        "peer  [✓] Dosya alındı: /etc/shadow  Sen: parola?") == 0);
+    return 0;
+}
+
+/* 11c) K-33: C1 + bidi kontrol kodları görünmez yön sahteciliği yapamaz */
+static int test_c1_bidi_dropped(void)
+{
+    TEST_ASSERT(expect_stripped("a\xC2\x9B" "31mb", "a31mb") == 0);
+    TEST_ASSERT(expect_stripped("a\xE2\x80\xAE" "dcba", "adcba") == 0);
+    TEST_ASSERT(expect_stripped("a\xE2\x80\xAE\xE2\x81\xA6", "a") == 0);
+    TEST_ASSERT(expect_stripped("a\xD8\x9C" "b", "ab") == 0);
+    return 0;
+}
+
+/* 11d) K-33 stdin: satır sonları korunur; ESC/C1/bidi yine geçmez. */
+static int test_input_preserves_eol(void)
+{
+    TEST_ASSERT(expect_input_stripped("yardim\n", "yardim\n") == 0);
+    TEST_ASSERT(expect_input_stripped("a\r\nb\n", "a\r\nb\n") == 0);
+    TEST_ASSERT(expect_input_stripped("\033[2Jmsg\n", "msg\n") == 0);
+    TEST_ASSERT(expect_input_stripped("a\xC2\x9B" "b\n", "ab\n") == 0);
+    TEST_ASSERT(expect_input_stripped("a\xE2\x80\xAE" "b\n", "ab\n") == 0);
+    TEST_ASSERT(expect_input_stripped("a\001b\n", "ab\n") == 0);
     return 0;
 }
 
@@ -190,6 +229,9 @@ int main(void)
     RUN_TEST(test_bare_esc);
     RUN_TEST(test_esc_other_class);
     RUN_TEST(test_c0_and_del);
+    RUN_TEST(test_line_injection_neutralized);
+    RUN_TEST(test_c1_bidi_dropped);
+    RUN_TEST(test_input_preserves_eol);
     RUN_TEST(test_utf8_preserved);
     RUN_TEST(test_attacker_screen_clear);
     RUN_TEST(test_plain_identity);

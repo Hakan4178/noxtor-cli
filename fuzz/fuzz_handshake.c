@@ -172,7 +172,8 @@ int main(void) {
     size_t pl_len = sizeof(payload_out);
 
     /* Asıl hedef: handshake_read */
-    err = handshake_read(&hs, msg, msg_len, payload_out, &pl_len);
+    err = handshake_read(&hs, msg, msg_len, payload_out, sizeof(payload_out),
+                         &pl_len);
 
     /* İnvariant: dönüş değeri tanımlı hata kodlarından biri olmalı.
      * ASan/OOB zaten handle ediyor; bu sadece enum dışı değer

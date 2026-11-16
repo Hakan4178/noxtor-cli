@@ -6,17 +6,92 @@
  *
  * Kernel 5.13+ gerektirir (Landlock ABI v1+; yeni haklar ABI'ye göre
  * koşullu eklenir, tablo için landlock_sandbox_init'e bak).
+ * ABI 9+ ile pathname Unix soketlerine connect de kısıtlanır; yalnız
+ * Tor'un socks.sock inode'una dosya düzeyinde istisna tanınır.
  * Kernel desteklemiyorsa fail-closed: NOX_ERR_* döner, çağıran
  * (--allow-unsandboxed-fs yoksa) çıkmak zorundadır.
  *
  * Kullanım:
- *   landlock_sandbox_init(config_dir_fd, downloads_dir_fd);
- *   // Bu noktadan sonra sadece downloads_dir (RW) + config_dir (RO) altında erişim
+ *   int socks_fd = landlock_open_unix_socket_fd(socks_path);
+ *   landlock_sandbox_init(config_dir_fd, downloads_dir_fd, tor_data_fd, socks_fd);
+ *   close(socks_fd);
+ *   // Bu noktadan sonra sadece downloads_dir (RW) + config_dir (RO)
+ *   // + tor_data_dir (silme) altında erişim
  * ================================================================ */
 #include "common.h"
 #include "landlock_sandbox.h"
-#include <assert.h>
 
+#include <errno.h>
+
+/* F5: Saf karar yardımcısı — event_loop'un platformdan bağımsız
+ * fail-closed matrisi. Android stub'larında da derlenir. */
+nox_ll_fs_policy_t landlock_fs_policy_decide(bool fds_ok,
+                                             nox_err_t init_rc,
+                                             bool active,
+                                             bool allow_unsandboxed) {
+    if (!fds_ok)
+        return NOX_LL_FS_ABORT;
+
+    if (init_rc == NOX_OK)
+        return active ? NOX_LL_FS_RUN : NOX_LL_FS_ABORT;
+
+    if (init_rc == NOX_ERR_LANDLOCK_UNSUPPORTED &&
+        !active && allow_unsandboxed)
+        return NOX_LL_FS_RUN_UNSANDBOXED;
+
+    /* NOX_ERR_CONFIG veya beklenmeyen hata: bayrak bypass etmez. */
+    return NOX_LL_FS_ABORT;
+}
+
+/* F5/ABI probe: Landlock syscall hata sınıflandırması.
+ * ret >= 0 başarı; ENOSYS/EOPNOTSUPP "kernel/LSM yok"; diğerleri
+ * yapılandırma hatası. Saf fonksiyon — testlerde kernel gerekmez. */
+nox_ll_syscall_status_t landlock_syscall_status(int ret, int err) {
+    if (ret >= 0)
+        return NOX_LL_SYSCALL_OK;
+    if (err == ENOSYS || err == EOPNOTSUPP)
+        return NOX_LL_SYSCALL_UNSUPPORTED;
+    return NOX_LL_SYSCALL_CONFIG_ERROR;
+}
+
+#ifdef NOX_NO_LANDLOCK
+
+/* Android/arm64: Landlock yok. Android SELinux dosya kısıtları
+ * kullanılır; uygulama kendi Landlock katmanını kurmaz. */
+int landlock_abi_version(void) {
+    errno = ENOSYS;
+    return -1;
+}
+
+int landlock_open_unix_socket_fd(const char *path) {
+    (void)path;
+    errno = ENOSYS;
+    return -1;
+}
+
+nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd,
+                                int tor_data_fd, int socks_fd) {
+    (void)config_dir_fd;
+    (void)downloads_dir_fd;
+    (void)tor_data_fd;
+    (void)socks_fd;
+    NOX_INFO(LOG_MOD_MAIN,
+             "android: Landlock yok — SELinux dosya kısıtları kullanılıyor; "
+             "Landlock sandbox'ı atlandı");
+    return NOX_ERR_LANDLOCK_UNSUPPORTED;
+}
+
+nox_hardbool_t landlock_is_available(void) {
+    return false;
+}
+
+nox_hardbool_t landlock_is_active(void) {
+    return false;
+}
+
+#else /* !NOX_NO_LANDLOCK */
+
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/landlock.h>
@@ -24,6 +99,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -48,10 +124,43 @@ static inline int sys_landlock_restrict_self(int ruleset_fd, __u32 flags)
 }
 
 /* ── Landlock ABI versiyonunu kontrol et ── */
-static int landlock_abi_version(void) {
+int landlock_abi_version(void) {
     int version = sys_landlock_create_ruleset(NULL, 0,
                     LANDLOCK_CREATE_RULESET_VERSION);
     return version;
+}
+
+/* ── Pathname Unix soketini O_PATH ile aç ve kimliğini doğrula ──
+ * Dizin veya normal dosya kabul edilmez: yanlış fd, Landlock kuralıyla
+ * tüm alt ağaca/soks olmayan inode'a hak vermemeli. */
+int landlock_open_unix_socket_fd(const char *path) {
+    if (!path || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+        close(fd);
+        errno = ENOTSOCK;
+        return -1;
+    }
+    if (st.st_uid != geteuid()) {
+        close(fd);
+        errno = EACCES;
+        return -1;
+    }
+    return fd;
 }
 
 /* ================================================================
@@ -59,45 +168,119 @@ static int landlock_abi_version(void) {
  *
  * @config_dir_fd:    config dizinin fd'si (O_DIRECTORY|O_NOFOLLOW) — RO
  * @downloads_dir_fd: downloads dizinin fd'si (O_DIRECTORY|O_NOFOLLOW) — RW
+ * @tor_data_fd:      tor_data_<pid> dizinin fd'si — dar silme kuralı
+ * @socks_fd:         socks.sock için O_PATH fd (ABI >= 9'da zorunlu)
  *
  * fd = anchor, path'e asla geri dönülmez (TOCTOU kapalı).
- * Sadece downloads (RW) + config (RO) altında erişim verilir.
+ * Sadece downloads (RW) + config (RO) + tor_data (silme) altında erişim
+ * verilir; ABI >= 9'da yalnız socks_fd inode'una RESOLVE_UNIX istisnası
+ * tanınır.
  *
  * Returns: NOX_OK veya NOX_ERR_CONFIG
  * ================================================================ */
 static nox_hardbool_t s_landlock_active = 0;
 
-nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
-    if (config_dir_fd < 0 || downloads_dir_fd < 0) {
-        NOX_ERROR(LOG_MOD_MAIN, "landlock: geçersiz dir fd (config=%d, downloads=%d)",
-                  config_dir_fd, downloads_dir_fd);
+nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd,
+                                int tor_data_fd, int socks_fd) {
+    if (config_dir_fd < 0 || downloads_dir_fd < 0 || tor_data_fd < 0) {
+        NOX_ERROR(LOG_MOD_MAIN,
+                  "landlock: geçersiz dir fd (config=%d, downloads=%d, tor_data=%d)",
+                  config_dir_fd, downloads_dir_fd, tor_data_fd);
         return NOX_ERR_CONFIG;
+    }
+
+    /* ── tor_data fd doğrulaması — her ABI'da zorunlu ──
+     * Silme kuralı yalnız bu inode'a bağlanır. Yanlış fd (dosya, başka
+     * kullanıcı) tüm config ağacına silme hakkı vermemeli. */
+    {
+        struct stat td_st;
+        if (fstat(tor_data_fd, &td_st) != 0) {
+            NOX_ERROR(LOG_MOD_MAIN, "landlock: tor_data fd doğrulanamadı (%s)",
+                      strerror(errno));
+            return NOX_ERR_CONFIG;
+        }
+        if (!S_ISDIR(td_st.st_mode)) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: tor_data fd bir dizin değil (mode=0%o)",
+                      td_st.st_mode);
+            return NOX_ERR_CONFIG;
+        }
+        if (td_st.st_uid != geteuid()) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: tor_data dizini başka UID'ye ait (uid=%u, euid=%u)",
+                      (unsigned)td_st.st_uid, (unsigned)geteuid());
+            return NOX_ERR_CONFIG;
+        }
     }
 
     /* ABI versiyonunu kontrol et */
     int abi = landlock_abi_version();
     if (abi < 0) {
-        NOX_WARN(LOG_MOD_MAIN, "landlock: desteklenmiyor (abi=%d), "
-                 "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz", abi);
+        int probe_err = errno;
+        if (landlock_syscall_status(abi, probe_err) ==
+            NOX_LL_SYSCALL_UNSUPPORTED) {
+            /* F5: kernel Landlock'u hiç bilmiyor/devre dışı — bu bir
+             * yapılandırma hatası değil, "desteklenmiyor"dur. */
+            NOX_WARN(LOG_MOD_MAIN,
+                     "landlock: desteklenmiyor (abi=%d, errno=%d), "
+                     "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz",
+                     abi, probe_err);
+            return NOX_ERR_LANDLOCK_UNSUPPORTED;
+        }
+        NOX_ERROR(LOG_MOD_MAIN,
+                  "landlock: ABI sorgusu başarısız (%s) — yapılandırma hatası",
+                  strerror(probe_err));
         return NOX_ERR_CONFIG;
     }
 
     if (abi < 1) {
         NOX_WARN(LOG_MOD_MAIN, "landlock: ABI v1 gerekli (abi=%d), "
                  "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz", abi);
-        return NOX_ERR_CONFIG;
+        return NOX_ERR_LANDLOCK_UNSUPPORTED;
     }
 
     NOX_INFO(LOG_MOD_MAIN, "landlock: ABI v%d tespit edildi", abi);
 
+    /* ── socks.sock fd doğrulaması (yalnız ABI >= 9) ──
+     * ABI < 9'da RESOLVE_UNIX yok; fd gerekmez ve yok sayılır.
+     * ABI >= 9'da eksik/yanlış fd fail-closed: aksi halde ya tüm
+     * pathname connect'ler EACCES olur ya da kural yanlış inode'a gider. */
+    if (abi >= 9) {
+        if (socks_fd < 0) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: ABI v%d için socks.sock fd gerekli (fd=%d)",
+                      abi, socks_fd);
+            return NOX_ERR_CONFIG;
+        }
+        struct stat socks_st;
+        if (fstat(socks_fd, &socks_st) != 0) {
+            NOX_ERROR(LOG_MOD_MAIN, "landlock: socks fd doğrulanamadı (%s)",
+                      strerror(errno));
+            return NOX_ERR_CONFIG;
+        }
+        if (!S_ISSOCK(socks_st.st_mode)) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: socks fd bir Unix soketi değil (mode=0%o)",
+                      socks_st.st_mode);
+            return NOX_ERR_CONFIG;
+        }
+        if (socks_st.st_uid != geteuid()) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: socks soketi başka UID'ye ait (uid=%u, euid=%u)",
+                      (unsigned)socks_st.st_uid, (unsigned)geteuid());
+            return NOX_ERR_CONFIG;
+        }
+    }
+
     /* ── Ruleset oluştur ── */
     /* ABI versiyonuna göre desteklenen hakları koşullu ekle */
-    __u32 handled = NOX_LL_BASE_RIGHTS;
+    __u64 handled = NOX_LL_BASE_RIGHTS;
     if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
     if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
 #ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
     if (abi >= 5) handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
 #endif
+    if (abi >= 9) handled |= LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
 
     struct landlock_ruleset_attr ruleset_attr = {
         .handled_access_fs = handled,
@@ -113,7 +296,9 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     int ruleset_fd = sys_landlock_create_ruleset(&ruleset_attr,
                                                   sizeof(ruleset_attr), 0);
     if (ruleset_fd < 0) {
-        if (errno == EOPNOTSUPP) {
+        int create_err = errno;
+        if (landlock_syscall_status(ruleset_fd, create_err) ==
+            NOX_LL_SYSCALL_UNSUPPORTED) {
             /* C-2 EK FIX: artık NOX_OK DEĞİL — sandbox kurulamadıysa
              * bunu çağırana "başarı" diye yalan söylemiyoruz. */
             NOX_ERROR(LOG_MOD_MAIN,
@@ -122,7 +307,7 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
             return NOX_ERR_LANDLOCK_UNSUPPORTED;
         }
         NOX_ERROR(LOG_MOD_MAIN, "landlock: ruleset oluşturulamadı (%s)",
-                  strerror(errno));
+                  strerror(create_err));
         return NOX_ERR_CONFIG;
     }
 
@@ -132,11 +317,17 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
      * haklar, ABI farkı gözetmeden tam liste olarak yazılır.
      * Gerçek allowed_access, bunun `handled` ile kesişimidir.
      *
-     * Bu tek satır (`wanted & handled`) hem C-1'i hem C-2'yi yapısal
-     * olarak imkansız hale getirir:
-     *   - C-1: MAKE_REG artık wanted'da → allowed'da da var → EACCES yok.
-     *   - C-2: TRUNCATE, handled'da yoksa (ABI<3) maskeden otomatik düşer →
-     *          allowed ⊄ handled durumu asla oluşamaz → EINVAL yok.
+     * `wanted & handled` yalnızca allowed_access'in handled_access_fs'in
+     * alt kümesi olmasını garanti eder; kernel'in EINVAL koşulunu kapatır.
+     * Bu, istenen tüm hakların kısıtlandığı anlamına gelmez:
+     *   - C-1: MAKE_REG wanted'ta → ABI uyumlu kernelde allowed'da da var →
+     *          downloads'ta O_CREAT EACCES ile engellenmez.
+     *   - C-2: TRUNCATE ABI<3'te handled'da yoktur. Bu durumda hak
+     *          allowed'dan düşer, ama Landlock TRUNCATE'i o ABI'de zaten
+     *          kısıtlayamaz. Yani "truncate güvenle reddediliyor" DEĞİL,
+     *          "truncate hiç kısıtlanmıyor" demektir. Sandbox öncesi açılmış
+     *          fd'ler de (F4) bu kapsamın dışındadır; Landlock açılış anında
+     *          etiketlenmemiş fd'lere geriye dönük uygulanmaz.
      */
     __u64 wanted =
         LANDLOCK_ACCESS_FS_READ_FILE    |
@@ -163,19 +354,17 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     }
 
     /* ── config dizini için kural ekle — fd anchor, HOME parse yok (Q1 Şık A) ──
-     * Sadece okuma izni — TOCTOU kapalı, path'e asla geri dönülmez.
-     * NOT: identity.key/salt event loop'ta RO okunabilir (şeffaf, bilerek):
-     *  dosyalar XSalsa20-Poly1305 şifreli, HS sonrası RAM'de arena+mlock'ta,
-     *  retry yok — erişilemez yapmak (READ_FILE çıkarmak) fail-closed olur
-     *  ama retry eklenirse kırar. Politika A: RO korunur, şifreli. */
+     * F3: yalnız okuma — REMOVE_FILE kaldırıldı. identity.key, salt ve
+     * contacts.db (WAL/SHM dahil) config kökünden silinemez. Silme
+     * ihtiyacı olan tek şey tor_data_<pid> içeriğidir; o ayrı kuralla
+     * verilir. NOT: identity.key/salt event loop'ta RO okunabilir
+     * (şeffaf, bilerek): dosyalar XSalsa20-Poly1305 şifreli, HS sonrası
+     * RAM'de arena+mlock'ta, retry yok. */
     {
         struct landlock_path_beneath_attr config_rule = {
             .allowed_access =
                 LANDLOCK_ACCESS_FS_READ_FILE |
-                LANDLOCK_ACCESS_FS_READ_DIR |
-                LANDLOCK_ACCESS_FS_REMOVE_FILE, /* L-21 FIX: shutdown'da
-                listen.sock unlink'i EPERM almadan çalışsın — yoksa bayat
-                socket dosyası bir sonraki bind()'i engeller */
+                LANDLOCK_ACCESS_FS_READ_DIR,
             .parent_fd = config_dir_fd,
         };
         rc = sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
@@ -186,6 +375,72 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
             close(ruleset_fd);
             return NOX_ERR_CONFIG;
         }
+    }
+
+    /* ── tor_data_<pid> için dar silme kuralı — F3 ──
+     * Yalnız bu alt ağaçta dosya/dizin silme serbest:
+     *   - torrc, listen.sock, Tor'un DataDirectory içeriği
+     * READ_FILE/MAKE_* verilmez: uygulama burada yeni dosya üretmez
+     * (torrc Landlock'tan önce yazıldı), yalnız temizler.
+     * REMOVE_DIR bu dizinin ALTINDAKİ dizinler içindir; tor_data_dir'ın
+     * kendisini silmek config kökünde REMOVE_DIR gerektirir ve bilerek
+     * verilmez — boş dizin sonraki açılışta Landlock öncesi
+     * cleanup_stale_tor_dirs ile temizlenir. */
+    {
+        __u64 td_wanted =
+            LANDLOCK_ACCESS_FS_READ_DIR |
+            LANDLOCK_ACCESS_FS_REMOVE_FILE |
+            LANDLOCK_ACCESS_FS_REMOVE_DIR;
+        struct landlock_path_beneath_attr tor_data_rule = {
+            .allowed_access = nox_ll_compute_rule_rights(td_wanted, handled),
+            .parent_fd = tor_data_fd,
+        };
+        rc = sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+                                   &tor_data_rule, 0);
+        if (rc < 0) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: tor_data kuralı eklenemedi (%s)",
+                      strerror(errno));
+            close(ruleset_fd);
+            return NOX_ERR_CONFIG;
+        }
+    }
+
+    /* ── socks.sock istisnası — yalnız ABI >= 9 ──
+     * RESOLVE_UNIX handled edilince domain dışındaki tüm pathname Unix
+     * soketlerine connect EACCES olur. Tor Landlock'tan önce spawn
+     * edildiği için socks.sock domain dışındadır; yalnız o inode'a
+     * dosya düzeyinde istisna tanınır. control.sock/listen.sock için
+     * kural YOK — onlar kapalı kalmalı. */
+    if (abi >= 9) {
+        __u64 socks_allowed =
+            nox_ll_compute_rule_rights(LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+                                       handled);
+        if (socks_allowed == 0) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: socks RESOLVE_UNIX maskesi boş — fail-closed");
+            close(ruleset_fd);
+            return NOX_ERR_CONFIG;
+        }
+        struct landlock_path_beneath_attr socks_rule = {
+            .allowed_access = socks_allowed,
+            .parent_fd = socks_fd,
+        };
+        rc = sys_landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+                                   &socks_rule, 0);
+        if (rc < 0) {
+            NOX_ERROR(LOG_MOD_MAIN,
+                      "landlock: socks.sock RESOLVE_UNIX kuralı eklenemedi (%s)",
+                      strerror(errno));
+            close(ruleset_fd);
+            return NOX_ERR_CONFIG;
+        }
+        NOX_INFO(LOG_MOD_MAIN,
+                 "landlock: socks.sock RESOLVE_UNIX istisnası eklendi");
+    } else {
+        NOX_WARN(LOG_MOD_MAIN,
+                 "landlock: ABI v%d < 9 — pathname Unix connect kısıtlanmıyor "
+                 "(F1 açık)", abi);
     }
 
     /* ── no_new_privs ayarla ──
@@ -211,7 +466,8 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd) {
     close(ruleset_fd);
 
     NOX_INFO(LOG_MOD_MAIN,
-             "landlock: sandbox aktif — downloads RW + config RO, dışı yasak");
+             "landlock: sandbox aktif — downloads RW + config RO + "
+             "tor_data silme, dışı yasak");
     return NOX_OK;
 }
 
@@ -244,7 +500,14 @@ nox_hardbool_t landlock_is_active(void) {
  *     (allowed | handled) == handled
  * Bu sayede kernel'in landlock_add_rule'da uyguladığı EINVAL
  * (allowed ⊄ handled) koşulu yapısal olarak asla oluşamaz.
+ *
+ * ÖNEMLİ: Bu fonksiyon yalnızca kural maskesini ABI'ye uyarlar.
+ * @handled'da olmayan bir hak, Landlock tarafından kısıtlanamayan haktır;
+ * maskeden düşmesi o hakkın güvenli biçimde reddedildiği anlamına GELMEZ.
+ * Örn. ABI<3'te TRUNCATE handled'da yoktur → truncate hiç kısıtlanmaz.
  * ================================================================ */
 __u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled) {
     return wanted & handled;
 }
+
+#endif /* !NOX_NO_LANDLOCK */

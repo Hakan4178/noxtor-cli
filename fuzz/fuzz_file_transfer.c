@@ -56,10 +56,8 @@ int main(void) {
   memset(&state, 0, sizeof(state));
   state.downloads_dir_fd = dir_fd;
 
-  /* Mock session oluşturalım (rx.has_key = false olunca pass-through yapar) */
-  struct noise_session mock_session;
-  memset(&mock_session, 0, sizeof(mock_session));
-  state.session = &mock_session;
+  /* H3: handle_rx artık düz metin alır (ps->rx_file üzerinde çalışır) */
+  struct peer_session *ps = &state.peers[0];
 
   while (__AFL_LOOP(10000)) {
     uint8_t buf[8192];
@@ -68,33 +66,33 @@ int main(void) {
       continue;
 
     /* Her tur öncesi rx_file struct'ını sıfırlayalım */
-    memset(&state.rx_file, 0, sizeof(state.rx_file));
-    state.rx_file.fd = -1;
+    memset(&ps->rx_file, 0, sizeof(ps->rx_file));
+    ps->rx_file.fd = -1;
 
     /* Konfigürasyon baytını çıkaralım */
     uint8_t cfg = buf[0];
     if (cfg & 0x01) {
       /* Aktif bir dosya transferi simüle edelim */
-      state.rx_file.active = true;
-      state.rx_file.expected_size = 100000;
-      state.rx_file.received_bytes = (cfg & 0x02) ? 99000 : 50000;
-      memset(state.rx_file.expected_hash, 0xAA, 32);
-      strncpy(state.rx_file.filename, "fuzz_test.dat", sizeof(state.rx_file.filename) - 1);
-      strncpy(state.rx_file.local_name, "received_fuzz_test.dat", sizeof(state.rx_file.local_name) - 1);
+      ps->rx_file.active = true;
+      ps->rx_file.expected_size = 100000;
+      ps->rx_file.received_bytes = (cfg & 0x02) ? 99000 : 50000;
+      memset(ps->rx_file.expected_hash, 0xAA, 32);
+      strncpy(ps->rx_file.filename, "fuzz_test.dat", sizeof(ps->rx_file.filename) - 1);
+      strncpy(ps->rx_file.local_name, "received_fuzz_test.dat", sizeof(ps->rx_file.local_name) - 1);
 
       /* Dosyayı downloads_dir_fd içinde açalım */
-      int fd = openat(state.downloads_dir_fd, state.rx_file.local_name,
+      int fd = openat(state.downloads_dir_fd, ps->rx_file.local_name,
                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
       if (fd >= 0) {
-        state.rx_file.fd = fd;
-        crypto_generichash_init(&state.rx_file.hash_state, NULL, 0, 32);
+        ps->rx_file.fd = fd;
+        crypto_generichash_init(&ps->rx_file.hash_state, NULL, 0, 32);
       } else {
-        state.rx_file.active = false;
+        ps->rx_file.active = false;
       }
     }
 
     /* Alıcı fonksiyonu çalıştıralım (buf + 1 ile fuzzer girdisini besleyelim) */
-    file_transfer_handle_rx(&state, buf + 1, (uint32_t)(n - 1));
+    file_transfer_handle_rx(&state, ps, buf + 1, (uint32_t)(n - 1));
 
     /* Kalan tüm kaynakları ve oluşturulan dosyayı temizleyelim */
     file_transfer_cleanup(&state);

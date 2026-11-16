@@ -21,6 +21,32 @@ NC='\033[0m'
 OUTDIR="/tmp/formal-verify"
 mkdir -p "$OUTDIR"
 
+# ESBMC ikilisi — sistemdeki /usr/local/bin/esbmc Boost ABI uyumsuzluğu
+# nedeniyle çalışmayabilir. Öncelik: ESBMC_BIN ortam değişkeni → yerel
+# build → PATH'te çalışan esbmc. Çalışmayan aday atlanır.
+if [[ -n "${ESBMC_BIN:-}" ]]; then
+    :
+elif [[ -x "$HOME/esbmc/build/src/esbmc/esbmc" ]] && \
+     "$HOME/esbmc/build/src/esbmc/esbmc" --version >/dev/null 2>&1; then
+    ESBMC_BIN="$HOME/esbmc/build/src/esbmc/esbmc"
+else
+    ESBMC_BIN="$(command -v esbmc 2>/dev/null || true)"
+    if [[ -n "$ESBMC_BIN" ]] && ! "$ESBMC_BIN" --version >/dev/null 2>&1; then
+        ESBMC_BIN=""
+    fi
+fi
+
+# ESBMC hizalama shim: ESBMC, __attribute__((aligned(64))) özniteliğini
+# yok sayıyor → crypto_generichash_state içeren struct'ları (file_rx_state →
+# peer_session → app_state) derleyiciden 96 byte KÜÇÜK modelliyor. Sonuç:
+# "memset of memory segment of size 369784 with 371328 bytes" gibi
+# FALSE POSITIVE'ler (13 Kasım: ESBMC state_machine 1/215 property FAILED).
+# libsodium'un CRYPTO_ALIGN'i #ifndef korumalı olduğu için, hizalama
+# özniteliğini komut satırından kaldırmak ESBMC'nin tahsisini derleyiciyle
+# hizalıyor. Etki yalnızca padding (struct semantiği değişmez).
+#
+# NOT: CBMC'ye UYGULANMAZ — CBMC aligned özniteliğini doğru uyguluyor.
+
 TOTAL_PASS=0
 TOTAL_FAIL=0
 
@@ -86,7 +112,7 @@ verify_log() {
         tests/cbmc_log.c src/log.c
 
     run_and_check "ESBMC log.c" 300 "$OUTDIR/esbmc_log.txt" \
-        esbmc -D__ESBMC__ -I include \
+        "$ESBMC_BIN" -D__ESBMC__ "-DCRYPTO_ALIGN(x)=" -I include \
         --overflow-check --unsigned-overflow-check --memory-leak-check \
         --unwind 130 \
         tests/cbmc_log.c src/log.c
@@ -129,14 +155,14 @@ verify_stdin() {
         tests/cbmc_stdin.c
 
     run_and_check "ESBMC stdin (unwind 100)" 300 "$OUTDIR/esbmc_stdin.txt" \
-        esbmc -D__ESBMC__ -I include \
+        "$ESBMC_BIN" -D__ESBMC__ "-DCRYPTO_ALIGN(x)=" -I include \
         --overflow-check --unsigned-overflow-check --memory-leak-check \
         --no-unwinding-assertions --unwind 100 \
         --no-pointer-check --no-bounds-check \
         tests/cbmc_stdin.c
 
     run_and_check "ESBMC stdin (unwind 4200)" 1800 "$OUTDIR/esbmc_stdin_4200.txt" \
-        esbmc -D__ESBMC__ -I include \
+        "$ESBMC_BIN" -D__ESBMC__ "-DCRYPTO_ALIGN(x)=" -I include \
         --overflow-check --unsigned-overflow-check --memory-leak-check \
         --no-unwinding-assertions --unwind 4200 \
         --no-pointer-check --no-bounds-check \
@@ -148,7 +174,7 @@ verify_noise() {
     log "\n${BOLD}${CYAN}═══ noise.c — ESBMC CHECK (12/27 fonksiyon) ═══${NC}"
 
     run_and_check "ESBMC noise easy (12 fonksiyon)" 300 "$OUTDIR/esbmc_noise_easy.txt" \
-        esbmc -D__ESBMC__ -I include \
+        "$ESBMC_BIN" -D__ESBMC__ "-DCRYPTO_ALIGN(x)=" -I include \
         --overflow-check --unsigned-overflow-check --memory-leak-check \
         --no-unwinding-assertions --unwind 50 \
         tests/cbmc_noise_easy.c
@@ -163,7 +189,7 @@ verify_crypto() {
         tests/cbmc_crypto.c
 
     run_and_check "ESBMC crypto.c" 300 "$OUTDIR/esbmc_crypto.txt" \
-        esbmc -D__ESBMC__ --overflow-check --unsigned-overflow-check \
+        "$ESBMC_BIN" -D__ESBMC__ "-DCRYPTO_ALIGN(x)=" --overflow-check --unsigned-overflow-check \
         --memory-leak-check --unwind 50 \
         tests/cbmc_crypto.c
 }
@@ -190,7 +216,7 @@ verify_state_machine() {
         tests/cbmc_state_machine.c src/state_machine.c
 
     run_and_check "ESBMC state_machine.c (strict)" 300 "$OUTDIR/esbmc_state_machine.txt" \
-        esbmc -D__ESBMC__ -I include \
+        "$ESBMC_BIN" -D__ESBMC__ "-DCRYPTO_ALIGN(x)=" -I include \
         --overflow-check \
         --unsigned-overflow-check \
         --memory-leak-check \
@@ -201,10 +227,10 @@ verify_state_machine() {
 
 # ════════════════════════════════════════════════════════════
 echo -e "${BOLD}${CYAN}noxtor-cli — Formal Verification (CBMC + ESBMC)${NC}"
-command -v cbmc  &>/dev/null || { echo -e "${RED}cbmc bulunamadı${NC}"; exit 1; }
-command -v esbmc &>/dev/null || { echo -e "${RED}esbmc bulunamadı${NC}"; exit 1; }
+command -v cbmc &>/dev/null || { echo -e "${RED}cbmc bulunamadı${NC}"; exit 1; }
+[[ -n "${ESBMC_BIN:-}" ]] || { echo -e "${RED}esbmc bulunamadı veya çalışmıyor${NC}"; exit 1; }
 echo -e "${CYAN}cbmc:${NC}  $(cbmc --version 2>&1 | head -1)"
-echo -e "${CYAN}esbmc:${NC} $(esbmc --version 2>&1 | head -1)"
+echo -e "${CYAN}esbmc:${NC} $ESBMC_BIN — $("$ESBMC_BIN" --version 2>&1 | head -1)"
 echo ""
 
 > "$OUTDIR/summary.txt"

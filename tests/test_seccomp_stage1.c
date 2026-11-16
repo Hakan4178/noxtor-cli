@@ -1,26 +1,8 @@
-/* ================================================================
- * test_seccomp_stage1.c — Stage 1 filtre testi (GERÇEK politika)
- *
- * src/seccomp.c'deki seccomp_policy_load(1) yüklenir; politika kopyası
- * DEĞİL. (Ders: kopya politika testi, kaynaktaki regresyonu gizler —
- * K-01 tam bu yüzden stage testleri yeşilken canlı kalmıştı.)
- *
- * Stage 1 = key_derive sonrası 120 sn Tor bootstrap penceresi:
- *   Engellenenler : process_vm_readv/writev, io_uring*, userfaultfd,
- *                   perf_event_open, bpf, kexec_file_load, finit_module,
- *                   personality → SIGSYS
- *   Serbest       : normal syscall'lar (getpid/write/mmap RW),
- *                   socket(AF_UNIX), fork (tor_spawn penceresi)
- *   ptrace        : yalnız release (NDEBUG) build'de engelli
- *
- * Her test ayrı child process'te çalışır.
- *
- * Build:
- *   make test                    (src .test.o'ları ile link edilir)
- *
- * Run:
- *   ./tests/test_seccomp_stage1
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_seccomp_stage1.c — gerçek seccomp_policy_load(1), ayrı child.
+ * Bootstrap: process_vm_*, io_uring, userfaultfd, perf, bpf, kexec,
+ * finit_module, personality → SIGSYS; AF_UNIX/fork serbest; ptrace NDEBUG.
+ */
 #include "common.h"
 #include "seccomp_policy.h"
 
@@ -31,6 +13,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "test_support.h"
 
 /* Stage 1 filtresini child process'e uygula — gerçek politika */
 static int apply_stage1(void) {
@@ -155,50 +138,6 @@ static void test_fork_allow(void) {
   _exit(1);
 }
 
-/* ── Ana test çalıştırıcı ── */
-
-static int run_test(const char *name __attribute__((unused)), const char *desc, void (*fn)(void), int should_die) {
-  printf("  %-38s ", desc);
-
-  pid_t child = fork();
-  if (child < 0) {
-    printf("[SKIP] fork başarısız\n");
-    return 0;
-  }
-
-  if (child == 0) {
-    fn();  /* asla dönmez — SIGSYS veya _exit */
-    _exit(0);
-  }
-
-  int status;
-  waitpid(child, &status, 0);
-
-  if (should_die) {
-    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS) {
-      printf("[PASS] SIGSYS ✓\n");
-      return 1;
-    } else if (WIFEXITED(status)) {
-      printf("[FAIL] exit=%d (SIGSYS bekleniyordu)\n", WEXITSTATUS(status));
-      return 0;
-    } else {
-      printf("[FAIL] signal=%d (SIGSYS bekleniyordu)\n", WTERMSIG(status));
-      return 0;
-    }
-  } else {
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-      printf("[PASS] yaşadı ✓\n");
-      return 1;
-    } else if (WIFSIGNALED(status)) {
-      printf("[FAIL] signal=%d (yaşaması bekleniyordu)\n", WTERMSIG(status));
-      return 0;
-    } else {
-      printf("[FAIL] exit=%d (yaşaması bekleniyordu)\n", WEXITSTATUS(status));
-      return 0;
-    }
-  }
-}
-
 int main(void) {
   printf("=== Seccomp Stage 1 Testi (gerçek politika) ===\n");
   printf("Bootstrap penceresi: memory/ring/perf/kernel syscall engeli\n");
@@ -208,26 +147,26 @@ int main(void) {
   int total = 0;
 
   /* Engellenmesi gerekenler (SIGSYS beklenir) */
-  total++; passed += run_test("pvm_readv",   "process_vm_readv              ", test_process_vm_readv,   1);
-  total++; passed += run_test("pvm_writev",  "process_vm_writev             ", test_process_vm_writev,  1);
-  total++; passed += run_test("iou_setup",   "io_uring_setup                ", test_io_uring_setup,     1);
-  total++; passed += run_test("iou_enter",   "io_uring_enter                ", test_io_uring_enter,     1);
-  total++; passed += run_test("iou_reg",     "io_uring_register             ", test_io_uring_register,  1);
-  total++; passed += run_test("uffd",        "userfaultfd                   ", test_userfaultfd,        1);
-  total++; passed += run_test("perf",        "perf_event_open               ", test_perf_event_open,    1);
-  total++; passed += run_test("bpf",         "bpf                           ", test_bpf,                1);
-  total++; passed += run_test("kexec_file",  "kexec_file_load               ", test_kexec_file_load,    1);
-  total++; passed += run_test("finit_mod",   "finit_module                  ", test_finit_module,       1);
-  total++; passed += run_test("personality", "personality                   ", test_personality,        1);
+  total++; passed += nox_test_seccomp_run("pvm_readv",   "process_vm_readv              ", test_process_vm_readv,   1);
+  total++; passed += nox_test_seccomp_run("pvm_writev",  "process_vm_writev             ", test_process_vm_writev,  1);
+  total++; passed += nox_test_seccomp_run("iou_setup",   "io_uring_setup                ", test_io_uring_setup,     1);
+  total++; passed += nox_test_seccomp_run("iou_enter",   "io_uring_enter                ", test_io_uring_enter,     1);
+  total++; passed += nox_test_seccomp_run("iou_reg",     "io_uring_register             ", test_io_uring_register,  1);
+  total++; passed += nox_test_seccomp_run("uffd",        "userfaultfd                   ", test_userfaultfd,        1);
+  total++; passed += nox_test_seccomp_run("perf",        "perf_event_open               ", test_perf_event_open,    1);
+  total++; passed += nox_test_seccomp_run("bpf",         "bpf                           ", test_bpf,                1);
+  total++; passed += nox_test_seccomp_run("kexec_file",  "kexec_file_load               ", test_kexec_file_load,    1);
+  total++; passed += nox_test_seccomp_run("finit_mod",   "finit_module                  ", test_finit_module,       1);
+  total++; passed += nox_test_seccomp_run("personality", "personality                   ", test_personality,        1);
 #ifdef NDEBUG
-  total++; passed += run_test("ptrace",      "ptrace (release)              ", test_ptrace,             1);
+  total++; passed += nox_test_seccomp_run("ptrace",      "ptrace (release)              ", test_ptrace,             1);
 #endif
 
   /* Serbest olması gerekenler */
-  total++; passed += run_test("safe",      "getpid/write                  ", test_safe_syscalls,    0);
-  total++; passed += run_test("mmap_rw",   "mmap(PROT_READ|WRITE)         ", test_mmap_rw_allow,    0);
-  total++; passed += run_test("af_unix",   "socket(AF_UNIX)               ", test_af_unix_allow,    0);
-  total++; passed += run_test("fork",      "fork (tor_spawn penceresi)    ", test_fork_allow,       0);
+  total++; passed += nox_test_seccomp_run("safe",      "getpid/write                  ", test_safe_syscalls,    0);
+  total++; passed += nox_test_seccomp_run("mmap_rw",   "mmap(PROT_READ|WRITE)         ", test_mmap_rw_allow,    0);
+  total++; passed += nox_test_seccomp_run("af_unix",   "socket(AF_UNIX)               ", test_af_unix_allow,    0);
+  total++; passed += nox_test_seccomp_run("fork",      "fork (tor_spawn penceresi)    ", test_fork_allow,       0);
 
   printf("\nSonuç: %d/%d test başarılı\n", passed, total);
   return (passed == total) ? 0 : 1;

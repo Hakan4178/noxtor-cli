@@ -378,31 +378,53 @@ static void atomic_message(struct app_state *state, enum ui_label label,
     fflush(stderr);
 }
 
-/* Sistem/hata bloğu — "  <color><tag><text>" (byte-identical);
- * scrub yok: text sahipliği caller'da (H-2 kuralı) */
+/* Sistem/hata bloğu — "  <color><tag><text>" (temiz metinde
+ * byte-identical); text backend'de strip edilir (T-02 / UI-1).
+ * Kopya caller'ın tamponuna dokunmadan sanitize edilir; H-2 gereği
+ * iş bitince sodium_memzero + free. */
 static void block_message(struct app_state *state, const struct tm *tm,
                           const char *color, const char *tag,
                           const char *text)
 {
+    /* UI-1/T-02: FE_SYSTEM/FE_ERROR yolu da atomic_message ile aynı
+     * politikayı uygulamalı — aksi halde terminal injection açık kalır. */
+    size_t text_len = strlen(text);
+    char *safe_text = malloc(text_len + 1);
+    const char *out = text;
+
+    if (safe_text) {
+        memcpy(safe_text, text, text_len + 1);
+        ui_strip_ansi(safe_text);
+        out = safe_text;
+    } else {
+        /* OOM: ham text ASLA basılmaz; güvenlik uyarısı görünür kalsın
+         * diye sabit yer tutucu (sessizce yutmak FE_ERROR'ü gizlerdi). */
+        out = "(mesaj gösterilemedi)";
+    }
+
     if (state->ln_active) {
         /* Linenoise modu (Faz G-1): yalnız içerik — satır yönetimi
          * linenoise'da (bkz. atomic_message notu). */
         print_timestamp_short(tm);
-        fprintf(stderr, "  %s%s%s%s\n", color, tag, text, g_ansi.theme->clr_reset);
+        fprintf(stderr, "  %s%s%s%s\n", color, tag, out, g_ansi.theme->clr_reset);
         fflush(stderr);
-        return;
+    } else {
+        int clear_lines = calc_current_input_lines(state);
+
+        fprintf(stderr, "\033[?25l");
+        clear_prompt_area_lines(clear_lines);
+        print_timestamp_short(tm);
+        fprintf(stderr, "  %s%s%s%s\n", color, tag, out, g_ansi.theme->clr_reset);
+        fflush(stderr);
+        redraw_input(state);
+        fprintf(stderr, "\033[?25h");
+        fflush(stderr);
     }
 
-    int clear_lines = calc_current_input_lines(state);
-
-    fprintf(stderr, "\033[?25l");
-    clear_prompt_area_lines(clear_lines);
-    print_timestamp_short(tm);
-    fprintf(stderr, "  %s%s%s%s\n", color, tag, text, g_ansi.theme->clr_reset);
-    fflush(stderr);
-    redraw_input(state);
-    fprintf(stderr, "\033[?25h");
-    fflush(stderr);
+    if (safe_text) {
+        sodium_memzero(safe_text, text_len + 1);
+        free(safe_text);
+    }
 }
 
 /* DOSYA TRANSFERİ PROGRESS BAR — [========--------] 45% 1.2/2.6 MB;

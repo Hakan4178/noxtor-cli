@@ -7,11 +7,25 @@
  *   102 = SIGSEGV ama si_code != SEGV_CPERR     → başka fault (bozuk)
  *   104 = sigaction kurulamadı
  *   WIFSIGNALED = handler'ı görmeden öldü → BROKEN
+ *
+ * Android/arm64 build'inde (NOX_NO_X86_ASM) x86 CET/arch_prctl kodu
+ * derlenmez; cet_ss_lock_and_verify() CET_SS_UNSUPPORTED döner.
  */
 
 #include "cet_shstk.h"
 
-#include "common.h" /* _GNU_SOURCE — signal.h/sigaction için */
+#include "common.h" /* _GNU_SOURCE + platform türetimi (NOX_NO_X86_ASM) */
+
+#ifdef NOX_NO_X86_ASM
+
+/* CET-SS x86'ya özgüdür. Android/arm64'te donanım sorgusu ve
+ * arch_prctl self-test'i yoktur; çağıranlar için sabit sonuç. */
+cet_ss_state cet_ss_lock_and_verify(void)
+{
+  return CET_SS_UNSUPPORTED;
+}
+
+#else /* !NOX_NO_X86_ASM */
 
 #include "asm_utils.h"
 
@@ -185,6 +199,8 @@ cet_ss_state cet_ss_lock_and_verify(void)
 
   return live;
 }
+
+#endif /* !NOX_NO_X86_ASM */
 
 const char *cet_ss_state_str(cet_ss_state st)
 {

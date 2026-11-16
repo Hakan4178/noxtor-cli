@@ -1,17 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_cet_shstk.c — 4b CET-SS mekanizma regresyon testi
- *
- * Doğrulanan:
- *   1. cet_ss_lock_and_verify() BROKEN DÖNDÜRMEZ — sonuç ya UNSUPPORTED
- *      (CPU/kernel shstk'siz), ya ENFORCED (aktif + kilitli + #CP
- *      self-test), ya NOT_ENFORCED (pasif — CET-OFF yolu, child exit
- *      100 ile exercise edilir).
- *   2. Ardışık iki çağrı aynı sonucu verir (LOCK idempotent: zaten
- *      kilitliyken de rc=0 — empirik, bkz. src/cet_shstk.c).
- *   3. cet_ss_state_str() her geçerli değer için tanımlı metin döndürür.
- *
- * NOT: Test shstk'yi BU makinede açmaz (aktifleşme için ortam değişkeni
- *      gerekir) — mevcut durumu bozmadan mekanizmayı çalıştırır.
+ * test_cet_shstk.c — CET shadow stack: BROKEN dönmez, LOCK idempotent,
+ * durum metinleri tanımlı. Makinede shstk açmaz; mevcut durumu bozmaz.
  */
 
 #include "cet_shstk.h"
@@ -21,9 +10,6 @@
 #include "test_common.h"
 
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
 /* 1) Sonuç BROKEN olmamalı — BROKEN = sahte güvenlik veya bozuk
  *    mekanizma demektir; regresyon tam olarak budur. */

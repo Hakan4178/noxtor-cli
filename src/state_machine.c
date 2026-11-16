@@ -15,6 +15,7 @@
 #include "common.h"
 #include "database.h"
 #include "file_transfer.h"
+#include "frame_queue.h"
 #include "network.h"
 #include "noise.h"
 #include "stdin_handler.h"
@@ -65,6 +66,7 @@ static const char *const event_names[] = {
     [EV_SEQ_MISMATCH]      = "SEQ_MISMATCH",
     [EV_ARENA_FAIL]        = "ARENA_FAIL",
     [EV_TOR_DIED]          = "TOR_DIED",
+    [EV_CRYPTO_FAIL]       = "CRYPTO_FAIL",
 };
 
 const char *sm_state_name(peer_state_t st)
@@ -189,6 +191,16 @@ static const state_transition_t transitions[] = {
   { ST_FILE_TX,          EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
   { ST_FILE_RX,          EV_TOR_DIED,           ST_IDLE,           action_cleanup      },
 
+/* ── Crypto/Protocol Fail — Her durumdan idle'e ─────────────────── */
+  { ST_IDLE,             EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_CONNECTING,       EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_HANDSHAKE_INIT,   EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_HANDSHAKE_RESP,   EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_TOFU_PENDING,     EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_ACTIVE,           EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_FILE_TX,          EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+  { ST_FILE_RX,          EV_CRYPTO_FAIL,        ST_IDLE,           action_cleanup      },
+
 /* ── Rate Limit ────────────────────────────────────────────────── */
   { ST_HANDSHAKE_INIT, EV_RATE_LIMIT,          ST_IDLE,           action_cleanup      },
   { ST_HANDSHAKE_RESP, EV_RATE_LIMIT,          ST_IDLE,           action_cleanup      },
@@ -236,6 +248,18 @@ nox_err_t sm_dispatch_active(struct app_state *state, peer_event_t event)
     return sm_dispatch(ps, state, event);
 }
 
+void sm_set_active_peer(struct app_state *state, struct peer_session *ps)
+{
+    if (!state || !ps)
+        return;
+    if (ps < state->peers || ps >= state->peers + NOX_MAX_PEERS)
+        return;
+
+    state->active_peer_idx = (int)(ps - state->peers);
+    strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
+    state->active_peer_onion[NOX_ONION_LEN] = '\0';
+}
+
 /* ================================================================
  * ACTION: CLEANUP — Merkezi temizlik
  *
@@ -275,18 +299,29 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
     sodium_memzero(ps->peer_onion, sizeof(ps->peer_onion));
     sodium_memzero(ps->connect_target, sizeof(ps->connect_target));
 
-    /* 4. TOFU state — Hassas verileri sıfırla */
+    /* 4. TOFU state — Hassas verileri sıfırla.
+     * C2: cleanup, aktif prompt'un sahibi olan peer'ı kaldırıyorsa global
+     * onay token'ını da kapat. Epoch global monoton olduğundan eşleşme
+     * başka bir peer'ın prompt'unu yanlışlıkla kapatmaz. */
+    if (state->tofu_prompt_epoch != 0 &&
+        ps->tofu_epoch == state->tofu_prompt_epoch) {
+        state->tofu_prompt_epoch = 0;
+        sodium_memzero(state->tofu_prompt_fp, sizeof(state->tofu_prompt_fp));
+    }
     ps->tofu_pending = false;
     ps->tofu_peer_fd = -1;
     ps->tofu_was_zero_key = false;
     ps->peer_verified = false;
     sodium_memzero(&ps->last_active, sizeof(ps->last_active));
+    sodium_memzero(&ps->frame_start, sizeof(ps->frame_start));
     sodium_memzero(ps->tofu_onion, sizeof(ps->tofu_onion));
     sodium_memzero(ps->tofu_name, sizeof(ps->tofu_name));
     sodium_memzero(ps->tofu_new_key, sizeof(ps->tofu_new_key));
 
     /* 5. Dosya transferleri — peer'a özel state */
     ps->queue_flushed = false;
+    ps->db_retry_pending = false;
+    frame_queue_reset(ps);
     if (ps->rx_file.active) {
         if (ps->rx_file.fd >= 0)
             close(ps->rx_file.fd);
@@ -307,6 +342,14 @@ static nox_err_t action_cleanup(struct peer_session *ps, struct app_state *state
     /* 6. Recv buffer sıfırlama */
     sodium_memzero(ps->recv_buf, sizeof(ps->recv_buf));
     ps->recv_pos = 0;
+
+    /* 6b. H2/H3: RX plaintext çalışma tamponu — tek sahibi peer,
+     * tek serbest noktası burası. Bir sonraki oturuma plaintext sızmaz. */
+    if (ps->rx_pt_buf) {
+        sodium_memzero(ps->rx_pt_buf, NOX_MAX_MSG_LEN + 1);
+        sodium_free(ps->rx_pt_buf);
+        ps->rx_pt_buf = NULL;
+    }
 
     /* 7. Peer identity — name ve unread_count */
     sodium_memzero(ps->name, sizeof(ps->name));
@@ -396,6 +439,11 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
         return NOX_ERR_PROTO;
     }
 
+    /* K-33: peer kontrollü isim rehbere/UI'ya girmeden önce CR/LF,
+     * C1 ve bidi kontrol karakterlerinden arındırılır. Aksi halde
+     * "Mallory\r\n[✓] ..." gibi adlar sahte sistem satırı üretir. */
+    ui_strip_ansi(ps->tofu_name);
+
     /* db_add_contact — rehbere kaydet */
     if (!state->ghost_mode) {
         nox_err_t db_err = db_add_contact(
@@ -415,6 +463,10 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
         sm_dispatch(ps, state, EV_PEER_DISCONNECTED);
         return NOX_ERR_ALLOC;
     }
+    /* sodium_malloc 0xdb doldurur; hardbool(0)'da 0xdb trap,
+     * fallback bool'da true olur. Deterministik zero-init
+     * (handshake_split de sıfırlar). */
+    sodium_memzero(ps->session, sizeof(*ps->session));
 
     if (handshake_split(ps->hs, ps->session) != NOX_OK) {
         ui_print_error(state, "session split başarısız");
@@ -429,11 +481,18 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
     ps->tx_seq = 0;
     ps->rx_seq = 0;
     ps->queue_flushed = false;
+    frame_queue_reset(ps);
+    ps->db_retry_pending = false;
     /* H-1 FIX: TOFU ile kurulan oturum doğrulanmamış sayılır — kuyruk
      * sızıntısını önlemek için peer_verified=false bırakılır. İlk
      * doğrulanmış SESSION_READY oturumunda peer_verified=true olacak. */
     ps->peer_verified = false;
     clock_gettime(CLOCK_MONOTONIC, &ps->last_active);
+    /* B1: TOFU onayı beklerken gelen baytlar yeni bir frame'in parçası
+     * olabilir. Onay gecikmesi trickle sayılmamalı; ACTIVE'e geçerken
+     * yarım frame saatini sıfırla. */
+    if (ps->recv_pos > 0)
+        clock_gettime(CLOCK_MONOTONIC, &ps->frame_start);
     NOX_DEBUG(LOG_MOD_NOISE,
               "session setup (TOFU): tx_seq=0 rx_seq=0 queue_flushed=false verified=0 tofu_zero=%d",
               ps->tofu_was_zero_key);
@@ -443,8 +502,8 @@ static nox_err_t action_tofu_accept(struct peer_session *ps, struct app_state *s
     snprintf(ps->peer_onion, sizeof(ps->peer_onion), "%s", ps->tofu_onion);
     strncpy(ps->name, ps->tofu_name, NOX_CONTACT_NAME_LEN);
     ps->name[NOX_CONTACT_NAME_LEN] = '\0';
-    strncpy(state->active_peer_onion, ps->peer_onion, NOX_ONION_LEN);
-    state->active_peer_onion[NOX_ONION_LEN] = '\0';
+    /* K-23: indeks + gösterim aynı peer'ı işaret etmeli. */
+    sm_set_active_peer(state, ps);
 
     NOX_INFO(LOG_MOD_NOISE, "session kuruldu — mesajlaşma hazır");
     ui_print_system(state, "[✓] şifreli kanal kuruldu (%s)", ps->tofu_name);
