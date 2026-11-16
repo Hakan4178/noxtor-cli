@@ -37,10 +37,10 @@ jobs:
 
     - name: Build libsodium 1.0.22
       run: |
-        curl -fsSLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.22-stable.tar.gz
-        echo "d862511f0ef382b5a6fab6909b511053d4ff62ea11cfd820ac6269d0a0993e9d  libsodium-1.0.22-stable.tar.gz" | sha256sum -c -
-        tar xzf libsodium-1.0.22-stable.tar.gz
-        cd libsodium-stable
+        curl -fsSLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.22.tar.gz
+        echo "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349  libsodium-1.0.22.tar.gz" | sha256sum -c -
+        tar xzf libsodium-1.0.22.tar.gz
+        cd libsodium-1.0.22
         ./configure --prefix=/usr/local
         make -j"$(nproc)"
         sudo make install
