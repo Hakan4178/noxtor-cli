@@ -1,22 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_pin.c — PIN doğrulama birim testleri
- *
- * validate_pin() fonksiyonunu test eder.
- * Terminal'e bağımlı DEĞİL — saf fonksiyon testi.
- *
- * Testler:
- *   1. Geçerli PIN — tam minimum uzunlukta
- *   2. Geçerli PIN — uzun, UTF-8 karakterlerli
- *   3. Çok kısa PIN → NOX_ERR_PIN
- *   4. Çok uzun PIN → NOX_ERR_PIN
- *   5. Boş string → NOX_ERR_PIN
- *   6. NULL pointer → NOX_ERR_PIN
- *   7. Embedded null byte → NOX_ERR_PIN
- *   8. Kontrol karakteri (newline) → NOX_ERR_PIN
- *   9. DEL karakteri (0x7F) → NOX_ERR_PIN
- *  10. Tab karakteri → kabul edilmeli (tek istisna)
- *  11. Tam sınır — 128 byte PIN → geçerli
- *  12. 129 byte → NOX_ERR_PIN
+ * test_pin.c — validate_pin: uzunluk, UTF-8, NUL/kontrol/DEL, tab istisnası.
  */
 
 #include "common.h"
@@ -28,9 +11,6 @@
 #include "test_common.h"
 
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
 /* 1. Geçerli PIN — tam 8 byte (minimum) */
 static int test_valid_min(void)
@@ -129,9 +109,6 @@ static int test_spaces_valid(void)
     return 0;
 }
 
-/* ================================================================
- * MAIN
- * ================================================================ */
 int main(void)
 {
     if (sodium_init() < 0) {

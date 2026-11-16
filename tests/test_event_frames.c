@@ -1,50 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_event_frames.c — event_loop frame dağıtım sözleşmesi (harness)
- *
- * process_peer_frames: recv_buf → header doğrula → (decrypt) →
- * dağıt → seq ilerlet. event_loop.c'nin kalbi; ilk kez izole test
- * ediliyor (loopback Noise çifti + socketpair, TÜM kripto gerçek).
- *
- * Kilitlenen sözleşmeler:
- *   - find_peer_by_fd: fd → slot eşlemesi, bulunamazsa NULL
- *   - hs_build_claim_payload: [ver|onion(62)|sig(64)]; seed/pub yoksa
- *     fail-closed; imza onion-adresinden verify edilebilir olmalı
- *   - TEXT happy: decrypt → rx_seq++ → buffer tüketilir
- *   - SEQ mismatch/replay (H2): IDLE + cleanup (fd kapandı, session
- *     serbest). Fix sonrası da aynı gözlem — tag fail ile tek yola düşer.
- *   - Yarım frame bekletilir; iki frame tek buffer'da slide edilir (M-3)
- *   - Session yokken TEXT bekletilir (TOFU sonrası drain kilidi)
- *   - CTRL (msg_index>=3) sessizce düşürülür (Y-2 — peer'ı öldürmesin)
- *
- * [H2/H3 FIX HEDEFİ — KIRMIZI] Auth fail artık sessiz yutulmaz:
- *   log + UI + EV_CRYPTO_FAIL → ST_IDLE. Nonce invariantı gereği
- *   başarısız decrypt kurtarılamaz ("devam" = zombi: rx_seq takılır,
- *   last_active recv'de tazelenir, sınırsız sessiz kayıp). Hedef
- *   sözleşme: ilk fail = kopma. Fix gelene kadar FAIL eden testler:
- *     test_mac_fail_disconnects              (bozuk MAC)
- *     test_len_tamper_disconnects            (len=0/aşırı → fail-closed kopma)
- *     test_header_junk_disconnects           (magic/tip 1-byte → fail-closed)
- *     test_file_decrypt_fail_disconnects     (FILE yolu)
- *     test_forged_probe_disconnects          (H3 oracle probe)
- *     test_type_flip_disconnects             (H2 type tamper → AD)
- *     test_file_type_flip_shows_garbage      (FILE→TEXT: içerik mesaj olur)
- *     test_text_into_active_transfer_corrupts(TEXT→FILE: indirmeye yazılır)
- *     test_ctrl_type_flip_eats_message       (TEXT→CTRL: sessiz yenir)
- *     test_old_ciphertext_splice             (eski ct + yeni seq)
- *     test_len_grow_tamper                   (len şişirme: çerçeve kayması)
- *     test_probe_storm_first_fail_disconnect (probe fırtınası: fail-fast)
- *     test_reconnect_same_slot_resets        (cleanup sonrası slot yeniden kullanımı)
- *     test_empty_payload_rejected            (boş TEXT/FILE = ilk occurrence fatal)
- *     test_handshake_payload_lengths_rejected(57/63/126 payload → msg3 yazılmamalı)
- *     test_handshake_version_rejected        (ver != 0x01 → msg3 yazılmamalı)
- *     test_msg3_not_written_on_onion_mismatch(MITM onion mismatch → kimlik sızmasın)
- *   - test_attacker_chain_bidirectional [30]: H1 claim/msg3 sızıntısı,
- *     H2/H3 saldırı matrisi iki yönde, ardından iki yönde temiz TEXT +
- *     FILE happy-path (metadata + chunk + BLAKE2b).
- *   Adım 4 (AD bağlama + fail-closed decode/fatal handler + boş payload)
- *   sonrası 12 test yeşile döner; fatal cleanup reconnect testini de yeşile
- *   çevirir. Güncel: 30/30 (tüm event-frame sözleşmeleri yeşil;
- *   Step 5 kırmızıları test_file_transfer.c'de ayrı tutulur).
+ * test_event_frames.c — event_loop frame dağıtım sözleşmesi.
+ * process_peer_frames: gerçek loopback Noise + socketpair; header/decode,
+ * TEXT/FILE dağıtımı, seq/replay, yarım frame/trickle, CTRL drop.
+ * H1/H2/H3: auth fail ilk hatada kopar; AD/type/len tamper fail-closed;
+ * claim/msg3 onion bağı doğrulanır. K-14, M-3, Y-2, B1/B2a.
  */
 
 #include "common.h"
@@ -65,10 +24,9 @@
 #include <unistd.h>
 #include <sodium.h>
 #include "test_common.h"
+#include "test_protocol_support.h"
 
-/* ================================================================
- * FIXTURE — loopback Noise çifti (test_file_transfer kalıbı)
- * ================================================================ */
+/* Fixture: loopback Noise çifti. */
 static struct app_state st;
 static struct noise_session *g_sess_i = NULL;  /* sender (encrypt) */
 static int g_sv[2] = {-1, -1};
@@ -77,62 +35,6 @@ static int g_sv[2] = {-1, -1};
  * loopback Noise çifti. p0'ın göndericisi g_sess_i, p1'inki g_sess_b. */
 static struct noise_session *g_sess_b = NULL;
 static int g_sv_b[2] = {-1, -1};
-
-/* Loopback Noise XX: initiator stack, responder sodium_malloc. Split
- * her hs'yi tüketir (zeroize) — çağrı iki complete hs ister. */
-static int make_split_pair(struct noise_session *sess_i,
-                           struct noise_session *sess_r)
-{
-    uint8_t i_priv[NOX_KEY_LEN], i_pub[NOX_KEY_LEN];
-    uint8_t r_priv[NOX_KEY_LEN], r_pub[NOX_KEY_LEN];
-    crypto_box_curve25519xsalsa20poly1305_keypair(i_pub, i_priv);
-    crypto_box_curve25519xsalsa20poly1305_keypair(r_pub, r_priv);
-
-    struct noise_handshake hs_i;
-    struct noise_handshake *hs_r = sodium_malloc(sizeof(*hs_r));
-    if (!hs_r) return -1;
-
-    if (handshake_init(&hs_i, true, i_priv, i_pub) != NOX_OK ||
-        handshake_init(hs_r, false, r_priv, r_pub) != NOX_OK) {
-        sodium_free(hs_r);
-        return -1;
-    }
-
-    uint8_t msg[NOISE_MAX_HANDSHAKE_LEN], pl[64];
-    size_t len, pl_len;
-    nox_err_t err = NOX_OK;
-
-    len = sizeof(msg);
-    if (handshake_write(&hs_i, NULL, 0, msg, &len) == NOX_OK) {
-        pl_len = sizeof(pl);
-        if (handshake_read(hs_r, msg, len, pl, sizeof(pl), &pl_len) == NOX_OK) {
-            len = sizeof(msg);
-            if (handshake_write(hs_r, NULL, 0, msg, &len) == NOX_OK) {
-                pl_len = sizeof(pl);
-                if (handshake_read(&hs_i, msg, len, pl, sizeof(pl), &pl_len) == NOX_OK) {
-                    len = sizeof(msg);
-                    if (handshake_write(&hs_i, NULL, 0, msg, &len) == NOX_OK) {
-                        pl_len = sizeof(pl);
-                        if (handshake_read(hs_r, msg, len, pl, sizeof(pl), &pl_len) != NOX_OK)
-                            err = NOX_ERR_CRYPTO;
-                    } else err = NOX_ERR_CRYPTO;
-                } else err = NOX_ERR_CRYPTO;
-            } else err = NOX_ERR_CRYPTO;
-        } else err = NOX_ERR_CRYPTO;
-    } else err = NOX_ERR_CRYPTO;
-
-    if (err == NOX_OK &&
-        (!handshake_is_complete(&hs_i) || !handshake_is_complete(hs_r)))
-        err = NOX_ERR_CRYPTO;
-
-    if (err == NOX_OK)
-        err = handshake_split(&hs_i, sess_i);   /* initiator → sender */
-    if (err == NOX_OK)
-        err = handshake_split(hs_r, sess_r);    /* responder → receiver */
-
-    sodium_free(hs_r);
-    return err == NOX_OK ? 0 : -1;
-}
 
 /* rx_pt_buf tek sahibi peer'dir; testte cleanup çalışmadıysa sızıntıyı
  * kapatmak için tek noktadan serbest bırak. */
@@ -153,12 +55,6 @@ static int buf_is_zero(const uint8_t *buf, size_t len)
         if (buf[i] != 0)
             return 0;
     return 1;
-}
-
-static struct timespec ts_of(long sec)
-{
-    struct timespec t = { .tv_sec = sec, .tv_nsec = 0 };
-    return t;
 }
 
 /* Temel state: slot0 ACTIVE + gerçek fd; session YOK */
@@ -192,7 +88,7 @@ static int attach_session_to(struct peer_session *ps,
     *sender_out = sodium_malloc(sizeof(struct noise_session));
     if (!ps->session || !*sender_out)
         return -1;
-    if (make_split_pair(*sender_out, ps->session) != 0)
+    if (nox_test_make_split_pair(*sender_out, ps->session) != 0)
         return -1;
     ps->peer_verified = true;   /* doğrulanmış — kuyruk flush serbest */
     ps->queue_flushed = true;   /* kuyruk işini bu test kapsamaz */
@@ -269,9 +165,6 @@ static void teardown_active_rx(struct peer_session *ps)
     rmdir(EVF_DIR);
 }
 
-/* ================================================================
- * YARDIMCILAR
- * ================================================================ */
 
 /* recv_buf'a tam frame yerleştir (header + ct) */
 static void frame_put(struct peer_session *ps, uint8_t type, uint32_t seq,
@@ -289,13 +182,10 @@ static void frame_put(struct peer_session *ps, uint8_t type, uint32_t seq,
     ps->recv_pos = FRAME_HEADER_WIRE_SIZE + ct_len;
 }
 
-/* Göndericinin kuracağı header'ı AD olarak bağlar. Tamper testleri
- * ciphertext'i "doğru" header ile üretir, teslimde header'ı değiştirir →
- * AD uyuşmazlığı = tag fail (H2).
- *
- * enc_frame: type hem AD'ye hem header'a yazılır. Tamper testi bilinçli
- * olarak farklı type ile header kurmak için enc_frame'i doğrudan çağırır;
- * enc_text/enc_file ise niyeti açık tutar (özellikle FILE→TEXT testi). */
+/* Header'ı AD olarak bağlar; tamper testleri ct'yi doğru header'la üretip
+ * teslimde header'ı değiştirir → AD uyuşmazlığı = tag fail (H2).
+ * enc_frame type'ı hem AD'ye hem header'a yazar; tamper testi bilinçli
+ * farklı type kurmak için doğrudan çağırır. */
 static uint32_t enc_frame(struct noise_session *sess, uint8_t type,
                           uint32_t seq, const uint8_t *pt, size_t pt_len,
                           uint8_t *ct)
@@ -346,13 +236,9 @@ static void build_v3_addr(const uint8_t pub[32], char out[63])
     snprintf(out, 63, "%s.onion", b32);
 }
 
-/* ================================================================
- * HANDSHAKE TEST YARDIMCILARI — gerçek Noise msg1/msg2 üretimi
- *
- * Initiator handshake'i kurulur, msg1 responder'a okutulur, responder
- * verilen payload'lu msg2'yi üretir ve frame ps->recv_buf'a konur.
- * Test process_peer_frames'i çağırınca initiator msg2'yi işler.
- * ================================================================ */
+/* Gerçek Noise msg1/msg2 üretimi: initiator hs kurulur, responder
+ * payload'lu msg2'yi üretir; process_peer_frames msg2'yi işler.
+ */
 
 /* Socket'te biriken byte sayısı (msg3 yazıldı mı?). */
 static int socket_pending_bytes(int fd)
@@ -373,10 +259,8 @@ static int socket_pending_bytes(int fd)
     return total;
 }
 
-/* responder_pub/priv verilirse onları kullanır; NULL ise üretir.
- * hs_out verilirse responder handshake'i (msg3 okunmamış) çağırana
- * bırakılır; B2 testi msg3'ü okuyup responder tarafını da split eder.
- * NULL verilirse responder handshake burada güvenle silinir. */
+/* responder_pub/priv NULL ise üretilir; hs_out verilirse responder hs
+ * (msg3 okunmamış) çağırana bırakılır, NULL ise burada silinir. */
 static int setup_hs_initiator_msg2(const uint8_t *payload, size_t payload_len,
                                    const char *connect_target,
                                    const uint8_t responder_pub[NOX_KEY_LEN],
@@ -526,15 +410,8 @@ static int run_hs_accept_case(const uint8_t *payload, size_t payload_len,
     return 0;
 }
 
-/* ================================================================
- * B2 — GERÇEK HANDSHAKE SONRASI CTRL POLİTİKASI
- *
- * [19] split oturumla çalışır; buradaki fixture gerçek Noise XX
- * msg1/msg2/msg3 akışını tamamlar, TOFU onayını (ghost mod) geçer ve
- * `state == ST_ACTIVE && session != NULL && hs == NULL` durumunu kurar.
- * Karşı tarafın transport anahtarı da aynı handshake'ten split edilir;
- * böylece "geç CTRL" gerçek AEAD ile üretilir.
- * ================================================================ */
+/* B2 fixture: gerçek Noise XX sonrası ACTIVE (session!=NULL, hs==NULL);
+ * karşı taraf anahtarı da split edilir → geç CTRL gerçek AEAD. */
 
 static struct noise_handshake *g_b2_hs_r = NULL;  /* responder handshake */
 static struct noise_session   *g_b2_sender = NULL; /* responder→peer TX */
@@ -654,13 +531,9 @@ static void post_hs_teardown(void)
     fixture_teardown();
 }
 
-/* ================================================================
- * UZUN SALDIRGAN ZİNCİRİ YARDIMCILARI
- *
- * İki peer'lı fixture: p0 ve p1'in her biri kendi socketpair'i ve
- * kendi Noise çiftiyle ACTIVE. Saldırı bir peer'ı öldürürken diğerinin
- * bütün durumu (fd/session/rx_seq/recv_pos) değişmemeli.
- * ================================================================ */
+/* İki peer'lı fixture: p0/p1 ayrı socketpair + Noise çifti, ikisi ACTIVE.
+ * Saldırı bir peer'ı öldürürken diğerinin tüm durumu korunmalı.
+ */
 
 static int setup_dual_active(void)
 {
@@ -683,7 +556,7 @@ static int setup_dual_active(void)
     p1->session = sodium_malloc(sizeof(struct noise_session));
     g_sess_b = sodium_malloc(sizeof(struct noise_session));
     if (!p1->session || !g_sess_b ||
-        make_split_pair(g_sess_b, p1->session) != 0)
+        nox_test_make_split_pair(g_sess_b, p1->session) != 0)
         return -1;
 
     p1->peer_verified = true;
@@ -892,13 +765,9 @@ static int run_chain_attack_case(chain_attack_t kind, int victim_idx,
     return 0;
 }
 
-/* ================================================================
- * FILE HAPPY-PATH (Step 5 normal akış) YARDIMCILARI
- *
- * Gerçek metadata biçimi: "METADATA\0"(9) + ad(256) + boyut(8) +
- * BLAKE2b(32) = 305 byte. Hash, sender'ın yaptığı gibi 8-byte
- * big-endian boyut + dosya içeriği üzerinden hesaplanır.
- * ================================================================ */
+/* FILE happy-path: metadata = "METADATA\0"(9) + ad(256) + boyut(8) +
+ * BLAKE2b(32) = 305 byte; hash 8-byte BE boyut + içerik üzerinden.
+ */
 
 static void put_be64(uint8_t out[8], uint64_t v)
 {
@@ -1049,9 +918,6 @@ static int chain_file_matches(const char *name, const uint8_t *data, size_t len)
     return ok;
 }
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
 /* 1) fd → peer eşlemesi + K-10 gerçek doluluk yüklemi */
 static int test_find_peer_by_fd(void)
@@ -1145,10 +1011,8 @@ static int test_text_frame_happy(void)
     return 0;
 }
 
-/* 5) İleri seq atlaması → IDLE + cleanup (fd gerçekten kapandı,
- *    session serbest). Fix sonrası da aynı gözlem: decrypt-öncesi
- *    kontrol silinince bu frame tag fail ile aynı tek yola düşer
- *    (seq authenticated olur; ayrı "saldırı çarpanı" kalmaz). */
+/* 5) İleri seq atlaması → IDLE + cleanup. Fix sonrası da aynı: decrypt
+ * öncesi kontrol silinirse tag fail aynı tek yola düşer (seq authenticated). */
 static int test_seq_mismatch_disconnects(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1163,10 +1027,8 @@ static int test_seq_mismatch_disconnects(void)
 
     process_peer_frames(ps, &st, ps->fd);
 
-    /* Yan etki kontrolü: cleanup yalnız state'i değil, aynı slotun
-     * recv buffer'ını ve sayaçlarını da sıfırlamalı — sonraki oturuma
-     * eski ciphertext/sıra sızmasın. Ölçümler teardown'dan ÖNCE alınır;
-     * assert'ler teardown sonrası çalışır (kırmızı testte sızıntı yok). */
+    /* Cleanup aynı slotun recv buffer'ı ve sayaçlarını da sıfırlamalı;
+     * ölçüm teardown'dan ÖNCE, assert sonrası. */
     int state_idle   = (ps->state == ST_IDLE);
     int session_null = (ps->session == NULL);
     int fd_closed    = (ps->fd == -1) &&
@@ -1187,11 +1049,9 @@ static int test_seq_mismatch_disconnects(void)
     return 0;
 }
 
-/* 6) REPLAY: kabul edilen frame'in AYNEN tekrarı (aynı seq + aynı ct).
- *    İlk frame rx_seq=1 yapar; tekrar gelen seq=0 pre-check'te reddedilir.
- *    (20 no'lu splice testinden farkı: orada eski ct + YENİ seq vardır;
- *    burada baytlar birebir aynıdır. İkisi aynı fatal yola düşse de
- *    farklı saldırı biçimlerini kilitler.) */
+/* 6) Replay: kabul edilen frame'in aynısı (seq+ct). İlk frame rx_seq=1
+ * yapar; tekrar seq=0 pre-check'te reddedilir. Splice'tan farkı: baytlar
+ * birebir aynıdır. */
 static int test_replay_same_seq_disconnects(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1221,11 +1081,8 @@ static int test_replay_same_seq_disconnects(void)
     return 0;
 }
 
-/* 7) [H2/H3 FIX HEDEFİ — KIRMIZI] MAC fail artık sessiz yutulmaz:
- *    log + UI + EV_CRYPTO_FAIL → ST_IDLE. Nonce invariantı gereği
- *    fail kurtarılamaz ("devam" = zombi); eski davranış (sessiz drop,
- *    ACTIVE kalır, last_active tazelenir) hedeflenen davranış DEĞİL.
- *    Bu test fix gelene kadar FAIL eder. */
+/* 7) MAC fail sessiz yutulmaz: log + UI + EV_CRYPTO_FAIL → ST_IDLE.
+ * Nonce invariantı gereği fail kurtarılamaz ("devam" = zombi). */
 static int test_mac_fail_disconnects(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1247,11 +1104,9 @@ static int test_mac_fail_disconnects(void)
     return 0;
 }
 
-/* 8) [H2/H3 FIX HEDEFİ — KIRMIZI] len manipülasyonu (0 / aşırı):
- *    kurulu oturumda kimlik-doğrulanamaz çerçeve → fail-closed KOPMA.
- *    Eski davranış: sessiz recv_pos=0 — aynı buffer'da arkadan gelen
- *    frame'ler de yanar, oturum yaşar (izsiz bastırma yüzeyi).
- *    İki alt-vaka ayrı fixture ister (ilki oturumu koparır). */
+/* 8) len manipülasyonu (0/aşırı): kurulu oturumda doğrulanamaz çerçeve
+ * → fail-closed kopma. Eski davranış sessiz recv_pos=0, ardıllar da yanar.
+ * İki alt-vaka ayrı fixture ister. */
 static int test_len_tamper_disconnects(void)
 {
     /* (a) len=0: payload yok → tag yok, doğrulanamaz */
@@ -1284,12 +1139,8 @@ static int test_len_tamper_disconnects(void)
     return 0;
 }
 
-/* 9) [H2/H3 FIX HEDEFİ — KIRMIZI] En ucuz tamper: header'da 1 byte
- *    (magic / tip). Eski davranış: decode PROTO → sessiz recv_pos=0;
- *    frame — ve aynı buffer'daki ardılları — izsiz yutulur, oturum
- *    yaşar. Hedef: kurulu oturumda çerçeve seviyesi ihlal = fail-closed
- *    kopma (TLS/SSH kayıt katmanı emsali: malformed record = fatal).
- *    İki alt-vaka ayrı fixture ister (ilki oturumu koparır). */
+/* 9) magic/tip 1 byte tamper: eski decode PROTO → sessiz recv_pos=0.
+ * Hedef: malformed record = fail-closed kopma (TLS/SSH emsali). */
 static int test_header_junk_disconnects(void)
 {
     /* (a) magic bozuk */
@@ -1351,16 +1202,14 @@ static int test_partial_frame_buffered(void)
     return 0;
 }
 
-/* 11b) B1: yarım frame + trickle deadline.
- *     last_active her recv'de tazelendiği için eski M-2 kontrolü
- *     (idle üzerinden) dakikada 1 bayt gönderen peer'ı asla
- *     yakalayamıyordu. Yeni sözleşme: frame'in yaşı ayrı sayılır;
- *     delta==timeout sınırında canlı, timeout+1'de ölü. */
+/* 11b) B1: yarım frame + trickle deadline. last_active her recv'de
+ * tazelendiğinden eski idle kontrolü dakikada 1 bayt peer'ı yakalayamıyordu.
+ * Frame yaşı ayrı sayılır: delta==timeout canlı, timeout+1 ölü. */
 static int test_partial_frame_trickle_expires(void)
 {
-    struct timespec start = ts_of(1000);
-    struct timespec at_limit = ts_of(1000 + NOX_HALFFRAME_TIMEOUT_SEC);
-    struct timespec past = ts_of(1000 + NOX_HALFFRAME_TIMEOUT_SEC + 1);
+    struct timespec start = nox_test_ts_of(1000);
+    struct timespec at_limit = nox_test_ts_of(1000 + NOX_HALFFRAME_TIMEOUT_SEC);
+    struct timespec past = nox_test_ts_of(1000 + NOX_HALFFRAME_TIMEOUT_SEC + 1);
 
     TEST_ASSERT(!frame_trickle_expired(&start, &at_limit,
                                        NOX_HALFFRAME_TIMEOUT_SEC));
@@ -1381,11 +1230,11 @@ static int test_partial_frame_trickle_expires(void)
     clock_gettime(CLOCK_MONOTONIC, &now);
     ps->recv_pos = 1;                 /* yarım header */
     ps->last_active = now;            /* trickle: recv taze görünüyor */
-    ps->frame_start = ts_of(now.tv_sec - NOX_HALFFRAME_TIMEOUT_SEC - 1);
+    ps->frame_start = nox_test_ts_of(now.tv_sec - NOX_HALFFRAME_TIMEOUT_SEC - 1);
     TEST_ASSERT(frame_trickle_expired(&ps->frame_start, &now,
                                       NOX_HALFFRAME_TIMEOUT_SEC));
 
-    ps->frame_start = ts_of(now.tv_sec - NOX_HALFFRAME_TIMEOUT_SEC);
+    ps->frame_start = nox_test_ts_of(now.tv_sec - NOX_HALFFRAME_TIMEOUT_SEC);
     TEST_ASSERT(!frame_trickle_expired(&ps->frame_start, &now,
                                        NOX_HALFFRAME_TIMEOUT_SEC));
     fixture_teardown();
@@ -1419,7 +1268,7 @@ static int test_frame_boundary_restarts_trickle_clock(void)
     ps->recv_pos = first_len + 7;
 
     /* 1. frame çok eskiden başlamış gibi görünsün. */
-    ps->frame_start = ts_of(1000);
+    ps->frame_start = nox_test_ts_of(1000);
 
     struct timespec before;
     clock_gettime(CLOCK_MONOTONIC, &before);
@@ -1509,10 +1358,8 @@ static int test_ctrl_after_handshake_dropped(void)
     return 0;
 }
 
-/* 14) [H2/H3 FIX HEDEFİ — KIRMIZI] FILE yolu: transfer dışı FILE
- *     frame'inde decrypt fail artık "tüketilip senkron korunur" DEĞİL
- *     → görünür kopma. (Eski davranış: return true → rx_seq++ → oturum
- *     yaşar; fail'in kaynağı belirsizken bunu sürdürmek güvensiz.) */
+/* 14) FILE yolu: transfer dışı FILE'da decrypt fail "tüket ve senkron
+ * koru" değil → görünür kopma; fail kaynağı belirsizken sürdürmek güvensiz. */
 static int test_file_decrypt_fail_disconnects(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1532,12 +1379,9 @@ static int test_file_decrypt_fail_disconnects(void)
     return 0;
 }
 
-/* 15) [H2/H3 FIX HEDEFİ — KIRMIZI] Sahte/probe frame (H3 oracle):
- *     saldırgan doğru seq ile rastgele ciphertext gönderir. Eski
- *     davranış: sessiz drop, cezasız probe, iz yok. Yeni: log + UI +
- *     kopma — probe'un gözlemlenebilir sonucu bağlantı kaybı olur.
- *     (Eski zombi kanıtı bu davranışın hedefiydi: ilk fail'de kopma
- *     olduğundan seq-rewrite ile zombi sahnelenemez.) */
+/* 15) Sahte/probe frame (H3 oracle): doğru seq + rastgele ct eski
+ * davranışta sessiz drop'tu. Yeni: log + UI + kopma; probe'un sonucu
+ * bağlantı kaybı olmalı. */
 static int test_forged_probe_disconnects(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1556,11 +1400,9 @@ static int test_forged_probe_disconnects(void)
     return 0;
 }
 
-/* 16) [H2 FIX HEDEFİ — KIRMIZI] type alanı tamper'ı: TEXT frame'inin
- *     header type'ı FILE'a çevrilirse eski kodda seq check geçer,
- *     decrypt BAŞARILI olur (payload aynı), mesaj sessizce bastırılır
- *     ve oturum sağlam kalırdı. AD bağlama sonrası: type authenticated
- *     → tag fail → görünür kopma. */
+/* 16) type tamper: TEXT header'ı FILE'a çevrilince eski kodda decrypt
+ * başarılı, mesaj sessizce bastırılırdı. AD sonrası: type authenticated
+ * → tag fail → kopma. */
 static int test_type_flip_disconnects(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1581,18 +1423,12 @@ static int test_type_flip_disconnects(void)
     return 0;
 }
 
-/* ================================================================
- * SALDIRGAN SENARYOLARI — [H2/H3 FIX HEDEFİ, KIRMIZI]
- * Header (type/seq/len) AEAD dışı olduğundan aşağıdaki manipulasyonlar
- * bugün ya sessizce yutuluyor ya da içerik sızıntısı/bastırma üretiyor.
- * AD bağlama + fatal handler sonrası hepsi "görünür kopma"ya dönmeli.
- * ================================================================ */
+/* Saldırgan senaryoları — H2/H3: header (type/seq/len) AEAD dışıdır.
+ * AD bağlama + fatal handler sonrası her manipülasyon görünür kopma
+ * üretmeli; sessiz yutma/sızıntı/bastırma yasak. */
 
-/* 17) FILE→TEXT flip: dosya içeriği sohbet mesajı olarak gösterilir.
- *     Saldırgan FILE frame'inin type byte'ını TEXT yapar: decrypt
- *     başarılı (payload aynı), ui_print_incoming binary chunk'ı
- *     "mesaj" diye basar, rx_seq ilerler, oturum sağlam kalır.
- *     Hedef: type authenticated → tag fail → kopma. */
+/* 17) FILE→TEXT flip: binary chunk "mesaj" diye basılır, rx_seq ilerler,
+ * oturum sağlam kalırdı. Hedef: type authenticated → tag fail → kopma. */
 static int test_file_type_flip_shows_garbage(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1614,12 +1450,9 @@ static int test_file_type_flip_shows_garbage(void)
     return 0;
 }
 
-/* 18) TEXT→FILE flip + AKTİF transfer: sohbet metni indirmeye yazılır.
- *     Saldırgan TEXT frame'inin type'ını FILE yapar; aktif RX varsa
- *     data-chunk dalı çalışır → mesaj byte'ları hedef dosyaya yazılır,
- *     hash'e girer, received_bytes ilerler. Sonuç: dosya bozulur
- *     (tamamlanınca hash fail → silinir) ve mesaj yok olur — hiç iz yok.
- *     Hedef: type tamper → tag fail → kopma; transfer state dokunulmaz. */
+/* 18) TEXT→FILE flip + aktif RX: mesaj byte'ları hedef dosyaya yazılır,
+ * hash bozulur, mesaj kaybolur. Hedef: type tamper → tag fail → kopma;
+ * transfer state'e dokunulmaz. */
 static int test_text_into_active_transfer_corrupts(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1634,10 +1467,8 @@ static int test_text_into_active_transfer_corrupts(void)
     frame_put(ps, NOX_MSG_FILE, 0, ct, n);
     process_peer_frames(ps, &st, ps->fd);
 
-    /* Bugün: received_bytes = n (metin dosyaya yazıldı), state ACTIVE.
-     * Hedef: kopma — hiçbir byte dosyaya/hash'e girmemeli.
-     * (Kırmızı dönemde sızıntı olmasın: teardown assert'lerden önce.)
-     * final_sess pointer'ı free sonrası karşılaştırılmaz; bool saklanır. */
+    /* Bugün: received_bytes=n, ACTIVE. Hedef: kopma, hiç byte yazılmamalı.
+     * Teardown assert'lerden önce (kırmızı dönemde sızıntı olmasın). */
     peer_state_t final_state = ps->state;
     uint32_t final_rx = ps->rx_seq;
     int final_session_nonnull = (ps->session != NULL);
@@ -1663,12 +1494,9 @@ static int test_text_into_active_transfer_corrupts(void)
     return 0;
 }
 
-/* 19) TEXT→CTRL flip (handshake bitmiş, hs=NULL): fail-fast kopma.
- *     K-14: post-handshake CTRL tanımlı bir protokol mesajı değildir;
- *     sessizce yutulursa rx_seq ilerlemez ve sonraki frame gecikmeli
- *     "replay" gibi kopar. Artık protokol ihlali → EV_CRYPTO_FAIL.
- *     Handshake nesnesi hâlâ dururken (msg_index >= 3) Y-2 davranışı
- *     korunur; test 13 bunu kilitler. */
+/* 19) TEXT→CTRL flip (hs=NULL): K-14 gereği post-handshake CTRL protokol
+ * ihlalidir; sessiz yutma rx_seq'i takar. Artık EV_CRYPTO_FAIL. Handshake
+ * sürerken (msg_index>=3) Y-2 davranışı korunur (test 13). */
 static int test_ctrl_type_flip_eats_message(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1687,10 +1515,8 @@ static int test_ctrl_type_flip_eats_message(void)
     return 0;
 }
 
-/* 19b) B2: GERÇEK handshake → ACTIVE (session != NULL, hs == NULL).
- *      Bu noktadan sonra CTRL tanımlı değildir; fail-fast beklenir.
- *      [19] split oturumla çalışırken bu test gerçek XX + TOFU split
- *      yolunu kullanır. */
+/* 19b) B2: gerçek handshake → ACTIVE (session!=NULL, hs==NULL); sonrası
+ * CTRL tanımsız, fail-fast beklenir. */
 static int test_post_handshake_ctrl_fails_closed(void)
 {
     if (setup_post_handshake_active() != 0) {
@@ -1772,10 +1598,8 @@ static int test_post_handshake_text_then_ctrl(void)
     return 0;
 }
 
-/* 19d) B2 izolasyon: geç CTRL yalnız hedef peer'ı kapatmalı. p0
- *      gerçek handshake ile ACTIVE; p1 bağımsız split oturum. p0'ın
- *      CTRL'i sonrası p1'in session/rx_seq'i bozulmamalı ve p1 yeni
- *      TEXT kabul etmeye devam etmeli. */
+/* 19d) B2 izolasyon: geç CTRL yalnız p0'ı kapatmalı; p1'in
+ * session/rx_seq'i bozulmamalı, yeni TEXT kabul etmeli. */
 static int test_post_handshake_ctrl_isolates_peer(void)
 {
     if (setup_post_handshake_active() != 0) {
@@ -1843,12 +1667,9 @@ static int test_post_handshake_ctrl_isolates_peer(void)
     return 0;
 }
 
-/* 20) Cut&paste splice: eski ciphertext + yeni seq.
- *     Saldırgan daha önce akan frame 0'ın ct'sini saklar; frame 1
- *     geldiğinde header seq=1 yazıp eski ct'yi iliştirir. Seq check
- *     bugün geçer (1==rx_seq), decrypt nonce-1 ile eski ct'yi açamaz →
- *     SESSİZ yutulur, oturum yaşar (mesaj kaybı izsiz). Hedef: tag
- *     fail → kopma. */
+/* 20) Cut&paste splice: eski frame 0 ct'si, header seq=1 ile gönderilir.
+ * Seq kontrolü geçer; nonce-1 eski ct'yi açamaz → sessiz yutulmamalı,
+ * tag fail → kopma. */
 static int test_old_ciphertext_splice(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1885,10 +1706,8 @@ static int test_old_ciphertext_splice(void)
     return 0;
 }
 
-/* 21) len şişirme: header len += 8, ardına 8 çöp byte.
- *     Çerçeve "tamamlanır", ct dilimi eski ct + çöp olur → tag fail.
- *     Bugün sessiz yutulur (desync izsiz). Hedef: len authenticated
- *     → tag fail → kopma; çerçeve kaymasına izin verilmez. */
+/* 21) len şişirme: header len += 8 + 8 çöp byte; ct dilimi eski ct+çöp
+ * → tag fail. Hedef: len authenticated → kopma, çerçeve kaymasına izin yok. */
 static int test_len_grow_tamper(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -1922,11 +1741,8 @@ static int test_len_grow_tamper(void)
     return 0;
 }
 
-/* 22) Probe fırtınası: tek buffer'da 3 sahte frame (hepsi seq=0).
- *     Bugün üçü de sessizce yutulur (rx_seq sabit kalır, seq'ler
- *     eşleşmeye devam eder) — izsiz, cezasız probe. Hedef: İLK fail'de
- *     kopma + kalan frame'ler İŞLENMEZ (fail-fast; fix döngüyü kırmalı,
- *     kopmuş oturumla devam etmemeli). */
+/* 22) Probe fırtınası: tek buffer'da 3 sahte frame (seq=0). Eskiden üçü
+ * sessizce yutulurdu. Hedef: İLK fail'de kopma, kalan frame'ler işlenmez. */
 static int test_probe_storm_first_fail_disconnect(void)
 {
     TEST_ASSERT(fixture_base() == 0);
@@ -2007,7 +1823,7 @@ static int test_multi_peer_isolation(void)
     p1->session = sodium_malloc(sizeof(struct noise_session));
     struct noise_session *sess1_i = sodium_malloc(sizeof(struct noise_session));
     TEST_ASSERT(p1->session != NULL && sess1_i != NULL);
-    TEST_ASSERT(make_split_pair(sess1_i, p1->session) == 0);
+    TEST_ASSERT(nox_test_make_split_pair(sess1_i, p1->session) == 0);
     p1->rx_seq = 0;
     p1->tx_seq = 0;
     p1->peer_verified = true;
@@ -2114,11 +1930,8 @@ static int test_reconnect_same_slot_resets(void)
     return 0;
 }
 
-/* 26) Boş payload = protokol ihlali (ilhak yok):
- *     geçerli MAC'li boş TEXT/FILE frame artık nonce'u tüketir ama
- *     uygulama katmanına geçmez; ilk occurrence'ta fail-closed kopma.
- *     Böylece "auth başarısı = tüket" (rx_seq++) korunurken boş pt
- *     sessizce kabul edilmez. */
+/* 26) Boş payload = protokol ihlali: geçerli MAC'li boş TEXT/FILE nonce'u
+ * tüketir ama uygulamaya geçmez; ilk occurrence'ta fail-closed kopma. */
 static int test_empty_payload_rejected(void)
 {
     /* (a) TEXT */
@@ -2244,21 +2057,8 @@ static int test_msg3_not_written_on_onion_mismatch(void)
     return 0;
 }
 
-/* 30) UZUN SALDIRGAN ZİNCİRİ — H1 → H2/H3 → çift yönlü temiz akış.
- *
- * Tek senaryo, gerçek Noise XX + gerçek AEAD + gerçek frame dağıtımı:
- *   1. H1: geçerli claim imzası doğrulanır; bozuk imza ve onion
- *      mismatch msg3 yazılmadan reddedilir; geçerli claim kabul edilir.
- *   2. H2/H3: type/seq/len/MAC/empty/keyless/forged saldırıları hem
- *      A→B hem B→A yönünde; victim fail-closed kapanır, karşı peer'ın
- *      fd/session/rx_seq'i bozulmaz.
- *   3. Temiz akış: iki yönde TEXT, sonra iki yönde FILE (metadata +
- *      parçalar + BLAKE2b doğrulaması) başarıyla tamamlanır.
- *
- * Step 5'in bilinçli kırmızı sözleşmeleri (metadata EAGAIN, fatal TX,
- * TX sırasında RX) test_file_transfer.c'de ayrı tutulur; burada Step 5
- * happy-path'i tek zincirin parçasıdır.
- */
+/* 30) Uzun zincir: H1 claim → H2/H3 iki yönlü tamper → temiz TEXT/FILE.
+ * Tek victim kopar; karşı peer'ın fd/session/rx_seq/recv_pos'u korunur. */
 static int test_attacker_chain_bidirectional(void)
 {
     /* ---------- 1. H1: kimlik / claim / msg3 sızıntısı ---------- */

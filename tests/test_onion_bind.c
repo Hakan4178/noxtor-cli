@@ -1,23 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_onion_bind.c — H-1/H-2 onion ↔ oturum bağı birim testleri
- *
- * Testler:
- *   1. Canlı Tor adresi crypto_onion_pubkey'ten geçer (checksum formülü
- *      Tor'un ServiceID üretimiyle birebir — canlı ADD_ONION kanıtı)
- *   2. Bozuk checksum'lı adres reddedilir (H-2)
- *   3. Seed → pub → address encode roundtrip (encoder/decoder tutarlı)
- *   4. Sign/verify roundtrip (claim ↔ onion ↔ static key bağı)
- *   5. Bozuk imza → NOX_ERR_AUTH
- *   6. Yanlış static key (başka rs) → NOX_ERR_AUTH
- *   7. Sabit seed + adres tek karakter bozulması → NOX_ERR_PROTO (checksum)
- *   8. crypto_onion_verify: kısa/uzun adres → NOX_ERR_PROTO
- *      (asıl handshake payload hard cut: test_event_frames)
- *   9. Payload v1 sabitleri tutarlı (1 + 62 + 64 == 127)
- *  10. Full Noise XX handshake gerçek v1 claim'lerle; msg2/msg3
- *      authenticated rs ile verify + split sonrası transport roundtrip
- *  11. validate_onion_address: canlı adres true, bozuk checksum false
- *  12. Başka onion'un anahtarıyla imzalanan claim → NOX_ERR_AUTH
- *  13. Relay: saldırganın rs'iyle kurban claim'i → NOX_ERR_AUTH
+ * test_onion_bind.c — H-1/H-2 onion ↔ static key bağı.
+ * ServiceID/checksum, seed→pub→adres roundtrip, claim sign/verify,
+ * yanlış anahtar/imza/checksum reddi, gerçek Noise XX v1 claim.
  */
 
 #include "common.h"
@@ -48,10 +32,7 @@ static const uint8_t FIXED_SEED[32] = {
 #define LIVE_TOR_ONION \
     "je63abepbqzrn7tvqfrdi5g7tp76uq3fv5dh7jwmala7yqwgkrfdlxad.onion"
 
-/* ================================================================
- * YARDIMCILAR — v3 adres kurulumu (test için)
- * (base32 encode: test_common.h → nox_test_base32_encode)
- * ================================================================ */
+/* v3 adres kurulumu; base32: test_common.h → nox_test_base32_encode. */
 
 /* pub → v3 onion adresi (checksum + version dahil) üret */
 static int make_onion_addr(char out[NOX_ONION_LEN + 1],
@@ -75,9 +56,7 @@ static int make_onion_addr(char out[NOX_ONION_LEN + 1],
     return 0;
 }
 
-/* ================================================================
- * 1. CANLI TOR ADRESİ — checksum formülü Tor ile birebir
- * ================================================================ */
+/* 1. CANLI TOR ADRESİ — checksum formülü Tor ile birebir */
 static int test_live_tor_address_accepted(void)
 {
     uint8_t pub[NOX_KEY_LEN];
@@ -85,9 +64,7 @@ static int test_live_tor_address_accepted(void)
     return 0;
 }
 
-/* ================================================================
- * 2. BOZUK CHECKSUM — H-2 zorunluluğu
- * ================================================================ */
+/* 2. BOZUK CHECKSUM — H-2 zorunluluğu */
 static int test_bad_checksum_rejected(void)
 {
     /* Canlı adresten checksum byte'larından birini değiştir —
@@ -108,9 +85,7 @@ static int test_bad_checksum_rejected(void)
     return 0;
 }
 
-/* ================================================================
- * 3. SEED → PUB → ADRES ENCODE → DECODE ROUNDTRIP
- * ================================================================ */
+/* 3. SEED → PUB → ADRES ENCODE → DECODE ROUNDTRIP */
 static int test_address_roundtrip(void)
 {
     uint8_t seed[32], pub[32], exp[64], back[NOX_KEY_LEN];
@@ -128,9 +103,7 @@ static int test_address_roundtrip(void)
     return 0;
 }
 
-/* ================================================================
- * 4. SIGN/VERIFY ROUNDTRIP — çekirdek H-1 bağı
- * ================================================================ */
+/* 4. SIGN/VERIFY ROUNDTRIP — çekirdek H-1 bağı */
 static int test_sign_verify_roundtrip(void)
 {
     uint8_t seed[32], pub[32], exp[64];
@@ -152,9 +125,7 @@ static int test_sign_verify_roundtrip(void)
     return 0;
 }
 
-/* ================================================================
- * 5. BOZUK İMZA → NOX_ERR_AUTH
- * ================================================================ */
+/* 5. BOZUK İMZA → NOX_ERR_AUTH */
 static int test_tampered_signature(void)
 {
     uint8_t seed[32], pub[32], exp[64];
@@ -177,11 +148,8 @@ static int test_tampered_signature(void)
     return 0;
 }
 
-/* ================================================================
- * 6. YANLIŞ STATIC KEY (başka rs) → NOX_ERR_AUTH
- * imza rs'e bağlı: saldırgan kendi oturumuna kurban imzasını
- * taşıyamaz (H-1'in doğrudan testi)
- * ================================================================ */
+/* 6. Yanlış static key (başka rs) → NOX_ERR_AUTH; imza rs'e bağlı,
+ * kurban imzası taşınamaz (H-1). */
 static int test_wrong_static_key(void)
 {
     uint8_t seed[32], pub[32], exp[64];
@@ -208,16 +176,9 @@ static int test_wrong_static_key(void)
     return 0;
 }
 
-/* ================================================================
- * 7. ADRES TEK KARAKTER BOZULMASI → NOX_ERR_PROTO (checksum)
- *
- * ÖNEMLİ: assert != NOX_OK yetmez. Checksum kontrolü tamamen
- * kaldırılsa bile crypto_onion_verify, bozuk adresten çıkan farklı
- * pubkey ile imza doğrulamasına gider ve NOX_ERR_AUTH döner; test
- * yine yeşil kalırdı. Bu yüzden kesin olarak NOX_ERR_PROTO aranır.
- * Sabit seed: rastgele seed'de bozuk adresin checksum'ı 2^-16
- * olasılıkla tesadüfen tutabilir ve test flaky olurdu.
- * ================================================================ */
+/* 7. Adres tek karakter bozulması → kesin NOX_ERR_PROTO (checksum).
+ * "!= NOX_OK" yetmez: checksum kaldırılsa verify NOX_ERR_AUTH dönerdi.
+ * Sabit seed şart — rastgele seed'de bozuk checksum 2^-16 tutabilir. */
 static int test_bitflipped_onion_rejected(void)
 {
     uint8_t seed[32], pub[32], exp[64];
@@ -243,14 +204,9 @@ static int test_bitflipped_onion_rejected(void)
     return 0;
 }
 
-/* ================================================================
- * 8. crypto_onion_verify KISA/UZUN ADRES → NOX_ERR_PROTO
- *
- * Bu test yalnızca verify'ın adres string uzunluğunu reddettiğini
- * kanıtlar. Handshake payload'ının 57/63/126/128 byte hard-cut'ı
- * event_loop'ta pl_len kontrolüdür; o sözleşme test_event_frames'te
- * ayrıca sınanır. Eski "short57" adı yanlıştı: 56 karakterdi.
- * ================================================================ */
+/* 8. crypto_onion_verify kısa/uzun adres → NOX_ERR_PROTO.
+ * Yalnız adres string uzunluğunu kılar; handshake payload hard-cut'ı
+ * (57/63/126/128) test_event_frames'te sınanır. */
 static int test_verify_rejects_bad_length(void)
 {
     uint8_t seed[32], pub[32], exp[64];
@@ -283,9 +239,7 @@ static int test_verify_rejects_bad_length(void)
     return 0;
 }
 
-/* ================================================================
- * 9. PAYLOAD v1 SABİTLERİ TUTARLILIK
- * ================================================================ */
+/* 9. PAYLOAD v1 SABİTLERİ TUTARLILIK */
 static int test_payload_layout_constants(void)
 {
     TEST_ASSERT(NOX_HS_PAYLOAD_V1_LEN ==
@@ -302,16 +256,9 @@ static int test_payload_layout_constants(void)
     return 0;
 }
 
-/* ================================================================
- * 10. FULL XX HANDSHAKE — GERÇEK v1 CLAIM'LER + TRANSPORT ROUNDTRIP
- *
- * Eski test 0x41 dolgu gönderiyordu: payload'ın claim olduğunu,
- * imzanın karşı tarafın authenticated rs'iyle (hs->rs) doğrulandığını
- * ve split sonrası anahtarların gerçekten uyuştuğunu kanıtlamıyordu.
- * Burada msg2/msg3 gerçek hs_build_claim_payload çıktısıdır; verify
- * için handshake'in kendi rs'i kullanılır. Split sonrası iki yönlü
- * encrypt/decrypt yapılır — anahtar uyuşmazlığı bu testten geçemez.
- * ================================================================ */
+/* 10. Full XX handshake — gerçek v1 claim + transport roundtrip.
+ * msg2/msg3 claim payload'ı; verify handshake rs'iyle; split sonrası
+ * iki yönlü şifreleme anahtar uyuşmazlığını yakalar. */
 static int test_handshake_with_v1_payload(void)
 {
     static struct app_state sa, sb;
@@ -434,9 +381,7 @@ static int test_handshake_with_v1_payload(void)
     return 0;
 }
 
-/* ================================================================
- * 11. validate_onion_address — checksum artık zorunlu (H-2)
- * ================================================================ */
+/* 11. validate_onion_address — checksum artık zorunlu (H-2) */
 static int test_validate_requires_checksum(void)
 {
     TEST_ASSERT(validate_onion_address(LIVE_TOR_ONION) == true);
@@ -451,12 +396,8 @@ static int test_validate_requires_checksum(void)
     return 0;
 }
 
-/* ================================================================
- * 12. YABANCI ONION İMZASI — başka onion'un anahtarıyla imzala,
- * geçerli checksum'lı A adresine karşı verify et → NOX_ERR_AUTH.
- * Test 6 yanlış static key'i kapatıyordu; bu test imza anahtarının
- * adresin kendi onion key'i olması gerektiğini kanıtlar.
- * ================================================================ */
+/* 12. Yabancı onion imzası: başka anahtarla imzala → geçerli checksum'lı
+ * A adresine karşı NOX_ERR_AUTH; imza anahtarı adresin onion key'i olmalı. */
 static int test_foreign_onion_signature_rejected(void)
 {
     uint8_t seed_a[32], seed_b[32];
@@ -494,11 +435,8 @@ static int test_foreign_onion_signature_rejected(void)
     return 0;
 }
 
-/* ================================================================
- * 13. RELAY — saldırgan C kendi static'iyle Noise kurar, kurban
- * B'nin geçerli claim'ini msg2'de iletir. Initiator'ın hs->rs'i C
- * olduğu için B claim'i NOX_ERR_AUTH ile reddedilmelidir.
- * ================================================================ */
+/* 13. Relay: C kendi static'iyle Noise kurup B'nin claim'ini msg2'de
+ * iletir; initiator rs=C olduğu için NOX_ERR_AUTH. */
 static int test_relayed_claim_rejected(void)
 {
     static struct app_state victim;
@@ -567,9 +505,6 @@ static int test_relayed_claim_rejected(void)
     return 0;
 }
 
-/* ================================================================
- * MAIN
- * ================================================================ */
 int main(void)
 {
     if (sodium_init() < 0) {

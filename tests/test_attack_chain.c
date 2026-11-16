@@ -1,24 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_attack_chain.c — saldırgan zinciri: kimlik/gösterim ayrışması +
- * UI satır enjeksiyonu.
- *
- * Zincir (K-23 + K-33):
- *   1. Saldırgan peer, TOFU adına CR/LF ve bidi kontrol karakterleri
- *      koyar. İsim sanitize edilmezse terminalde sahte "[✓] sistem
- *      mesajı" satırları üretir.
- *   2. Saldırganın TOFU onayı `active_peer_onion` alanını günceller ama
- *      `active_peer_idx` eski dürüst peer'ta kalırsa UI/prompt saldırganı
- *      gösterirken mesajlar dürüst peer'a gider (split-brain).
- *   3. Kullanıcı "aktif peer saldırgan" sanıp hassas veriyi yanlış
- *      peer'a yollar; sahte sistem satırı da güveni pekiştirir.
- *
- * Bu test iki invariant'ı kilitler:
- *   - `ACTIVE_PEER(state)->peer_onion == state->active_peer_onion`
- *   - `ps->name` içinde CR/LF/bidi kontrol karakteri yok
- * ve doğrudan sanitizer'ın CR/LF + bidi + C1 davranışını doğrular.
- *
- * Bad patch (regresyon): aktif peer setter'ı yalnız onion string'ini
- * güncellemek veya `ui_strip_ansi`'da CR/LF/bidi'yi korumak.
+ * test_attack_chain.c — K-23 + K-33 saldırgan zinciri.
+ * TOFU adına CR/LF+bidi enjeksiyonu sahte UI satırı üretir; aktif-peer
+ * split-brain ile mesaj yanlış peer'a gider. İki invariant: onion/idx
+ * tutarlılığı ve isimde kontrol karakteri olmaması.
  */
 
 #include "common.h"

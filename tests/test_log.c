@@ -1,12 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_log.c — nox_strerror exhaustive sözleşmesi
- *
- * Amaç: nox_err_t'ye yeni bir değer eklendiğinde nox_strerror()
- * switch'inin ve kullanıcıya gösterilen metnin sessizce eksik
- * kalmamasını normal test paketinde de zorunlu kılmak.
- *
- * Bu test, tests/cbmc_log.c'deki formal harness'in hızlı ve
- * ASan/UBSan altında çalışan ikizidir.
+ * test_log.c — nox_strerror exhaustive sözleşmesi (yeni errno sessiz kalmasın).
  */
 
 #include "common.h"

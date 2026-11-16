@@ -1,18 +1,7 @@
-/* ================================================================
- * Seccomp Deneme — ptrace + mount + reboot engelleme
- *
- * Bağımsız test: libseccomp ile ptrace/mount/reboot'u engelle,
- * sonra deneyip çalışıp çalışmadığını gör. Kurallar filtreye
- * eklenir; aksi halde "engellendi" sonucu seccomp'u değil, yetki
- * yokluğunu ölçerdi. [✗] durumları exit code'a yansır.
- *
- * Compile:
- *   cc -o tests/test_seccomp tests/test_seccomp.c -lseccomp
- *
- * Run:
- *   ./tests/test_seccomp
- *   strace ./tests/test_seccomp   ← ptrace hata vermeli
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_seccomp.c — bağımsız libseccomp denemesi: ptrace/mount/reboot engeli.
+ * Kurallar filtreye eklenir; engel yetki yokluğu değil politika olmalı.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

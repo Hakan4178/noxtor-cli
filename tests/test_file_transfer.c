@@ -1,36 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_file_transfer.c — file_transfer RX/TX birim testleri (C2)
- *
- * Kapsam:
- *   1. M-F3 REGRESYON: aktif RX sırasında decrypt fail → rx_abort →
- *      yarım dosya unlinkat ile silinir (orphan kalmaz). Eski inline
- *      temizlik close+memzero yapıp unlinkat atlıyordu.
- *   2. Transfer dış decrypt fail → sessiz ret (abort yok, crash yok)
- *   3. Başarılı DATA chunk: loopback Noise session ile şifrelenmiş chunk
- *      yazılır + hash ilerler + tamamlanma → dosya diskte kalır, struct
- *      sıfırlanır (hash eşleşmezse unlink olurdu — dosyanın varlığı
- *      hash doğruluğunun kanıtı)
- *   4. T-03: METADATA kısmi yazım/EAGAIN → kopma YOK; frame kuyrukta
- *      offset ile bekler, tx_seq yalnız commit'te artar, sonraki frame
- *      (FILE chunk) doğru sırayla ve doğru içerikle parse edilir.
- *   5. C2 fatal TX: zero-byte/kalıcı hata ve kısmi frame sonrası kalıcı
- *      hata → teardown; tüketilen nonce geri alınamaz.
- *   6. TX sırasında gelen METADATA: ortak TX+RX durumu yok; muhafazakâr
- *      sözleşme: yerel hata + reddet, yarım dosya açma, oturumu koru.
- *   7. TX başlangıç/bitiş: ACTIVE → FILE_TX → ACTIVE; kuyruk boşalınca
- *      tamamlanır. Aksi halde sonraki transfer/RX kabulü kilitlenir.
- *   8. TX şifreleme hatası nonce tüketmeden: transfer abort, oturum kalır.
- *   9. TX nonce tükenmesi: fail-closed, transfer + oturum teardown.
- *  10. İki chunk'lık başarılı TX: tx_seq ve nonce commit'te sırayla artar.
- *  11. 100 chunk'lık akış: küçük SO_SNDBUF + kısmi yazım; alıcı tüm
- *      frame'leri sırayla çözer ve içerik hash'i eşleşir.
- *  12. T-04/K-29 REGRESYON: aktif RX'te 305-byte dürüst DATA chunk'ı
- *      "METADATA" ile başlasa bile metadata sanılmamalı; uzak peer
- *      transferi bu önekle iptal ettirememeli.
- *
- * Kurulum şablonu: tests/test_tofu_epoch.c loopback dansı + iki taraf
- * handshake_split (state_machine.c:418 kalıbı): g_sess_i sender (encrypt),
- * ps->session receiver (decrypt).
+ * test_file_transfer.c — dosya transferi RX/TX sözleşmeleri (C2).
+ * M-F3 rx_abort/unlink, gerçek AEAD chunk+hash, T-03 METADATA kısmi
+ * yazım, fatal flush/zeroize, TX nonce tükenmesi, T-04/K-29
+ * METADATA-prefix sniff regresyonu, 100-chunk akış.
  */
 
 #include "common.h"
@@ -52,73 +24,15 @@
 #include <unistd.h>
 #include <sodium.h>
 #include "test_common.h"
+#include "test_protocol_support.h"
 
 
-/* ================================================================
- * FIXTURE
- * ================================================================ */
 static struct app_state st;
 static const char *TEST_DL_DIR = "tests/.tmp_dl_ftx";
 static struct noise_session *g_sess_i = NULL; /* sender (encrypt) */
 static int g_tx_peer_fd = -1;
 static char g_tx_src_path[256];
 static size_t g_tx_prefill_len = 0;
-
-/* Loopback Noise XX: initiator stack, responder sodium_malloc. Split
- * her hs'yi tüketir (zeroize) — çağrı iki complete hs ister. */
-static int make_split_pair(struct noise_session *sess_i,
-                           struct noise_session *sess_r)
-{
-    uint8_t i_priv[NOX_KEY_LEN], i_pub[NOX_KEY_LEN];
-    uint8_t r_priv[NOX_KEY_LEN], r_pub[NOX_KEY_LEN];
-    crypto_box_curve25519xsalsa20poly1305_keypair(i_pub, i_priv);
-    crypto_box_curve25519xsalsa20poly1305_keypair(r_pub, r_priv);
-
-    struct noise_handshake hs_i;
-    struct noise_handshake *hs_r = sodium_malloc(sizeof(*hs_r));
-    if (!hs_r) return -1;
-
-    if (handshake_init(&hs_i, true, i_priv, i_pub) != NOX_OK ||
-        handshake_init(hs_r, false, r_priv, r_pub) != NOX_OK) {
-        sodium_free(hs_r);
-        return -1;
-    }
-
-    uint8_t msg[NOISE_MAX_HANDSHAKE_LEN], pl[64];
-    size_t len, pl_len;
-    nox_err_t err = NOX_OK;
-
-    len = sizeof(msg);
-    if (handshake_write(&hs_i, NULL, 0, msg, &len) == NOX_OK) {
-        pl_len = sizeof(pl);
-        if (handshake_read(hs_r, msg, len, pl, sizeof(pl), &pl_len) == NOX_OK) {
-            len = sizeof(msg);
-            if (handshake_write(hs_r, NULL, 0, msg, &len) == NOX_OK) {
-                pl_len = sizeof(pl);
-                if (handshake_read(&hs_i, msg, len, pl, sizeof(pl), &pl_len) == NOX_OK) {
-                    len = sizeof(msg);
-                    if (handshake_write(&hs_i, NULL, 0, msg, &len) == NOX_OK) {
-                        pl_len = sizeof(pl);
-                        if (handshake_read(hs_r, msg, len, pl, sizeof(pl), &pl_len) != NOX_OK)
-                            err = NOX_ERR_CRYPTO;
-                    } else err = NOX_ERR_CRYPTO;
-                } else err = NOX_ERR_CRYPTO;
-            } else err = NOX_ERR_CRYPTO;
-        } else err = NOX_ERR_CRYPTO;
-    } else err = NOX_ERR_CRYPTO;
-
-    if (err == NOX_OK &&
-        (!handshake_is_complete(&hs_i) || !handshake_is_complete(hs_r)))
-        err = NOX_ERR_CRYPTO;
-
-    if (err == NOX_OK)
-        err = handshake_split(&hs_i, sess_i);   /* initiator → sender */
-    if (err == NOX_OK)
-        err = handshake_split(hs_r, sess_r);    /* responder → receiver */
-
-    sodium_free(hs_r);
-    return err == NOX_OK ? 0 : -1;
-}
 
 /* state + downloads dir + slot0 session (receiver) + sender session */
 static int fixture_rx(void)
@@ -146,23 +60,10 @@ static int fixture_rx(void)
     g_sess_i = sodium_malloc(sizeof(struct noise_session));
     if (!st.peers[0].session || !g_sess_i) return -1;
 
-    if (make_split_pair(g_sess_i, st.peers[0].session) != 0) return -1;
+    if (nox_test_make_split_pair(g_sess_i, st.peers[0].session) != 0) return -1;
 
     st.peers[0].state = ST_ACTIVE;
     return 0;
-}
-
-/* Adım 5 TX fixture'ı: gerçek kaynak dosya + gerçek socket + AEAD anahtarı.
- * `fill_socket` true ise alıcı hiç okumaz; soket EAGAIN'e kadar doldurulur. */
-static void init_cipher_session(struct noise_session *s, uint64_t n)
-{
-    memset(s, 0, sizeof(*s));
-    memset(s->tx.k, 0x42, NOX_KEY_LEN);
-    memset(s->rx.k, 0x42, NOX_KEY_LEN);
-    s->tx.n = n;
-    s->rx.n = n;
-    s->tx.has_key = true;
-    s->rx.has_key = true;
 }
 
 #if defined(EAGAIN) && defined(EWOULDBLOCK) && (EAGAIN != EWOULDBLOCK)
@@ -369,7 +270,7 @@ static int fixture_tx(bool fill_socket)
     ps->state = ST_ACTIVE;
     ps->session = sodium_malloc(sizeof(*ps->session));
     if (!ps->session) return -1;
-    init_cipher_session(ps->session, 0);
+    nox_test_init_cipher_session(ps->session, 0);
 
     if (fill_socket && fill_socket_to_eagain(ps->fd, &g_tx_prefill_len) != 0)
         return -1;
@@ -476,9 +377,6 @@ static void fixture_teardown(void)
     }                                                                  \
 } while (0)
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
 /* 0) K-26 kotası: 100 GiB tavanı NOX_ERR_QUOTA'ya bağlanıyor */
 static int test_quota_bounds(void)
@@ -593,18 +491,9 @@ static int test_rx_data_chunk_success(void)
     return 0;
 }
 
-/* 3b) T-04/K-29 REGRESYON — saldırgan gözünden:
- *
- * Aktif RX sırasında gelen her FILE frame'i veridir; 305 byte'lık meşru
- * bir chunk "METADATA" ile başlayabilir. Eski sniff, payload uzunluğu ve
- * ilk 9 byte'a bakıp bunu yeni metadata sanıyor, `rx_file.active` dalına
- * girip transferi iptal ediyordu. Uzak peer, dosyanın 305-hizalı ilk
- * parçasını "METADATA" ile başlatıp dürüst alımı süresiz kere bozabiliyordu.
- *
- * Bad patch (regresyon): sniff koşulunu `!ps->rx_file.active` guard'ından
- * önce çalıştırmak. Bu test o durumda ilk chunk'tan sonra active=false /
- * dosya silinmiş görür ve kırmızıya döner.
- */
+/* 3b) T-04/K-29: aktif RX'te her FILE frame'i veridir; 305 byte'lık meşru
+ * chunk "METADATA" ile başlayabilir. Eski sniff transferi iptal ediyordu;
+ * regresyon sniff'i !rx_file.active guard'ından önce çalıştırmak. */
 static int test_rx_data_chunk_metadata_prefix(void)
 {
     if (fixture_rx() != 0) { TEST_ASSERT(!"fixture"); }
@@ -687,12 +576,9 @@ static int test_rx_data_chunk_metadata_prefix(void)
     return 0;
 }
 
-/* 4) F9 REGRESYON: chunk-timeout FILE_RX hayaletini bırakmamalı.
- * event_loop.c timeout bloğu unlink+close+memzero yapıp EV_FILE_DONE
- * dispatch etmiyordu (rx_abort ediyordu) → ST_FILE_RX + active=false,
- * /switch 3600sn bloklu. Patch: FILE_RX ise EV_FILE_DONE dispatch.
- * Bu test patch sözleşmesini kilitler: expired predikat + timeout
- * temizliği sonrası state ACTIVE'a dönmeli, yarım dosya silinmeli. */
+/* 4) F9: timeout FILE_RX hayaleti bırakmamalı. Eski blok rx_abort edip
+ * EV_FILE_DONE dispatch etmiyordu → /switch 3600sn bloklu. Patch: FILE_RX
+ * ise EV_FILE_DONE; sonrası ACTIVE + yarım dosya silinmiş. */
 static int test_rx_chunk_timeout_returns_to_active(void)
 {
     if (fixture_rx() != 0) { TEST_ASSERT(!"fixture"); }
@@ -746,13 +632,9 @@ static int test_rx_chunk_timeout_returns_to_active(void)
     return 0;
 }
 
-/* 6) T-03 REGRESYON (C2): METADATA kısmi yazım/EAGAIN → kopma YOK.
- *
- * Soket dolu; METADATA commit edilir (tx_seq=1, nonce=1) ve kuyrukta
- * offset ile bekler. Kısmi flush NOX_ERR_AGAIN döner, oturum açık kalır.
- * Soket boşalınca aynı frame kaldığı yerden tamamlanır; ardından gelen
- * FILE chunk doğru sırada ve doğru içerikle parse edilir.
- */
+/* 6) T-03: METADATA commit edilir (tx_seq=1, nonce=1), soket dolu olduğu
+ * için offset'le bekler. Kısmi flush AGAIN döner, oturum açık kalır; soket
+ * boşalınca aynı frame tamamlanır, ardından FILE chunk doğru parse edilir. */
 static int test_tx_metadata_partial_no_disconnect(void)
 {
     FT_TX_ASSERT(fixture_tx(true) == 0);
@@ -793,10 +675,8 @@ static int test_tx_metadata_partial_no_disconnect(void)
     /* Kirlilik önekini (prefill) tamamen boşalt. */
     FT_TX_ASSERT(drain_discard(g_tx_peer_fd, prefill_len) == 0);
 
-    /* Kısmi yazımı deterministik mod: AF_UNIX tampon muhasebesi 318 B'lik
-     * frame'i tek seferde ya hiç ya tam yazar; gerçek kısmi durumu,
-     * frame'in ilk 100 byte'ını sokete yazıp kuyruk offset'ini aynı
-     * noktaya kurarak modelliyoruz. Kalan gerçek flush ile gider. */
+    /* AF_UNIX frame'i ya tam ya hiç yazar; gerçek kısmi durumu ilk 100
+     * byte'ı yazıp kuyruk offset'ini aynı noktaya kurarak modelliyoruz. */
     const uint16_t off_seed = 100U;
     FT_TX_ASSERT(frame_len > off_seed);
     ssize_t seeded = send(ps->fd, slot->buf, off_seed,
@@ -823,7 +703,7 @@ static int test_tx_metadata_partial_no_disconnect(void)
     FT_TX_ASSERT(fh.len == 305U + NOX_MAC_LEN);
 
     struct noise_session rx;
-    init_cipher_session(&rx, 0);
+    nox_test_init_cipher_session(&rx, 0);
     uint8_t pt[NOX_MAX_MSG_LEN + 1];
     ssize_t n = noise_decrypt(&rx, frame, FRAME_HEADER_WIRE_SIZE,
                               frame + FRAME_HEADER_WIRE_SIZE, fh.len, pt);
@@ -866,13 +746,9 @@ static int test_tx_metadata_partial_no_disconnect(void)
     return 0;
 }
 
-/* 7) C2 fatal TX: kalıcı yazma hatası (EBADF), HİÇ byte yazılmadı.
- * Başarılı şifreleme nonce'u tüketmiştir; rollback yasak. Frame
- * düşürülemez, bu yüzden kalıcı hata teardown'dır.
- *
- * NOT: Gerçek send()==0 dalı bu testte kurulamıyor; burada EBADF
- * üretilir. Zero-byte dalının doğrulanması K-06/K-28 borcudur.
- */
+/* 7) C2 fatal TX: EBADF, hiç byte yazılmadı. Şifreleme nonce'u tüketmiştir,
+ * rollback yasak; frame düşürülemez → kalıcı hata teardown'dır.
+ * NOT: send()==0 dalı burada kurulamıyor; K-06/K-28 borcu. */
 static int test_tx_chunk_fatal_write_disconnects(void)
 {
     FT_TX_ASSERT(fixture_tx(false) == 0);
@@ -908,11 +784,9 @@ static int test_tx_chunk_fatal_write_disconnects(void)
     return 0;
 }
 
-/* 8) C2 fatal TX: KISMİ frame kabloda kaldıktan SONRA kalıcı hata.
- * Stream yeniden senkronize edilemez; transferle birlikte oturum kapanır.
- * (Kısmi yazım + EAGAIN tek başına teardown DEĞİLDİR; offset korunur.
- * Burada alıcı kapatılarak kalıcı hata üretilir.)
- */
+/* 8) C2 fatal TX: kısmi frame kabloda kaldıktan sonra kalıcı hata → stream
+ * resync edilemez, transferle oturum kapanır. (Kısmi yazım+EAGAIN tek
+ * başına teardown değil; offset korunur.) */
 static int test_tx_chunk_partial_then_fatal_disconnects(void)
 {
     FT_TX_ASSERT(fixture_tx(true) == 0);
@@ -959,13 +833,9 @@ static int test_tx_chunk_partial_then_fatal_disconnects(void)
     return 0;
 }
 
-/* 9) [ADIM 5 — MUHAFAZAKÂR SÖZLEŞME] TX sırasında METADATA.
- *
- * Peer, biz dosya gönderirken geçerli bir METADATA frame'i yollar.
- * Mevcut state machine TX+RX'i birlikte temsil etmiyor. Handler state
- * geçişini reddeder, yerel hata gösterir, hiç dosya açmaz ve oturumu
- * korur. Full-duplex tasarımı seçilirse bu test bilinçli değiştirilir.
- */
+/* 9) Adım 5 muhafazakâr sözleşme: TX sırasında METADATA gelirse handler
+ * geçişi reddeder, yerel hata gösterir, dosya açmaz, oturumu korur.
+ * Full-duplex seçilirse test bilinçli değişir. */
 static int test_rx_metadata_during_tx_rejected(void)
 {
     FT_RX_ASSERT(fixture_rx() == 0);
@@ -998,11 +868,8 @@ static int test_rx_metadata_during_tx_rejected(void)
     return 0;
 }
 
-/* 10) [ADIM 5] TX başlangıç/bitiş durum geçişleri:
- * file_transfer_start ACTIVE → FILE_TX yapar; son chunk bitince
- * FILE_TX → ACTIVE döner. Aksi halde peer bir sonraki transferi
- * başlatamaz veya RX kabul edemez.
- */
+/* 10) TX geçişleri: start ACTIVE→FILE_TX; son chunk FILE_TX→ACTIVE.
+ * Aksi halde peer yeni transfer başlatamaz veya RX kabul edemez. */
 static int test_start_and_complete_file_tx(void)
 {
     FT_TX_ASSERT(fixture_tx(false) == 0);
@@ -1040,10 +907,8 @@ static int test_start_and_complete_file_tx(void)
     return 0;
 }
 
-/* 11) [ADIM 5] Şifreleme nonce tüketmeden fail ederse yalnız transfer
- * iptal edilir; peer oturumu, fd ve nonce sayacı korunur.
- * Keyless session bu dalı gerçek noise_encrypt guard'ı üzerinden tetikler.
- */
+/* 11) Şifreleme nonce tüketmeden fail ederse yalnız transfer iptal;
+ * peer fd/session/nonce sayacı korunur (keyless session gerçek guard). */
 static int test_tx_encrypt_without_nonce_keeps_session(void)
 {
     FT_TX_ASSERT(fixture_tx(false) == 0);
@@ -1193,7 +1058,7 @@ static int test_tx_file_stream(void)
     size_t wire_len = 0;
 
     struct noise_session rx;
-    init_cipher_session(&rx, 0);
+    nox_test_init_cipher_session(&rx, 0);
 
     crypto_generichash_state got_hs;
     FT_TX_ASSERT(crypto_generichash_init(&got_hs, NULL, 0, 32) == 0);

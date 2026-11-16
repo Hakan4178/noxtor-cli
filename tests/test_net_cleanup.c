@@ -1,20 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_net_cleanup.c — stale Tor kalıntı süpürme sözleşmesi (network.c)
- *
- * EN KÖTÜ ŞİDDET SINIFI testleri: sweep yanlış olursa (a) Tor anahtarları
- * diskte sızar, (b) symlink takip edilirse config dışı victim dizin
- * silinir, (c) aşırı agresif silme canlı Tor'un verisini uçurur.
- *
- * Sözleşme (cleanup_stale_tor_dirs + is_our_stale_entry + safe_parse_pid):
- *   - tor_data_<pid> (dizin): ölü pid + bizim UID → rm_rf (içi dolu dahil)
- *   - torrc_<pid> (dosya): ölü pid → unlink
- *   - canlı pid (tor olmasa bile) → DOKUNULMAZ
- *   - symlink: takip EDİLMEZ — link gider, hedef KALIR
- *   - eşleşmeyen adlar → dokunulmaz
- *   - pid parse: strtol + ERANGE + endptr; <=0 / >INT_MAX → red
- *
- * Bad patch avı: rm_rf→rmdir (anahtar sızması), lstat→stat (symlink
- * takibi), kill mantığında ters karar (canlıyı silme).
+ * test_net_cleanup.c — stale Tor kalıntı süpürme (cleanup_stale_tor_dirs).
+ * Ölü pid temizlenir; canlı pid/yabancı ad korunur; symlink takip edilmez;
+ * pid parse ERANGE/endptr sınırları fail-closed.
  */
 
 #include "common.h"
@@ -58,9 +45,6 @@ static int tests_passed = 0;
 #define FIX_DIR  "tests/.tmp_net_clean"
 #define VIC_DIR  "tests/.tmp_net_clean_victim"
 
-/* ================================================================
- * YARDIMCILAR
- * ================================================================ */
 
 /* Ölü pid üret: fork + hemen çık + reap — sweep "kesin ölü" görmeli */
 static pid_t spawn_dead_pid(void)
@@ -133,9 +117,6 @@ static void fixture_reset(void)
     mkdir_p(FIX_DIR);
 }
 
-/* ================================================================
- * SWEEP TESTLERİ
- * ================================================================ */
 
 /* 1) Ölü pid'li tor_data dizini İÇERİĞİYLE silinir — rm_rf→rmdir
  *    "basitleştirmesi" (anahtar sızması) bu testte kırmızı verir */

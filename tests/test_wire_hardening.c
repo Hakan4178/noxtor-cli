@@ -1,18 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_wire_hardening.c — saldırgan kaynaklı iki yüzeyin sertleştirme kilidi
- *
- * İki bağımsız korpus, tek dosya:
- *
- * A) sanitize_filename (file_transfer.c:31) — PEERDAN GELEN dosya adı.
- *    Path traversal'ın ilk savunma hattı; daha önce HİÇ unit corpus'u yoktu.
- *    Sözleşme: basename / max_len sınırı / whitelist (a-z A-Z 0-9 . _ -) /
- *    ".."→"__" / baştaki '.'→'_' / boş→"file_%08x". Testler hem temiz
- *    isimleri (iyi) hem traversal denemelerini (kötü) sabitler.
- *
- * B) frame_header_decode (network.c:1865) — AĞDAN GELEN 13 byte.
- *    Sözleşme: magic/type/len doğrulanır, hata NOX_ERR_PROTO. L-7 (tip
- *    aralığı) ve uzunluk tavanı burada kilitlenir. NULL wire → fail-closed
- *    (çökme yok, PROTO).
+ * test_wire_hardening.c — peerden gelen iki yüzey.
+ * sanitize_filename: basename/whitelist/".."/gizli ad; frame_header_decode:
+ * magic/type/len, L-7 tip aralığı, uzunluk tavanı, NULL fail-closed.
  */
 
 #include "common.h"
@@ -74,9 +63,7 @@ static int expect_sanitized(const char *in, size_t max_len, const char *want)
     return 0;
 }
 
-/* ================================================================
- * A) sanitize_filename — iyi yol (temiz isimler bozulmaz)
- * ================================================================ */
+/* A) sanitize_filename — iyi yol (temiz isimler bozulmaz) */
 
 static int test_sanitize_clean_names_unchanged(void)
 {
@@ -85,9 +72,7 @@ static int test_sanitize_clean_names_unchanged(void)
     return 0;
 }
 
-/* ================================================================
- * A) sanitize_filename — kötü yol (traversal korpusu)
- * ================================================================ */
+/* A) sanitize_filename — kötü yol (traversal korpusu) */
 
 static int test_sanitize_traversal(void)
 {
@@ -160,9 +145,7 @@ static int test_sanitize_bounds_and_null(void)
     return 0;
 }
 
-/* ================================================================
- * B) frame_header_decode — roundtrip (iyi yol)
- * ================================================================ */
+/* B) frame_header_decode — roundtrip (iyi yol) */
 
 static int test_frame_roundtrip_all_types(void)
 {
@@ -212,9 +195,7 @@ static int test_frame_boundary_len_and_seq(void)
     return 0;
 }
 
-/* ================================================================
- * B) frame_header_decode — kötü yol (hostile wire)
- * ================================================================ */
+/* B) frame_header_decode — kötü yol (hostile wire) */
 
 static int test_frame_bad_magic(void)
 {

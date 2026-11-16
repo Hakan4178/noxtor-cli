@@ -1,18 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_ansi_strip.c — ui_strip_ansi hostile korpusu (B: iki kopya drift'i)
- *
- * B BULGUSU: strip_ansi_escape İKİ kopya hâlindeydi (frontend.c +
- * stdin_handler.c) ve drift başlamıştı: stdin kopyasında OSC/DCS tarama
- * limiti (256) vardı, frontend kopyasında yok. Tek doğruluk kaynağı:
- * ui_strip_ansi (frontend.c, limitli versiyon kanonik). Bu test korpusu
- * TEK davranışı kilitler — bir daha tek tarafa fix uygulanamaz.
- *
- * Korpus kategorileri:
- *   CSI (parametreli/sırt-sırt/aşırı uzun), OSC (BEL/ST/sonlanmamış/
- *   limit-256), DCS, bare ESC, ESC+( ), C0 drop vs \t keep, çıktıda
- *   CR/LF boşluğa çevirme, stdin'de CR/LF koruma, DEL/C1/bidi drop,
- *   UTF-8 butunluğu (Türkçe + emoji), attacker mesaj/satır temizliği,
- *   NULL/boş.
+ * test_ansi_strip.c — ui_strip_ansi korpusu (tek kanonik strip davranışı).
+ * Kapsam: CSI/OSC/DCS/ESC, C0/DEL/C1/bidi, çıktıda CR/LF vs stdin EOL,
+ * UTF-8 bütünlüğü. T-02 + K-33 regresyonu.
  */
 
 #include "common.h"
@@ -179,10 +168,7 @@ static int test_c1_bidi_dropped(void)
     return 0;
 }
 
-/* 11d) K-33 stdin regresyonu: girdi sanitizer'ı satır sonlarını
- *      korumalı; aksi halde stdin_handler '
-' bulamaz ve Enter hiçbir
- *      komutu çalıştırmaz. Saldırgan ESC/C1/bidi yine geçemez. */
+/* 11d) K-33 stdin: satır sonları korunur; ESC/C1/bidi yine geçmez. */
 static int test_input_preserves_eol(void)
 {
     TEST_ASSERT(expect_input_stripped("yardim\n", "yardim\n") == 0);

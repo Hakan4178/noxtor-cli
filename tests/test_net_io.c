@@ -1,25 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_net_io.c — network.c I/O sözleşmeleri (socketpair fixtür'ü)
- *
- * Kapsam:
- *   read_full        — tam okuma, EOF ortada, len=0, bad fd, parçalı
- *                      teslimat, sinyalle EINTR, kısmi veri + timeout
- *   write_full       — EPIPE, kısa yazma döngüsü, toplam deadline
- *   ctrl_read_line   — satır + CRLF, C3 overflow (newline'sız dolan
- *                      buffer), kapalı peer (NOX_ERR_TOR), hızlı timeout
- *                      (NOX_ERR_TIMEOUT, enjekte edilebilir!), kısmi satır
- *                      sonrası timeout, toplam deadline (slow loris)
- *   ctrl_read_response — tek satır, 250- devam birleştirme, 4xx/5xx hata
- *                      (NOX_ERR_TOR), H-2 64-satır limiti (off-by-one
- *                      sınırı dahil), buffer tavanı, hızlı timeout,
- *                      yarım yanıt ve satırlar arası toplam deadline
- *   ctrl_send_command — write_full zarfı, kapalı peer (EPIPE)
- *   epoll_add/remove  — ekle/sil, double-remove (H-13 ENOENT→OK),
- *                      -1 epoll fd'de çökme yok
- *
- * Not: read_full/write_full üretimde NOX_READ_TIMEOUT_MS=10000 kullanır.
- * Testler, aynı kod yolunu küçük timeout ile sınamak için _timeout
- * varyantlarını kullanır; SIGPIPE main.c ile aynı şekilde ignore edilir.
+ * test_net_io.c — read_full/write_full, ctrl_read_line/response,
+ * ctrl_send_command, epoll add/remove; EINTR/timeout/EPIPE/overflow.
  */
 
 #include "common.h"
@@ -132,9 +113,7 @@ static int wait_child_ok(pid_t pid)
     return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 }
 
-/* ================================================================
- * read_full
- * ================================================================ */
+/* read_full */
 
 static int test_read_full_exact(void)
 {
@@ -317,9 +296,7 @@ static int test_read_full_timeout_after_partial(void)
     return 0;
 }
 
-/* ================================================================
- * ctrl_read_line
- * ================================================================ */
+/* ctrl_read_line */
 
 static int test_ctrl_read_line_basic_crlf(void)
 {
@@ -456,9 +433,7 @@ static int test_ctrl_read_line_tiny_buffer(void)
     return 0;
 }
 
-/* ================================================================
- * ctrl_read_response
- * ================================================================ */
+/* ctrl_read_response */
 
 static int test_ctrl_response_single_line(void)
 {
@@ -625,9 +600,7 @@ static int test_ctrl_response_total_deadline(void)
     return 0;
 }
 
-/* ================================================================
- * ctrl_send_command + epoll
- * ================================================================ */
+/* ctrl_send_command + epoll */
 
 static int test_ctrl_send_command_roundtrip(void)
 {

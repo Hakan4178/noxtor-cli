@@ -1,13 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_tx_order.c — C2: FILE/TEXT ortak TX kuyruğu sıra sözleşmesi
- *
- * Kapsam:
- *   1. FILE chunk kuyrukta beklerken gelen TEXT aynı kuyruğa girer;
- *      wire sırası birebir: chunk k → TEXT k+1. Transfer, kuyruk
- *      boşalınca tamamlanır (nonce sırası = wire sırası).
- *   2. Kuyrukta TEXT varken FILE başlatılabilir (Q3); METADATA ve ilk
- *      chunk sıranın sonuna girer: TEXT k → METADATA k+1 → chunk k+2.
- *   3. Disconnect cleanup kuyruğu ve transfer state'ini zeroize eder.
+ * test_tx_order.c — FILE/TEXT ortak TX kuyruğu sırası.
+ * chunk k → TEXT k+1; TEXT varken FILE → METADATA k+1 → chunk k+2;
+ * disconnect cleanup zeroize.
  */
 
 #include "common.h"
@@ -29,6 +23,7 @@
 #include <sodium.h>
 
 #include "test_common.h"
+#include "test_protocol_support.h"
 
 static struct app_state st;
 static int g_rx_fd = -1;
@@ -78,17 +73,6 @@ static void fixture_teardown(void)
     sodium_memzero(&st, sizeof(st));
 }
 
-static void init_cipher_session(struct noise_session *s, uint64_t n)
-{
-    memset(s, 0, sizeof(*s));
-    memset(s->tx.k, 0x42, NOX_KEY_LEN);
-    memset(s->rx.k, 0x42, NOX_KEY_LEN);
-    s->tx.n = n;
-    s->rx.n = n;
-    s->tx.has_key = true;
-    s->rx.has_key = true;
-}
-
 static int make_tmp_file(const void *payload, size_t len)
 {
     static const char tmpl[] = "/tmp/opencode/c2_tx_order_XXXXXX";
@@ -128,7 +112,7 @@ static int fixture_setup(const void *payload, size_t len)
     ps->session = sodium_malloc(sizeof(*ps->session));
     if (!ps->session)
         return -1;
-    init_cipher_session(ps->session, 5);
+    nox_test_init_cipher_session(ps->session, 5);
     ps->tx_seq = 5;
 
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -190,33 +174,6 @@ static int stage_text_frame(struct peer_session *ps, const char *text)
                : -1;
 }
 
-static int read_exact(int fd, void *buf, size_t len)
-{
-    uint8_t *p = buf;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = read(fd, p + got, len - got);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return -1;
-        got += (size_t)n;
-    }
-    return 0;
-}
-
-static int read_frame(int fd, struct frame_header *fh, uint8_t *wire,
-                      uint8_t *ct)
-{
-    if (read_exact(fd, wire, FRAME_HEADER_WIRE_SIZE) != 0)
-        return -1;
-    if (frame_header_decode(wire, fh) != NOX_OK)
-        return -1;
-    if (fh->len > NOX_MAX_MSG_LEN + NOX_MAC_LEN)
-        return -1;
-    return read_exact(fd, ct, fh->len);
-}
-
 static int expect_text(int fd, struct noise_session *rx, uint32_t seq,
                        const char *text)
 {
@@ -225,7 +182,7 @@ static int expect_text(int fd, struct noise_session *rx, uint32_t seq,
     uint8_t ct[NOX_MAX_MSG_LEN + NOX_MAC_LEN];
     uint8_t pt[NOX_MAX_MSG_LEN + 1];
 
-    if (read_frame(fd, &fh, wire, ct) != 0)
+    if (nox_test_read_frame(fd, &fh, wire, ct) != 0)
         return -1;
     if (fh.type != NOX_MSG_TEXT || fh.seq != seq)
         return -1;
@@ -246,7 +203,7 @@ static int expect_file(int fd, struct noise_session *rx, uint32_t seq,
     uint8_t ct[NOX_MAX_MSG_LEN + NOX_MAC_LEN];
     uint8_t pt[NOX_MAX_MSG_LEN + 1];
 
-    if (read_frame(fd, &fh, wire, ct) != 0)
+    if (nox_test_read_frame(fd, &fh, wire, ct) != 0)
         return -1;
     if (fh.type != NOX_MSG_FILE || fh.seq != seq)
         return -1;
@@ -290,7 +247,7 @@ static int test_file_chunk_then_text(void)
     TX_ASSERT(ps->state == ST_ACTIVE);
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     TX_ASSERT(expect_file(g_rx_fd, &rx, 5U, "AB", 2U) == 0);
     TX_ASSERT(expect_text(g_rx_fd, &rx, 6U, "hello") == 0);
 
@@ -329,14 +286,14 @@ static int test_text_then_file_start(void)
     TX_ASSERT(ps->state == ST_ACTIVE);
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     TX_ASSERT(expect_text(g_rx_fd, &rx, 5U, "wait") == 0);
 
     struct frame_header fh;
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     uint8_t ct[NOX_MAX_MSG_LEN + NOX_MAC_LEN];
     uint8_t pt[NOX_MAX_MSG_LEN + 1];
-    TX_ASSERT(read_frame(g_rx_fd, &fh, wire, ct) == 0);
+    TX_ASSERT(nox_test_read_frame(g_rx_fd, &fh, wire, ct) == 0);
     TX_ASSERT(fh.type == NOX_MSG_FILE && fh.seq == 6U);
     ssize_t n = noise_decrypt(&rx, wire, sizeof(wire), ct, fh.len, pt);
     TX_ASSERT(n == 305 && memcmp(pt, "METADATA", 9) == 0);

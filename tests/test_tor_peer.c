@@ -1,18 +1,7 @@
-/* ================================================================
- * test_tor_peer.c — tor_verify_peer (SO_PEERCRED) regresyon testi
- *
- * Bulgu 2.1: "control soketine connect olmak, karşıdakinin Tor olduğunu
- * kanıtlamaz." Fix, connect sonrası SO_PEERCRED ile peer PID/UID
- * doğrulaması yapar. Bu test gerçek AF_UNIX soket çiftiyle senaryoları
- * kilitler:
- *   1) gerçek dinleyici child PID'i → kabul (NOX_OK)
- *   2) yanlış PID (parent) → ret (NOX_ERR_PEER) — sahte soket taklidi
- *   3) geçersiz fd (-1) → NOX_ERR_NET (getsockopt)
- *   4) socket olmayan fd (/dev/null) → NOX_ERR_NET
- *
- * Semantik doğrulama: /tmp/opencode/peercred_probe.c
- * (müşteri tarafında SO_PEERCRED = DİNLEYEN sürecin pid/uid'i).
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_tor_peer.c — tor_verify_peer (SO_PEERCRED).
+ * Doğru child pid kabul; yanlış pid/geçersiz fd/socket olmayan fd ret.
+ */
 #define _GNU_SOURCE
 #include "common.h"
 #include "network.h"

@@ -12,6 +12,11 @@
  *   8. Ghost HS: rastgele seed pub'ı ↔ ServiceID eşleşmesi kabul
  *   9. Yabancı ama geçerli ServiceID → derived HS reddi
  *  10. Yabancı ama geçerli ServiceID → ghost HS reddi
+ *  11. F2 derived HS: 106 byte listen_path (worst-case komut)
+ *  12. F2 torrc sahiplik satırı biçim/sınır/hata sözleşmesi
+ *  13. F2 generate_torrc gerçek çıktısında sahiplik satırı
+ *  14. F2 control fd kapatma → peer EOF
+ *  15. F2 control fd: NULL durum ve socket olmayan fd
  *
  * Not: UTF-8 chunk sınırı sözleşmesi ayrı dosyada (test_chunk_size.c)
  * gerçek nox_next_chunk_size ile test edilir — burada kopya barındırılmaz.
@@ -603,6 +608,199 @@ static int test_tor_close_control_fd(void)
     return 0;
 }
 
+/* ================================================================
+ * TEST: F2 derived HS — worst-case listen_path (106 byte) komuta sığar
+ *
+ * tor_spawn control.sock için sun_path ≤ 106 uygular. Bu, ADD_ONION
+ * komutunun üretimde görebileceği en uzun yoldur; cmd buffer'ı
+ * (NOX_PATH_MAX + 128) bu durumda taşmamalı ve biçim korunmalı.
+ * ================================================================ */
+static int test_derived_hs_max_listen_path(void)
+{
+    char listen_path[107];
+    memcpy(listen_path, "/tmp/", 5);
+    memset(listen_path + 5, 'a', 96);
+    memcpy(listen_path + 101, ".sock", 5);
+    listen_path[106] = '\0';
+    TEST_ASSERT(strlen(listen_path) == 106);
+
+    char expected[NOX_ONION_LEN + 1];
+    TEST_ASSERT(test_derive_expected_onion(expected, TEST_MASTER_A) == 0);
+
+    struct fake_tor ft;
+    TEST_ASSERT(fake_tor_start(&ft, FAKE_TOR_MATCH_REQUEST, NULL) == 0);
+
+    char out[NOX_ONION_LEN + 1] = {0};
+    nox_err_t err = tor_create_derived_hs(ft.fd, listen_path, TEST_MASTER_A,
+                                          out, sizeof(out));
+    int child_ok = fake_tor_finish(&ft);
+
+    TEST_ASSERT(child_ok == 0);
+    TEST_ASSERT(err == NOX_OK);
+    TEST_ASSERT(strcmp(out, expected) == 0);
+    return 0;
+}
+
+/* ================================================================
+ * TEST: F2 torrc sahiplik satırı — biçim, tam sınır, hata sözleşmesi
+ * ================================================================ */
+static int test_tor_append_owning_controller_process(void)
+{
+    static const char prefix[] = "SocksPort unix:/tmp/socks.sock\n";
+    char buf[256];
+    memcpy(buf, prefix, sizeof(prefix));
+    size_t len = sizeof(prefix) - 1;
+
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    buf, sizeof(buf), &len, 12345) == NOX_OK);
+    TEST_ASSERT(strcmp(buf, "SocksPort unix:/tmp/socks.sock\n"
+                            "__OwningControllerProcess 12345\n") == 0);
+    TEST_ASSERT(len == strlen(buf));
+
+    /* Tam sığan buffer: satır + NUL tam kapasiteye eşit. */
+    static const char line[] = "__OwningControllerProcess 42\n";
+    char exact[sizeof(line)];
+    size_t exact_len = 0;
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    exact, sizeof(exact), &exact_len, 42) == NOX_OK);
+    TEST_ASSERT(exact_len == sizeof(line) - 1);
+    TEST_ASSERT(strcmp(exact, line) == 0);
+
+    /* Bir byte eksik: NUL sığmaz → OVERFLOW, *len değişmez. */
+    char tight[sizeof(line) - 1];
+    memset(tight, 0xA5, sizeof(tight));
+    size_t tight_len = 3;
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    tight, sizeof(tight), &tight_len, 42) == NOX_ERR_OVERFLOW);
+    TEST_ASSERT(tight_len == 3);
+
+    /* Hata sözleşmesi: geçersiz argümanlar CONFIG, len korunur. */
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    NULL, sizeof(buf), &len, 1) == NOX_ERR_CONFIG);
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    buf, sizeof(buf), NULL, 1) == NOX_ERR_CONFIG);
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    buf, 0, &len, 1) == NOX_ERR_CONFIG);
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    buf, sizeof(buf), &len, 0) == NOX_ERR_CONFIG);
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    buf, sizeof(buf), &len, -1) == NOX_ERR_CONFIG);
+
+    size_t at_cap = sizeof(buf);
+    TEST_ASSERT(tor_append_owning_controller_process(
+                    buf, sizeof(buf), &at_cap, 1) == NOX_ERR_CONFIG);
+    TEST_ASSERT(at_cap == sizeof(buf));
+    return 0;
+}
+
+/* ================================================================
+ * TEST: F2 generate_torrc — gerçek torrc çıktısında sahiplik satırı
+ * ================================================================ */
+static int test_generate_torrc_owning_line(void)
+{
+    char tmp_dir[] = "/tmp/noxtor_torrc_XXXXXX";
+    TEST_ASSERT(mkdtemp(tmp_dir) != NULL);
+
+    static struct app_state state;
+    memset(&state, 0, sizeof(state));
+    state.config_dir_fd = -1;
+    state.tor_data_fd = -1;
+    state.transport_type = TRANSPORT_DIRECT;
+    TEST_ASSERT(snprintf(state.config_dir, sizeof(state.config_dir), "%s",
+                         tmp_dir) > 0);
+
+    TEST_ASSERT(generate_torrc(&state) == NOX_OK);
+    TEST_ASSERT(state.tor_data_fd >= 0);
+
+    char content[4096];
+    int fd = open(state.torrc_path, O_RDONLY | O_CLOEXEC);
+    TEST_ASSERT(fd >= 0);
+
+    size_t total = 0;
+    while (total < sizeof(content) - 1) {
+        ssize_t r = read(fd, content + total, sizeof(content) - 1 - total);
+        if (r < 0 && errno == EINTR)
+            continue;
+        TEST_ASSERT(r >= 0);
+        if (r == 0)
+            break;
+        total += (size_t)r;
+    }
+    content[total] = '\0';
+    close(fd);
+
+    char expected[64];
+    int n = snprintf(expected, sizeof(expected),
+                     "__OwningControllerProcess %d\n", (int)getpid());
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(expected));
+    TEST_ASSERT(strstr(content, expected) != NULL);
+    TEST_ASSERT(total >= (size_t)n);
+    TEST_ASSERT(memcmp(content + total - (size_t)n, expected,
+                       (size_t)n) == 0);
+
+    TEST_ASSERT(close(state.tor_data_fd) == 0);
+    state.tor_data_fd = -1;
+    TEST_ASSERT(unlink(state.torrc_path) == 0);
+    TEST_ASSERT(rmdir(state.tor_data_dir) == 0);
+    TEST_ASSERT(rmdir(tmp_dir) == 0);
+    return 0;
+}
+
+/* ================================================================
+ * TEST: F2 control fd kapatma — peer tarafında EOF görülmeli
+ * ================================================================ */
+static int test_tor_close_control_fd_peer_eof(void)
+{
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    static struct app_state state;
+    memset(&state, 0, sizeof(state));
+    state.tor_ctrl_fd = sv[0];
+
+    tor_close_control_fd(&state);
+    TEST_ASSERT(state.tor_ctrl_fd == -1);
+
+    char c;
+    ssize_t r;
+    do {
+        r = read(sv[1], &c, 1);
+    } while (r < 0 && errno == EINTR);
+    TEST_ASSERT(r == 0); /* shutdown + close → FIN, peer EOF */
+
+    close(sv[1]);
+    return 0;
+}
+
+/* ================================================================
+ * TEST: F2 control fd — NULL state ve socket olmayan fd güvenli
+ * ================================================================ */
+static int test_tor_close_control_fd_invalid_args(void)
+{
+    tor_close_control_fd(NULL); /* çökme/hata olmamalı */
+
+    int p[2];
+    TEST_ASSERT(pipe(p) == 0);
+
+    static struct app_state state;
+    memset(&state, 0, sizeof(state));
+    state.tor_ctrl_fd = p[0];
+
+    tor_close_control_fd(&state);
+    TEST_ASSERT(state.tor_ctrl_fd == -1);
+    errno = 0;
+    TEST_ASSERT(fcntl(p[0], F_GETFD) == -1);
+    TEST_ASSERT(errno == EBADF);
+    close(p[1]);
+
+    /* -1 fd no-op. */
+    memset(&state, 0, sizeof(state));
+    state.tor_ctrl_fd = -1;
+    tor_close_control_fd(&state);
+    TEST_ASSERT(state.tor_ctrl_fd == -1);
+    return 0;
+}
+
 /* UTF-8 chunking testi bilinçli olarak kaldırıldı: eski kopya fonksiyon
  * (get_next_chunk_size_test) üretim kodunu DEĞİL test içindeki kopyasını
  * test ediyordu — yanıltıcı. Sözleşme artık gerçek nox_next_chunk_size
@@ -630,7 +828,12 @@ int main(void)
     RUN_TEST(test_service_id_matches_ghost_pub);
     RUN_TEST(test_service_id_foreign_pub_rejected_derived);
     RUN_TEST(test_service_id_foreign_pub_rejected_ghost);
+    RUN_TEST(test_derived_hs_max_listen_path);
+    RUN_TEST(test_tor_append_owning_controller_process);
+    RUN_TEST(test_generate_torrc_owning_line);
     RUN_TEST(test_tor_close_control_fd);
+    RUN_TEST(test_tor_close_control_fd_peer_eof);
+    RUN_TEST(test_tor_close_control_fd_invalid_args);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n\n",
             tests_passed, tests_run);

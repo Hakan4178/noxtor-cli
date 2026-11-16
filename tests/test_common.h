@@ -12,6 +12,9 @@
  * TEST_ASSERT_MEM_ZERO — bellek bloğunun tamamının sıfır olduğunu doğrular.
  * RUN_TEST      — testi çalıştırır, OK/FAIL renkli basar, sayacı ilerletir.
  *
+ * Ortak yardımcılar: test_support.h (proje bağımsız) ve
+ * test_protocol_support.h (Noise/frame/fixture, proje tipleriyle).
+ *
  * Çıkış kodu sözleşmesi (main):
  *   return (tests_passed == tests_run) ? 0 : 1;
  */

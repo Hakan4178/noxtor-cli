@@ -1,21 +1,8 @@
-/* ================================================================
- * test_socks_peer.c — socks5_connect SO_PEERCRED doğrulama testi
- *
- * Bulgu 2.1b: Tor AYAKTAYKEN <tor_data>/socks.sock yolu aynı-UID
- * saldırgan tarafından unlink/rebind edilebilir. Fix, connect sonrası
- * peer PID'ini spawn edilen tor_pid ile karşılaştırır; uyuşmazsa
- * SOCKS greeting'i BİLE gönderilmez (fail-closed).
- *
- * Senaryolar (gerçek AF_UNIX soketleri, ayrı child dinleyici):
- *   1) yanlış PID → NOX_ERR_PEER + dinleyicide 0 byte (sır sızmaz)
- *   2) expected_pid <= 0 → NOX_ERR_PEER, bağlantı hiç denenmez
- *   3) doğru PID → NOX_OK + SOCKS5 handshake tamamlanır
- *
- * Sertleştirme: dinleyici okuduğu baytları SAYAR ve sonucu yapı olarak
- * parent'a bildirir; hazır sinyali 'R' olarak doğrulanır; EINTR/kısa
- * okuma ve waitpid hataları sessizce yutulmaz. Beklenmeyen sonuçta
- * test 1 döner (CI sinyali).
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_socks_peer.c — socks5_connect SO_PEERCRED doğrulaması.
+ * Yanlış/geçersiz pid → NOX_ERR_PEER ve SOCKS greeting gönderilmez;
+ * doğru pid → handshake tamamlanır.
+ */
 #define _GNU_SOURCE
 #include "common.h"
 #include "network.h"

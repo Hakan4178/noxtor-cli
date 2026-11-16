@@ -1,17 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_chunk_size.c — nox_next_chunk_size UTF-8 sınır sözleşmesi (D)
- *
- * get_next_chunk_size üretim sınırında kodpoint bölmüyordu (kanitlanmamış
- * varsayım) — bu test hem mevcut davranışı kilitler hem de 4000 sınırına
- * tam oturan karakterlerin (2/3/4 byte) güvenli bölünmesini belgeler.
- *
- * Sınır: chunk_limit = 4000 (stdin_handler.c). Sözleşme:
- *   - remaining <= 4000 → kalanın tamamı
- *   - kodpoint ortasına denk gelen sınır → sınır LEAD byte'ın ÖNÜNE çekilir
- *   - tamamen continuation garbage (geçersiz UTF-8) → 1 (progress garantisi)
- *   - offset >= total → 0
- *   - reassembly property: parçalar birleşince orijinal + hiçbir sınır
- *     geçerli UTF-8 girişte kodpoint bölmez
+ * test_chunk_size.c — nox_next_chunk_size UTF-8 sınır sözleşmesi.
+ * Sınır kodpoint ortasına denk gelmez; geçersiz continuation'da 1,
+ * offset>=total'de 0; parçalar birleşince orijinal metin.
  */
 
 #include "common.h"

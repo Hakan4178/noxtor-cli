@@ -1,40 +1,8 @@
-/* ================================================================
- * test_landlock_rights.c — Landlock hak maskeleme testleri
- *
- * C-1 + C-2 regresyon testleri. İki katman:
- *
- * 1) Saf fonksiyon testleri (GERÇEK KERNEL GEREKMEZ — her CI'da çalışır):
- *    nox_ll_compute_rule_rights(wanted, handled) maskesi üzerinden:
- *      - C-2: ABI 1-2'de TRUNCATE allowed'dan elenir; bu yalnızca EINVAL'i
- *             önler, truncate'in kısıtlandığı anlamına gelmez
- *             (handled'da olmayan hak Landlock tarafından uygulanmaz)
- *      - C-1: MAKE_REG her ABI'da allowed'da kalır (downloads'da O_CREAT çalışır)
- *
- * 2) Entegrasyon testi (gerçek kernel, Landlock ABI >= 1):
- *      - downloads içinde openat(O_CREAT) → BAŞARI beklenir
- *      - downloads dışında openat(O_CREAT) → EACCES beklenir
- *        (sandbox'ın hem izin verdiğini hem GERÇEKTEN kısıtladığını doğrular —
- *        C-1'in "sandbox kuruldu ama hiçbir şey çalışmıyor" tuzağını yakalar)
- *
- * 3) F1 testleri (ABI >= 9):
- *      - yalnız socks.sock inode'una RESOLVE_UNIX istisnası verilir
- *      - izinli socks connect BAŞARILI, control.sock connect EACCES
- *      - socks_fd = -1 / dizin / normal dosya → init fail-closed
- *
- * 4) F3 testleri (her ABI):
- *      - config kökünde identity.key/salt/contacts.db/WAL/SHM unlink → EACCES
- *      - tor_data içinde torrc/listen.sock/alt dizin silme → OK
- *      - tor_data_fd = -1 / normal dosya → init fail-closed
- *      - tor_data dizininin kendisi config'ten silinemez (EACCES);
- *        boş dizin sonraki açılışta cleanup_stale_tor_dirs'e kalır
- *      - tor_data içinde yeni dosya oluşturma → EACCES (MAKE_REG yok)
- *
- * Kernel'de Landlock yoksa entegrasyon testi SKIP edilir (fail değil).
- * ABI < 9'da F1 kısmı SKIP edilir; C-1/C-2/F3 entegrasyonu yine koşar.
- *
- * Compile:  (make test tarafından otomatik — TEST_SRC_OBJS'a linklenir)
- * Run:      ./tests/test_landlock_rights
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_landlock_rights.c — Landlock hak maskeleme + F1/F3.
+ * C-1/C-2 saf maske; gerçek kernelde downloads/config/tor_data erişim
+ * sınırları; ABI<9 ve Landlock yoksa ilgili katman SKIP.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -252,12 +220,9 @@ static int make_file_at(int dir_fd, const char *name, const char *content) {
     return (w == (ssize_t)len) ? 0 : -1;
 }
 
-/* ── 2. Entegrasyon testi — gerçek kernel, Landlock ABI >= 1 ───────
- * Sandbox ayrı child process'te uygulanır:
- *  - child: landlock_sandbox_init + openat kontrolleri, _exit ile çıkar
- *    (LSAN'ı atlar — sandbox sonrası /proc okunamaz)
- *  - parent: sandbox'sızdır → /proc erişimi ve dizin temizliği sorunsuz
- * Return: 0 = GEÇTİ, 1 = BAŞARISIZ, 2 = SKIP (kernel Landlock'suz)  */
+/* 2. Entegrasyon: sandbox ayrı child'da (init + openat kontrolleri, _exit
+ * ile LSAN atlanır); parent sandbox'sız /proc ve temizlik yapar.
+ * Dönüş: 0 geçti, 1 başarısız, 2 SKIP (Landlock yok). */
 
 static int run_integration(void) {
     char dl_tpl[] = "/tmp/ll_dl_XXXXXX";

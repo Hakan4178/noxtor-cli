@@ -1,26 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_frontend.c — ortak frontend katmanı birim testi (Faz 1, commit 1-3)
- *
- * Kilitlenen davranışlar:
- *   A. Dispatch iskeleti (commit 1):
- *      - backend yokken emit no-op (fuzz hedefleri registration yapmaz)
- *      - NULL ev no-op; son registration kazanır; NULL ile unregister
- *      - emit SENKRON + KOPYASIZ: backend aynı ev pointer'ını alır,
- *        ctx aynen geçer (struct kopyası yok — tehdit modeli kuralı)
- *   B. fe_now_tm (commit 2): alan aralıkları + mktime round-trip
- *      (tek clock_gettime + localtime_r kaynağı — 5 kopyanın kilit testi)
- *   C. Bildirim yolları (commit 3 sonrası davranış — stderr'e capture):
- *      - ui_print_incoming boş/beyaz-only filtre (erken return, çıktı YOK)
- *      - incoming/outgoing/system/error içerik + label formatı
- *      - ANSI strip atomic_message yolunda (attacker mesaj temizliği)
- *      - vsnprintf truncation (4096 cap) crash'siz
- *      - ui_print_progress: total==0 erken dönüş; render çıktısı
- *   D. fe_tui.c split (commit 3): !HAVE_TERMBOX'da no-op — link ve
- *      crash-sağlam (TUI=1 modunda test edilmez: init'siz termbox'a
- *      dokunulmaz, o yol pty smoke ile doğrulanır)
- *
- * Not: timestamp değerleri duyarlı değildir — sadece aralık/tutarlılık
- * kontrol edilir (determinizm testi DEĞİL).
+ * test_frontend.c — ortak frontend: dispatch (senkron/kopyasız), fe_now_tm,
+ * bildirim yolları/strip/truncation, TUI olmayan backend no-op.
  */
 
 #include "common.h"
@@ -36,9 +16,7 @@
 #include "test_common.h"
 
 
-/* ================================================================
- * PROBE BACKEND — dispatch iskeleti testi (kısım A)
- * ================================================================ */
+/* PROBE BACKEND — dispatch iskeleti testi (kısım A) */
 struct probe_ctx {
     int                calls;
     void              *seen_ctx;    /* ctx aynen geçti mi (kimlik) */
@@ -154,9 +132,7 @@ static int test_unregister_resets(void)
     return 0;
 }
 
-/* ================================================================
- * fe_now_tm — ortak zaman damgası (kısım B)
- * ================================================================ */
+/* fe_now_tm — ortak zaman damgası (kısım B) */
 
 /* ── B1: alan aralıkları geçerli ────────────────────────────────── */
 static int test_now_tm_valid_fields(void)
@@ -200,9 +176,7 @@ static int test_now_tm_mktime_roundtrip(void)
     return 0;
 }
 
-/* ================================================================
- * stderr capture yardımcıları (kısım C)
- * ================================================================ */
+/* stderr capture yardımcıları (kısım C) */
 
 /* fn(st, msg) çağrısının stderr çıktısını buf'a yakala.
  * Return: yakalanan uzunluk (hata: -1). */
@@ -328,10 +302,8 @@ static int test_system_content(void)
     return 0;
 }
 
-/* ── C5b: system — ANSI strip block_message yolunda ──────────────
- * T-02: FE_SYSTEM de FE_MSG_IN gibi sanitize edilmeli. OSC yükü
- * seçildi: tema renkleriyle çakışmaz, doğrudan "pwned" sızıntısını
- * ararız. */
+/* C5b/T-02: FE_SYSTEM de FE_MSG_IN gibi sanitize edilir; OSC yükü
+ * "pwned" sızıntısı arar. */
 static int test_system_strips_ansi(void)
 {
     static struct app_state st;
@@ -455,16 +427,11 @@ static int test_progress_renders(void)
     return 0;
 }
 
-/* ================================================================
- * fe_tui split — link + no-op (kısım D)
- * ================================================================ */
+/* fe_tui split — link + no-op (kısım D) */
 
 #ifndef HAVE_TERMBOX
-/* ── D1: !TUI'da fe_tui_ops emit no-op — crash/çıktı yok ────────
- * inline no-op'lar devrede (tui_chat_append/refresh_all); asıl amaç:
- * dispatch → TUI backend yolu her iki modda da linklenir, non-TUI'da
- * ölü kod kalır. (TUI=1 modunda test atlanır — init'siz termbox'a
- * dokunulmaz, o yol pty smoke ile doğrulanır.) */
+/* D1: !TUI'da fe_tui_ops emit no-op (crash/çıktı yok); dispatch→TUI yolu
+ * iki modda linklenir. TUI=1'de atlanır (pty smoke doğrular). */
 static int test_fe_tui_noop_no_termbox(void)
 {
     static struct app_state st;

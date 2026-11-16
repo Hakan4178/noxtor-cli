@@ -1,24 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_c1_text_paths.c — C1/C2: TEXT gönderim yolları entegrasyon testleri
- *
- * Kapsam:
- *   1. Çok parçalı TEXT: nonce sırası = şifreleme sırası = wire sırası;
- *      alıcı gerçek AEAD ile çözer.
- *   2. DB kuyruğu callback'i: slot dolu → AGAIN + db_retry_pending;
- *      kuyruk boşalınca aynı callback başarıyla yazar.
- *   3. Kuyruk dolu → yeni TEXT AGAIN; hiçbir frame şifrelenmez,
- *      nonce tüketilmez, kuyruk değişmez.
- *   4. Preflight: mesaj kalan boş slotlara sığmıyorsa tamamen reddedilir;
- *      kuyruk boşalınca aynı mesaj tek seferde girer.
- *   5. C2/Q3: FILE başlangıcı kuyrukta TEXT varken de yapılabilir;
- *      METADATA sıranın sonuna girer.
- *   6. Kuyrukta boş slot yoksa FILE başlangıcı reddedilir; nonce tüketilmez.
- *   7. Disconnect cleanup: frame kuyruğu, session ve tx_seq zeroize edilir.
- *   8. C2/Q1: >16 KB mesaj (5 frame) 4 slotlu kuyruğa sığmaz → AGAIN;
- *      hiçbir frame şifrelenmez, kuyruk boş kalır.
- *   9. Küçük SO_SNDBUF + kuyruk dolu: EAGAIN altında offset'li ilerleme;
- *      hiçbir frame kaybolmaz, duplike olmaz.
- *  10. FILE başlangıcı EPOLLOUT ilgisini kendisi kurar (liveness).
+ * test_c1_text_paths.c — TEXT gönderim yolları (C1/C2).
+ * Segment nonce/wire sırası, DB callback/AGAIN, kuyruk doluluğu,
+ * FILE+METADATA sırası, EPOLLOUT liveness, cleanup zeroize.
  */
 
 #include "common.h"
@@ -39,6 +22,7 @@
 #include <sodium.h>
 
 #include "test_common.h"
+#include "test_protocol_support.h"
 
 static struct app_state st;
 static int g_rx_fd = -1;
@@ -97,17 +81,6 @@ static void fixture_teardown(void)
     sodium_memzero(&st, sizeof(st));
 }
 
-static void init_cipher_session(struct noise_session *s, uint64_t n)
-{
-    memset(s, 0, sizeof(*s));
-    memset(s->tx.k, 0x42, NOX_KEY_LEN);
-    memset(s->rx.k, 0x42, NOX_KEY_LEN);
-    s->tx.n = n;
-    s->rx.n = n;
-    s->tx.has_key = true;
-    s->rx.has_key = true;
-}
-
 static int fixture_setup(void)
 {
     memset(&st, 0, sizeof(st));
@@ -128,7 +101,7 @@ static int fixture_setup(void)
     ps->session = sodium_malloc(sizeof(*ps->session));
     if (!ps->session)
         return -1;
-    init_cipher_session(ps->session, 5);
+    nox_test_init_cipher_session(ps->session, 5);
     ps->tx_seq = 5;
 
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -208,33 +181,6 @@ static int make_tmp_file(void)
     return 0;
 }
 
-static int read_exact(int fd, void *buf, size_t len)
-{
-    uint8_t *p = buf;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = read(fd, p + got, len - got);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return -1;
-        got += (size_t)n;
-    }
-    return 0;
-}
-
-static int read_frame(int fd, struct frame_header *fh, uint8_t *wire,
-                      uint8_t *ct)
-{
-    if (read_exact(fd, wire, FRAME_HEADER_WIRE_SIZE) != 0)
-        return -1;
-    if (frame_header_decode(wire, fh) != NOX_OK)
-        return -1;
-    if (fh->len > NOX_MAX_MSG_LEN + NOX_MAC_LEN)
-        return -1;
-    return read_exact(fd, ct, fh->len);
-}
-
 static int no_pending_wire_bytes(void)
 {
     uint8_t b;
@@ -258,7 +204,7 @@ static int expect_text_frame(int fd, struct noise_session *rx, uint32_t seq,
     uint8_t ct[NOX_MAX_MSG_LEN + NOX_MAC_LEN];
     uint8_t pt[NOX_MAX_MSG_LEN + 1];
 
-    if (read_frame(fd, &fh, wire, ct) != 0)
+    if (nox_test_read_frame(fd, &fh, wire, ct) != 0)
         return -1;
     if (fh.type != NOX_MSG_TEXT || fh.seq != seq)
         return -1;
@@ -308,7 +254,7 @@ static int test_segmented_aead_roundtrip(void)
     C1_ASSERT(ps->tx_seq == 8U); /* 5 + 3 */
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
 
     C1_ASSERT(expect_text_frame(g_rx_fd, &rx, 5U, g_aux, 4000U) == 0);
     C1_ASSERT(expect_text_frame(g_rx_fd, &rx, 6U, g_aux + 4000U, 4000U) == 0);
@@ -356,7 +302,7 @@ static int test_send_queued_callback_queue_full(void)
     C1_ASSERT(ps->tx_seq == seq_before + 1U);
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     for (size_t i = 0; i < (size_t)FRAME_QUEUE_SLOTS; i++) {
         C1_ASSERT(expect_text_frame(g_rx_fd, &rx, (uint32_t)(5U + i),
                                     staged[i], strlen(staged[i])) == 0);
@@ -397,7 +343,7 @@ static int test_queue_full_returns_again(void)
     C1_ASSERT(ps->tx_seq == 10U);
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     for (size_t i = 0; i < (size_t)FRAME_QUEUE_SLOTS; i++) {
         C1_ASSERT(expect_text_frame(g_rx_fd, &rx, (uint32_t)(5U + i),
                                     staged[i], strlen(staged[i])) == 0);
@@ -437,7 +383,7 @@ static int test_partial_fit_returns_again(void)
     C1_ASSERT(ps->tx_seq == 10U); /* 8 + 2 */
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     for (size_t i = 0; i < 3U; i++) {
         C1_ASSERT(expect_text_frame(g_rx_fd, &rx, (uint32_t)(5U + i),
                                     staged[i], strlen(staged[i])) == 0);
@@ -474,14 +420,14 @@ static int test_file_start_queues_behind_text(void)
     C1_ASSERT(frame_queue_flush(&st, ps) == NOX_OK);
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     C1_ASSERT(expect_text_frame(g_rx_fd, &rx, 5U, "bekleyen", 8U) == 0);
 
     struct frame_header fh;
     uint8_t wire[FRAME_HEADER_WIRE_SIZE];
     uint8_t ct[NOX_MAX_MSG_LEN + NOX_MAC_LEN];
     uint8_t pt[NOX_MAX_MSG_LEN + 1];
-    C1_ASSERT(read_frame(g_rx_fd, &fh, wire, ct) == 0);
+    C1_ASSERT(nox_test_read_frame(g_rx_fd, &fh, wire, ct) == 0);
     C1_ASSERT(fh.type == NOX_MSG_FILE && fh.seq == 6U);
     ssize_t n = noise_decrypt(&rx, wire, sizeof(wire), ct, fh.len, pt);
     C1_ASSERT(n == 305);
@@ -493,7 +439,7 @@ static int test_file_start_queues_behind_text(void)
     C1_ASSERT(ps->tx_file.active);
     C1_ASSERT(ps->tx_seq == 8U); /* + FILE chunk */
     C1_ASSERT(frame_queue_flush(&st, ps) == NOX_OK);
-    C1_ASSERT(read_frame(g_rx_fd, &fh, wire, ct) == 0);
+    C1_ASSERT(nox_test_read_frame(g_rx_fd, &fh, wire, ct) == 0);
     C1_ASSERT(fh.type == NOX_MSG_FILE && fh.seq == 7U);
     n = noise_decrypt(&rx, wire, sizeof(wire), ct, fh.len, pt);
     C1_ASSERT(n == (ssize_t)(sizeof("c1-text-test") - 1U));
@@ -543,7 +489,7 @@ static int test_file_start_rejected_when_no_free_slot(void)
     C1_ASSERT(ps->tx_seq == seq_before + 1U); /* yalnız METADATA */
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     for (size_t i = 0; i < (size_t)FRAME_QUEUE_SLOTS; i++) {
         C1_ASSERT(expect_text_frame(g_rx_fd, &rx, (uint32_t)(5U + i),
                                     staged[i], strlen(staged[i])) == 0);
@@ -613,7 +559,7 @@ static int test_oversized_segmented_message(void)
     C1_ASSERT(frame_queue_empty(ps));
 
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     C1_ASSERT(expect_text_frame(g_rx_fd, &rx, 5U, "sonraki", 7U) == 0);
     C1_ASSERT(no_pending_wire_bytes());
 
@@ -691,7 +637,7 @@ static int test_queue_backpressure_resumes_after_eagain(void)
     const uint8_t *p = raw + prefill_len;
     size_t left = raw_len - prefill_len;
     struct noise_session rx;
-    init_cipher_session(&rx, 5);
+    nox_test_init_cipher_session(&rx, 5);
     for (size_t i = 0; i < 4U; i++) {
         C1_ASSERT(left >= FRAME_HEADER_WIRE_SIZE);
         struct frame_header fh;

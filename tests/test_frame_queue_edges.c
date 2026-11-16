@@ -1,23 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_frame_queue_edges.c — C1: TX frame kuyruğu sınır/uç durumları
- *
- * test_frame_queue.c temel sözleşmeyi doğrular; bu dosya halka (ring)
- * taşması, state'siz reserve, başarısız commit'lerin atomikliği, çoklu
- * frame kısmi yazımı ve EAGAIN sonrası epoll interest'ini kilitler.
- *
- * Kapsam:
- *   1. 4 slot dolup bir kısmı drain edildikten sonra yeni frame ekleme:
- *      head/tail wrap sırasında FIFO ve bayt içeriği birebir korunur.
- *   2. reserve yalnızca pointer döndürür; tx_seq/count/head/tail değişmez.
- *   3. len=0, len>TX_BUF_CAPACITY ve dolu kuyruk commit'leri tx_seq'i
- *      artırmaz, kuyruğu (slot len/off dahil) bozmaz.
- *   4. Çoklu frame + küçük SO_SNDBUF + ön dolgu: birden fazla flush
- *      turunda kısmi yazım olsa da wire akışı bozulmaz.
- *   5. Kalıcı yazma hatası: NOX_ERR_IO + tam teardown + zeroize
- *      (hem hiç yazılmamış hem de kısmi yazılmış frame için).
- *   6. NULL peer yolları, reset(NULL), reset idempotentliği ve fd<0.
- *   7. EAGAIN sonrası epoll interest EPOLLIN|EPOLLOUT olur; bunu
- *      epoll_wait ile gözlemlenebilir biçimde doğrula.
+ * test_frame_queue_edges.c — ring wrap, reserve/commit atomikliği,
+ * çoklu frame kısmi yazım, fatal teardown, NULL/fd<0, EAGAIN epoll ilgisi.
  */
 
 #include "common.h"
@@ -34,6 +17,7 @@
 #include <sodium.h>
 
 #include "test_common.h"
+#include "test_protocol_support.h"
 
 static struct app_state st;
 static int g_rx_fd = -1;
@@ -48,25 +32,6 @@ static size_t g_prefill_len;
 
 /* Kuyruk anlık görüntüsü — büyük struct'ı stack'e kopyalamamak için. */
 static struct frame_queue g_snapshot;
-
-static void fixture_teardown(void)
-{
-    struct peer_session *ps = &st.peers[0];
-
-    if (ps->fd >= 0) {
-        close(ps->fd);
-        ps->fd = -1;
-    }
-    if (g_rx_fd >= 0) {
-        close(g_rx_fd);
-        g_rx_fd = -1;
-    }
-    if (g_epfd >= 0) {
-        close(g_epfd);
-        g_epfd = -1;
-    }
-    sodium_memzero(&st, sizeof(st));
-}
 
 static int fixture_setup(void)
 {
@@ -107,7 +72,7 @@ static int fixture_setup(void)
 
 #define FQ_ASSERT(cond) do {                                            \
     if (!(cond)) {                                                      \
-        fixture_teardown();                                             \
+        nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);                                             \
         TEST_ASSERT(cond);                                              \
     }                                                                   \
 } while (0)
@@ -220,10 +185,7 @@ static int setup_small_sndbuf_and_prefill(size_t len)
     return 0;
 }
 
-/*
- * Kuyruk iç tutarlılığı: tail = (head + count) % SLOTS, dolu her slotta
- * 0 < len <= TX_BUF_CAPACITY ve off <= len.
- */
+/* Kuyruk tutarlılığı: tail=(head+count)%SLOTS; dolu slotta 0<len<=CAP, off<=len. */
 static int queue_invariant(const struct peer_session *ps)
 {
     if (!ps)
@@ -257,11 +219,8 @@ static int queue_invariant(const struct peer_session *ps)
     return 1;
 }
 
-/*
- * 1) Ring wrap-around: 4 slot doldur, bir kısmını flush/drain et,
- *    boşalan slotlara yeni frame ekle. Halka tam doluyken (head == tail,
- *    tail 0'a sarmış) head'den başlayan FIFO sırası korunmalı.
- */
+/* 1) Ring wrap: 4 slot doldur, kısmını drain et, boşalanlara ekle;
+ * tam doluyken head'den FIFO korunur. */
 static int test_ring_wrap_preserves_fifo(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
@@ -322,14 +281,12 @@ static int test_ring_wrap_preserves_fifo(void)
     FQ_ASSERT(drain_receiver() == 0);
     FQ_ASSERT(verify_stream() == 0);
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
-/*
- * 2) reserve state değiştirmez: aynı tail slotunu döndürür, tx_seq,
- *    count, head, tail ve slot len/off alanları aynı kalır.
- */
+/* 2) reserve state değiştirmez: aynı tail slotu, tx_seq/count/head/tail
+ * ve len/off sabit. */
 static int test_reserve_does_not_mutate(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
@@ -365,15 +322,12 @@ static int test_reserve_does_not_mutate(void)
     FQ_ASSERT(drain_receiver() == 0);
     FQ_ASSERT(verify_stream() == 0);
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
-/*
- * 3) Başarısız commit atomiktir: len 0, len > kapasite ve dolu kuyruk
- *    yollarında tx_seq artmaz; kuyruk bayt bayt aynı kalır.
- *    Ayrıca len == TX_BUF_CAPACITY sınırı kabul edilir.
- */
+/* 3) Başarısız commit atomik: len 0/aşırı/dolu kuyrukta tx_seq artmaz,
+ * kuyruk aynı; len==CAP kabul. */
 static int test_failed_commit_leaves_queue_intact(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
@@ -429,14 +383,12 @@ static int test_failed_commit_leaves_queue_intact(void)
     FQ_ASSERT(drain_receiver() == 0);
     FQ_ASSERT(verify_stream() == 0);
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
-/*
- * 4) Çoklu frame + küçük SO_SNDBUF + ön dolgu: birçok flush turunda
- *    kısmi yazım gerçekleşir; bayt sırası ve içeriği bozulmadan tamamlanır.
- */
+/* 4) Çoklu frame + küçük SO_SNDBUF + ön dolgu: birçok kısmi yazımda
+ * bayt sırası/içerik bozulmaz. */
 static int test_multiframe_partial_write_order(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
@@ -479,15 +431,13 @@ static int test_multiframe_partial_write_order(void)
         TEST_ASSERT_MEM_ZERO(ps->tx_frames.slots[i].buf, TX_BUF_CAPACITY);
     }
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
-/*
- * 5) Kalıcı yazma hatası (alıcı kapandı): NOX_ERR_IO, fd=-1, ST_IDLE,
- *    kuyruk boş, tx_seq=0 ve tüm tx_frames zeroize edilmiş olmalı.
- */
-static int test_fatal_write_teardown(void)
+/* 5) Kalıcı hata (alıcı kapandı): IO, fd=-1, IDLE, kuyruk boş, tx_seq=0,
+ * tx_frames zeroize. */
+static int test_fatal_write_teardown_multi_frame(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
     struct peer_session *ps = &st.peers[0];
@@ -507,14 +457,12 @@ static int test_fatal_write_teardown(void)
     FQ_ASSERT(ps->tx_seq == 0U);
     TEST_ASSERT_MEM_ZERO(&ps->tx_frames, sizeof(ps->tx_frames));
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
-/*
- * 5b) Kısmi frame yazıldıktan sonra alıcı kapanırsa da oturum kapanır:
- *     yarım frame resync edilemez; kuyruk tamamen zeroize edilir.
- */
+/* 5b) Kısmi frame sonrası alıcı kapanırsa da oturum kapanır; yarım frame
+ * resync edilemez, kuyruk zeroize. */
 static int test_fatal_write_after_partial(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
@@ -540,14 +488,12 @@ static int test_fatal_write_after_partial(void)
     FQ_ASSERT(ps->tx_seq == 0U);
     TEST_ASSERT_MEM_ZERO(&ps->tx_frames, sizeof(ps->tx_frames));
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
-/*
- * 6) NULL peer güvenliği, reset(NULL), reset idempotentliği ve fd<0.
- *    Reset sonrası kuyruk yeniden kullanılabilir olmalı.
- */
+/* 6) NULL peer, reset(NULL), reset idempotent, fd<0; reset sonrası kuyruk
+ * yeniden kullanılabilir. */
 static int test_null_reset_and_bounds(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
@@ -604,19 +550,13 @@ static int test_null_reset_and_bounds(void)
     FQ_ASSERT(drain_receiver() == 0);
     FQ_ASSERT(verify_stream() == 0);
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
-/*
- * 7) EAGAIN sonrası epoll interest'i EPOLLIN|EPOLLOUT olur. Interest
- *    maskesini /proc'tan okumak yerine davranışla doğrula:
- *      - kısmi yazım + EAGAIN (flush NOX_ERR_AGAIN),
- *      - alıcıyı boşalt → soket yazılabilir hâle gelir,
- *      - alıcıdan 1 byte gönder → soket okunabilir hâle gelir,
- *      - epoll_wait her iki biti de raporlamalı.
- *    EPOLL_CTL_MOD yapılmasaydı yalnızca EPOLLIN gelir, test düşer.
- */
+/* 7) EAGAIN sonrası interest EPOLLIN|EPOLLOUT olmalı: kısmi yazım+AGAIN,
+ * alıcıyı boşalt + 1 byte gönder, epoll_wait iki biti de raporlar.
+ * EPOLL_CTL_MOD yoksa yalnız EPOLLIN gelir. */
 static int test_eagain_sets_epollout_interest(void)
 {
     FQ_ASSERT(fixture_setup() == 0);
@@ -650,7 +590,7 @@ static int test_eagain_sets_epollout_interest(void)
     FQ_ASSERT((ev.events & (uint32_t)(EPOLLIN | EPOLLOUT)) ==
               (uint32_t)(EPOLLIN | EPOLLOUT));
 
-    fixture_teardown();
+    nox_test_frame_fixture_teardown(&st, &g_rx_fd, &g_epfd);
     return 0;
 }
 
@@ -666,7 +606,7 @@ int main(void)
     RUN_TEST(test_reserve_does_not_mutate);
     RUN_TEST(test_failed_commit_leaves_queue_intact);
     RUN_TEST(test_multiframe_partial_write_order);
-    RUN_TEST(test_fatal_write_teardown);
+    RUN_TEST(test_fatal_write_teardown_multi_frame);
     RUN_TEST(test_fatal_write_after_partial);
     RUN_TEST(test_null_reset_and_bounds);
     RUN_TEST(test_eagain_sets_epollout_interest);

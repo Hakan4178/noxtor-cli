@@ -1,16 +1,6 @@
-/* ================================================================
- * test_mdwe.c — PR_SET_MDWE (Memory-Deny-Write-Execute) davranış testi
- *
- * Kernel ≥6.3. Seccomp'tan bağımsız, saf çekirdek davranışı doğrulanır:
- * main.c'nin TUI init sonrası / seccomp stage-2 öncesi set ettiği
- * "exec-gain yok" politikasının dayandığı mekanizma (systemd 254+
- * MemoryDenyWriteExecute için seccomp BPF yerine bunu kullanıyor).
- *
- * Not: reddetme errno'su bu kernelde EACCES (13); EPERM de kabul edilir.
- * (Ölçüm: PR_GET_MDWE=1 → prctl SET sonrası mask doğrulanır.)
- *
- * Desteklemeyen kernelde SKIP (exit 0) — seccomp W^X yine devrede.
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_mdwe.c — PR_SET_MDWE (W^X) davranışı; desteklemeyen kernelde SKIP.
+ */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>

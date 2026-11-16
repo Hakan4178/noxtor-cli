@@ -1,31 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_sm_cleanup.c — action_cleanup sözleşmesi (state_machine merkezi temizlik)
- *
- * action_cleanup, refactör öncesinde 18 farklı yerde tekrarlanan temizliğin
- * TEK noktası; her disconnect/timeout/reject/TOR_DIED yolu oradan geçer.
- * Sözleşme (state_machine.c:248-324), 8 adım:
- *   fd close + epoll remove → hs/session memzero+free → identity memzero →
- *   TOFU sıfırlama → rx/tx file tasfiyesi (close+unlinkat+plain_buf free) →
- *   recv_buf memzero → name/unread sıfırlama → aktif-peer bound'u.
- *
- * Testler (iyi + kötü yama karışımı):
- *   1. ACTIVE + PEER_DISCONNECTED — tam temizlik (gerçek fd: socketpair →
- *      EBADF kanıtı; canary alanlar sıfır)
- *   2. hs/session — sodium_malloc (free sonrası okunamaz + LSAN temiz)
- *   3. rx_file aktif → dosya unlinkat + fd close + struct sıfır
- *      (SM seviyesinde M-F3 ikizi — downloads_dir_fd=-1 NEGATİFİ dahil)
- *   4. tx_file aktif → plain_buf sodium_free + fd close
- *   5. active_peer_idx BAŞKA slot'u gösteriyorsa → idx KORUNUR
- *   6. C4 çifti: idx = 99 (NOX_MAX_PEERS dışı) → bound devrede, crash yok,
- *      idx ve active_peer_onion dokunulmaz
- *   7. TOR_DIED — 8 state'in tamamı → ST_IDLE + idempotent
- *   8. Geçersiz geçiş → NOX_ERR_STATE + state DEĞİŞMEZ
- *   9. epoll_fd = -1 iken cleanup → crash yok (erken dönem anı)
- *  10. Boş slot üzerinde ikinci cleanup → idempotent
- *  11. EV_CRYPTO_FAIL — ACTIVE tam cleanup (rx_pt_buf dahil)
- *  12. EV_CRYPTO_FAIL — FILE_RX yarım dosya unlink + fd close
- *  13. EV_CRYPTO_FAIL — IDLE no-op + idempotent
- *  14. EV_CRYPTO_FAIL — 8 state'in tamamı + event adı
+ * test_sm_cleanup.c — action_cleanup merkezi temizlik sözleşmesi.
+ * fd/epoll, hs/session, identity, TOFU, rx/tx dosya, recv_buf, isim ve
+ * aktif-peer bound'u; 8 state × event yolları idempotent/fail-closed.
  */
 
 #include "common.h"
@@ -43,23 +19,11 @@
 #include <errno.h>
 
 #include "test_common.h"
+#include "test_protocol_support.h"
 
 
-/* ================================================================
- * FIXTURE
- * ================================================================ */
 static struct app_state st;
 static struct peer_session *slot(unsigned i) { return &st.peers[i]; }
-
-static void fixture_reset(void)
-{
-    memset(&st, 0, sizeof(st));
-    st.active_peer_idx  = -1;
-    st.epoll_fd         = -1;
-    st.downloads_dir_fd = -1;
-    for (unsigned i = 0; i < NOX_MAX_PEERS; i++)
-        st.peers[i].fd = -1;
-}
 
 /* Gerçek socket fd — cleanup sonrası EBADF ile doğrulanır */
 static int make_real_fd(void)
@@ -87,14 +51,11 @@ static void attach_crypto(struct peer_session *ps)
     ps->rx_seq = 9;
 }
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
 /* 1) ACTIVE + PEER_DISCONNECTED — 8 adımın tamamı, gözle görülür kanıt */
 static int test_active_disconnect_full_cleanup(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(1);
     ps->state = ST_ACTIVE;
     ps->fd = make_real_fd();
@@ -151,7 +112,7 @@ static int test_active_disconnect_full_cleanup(void)
  *    kendisi sıfırlar (sodium kontratı) — sözleşme testi bütündür */
 static int test_crypto_state_released(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(0);
     ps->state = ST_TOFU_PENDING;
     attach_crypto(ps);
@@ -171,7 +132,7 @@ static int test_crypto_state_released(void)
  *    cleanup tarafı — unlinkat atlanırsa orphan kalır) */
 static int test_rx_file_active_unlinks(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     const char *dir = "tests/.tmp_sm_clean";
     mkdir(dir, 0700);
     st.downloads_dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -205,7 +166,7 @@ static int test_rx_file_active_unlinks(void)
  *    (fd yine kapanmalı; dosya diske yazıldıysa orphan'lık burada görünür) */
 static int test_rx_file_active_no_downloads_fd(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(0);
     ps->state = ST_FILE_RX;
     ps->rx_file.active = true;
@@ -232,7 +193,7 @@ static int test_rx_file_active_no_downloads_fd(void)
 /* 4) tx_file aktif → plain_buf sodium_free + close + sıfırlama */
 static int test_tx_file_frees_plain_buf(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(0);
     ps->state = ST_FILE_TX;
     ps->tx_file.active = true;
@@ -256,7 +217,7 @@ static int test_tx_file_frees_plain_buf(void)
  *    (yanlış peer'ın aktifliği düşürülmez — yanlış pozitif engeli) */
 static int test_active_idx_other_slot_preserved(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(1);
     ps->state = ST_ACTIVE;
     ps->fd = make_real_fd();
@@ -278,7 +239,7 @@ static int test_active_idx_other_slot_preserved(void)
  *    (types.h ACTIVE_PEER bound'u ile state_machine:316 bound'unun çifti) */
 static int test_active_idx_out_of_bounds_guarded(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(0);
     ps->state = ST_ACTIVE;
     ps->fd = make_real_fd();
@@ -306,7 +267,7 @@ static int test_tor_died_all_states(void)
     TEST_ASSERT(sizeof(states) / sizeof(states[0]) == 8);
 
     for (size_t s = 0; s < sizeof(states) / sizeof(states[0]); s++) {
-        fixture_reset();
+        nox_test_fixture_reset(&st);
         struct peer_session *ps = slot(2);
         ps->state = states[s];
         ps->fd = make_real_fd();
@@ -336,7 +297,7 @@ static int test_tor_died_all_states(void)
  *    yalnız action NOX_OK dönerse geçiş uygulanır) */
 static int test_invalid_transition_rejected(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(0);
     ps->state = ST_ACTIVE;
     ps->fd = make_real_fd();
@@ -361,7 +322,7 @@ static int test_invalid_transition_rejected(void)
 /* 9) epoll_fd = -1 iken cleanup — erken dönem/kurulum hatası anı, crash yok */
 static int test_cleanup_without_epoll(void)
 {
-    fixture_reset();   /* st.epoll_fd = -1 */
+    nox_test_fixture_reset(&st);   /* st.epoll_fd = -1 */
     struct peer_session *ps = slot(0);
     ps->state = ST_CONNECTING;
     ps->fd = make_real_fd();
@@ -376,7 +337,7 @@ static int test_cleanup_without_epoll(void)
 /* 10) Boş slot + IDLE → TOR_DIED idempotent (fd=-1, hs=NULL — hepsi no-op) */
 static int test_cleanup_idle_slot_idempotent(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(3);   /* tertemiz slot */
 
     TEST_ASSERT(sm_dispatch(ps, &st, EV_TOR_DIED) == NOX_OK);
@@ -392,7 +353,7 @@ static int test_cleanup_idle_slot_idempotent(void)
  *     Kripto hatası da TOR_DIED gibi görünür kopma + merkezi temizlik olmalı. */
 static int test_crypto_fail_active_full_cleanup(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(2);
     ps->state = ST_ACTIVE;
     ps->fd = make_real_fd();
@@ -452,7 +413,7 @@ static int test_crypto_fail_active_full_cleanup(void)
 /* 12) FILE_RX + EV_CRYPTO_FAIL — yarım dosya unlinkat, fd close, struct sıfır */
 static int test_crypto_fail_file_rx_removes_partial(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     const char *dir = "tests/.tmp_sm_crypto";
     mkdir(dir, 0700);
     st.downloads_dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -487,7 +448,7 @@ static int test_crypto_fail_file_rx_removes_partial(void)
 /* 13) IDLE + EV_CRYPTO_FAIL — kaynaksız no-op; fatal tekrarı güvenli */
 static int test_crypto_fail_idle_noop(void)
 {
-    fixture_reset();
+    nox_test_fixture_reset(&st);
     struct peer_session *ps = slot(3);
 
     TEST_ASSERT(ps->state == ST_IDLE);
@@ -511,7 +472,7 @@ static int test_crypto_fail_all_states(void)
     TEST_ASSERT(strcmp(sm_event_name(EV_CRYPTO_FAIL), "CRYPTO_FAIL") == 0);
 
     for (size_t s = 0; s < sizeof(states) / sizeof(states[0]); s++) {
-        fixture_reset();
+        nox_test_fixture_reset(&st);
         struct peer_session *ps = slot(2);
         ps->state = states[s];
         ps->fd = make_real_fd();

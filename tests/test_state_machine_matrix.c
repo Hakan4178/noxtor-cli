@@ -1,32 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_state_machine_matrix.c — Peer durum makinesi GEÇİŞ MATRİSİ testi
- *
- * Neden bu test var:
- *   state_machine.c'deki geçiş tablosu 8 state × 18 event = 144 çift üzerinde
- *   çalışır; tablonun kendisi 57 satırdır ve "hangi çift geçerli" bilgisi
- *   YALNIZCA kodda yaşar. Bu test, tablonun **spesifikasyonunu** test içinde
- *   tutar ve 144 çiftin TAMAMINI dener:
- *
- *     - tanımlı çift  → geçiş olur (NOX_OK) ve hedef state'e geçilir
- *     - tanımsız çift → NOX_ERR_STATE + state DEĞİŞMEZ (fail-closed)
- *     - TOFU accept   → token/handshake eksikse fail-closed (NOX_ERR_PROTO)
- *
- * Böylece: bir geçiş yanlışlıkla silinirse/kayarsa, bir state yanlış
- * hedefe geçerse veya "geçersiz geçiş" sessizce yutulursa test kırmızıya
- * döner. K-38 (state-machine stub'ları) ve K-23 (aktif-peer split-brain)
- * kayıtlarının regresyon korumasıdır.
- *
- * Ayrıca iki tasarım gerçeğini teste gömüyoruz (ikisi de bilinçli):
- *   - ST_CONNECTING: hiçbir geçiş bu state'e GİRMEZ → **ölü state**
- *     (SOCKS5 bağlantısı state machine'in dışında kurulur, bkz.
- *     stdin_handler.c /connect → sm_dispatch(EV_CONNECT_CMD)).
- *   - ST_TOFU_PENDING: EV_HANDSHAKE_TIMEOUT **reddedilir**; TOFU timeout
- *     yolu EV_PEER_DISCONNECTED'dır (event_loop.c TOFU sweeper).
- *
- * Kapsam: saf durum makinesi. Action'lar fixture'da IO'suz ya da
- * deterministik hata yolunda çalışır (bkz. fixture_reset notları).
- *
- * Build: make test      Run: ./tests/test_state_machine_matrix
+ * test_state_machine_matrix.c — 8×18 geçiş matrisinin tamamı.
+ * Tanımlı çift hedefe geçer; tanımsız çift NOX_ERR_STATE + state korunur.
+ * K-38/K-23 regresyonu; ST_CONNECTING ölü state, TOFU timeout disconnect.
  */
 
 #include "common.h"
@@ -39,13 +14,8 @@
 
 #include "test_common.h"
 
-/* ================================================================
- * SPESİFİKASYON — geçiş tablosunun test içindeki kopyası
- *
- * Buradaki tablo "sözleşmedir": uygulamadaki tablo bu tabloyla birebir
- * uyuşmak zorundadır. Bir satır eklenir/çıkarılırsa test kırmızıya döner
- * ve güncelleme buraya da yansıtılır (bilinçli değişiklik izi).
- * ================================================================ */
+/* Spesifikasyon — geçiş tablosunun test içindeki kopyası sözleşmedir:
+ * uygulama tablosu birebir uyuşmalı; satır değişirse test kırmızıya döner. */
 
 typedef enum {
     EXPECT_OK,           /* geçiş olur, hedef state'e geçilir            */
@@ -140,9 +110,6 @@ static const spec_t SPEC[] = {
 
 #define SPEC_COUNT (sizeof(SPEC) / sizeof(SPEC[0]))
 
-/* ================================================================
- * FIXTURE
- * ================================================================ */
 static struct app_state st;
 
 static void fixture_reset(void)
@@ -170,16 +137,10 @@ static const spec_t *spec_lookup(peer_state_t from, peer_event_t ev)
     return NULL;
 }
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
-/* 1) TAM MATRİS: 8 state × 18 event = 144 çift
- *
- * Her çift bağımsız fixture ile denenir. Beklenen sonuç:
- *   - spec'te var  → NOX_OK + hedef state (veya fail-closed varyantı)
- *   - spec'te yok  → NOX_ERR_STATE + state DEĞİŞMEZ
- */
+/* 1) Tam matris: 8 state × 18 event = 144 çift, her biri bağımsız fixture.
+ * Tanımlı çift → NOX_OK + hedef state; tanımsız → NOX_ERR_STATE + state
+ * değişmez. */
 static int test_matrix_full_sweep(void)
 {
     int checked = 0;
@@ -259,14 +220,9 @@ static int test_matrix_full_sweep(void)
     return 0;
 }
 
-/* 2) ULAŞILABİLİRLİK — hangi state'lere gerçekten geçilebiliyor?
- *
- * Uygulamadan türetilir (spec'ten değil): sweep sırasında hedef state
- * kümesi toplanır. Beklenen:
- *   - ST_CONNECTING **ölü** → hiçbir geçiş ona girmez
- *     (SOCKS5 bağlantısı SM dışında kurulur)
- *   - diğer tüm state'ler ULAŞILABİLİR olmalı (ölü state kalmamalı)
- */
+/* 2) Ulaşılabilirlik: sweep sırasında hedef state kümesi toplanır.
+ * ST_CONNECTING ölü (SOCKS5 SM dışında kurulur); diğer tüm state'ler
+ * ulaşılabilir olmalı. */
 static int test_state_reachability(void)
 {
     bool reachable[ST_COUNT];
@@ -304,11 +260,8 @@ static int test_state_reachability(void)
     return 0;
 }
 
-/* 3) TOFU onay token'ı fail-closed (C2 epoch/fp bağı)
- *
- * Slot recycle senaryosu: eski prompt'un epoch'u yeni slot'a taşınmışsa
- * onay "y" yolunda **reddedilmelidir** — session kurulmaz.
- */
+/* 3) TOFU token fail-closed (C2): eski prompt epoch'u yeni slot'a
+ * taşınmışsa onay reddedilir, session kurulmaz. */
 static int test_tofu_accept_token_fail_closed(void)
 {
     fixture_reset();
@@ -329,11 +282,8 @@ static int test_tofu_accept_token_fail_closed(void)
     return 0;
 }
 
-/* 4) TOFU onay — handshake yokken fail-closed
- *
- * Token eşleşiyor ama peer TOFU beklerken ayrılmış (ps->hs == NULL):
- * action session kurmadan NOX_ERR_PROTO dönmeli.
- */
+/* 4) TOFU onay handshake yokken fail-closed: token eşleşse de
+ * ps->hs==NULL → NOX_ERR_PROTO. */
 static int test_tofu_accept_without_handshake(void)
 {
     fixture_reset();
@@ -353,11 +303,8 @@ static int test_tofu_accept_without_handshake(void)
     return 0;
 }
 
-/* 5) Saf fonksiyonlar: sm_state_name / sm_event_name
- *
- * Geçerli enum değerleri için isim dönmeli, enum dışı → "UNKNOWN"
- * (sentinel/bozuk değer log'da çökme yaratmamalı).
- */
+/* 5) sm_state_name/sm_event_name: geçerli enum isim döner, enum dışı
+ * "UNKNOWN" (log çökmez). */
 static int test_name_functions(void)
 {
     for (unsigned s = 0; s < (unsigned)ST_COUNT; s++) {
@@ -379,15 +326,9 @@ static int test_name_functions(void)
     return 0;
 }
 
-/* 6) Disconnect matrisi: her durumdan ST_IDLE
- *
- * action_cleanup tek noktadır; her durumdan disconnect → IDLE.
- *
- * İSTİSNA: ST_IDLE'da disconnect geçişi **yok** — temizlenecek peer state'i
- * yok (fd = -1, hs/session NULL). Bu çift reddedilir (NOX_ERR_STATE) ve
- * state zaten IDLE olduğu için değişmez. "Her state'ten disconnect" diye
- * beklensaydı, uygulamanın doğru davranışı (reddetmek) hata gibi görünürdü.
- */
+/* 6) Disconnect matrisi: her durumdan ST_IDLE (action_cleanup tek nokta).
+ * İSTİSNA: ST_IDLE'da geçiş yok — temizlenecek state yok (fd=-1,
+ * hs/session NULL); reddedilir (NOX_ERR_STATE), state zaten IDLE. */
 static int test_disconnect_from_every_state(void)
 {
     for (unsigned s = 0; s < (unsigned)ST_COUNT; s++) {
@@ -408,10 +349,8 @@ static int test_disconnect_from_every_state(void)
     return 0;
 }
 
-/* 7) TOR_DIED / CRYPTO_FAIL: her durumdan ST_IDLE (fail-closed kopma)
- *
- * K-08: AEAD/protokol hatası sessizce yutulmamalı — oturum IDLE'e düşer.
- */
+/* 7) TOR_DIED/CRYPTO_FAIL: her durumdan ST_IDLE. K-08: AEAD/protokol
+ * hatası sessiz yutulmaz. */
 static int test_fatal_events_from_every_state(void)
 {
     const peer_event_t fatal[] = { EV_TOR_DIED, EV_CRYPTO_FAIL };
@@ -430,12 +369,9 @@ static int test_fatal_events_from_every_state(void)
     return 0;
 }
 
-/* 8) TOFU timeout yolu EV_PEER_DISCONNECTED'dır
- *
- * event_loop.c TOFU sweeper'ı EV_HANDSHAKE_TIMEOUT değil
- * EV_PEER_DISCONNECTED gönderir; ST_TOFU_PENDING'te
- * EV_HANDSHAKE_TIMEOUT **reddedilmeli** (yanlış yol kullanılmasın).
- */
+/* 8) TOFU timeout yolu EV_PEER_DISCONNECTED'dır; event_loop sweeper'ı
+ * EV_HANDSHAKE_TIMEOUT göndermez. ST_TOFU_PENDING'te HANDSHAKE_TIMEOUT
+ * reddedilmeli (yanlış yol kullanılmasın). */
 static int test_tofu_timeout_path(void)
 {
     fixture_reset();
@@ -453,9 +389,6 @@ static int test_tofu_timeout_path(void)
     return 0;
 }
 
-/* ================================================================
- * MAIN
- * ================================================================ */
 int main(void)
 {
     fprintf(stderr, "=== State Machine Geçiş Matrisi Testi ===\n");

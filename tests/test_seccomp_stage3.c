@@ -1,32 +1,9 @@
-/* ================================================================
- * test_seccomp_stage3.c — Stage 3 sıfır-ağ-sızıntısı testi
- *
- * src/seccomp.c'deki seccomp_policy_load(3) yüklenir; politika kopyası
- * DEĞİL. (Ders: kopya politika testi, kaynaktaki regresyonu gizler.)
- *
- * Her test ayrı child process'te çalışır:
- *   1. socket(AF_INET/AF_INET6) tüm tipler (K-03: +BT/SMC/RDS/QIPCRTR)
- *                                          → SIGSYS beklenir
- *   2. S-1 allowlist: AF_UNIX dışı HER domain (AF_PPPOX, AF_TIPC, AF_IB,
- *      AF_MCTP, AF_RXRPC, AF_LLC, AF_IRDA, AF_ISDN, AF_SNA, AF_PHONET,
- *      AF_X25, AF_DECnet, AF_BRIDGE, AF_ASH dahil) → SIGSYS
- *   3. clone() → SIGSYS; clone3 → ENOSYS (fallback yaşar)
- *   4. getaddrinfo/connect                → SIGSYS beklenir
- *   5. symlink/link/chmod/chown/shmat (SHM_EXEC dahil) → SIGSYS
- *      sendto → serbest (glibc send uyumu; TODO(IPC-SENDTO))
- *   6. AF_UNIX/socketpair/mmap RW serbest → yaşaması beklenir
- *      (AF_UNIX'un SOCK_STREAM/DGRAM/SEQPACKET tüm tipleri serbest)
- *
- * NOT: Seccomp filtresi syscall'den önce çalıştığı için kernel'in aile
- * desteği (EAFNOSUPPORT vb.) sonucu DEĞİŞTİRMEZ — aile desteklenmese
- * bile SIGSYS beklenir. "Atla" yolu yoktur: filtreye ulaşmak = regresyon.
- *
- * Build:
- *   make test                    (src .test.o'ları ile link edilir)
- *
- * Run:
- *   ./tests/test_seccomp_stage3
- * ================================================================ */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * test_seccomp_stage3.c — gerçek seccomp_policy_load(3), ayrı child.
+ * Sıfır ağ: AF_INET/INET6 tüm tipler, AF_UNIX dışı tüm domainler,
+ * connect/getaddrinfo, W^X, symlink/link/chmod/chown → SIGSYS.
+ * AF_UNIX/socketpair/mmap RW serbest. K-03 + S-1 allowlist.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +33,7 @@
 
 #include "common.h"
 #include "seccomp_policy.h"
+#include "test_support.h"
 
 /* Stage 3 filtresini child process'e uygula — GERÇEK politika
  * (src/seccomp.c → seccomp_policy_load). Kopya filtre yerine kaynağın
@@ -109,10 +87,7 @@ static void test_clone(void) {
 
 static void test_getaddrinfo(void) {
   if (apply_stage3() < 0) _exit(2);
-  /* "8.8.8.8" IP literal — DNS çözümlemez.
-   * "google.com" gerçek DNS çözümlemesi gerektirir.
-   * glibc nsswitch.files → /etc/hosts'tan çözülebilir,
-   * ama AF_NETLINK/AF_INET socket açmaya çalışır. */
+  /* "8.8.8.8" DNS çözmez; "google.com" AF_NETLINK/AF_INET socket açar. */
   struct addrinfo hints = {0}, *result = NULL;
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -157,16 +132,10 @@ static void test_af_unix_should_work(void) {
   _exit(1);
 }
 
-/* ── S-1: socket() allowlist — AF_UNIX dışı her domain kapalı ──────
- * Aile listesi (deny-list) kapatmadığı, ağ taşıyabilen aileler:
- * AF_PPPOX (PPPoX — 13 Kasım 2026 turunda bu kernelde ETKİN olduğu
- * ölçüldü), AF_TIPC, AF_IB (RDMA), AF_MCTP, AF_RXRPC, AF_LLC, AF_IRDA,
- * AF_ISDN, AF_SNA, AF_PHONET, AF_X25, AF_DECnet, AF_BRIDGE, AF_ASH.
- *
- * Allowlist kuralı: socket(domain != AF_UNIX) → KILL_PROCESS.
- * Seccomp filtresi syscall'den ÖNCE çalışır → aile kernel'de desteklenmese
- * bile SIGSYS beklenir. Bu yüzden kernel hatasına (EAFNOSUPPORT vb.)
- * "atla" yolu YOKTUR: filtreye ulaşmak = regresyon = FAIL. */
+/* S-1: socket() allowlist — AF_UNIX dışı her domain KILL_PROCESS.
+ * Deny-list AF_PPPOX, TIPC, IB, MCTP, RXRPC, LLC, IRDA, ISDN, SNA, PHONET,
+ * X25, DECnet, BRIDGE, ASH'ı kaçırıyordu. Filtre syscall'den önce koşar:
+ * kernel aileyi desteklemese bile SIGSYS; EAFNOSUPPORT "atla" yolu yok. */
 
 /* Test edilecek domain — child fork sonrası bu değeri miras alır */
 static int g_af_domain;
@@ -314,11 +283,8 @@ static void test_mprotect_rw_allow(void) {
   _exit(0);
 }
 
-/* ── shmat: W^X ailesinin kalbi (denetim: "stage 3'te yasaklanmıyor") ──
- * shmat tümüyle yasak (blacklist .stage=2 → load(3)'e dahil; W^X ailesi
- * stage-2'den aktarıldı). SHM_EXEC (Linux ≥2.6.9) segmenti YÜRÜTÜLEBİLİR
- * eşler (man7 shmop(2): "Allow the contents ... to be executed") — W^X
- * iddiası bu kural olmadan eksik kalırdı. Bu testler regresyonu yakalar. */
+/* shmat tümüyle yasak (W^X ailesi stage-2'den). SHM_EXEC yürütülebilir
+ * eşler (shmop(2)); bu kural olmadan stage-3 W^X iddiası eksik kalırdı. */
 #ifndef SHM_EXEC
 #define SHM_EXEC 0100000  /* linux/shm.h — glibc'te her sürümde yok */
 #endif
@@ -492,18 +458,9 @@ static void test_af_qipcrtr(void) {
   _exit(1);
 }
 
-/* ── Stage 3 — gerçek event-loop syscall'ları (yaşaması beklenir) ──
- * NoxTor'un stage 3'te fiilen kullandığı syscall'lar:
- *   epoll_create1  → network.c:1810 (event loop kurulumu)
- *   epoll_ctl      → stdin_handler.c:566, event_loop.c (fd kaydı)
- *   epoll_wait     → event_loop.c (ana döngü)
- *   poll           → network.c read_full/write_full/ctrl_read_line
- *   fcntl(F_GETFL) → set_nonblocking deseni
- *   accept4        → event_loop.c:863 (AF_UNIX bağlantı kabulü)
- *   read/write     → network.c read_full/write_full
- *   clock_gettime  → zaman aşımı/aktivite takibi (CLOCK_MONOTONIC)
- *   nanosleep      → network.c safe_nanosleep (backoff)
- * Hiçbiri filtrede değil; stage 3'te event loop'u bloklamamalı. */
+/* Stage 3 — event-loop syscall'ları (yaşaması beklenir): epoll_create1,
+ * epoll_ctl/wait, poll, fcntl(F_GETFL), accept4, read/write,
+ * clock_gettime, nanosleep. Hiçbiri filtrede değil. */
 
 static void test_epoll_create1(void) {
   if (apply_stage3() < 0) _exit(2);
@@ -622,57 +579,12 @@ static void test_nanosleep_zero(void) {
 
 /* ── Ana test çalıştırıcı ── */
 
-/* run_test dönüş kodu: 1 = PASS, 0 = FAIL */
-static int run_test(const char *name __attribute__((unused)), const char *desc, void (*fn)(void), int should_die) {
-  printf("  %-38s ", desc);
-
-  pid_t child = fork();
-  if (child < 0) {
-    printf("[SKIP] fork başarısız\n");
-    return 0;
-  }
-
-  if (child == 0) {
-    fn();  /* asla dönmez — SIGSYS veya _exit */
-    _exit(0);
-  }
-
-  int status;
-  waitpid(child, &status, 0);
-
-  if (should_die) {
-    /* SIGSYS ile ölüm bekleniyor */
-    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS) {
-      printf("[PASS] SIGSYS ✓\n");
-      return 1;
-    } else if (WIFEXITED(status)) {
-      printf("[FAIL] exit=%d (SIGSYS bekleniyordu)\n", WEXITSTATUS(status));
-      return 0;
-    } else {
-      printf("[FAIL] signal=%d (SIGSYS bekleniyordu)\n", WTERMSIG(status));
-      return 0;
-    }
-  } else {
-    /* Yaşaması bekleniyor */
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-      printf("[PASS] yaşadı ✓\n");
-      return 1;
-    } else if (WIFSIGNALED(status)) {
-      printf("[FAIL] signal=%d (yaşaması bekleniyordu)\n", WTERMSIG(status));
-      return 0;
-    } else {
-      printf("[FAIL] exit=%d (yaşaması bekleniyordu)\n", WEXITSTATUS(status));
-      return 0;
-    }
-  }
-}
-
 /* Sayaç yönetimi */
 static int g_passed = 0;
 static int g_total = 0;
 
 static void run(const char *desc, void (*fn)(void), int should_die) {
-  int r = run_test(NULL, desc, fn, should_die);
+  int r = nox_test_seccomp_run(NULL, desc, fn, should_die);
   g_total++;
   g_passed += r;
 }

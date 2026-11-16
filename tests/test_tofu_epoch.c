@@ -1,27 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_tofu_epoch.c — C2 TOFU slot-recycling token birim testi
- *
- * C2 (audit §1): "y" prompt'taki slot instance'ına bağlanmalı. Slot
- * recycle'ı (drop → aynı slota yeni anahtar → yeni prompt) esnasında
- * kullanıcı eski fp'ye verdiği "y" ile YENİ anahtarı rehbere
- * kaydedememeli.
- *
- * Testler:
- *   1. İlk prompt: epoch=1, snapshot (tofu_prompt_epoch + fp) kurulur
- *   2. Supersede (çekirdek): çözülmemiş prompt varken yeni prompt
- *      snapshot'ı EZMEZ — recycle korumasının çekirdeği
- *   3. "n" ile çözüm → snapshot sıfırlanır; sonraki prompt taze kurulur
- *   4. Bayat "y" (recycle) → reddedilir + yeniden arm edilir
- *   5. Negatif: epoch eşit ama fp farklı → RET (token fp boyutu)
- *   6. Negatif: fp eşit ama epoch farklı → RET (token epoch boyutu)
- *   7. Token tutuyor ama hs ölü → accept fail-closed + cleanup
- *   8. Prompt sahibi cleanup → global prompt token'ı kapanır
- *   9. GERÇEK accept yolu: loopback Noise XX handshake + test db ile
- *      tam onay → ST_ACTIVE, session kuruldu, rehberde kayıtlı,
- *      snapshot sıfırlandı
- *
- * Kapsam notu: 1-7 db'ye dokunmaz (accept hs guard'ı öncesinden döner).
- * 8'de db_add_contact gerçekten çağrılır ve db_get_contact ile okunur.
+ * test_tofu_epoch.c — TOFU slot-recycling token (C2).
+ * Epoch+fp snapshot; bayat "y" yeni anahtarı kaydetmez; accept yolu
+ * gerçek Noise XX + db roundtrip ile doğrulanır.
  */
 
 #include "common.h"
@@ -40,9 +20,6 @@
 #include "test_common.h"
 
 
-/* ================================================================
- * FIXTURE
- * ================================================================ */
 static struct app_state st;
 
 static struct peer_session *slot0(void) { return &st.peers[0]; }
@@ -64,12 +41,8 @@ static nox_err_t prompt_with(uint8_t fill)
     return sm_dispatch(slot0(), &st, EV_HANDSHAKE_DONE);
 }
 
-/* ================================================================
- * GERÇEK ACCEPT İÇİN YARDIMCILAR
- *
- * action_tofu_accept, tamamlanmış bir Noise XX hs + geçerli db ister.
- * Şablon: tests/test_noise.c loopback dansı (prologue yok).
- * ================================================================ */
+/* action_tofu_accept tamamlanmış Noise XX + geçerli db ister; şablon
+ * test_noise loopback (prologue yok). */
 static const char *TEST_ONION =
     "abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrst.onion";
 static const char *TEST_NAME = "C2 Test";
@@ -170,9 +143,6 @@ static void teardown_accept(void)
     cleanup_db_dir();
 }
 
-/* ================================================================
- * TESTLER
- * ================================================================ */
 
 /* 1) İlk prompt: epoch + snapshot + fp kopyalanır, state geçişi olur */
 static int test_prompt_snapshot(void)

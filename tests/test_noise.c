@@ -1,17 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * test_noise.c — Noise XX handshake + transport testleri
- *
- * Öne çıkan testler:
- *   1. Loopback handshake — initiator ↔ responder aynı process
- *   2. Transport round-trip — şifrele/çöz
- *   3. MAC tamper — bozulmuş ciphertext reddedilmeli
- *   4. Nonce replay — aynı nonce ile iki kez şifreleme farklı çıktı
- *   5. Handshake yanlış sıra — state hatası
- *   6. Remote static key doğrulama
- *   7. AD bağlama — yanlış/eksik AD → -1, nonce invariant
- *   8. AD zorunlu — NULL/boş AD → -1
- *   9. Nonce tükenmesi — MAX reddi, MAX-1 son başarılı, wrap yok
- *  10. Keyless fail — sıfır olmayan nonce tüketilmez
+ * test_noise.c — Noise XX handshake + transport.
+ * Loopback handshake, MAC/AD tamper, nonce replay/tükenmesi, yanlış sıra,
+ * remote static doğrulama, keyless fail.
  */
 
 #include "common.h"
@@ -33,9 +23,7 @@ static const uint8_t AD[FRAME_HEADER_WIRE_SIZE] = {
 };
 
 
-/* ================================================================
- * YARDIMCI — Curve25519 key pair üret
- * ================================================================ */
+/* Curve25519 key pair üret. */
 static void gen_static_keypair(uint8_t priv[NOX_KEY_LEN],
                                uint8_t pub[NOX_KEY_LEN])
 {
@@ -103,12 +91,8 @@ out:
     return rc;
 }
 
-/* ================================================================
- * TEST: Tam loopback handshake
- *
- * Initiator (Alice) ↔ Responder (Bob)
- * 3 mesaj sonunda her iki taraf da transport-ready olmalı.
- * ================================================================ */
+/* Tam loopback handshake: Initiator ↔ Responder, 3 mesaj sonunda iki
+ * taraf da transport-ready. */
 static int test_loopback_handshake(void)
 {
     /* Key pairs */
@@ -164,9 +148,7 @@ static int test_loopback_handshake(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Transport round-trip
- * ================================================================ */
+/* Transport round-trip */
 static int test_transport_roundtrip(void)
 {
     /* Handshake yap */
@@ -231,9 +213,7 @@ static int test_transport_roundtrip(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: MAC tamper — bozulmuş ciphertext reddedilmeli
- * ================================================================ */
+/* MAC tamper — bozulmuş ciphertext reddedilmeli */
 static int test_mac_tamper(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -278,10 +258,8 @@ static int test_mac_tamper(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Nonce fail'de artmamalı — Noise spec §5.1
- * Sahte paket sonrası meşru paketin çözülebilmesi gerekir.
- * ================================================================ */
+/* Nonce fail'de artmamalı (Noise §5.1): sahte paket sonrası meşru paket
+ * çözülebilmeli. */
 static int test_nonce_no_increment_on_fail(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -350,12 +328,8 @@ static int test_nonce_no_increment_on_fail(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: TX nonce tükenmesi — UINT64_MAX kullanılmaz, wrap yok
- *
- * MAX-1'de başarılı şifreleme sayacı MAX'a taşır; sonraki deneme
- * fail-closed olmalı, sayacı geri sarmamalı ve çıktıya dokunmamalı.
- * ================================================================ */
+/* TX nonce tükenmesi: MAX-1 başarılı, sayaç MAX; sonraki deneme
+ * fail-closed, sayaç geri sarmaz, çıktıya dokunmaz. */
 static int test_nonce_exhaustion_encrypt(void)
 {
     struct noise_session sa, sb;
@@ -389,13 +363,8 @@ static int test_nonce_exhaustion_encrypt(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: RX nonce tükenmesi — MAX-1 son başarılı decrypt
- *
- * MAX-1'de çözülen paket sayacı MAX'a taşır; aynı paket tekrar
- * geldiğinde nonce tükenmiş olduğu için AEAD'e girmeden reddedilir
- * ve sayaç değişmez.
- * ================================================================ */
+/* RX nonce tükenmesi: MAX-1 son başarılı decrypt, sayaç MAX'a taşar;
+ * aynı paket AEAD'e girmeden reddedilir, sayaç değişmez. */
 static int test_nonce_exhaustion_decrypt(void)
 {
     struct noise_session sa, sb;
@@ -428,9 +397,7 @@ static int test_nonce_exhaustion_decrypt(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Double split yasak — ikinci split fail etmeli
- * ================================================================ */
+/* Double split yasak — ikinci split fail etmeli */
 static int test_double_split(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -474,9 +441,7 @@ static int test_double_split(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Remote static key doğrulama
- * ================================================================ */
+/* Remote static key doğrulama */
 static int test_remote_static_key(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -513,9 +478,7 @@ static int test_remote_static_key(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Handshake yanlış sıra → state hatası
- * ================================================================ */
+/* Handshake yanlış sıra → state hatası */
 static int test_wrong_order(void)
 {
     uint8_t priv[NOX_KEY_LEN], pub[NOX_KEY_LEN];
@@ -532,9 +495,7 @@ static int test_wrong_order(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: NULL parametre güvenliği
- * ================================================================ */
+/* NULL parametre güvenliği */
 static int test_noise_null_safety(void)
 {
     TEST_ASSERT(handshake_init(NULL, true, NULL, NULL) == NOX_ERR_PROTO);
@@ -551,9 +512,7 @@ static int test_noise_null_safety(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Handshake onion payload exchange
- * ================================================================ */
+/* Handshake onion payload exchange */
 static int test_handshake_onion_payload(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -601,13 +560,8 @@ static int test_handshake_onion_payload(void)
     return 0;
 }
 
-/* ================================================================
- * ORTAK VEKTÖR ANAHTARLARI — Cacophony (Noise_XX_25519_ChaChaPoly_BLAKE2b)
- *
- * Kaynak: cacophony.txt (dissononce/tgalal)
- * Prologue: "John Galt" (0x4a6f686e2047616c74)
- * İki spec-vector testi (aşağıda) bu anahtarları paylaşır.
- * ================================================================ */
+/* Ortak Cacophony vektör anahtarları (Noise_XX_25519_ChaChaPoly_BLAKE2b,
+ * prologue "John Galt"); iki spec-vector testi paylaşır. */
 #ifdef NOISE_TEST_DETERMINISTIC
 static const uint8_t prologue[9] = {
     0x4a, 0x6f, 0x68, 0x6e, 0x20, 0x47, 0x61, 0x6c, 0x74
@@ -641,11 +595,8 @@ static const uint8_t resp_e_priv[32] = {   /* Responder ephemeral */
     0x79, 0x3d, 0x5e, 0x63, 0xda, 0x6b, 0x37, 0x5b
 };
 
-/* ================================================================
- * TEST: Cacophony spec vektörleri — Noise_XX_25519_ChaChaPoly_BLAKE2b
- *
- * Her mesajda payload var — deterministik ciphertext karşılaştırması.
- * ================================================================ */
+/* Cacophony spec vektörleri (XX_25519_ChaChaPoly_BLAKE2b): her mesajda
+ * payload, deterministik ct karşılaştırması. */
 static int test_spec_vectors(void)
 {
     /* msg0 payload: "Ludwig von Mises" */
@@ -785,14 +736,8 @@ static int test_spec_vectors(void)
     return 0;
 }
 
-/* ================================================================
- * PAYLOAD VARYASYON TESTLERİ
- *
- * Aynı Cacophony anahtarları/prologue (dosya kapsamı) ile farklı
- * payload boyutları test edilir. Byte-for-byte ciphertext
- * doğrulanmaz (beklenen değerler mevcut değil), sadece roundtrip
- * ve tamamlanma doğrulanır.
- * ================================================================ */
+/* Payload varyasyonları: aynı Cacophony anahtar/prologue ile farklı
+ * boyutlar; ciphertext byte karşılaştırması yok, roundtrip + tamamlanma. */
 static int test_spec_vectors_payloads(void)
 {
     uint8_t init_s_pub[32], resp_s_pub[32];
@@ -896,12 +841,8 @@ static int test_spec_vectors_payloads(void)
 }
 #endif /* NOISE_TEST_DETERMINISTIC */
 
-/* ================================================================
- * TEST: H2 — AD bağlama
- *
- * Aynı ciphertext, yanlış AD ile tag fail etmeli ve RX nonce'u
- * İLERLETMEMELİ; doğru AD ile tekrar denenince başarılı olmalı.
- * ================================================================ */
+/* H2 — AD bağlama: yanlış AD tag fail + RX nonce İLERLEMEZ; doğru AD
+ * ile tekrar denemek başarılı olmalı. */
 static int test_ad_binding(void)
 {
     uint8_t a_priv[NOX_KEY_LEN], a_pub[NOX_KEY_LEN];
@@ -967,9 +908,7 @@ static int test_ad_binding(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: H2 — AD zorunluluğu (NULL / sıfır uzunluk fail-closed)
- * ================================================================ */
+/* H2 — AD zorunluluğu (NULL / sıfır uzunluk fail-closed) */
 static int test_ad_required(void)
 {
     struct noise_session s;
@@ -987,13 +926,9 @@ static int test_ad_required(void)
     return 0;
 }
 
-/* ================================================================
- * TEST: Transport keyless fail-closed (P0 — Adım 2.5)
- *
- * Sıfırlanmış session'da tx/rx.has_key == false iken noise_* transport
- * sarmalayıcıları cipher_* pass-through'a düşmemeli; -1 dönmeli ve
- * çıktı tamponuna dokunmamalı.
- * ================================================================ */
+/* Transport keyless fail-closed (P0): tx/rx.has_key == false iken
+ * noise_* cipher_* pass-through'a düşmemeli; -1 dönmeli, çıktıya
+ * dokunmamalı. */
 static int test_transport_rejects_keyless_encrypt(void)
 {
     struct noise_session s;
@@ -1035,9 +970,6 @@ static int test_transport_rejects_keyless_decrypt(void)
     return 0;
 }
 
-/* ================================================================
- * MAIN
- * ================================================================ */
 int main(void)
 {
     if (sodium_init() < 0) {
