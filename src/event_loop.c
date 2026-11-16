@@ -790,6 +790,150 @@ void process_peer_frames(struct peer_session *ps, struct app_state *state,
   } /* while frame processing loop */
 }
 
+#ifndef NOX_NO_LANDLOCK
+
+static const struct nox_ll_gate_ops g_default_ll_gate_ops = {
+  .abi_version = landlock_abi_version,
+  .open_socks = landlock_open_unix_socket_fd,
+  .sandbox_init = landlock_sandbox_init,
+  .is_active = landlock_is_active,
+  .close_fd = close,
+};
+
+/* F5: Landlock ön-kontrol kapısı. Üretimde ops == NULL; testlerde
+ * fake ops enjekte edilir. false dönerse state->running=false yapılmıştır
+ * ve event_loop return etmelidir. Karar/mesaj sırası F5 öncesiyle
+ * birebir aynıdır. */
+bool event_loop_landlock_gate(struct app_state *state,
+                              const struct nox_ll_gate_ops *ops) {
+  if (!ops)
+    ops = &g_default_ll_gate_ops;
+
+  bool fds_ok = state->config_dir_fd >= 0 &&
+                state->downloads_dir_fd >= 0;
+
+  /* F3: tor_data fd zorunlu — dar silme kuralının anchor'ı yoksa
+   * sandbox eksik kurulur; sessizce devam etme. */
+  if (state->tor_data_fd < 0) {
+    NOX_FATAL(LOG_MOD_MAIN,
+              "landlock: tor_data fd yok (torrc üretimi başarısız?)");
+    ui_print_error(state,
+        "Tor veri dizini doğrulanamadı; dosya sistemi sandbox'ı "
+        "kurulamıyor. Uygulama kapatılıyor.");
+    state->running = false;
+    return false;
+  }
+
+  nox_err_t ll_err = NOX_ERR_CONFIG;
+  int ll_abi = -1;
+  int socks_fd = -1;
+
+  if (fds_ok) {
+    ll_abi = ops->abi_version();
+
+    /* F1: opsiyonel strict politika — ABI < 9'da sandbox'ın eksik
+     * kalmasını kabul etme. Varsayılan politika görünür uyarıdır. */
+    if (state->require_landlock_resolve_unix && ll_abi < 9) {
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock: RESOLVE_UNIX için ABI >= 9 gerekli (abi=%d)",
+                ll_abi);
+      ui_print_error(state,
+          "Landlock ABI >= 9 (Linux 7.1+) gerekli: "
+          "--require-landlock-resolve-unix ile çıkılıyor.");
+      state->running = false;
+      return false;
+    }
+
+    if (ll_abi >= 9) {
+      /* Tor Landlock'tan önce spawn edildi; socks.sock domain dışında.
+       * Yalnız bu inode'a dosya düzeyinde istisna tanınacak. fd'yi
+       * path'e geri dönmeden doğrula ve init'e anchor olarak ver. */
+      socks_fd = ops->open_socks(state->socks_path);
+      if (socks_fd < 0) {
+        NOX_ERROR(LOG_MOD_MAIN,
+                  "landlock: socks.sock açılamadı/doğrulanamadı (%s)",
+                  strerror(errno));
+        ui_print_error(state,
+            "Tor SOCKS soketi doğrulanamadı; güvenli bağlantı kurulamaz. "
+            "Uygulama kapatılıyor.");
+        state->running = false;
+        return false;
+      }
+    } else if (ll_abi >= 1) {
+      NOX_WARN(LOG_MOD_MAIN,
+               "landlock: ABI v%d < 9 — pathname Unix connect kısıtlanmıyor "
+               "(F1 açık)", ll_abi);
+      ui_print_error(state,
+          "⚠ Landlock ABI < 9: pathname Unix soket bağlantıları "
+          "kısıtlanamıyor (F1 açık). Tam koruma için Linux 7.1+ gerekir.");
+    }
+
+    ll_err = ops->sandbox_init(state->config_dir_fd,
+                               state->downloads_dir_fd,
+                               state->tor_data_fd,
+                               socks_fd);
+    if (socks_fd >= 0) {
+      ops->close_fd(socks_fd);
+    }
+  } else {
+    NOX_FATAL(LOG_MOD_MAIN,
+              "landlock: config/downloads fd yok (config=%d, downloads=%d)",
+              state->config_dir_fd, state->downloads_dir_fd);
+    ui_print_error(state,
+        "Yapılandırma/indirme dizini doğrulanamadı; dosya sistemi "
+        "sandbox'ı kurulamıyor. Uygulama kapatılıyor.");
+  }
+
+  /* F5: fail-closed karar matrisi — eksik fd, NOX_OK+!active ve
+   * unsupported+onaysız yolların hepsi abort eder. Bayrak yalnız
+   * NOX_ERR_LANDLOCK_UNSUPPORTED için bypass sağlar. */
+  nox_ll_fs_policy_t policy =
+      landlock_fs_policy_decide(fds_ok, ll_err,
+                                ops->is_active(),
+                                state->allow_unsandboxed_fs);
+
+  if (policy == NOX_LL_FS_RUN_UNSANDBOXED) {
+    /* Kullanıcı bilerek onayladıysa: devam et ama görünür şekilde uyar —
+     * sadece log'a değil, TUI/terminal ekranına da. */
+    NOX_WARN(LOG_MOD_MAIN,
+             "landlock devre dışı — KULLANICI ONAYIYLA sandbox'sız çalışılıyor");
+    ui_print_error(state, "Dosya sistemi sandbox'ı KAPALI "
+                          "(--allow-unsandboxed-fs ile onaylandı).");
+  } else if (policy == NOX_LL_FS_ABORT) {
+    if (!fds_ok) {
+      /* Mesaj yukarıdaki eksik-fd dalında basıldı. */
+      state->running = false;
+      return false;
+    }
+    if (ll_err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
+      /* C-2 FIX: varsayılan fail-closed — seccomp ile simetrik.
+       * Sandbox'sız çalışmak açık bayrak gerektiren bilinçli bir tercih. */
+      ui_print_error(state,
+          "Bu çekirdek Landlock desteklemiyor (Linux 5.13+ gerekli). "
+          "Dosya sistemi sandbox'ı olmadan çalışmak engellendi. "
+          "Bilinçli olarak devam etmek için --allow-unsandboxed-fs kullanın.");
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock kurulamadı — kullanıcı onayı yok, çıkılıyor");
+    } else if (ll_err == NOX_OK) {
+      /* Init başarılı dedi ama aktiflik doğrulanamıyor: invariant
+       * ihlali — uyarıyla devam etme, fail-closed. */
+      NOX_FATAL(LOG_MOD_MAIN,
+                "landlock: init OK ama sandbox aktif DEĞİL — fail-closed");
+      ui_print_error(state,
+          "Dosya sistemi sandbox'ı AKTİF DEĞİL. Uygulama kapatılıyor.");
+    } else {
+      NOX_ERROR(LOG_MOD_MAIN, "landlock: yapılandırma hatası");
+      ui_print_error(state, "Sandbox yapılandırma hatası.");
+    }
+    state->running = false;
+    return false;
+  }
+
+  return true;
+}
+
+#endif /* !NOX_NO_LANDLOCK */
+
 /* ================================================================
  * EVENT LOOP — epoll tabanlı async I/O
  * ================================================================ */
@@ -803,115 +947,43 @@ void event_loop(struct app_state *state) {
    * Sadece downloads dizini okunabilir/yazılabilir; ABI >= 9'da
    * pathname Unix connect'ler de kısıtlanır (F1).
    * Kernel 5.13+ gerektirir, desteklemiyorsa hata döner.
-   * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez. */
-  if (state->config_dir_fd >= 0 && state->downloads_dir_fd >= 0) {
-    int ll_abi = landlock_abi_version();
-    int socks_fd = -1;
-
-    /* F3: tor_data fd zorunlu — dar silme kuralının anchor'ı yoksa
-     * sandbox eksik kurulur; sessizce devam etme. */
-    if (state->tor_data_fd < 0) {
-      NOX_FATAL(LOG_MOD_MAIN,
-                "landlock: tor_data fd yok (torrc üretimi başarısız?)");
-      ui_print_error(state,
-          "Tor veri dizini doğrulanamadı; dosya sistemi sandbox'ı "
-          "kurulamıyor. Uygulama kapatılıyor.");
-      state->running = false;
-      return;
-    }
-
-    /* F1: opsiyonel strict politika — ABI < 9'da sandbox'ın eksik
-     * kalmasını kabul etme. Varsayılan politika görünür uyarıdır. */
-    if (state->require_landlock_resolve_unix && ll_abi < 9) {
-      NOX_FATAL(LOG_MOD_MAIN,
-                "landlock: RESOLVE_UNIX için ABI >= 9 gerekli (abi=%d)",
-                ll_abi);
-      ui_print_error(state,
-          "Landlock ABI >= 9 (Linux 7.1+) gerekli: "
-          "--require-landlock-resolve-unix ile çıkılıyor.");
-      state->running = false;
-      return;
-    }
-
-    if (ll_abi >= 9) {
-      /* Tor Landlock'tan önce spawn edildi; socks.sock domain dışında.
-       * Yalnız bu inode'a dosya düzeyinde istisna tanınacak. fd'yi
-       * path'e geri dönmeden doğrula ve init'e anchor olarak ver. */
-      socks_fd = landlock_open_unix_socket_fd(state->socks_path);
-      if (socks_fd < 0) {
-        NOX_ERROR(LOG_MOD_MAIN,
-                  "landlock: socks.sock açılamadı/doğrulanamadı (%s)",
-                  strerror(errno));
-        ui_print_error(state,
-            "Tor SOCKS soketi doğrulanamadı; güvenli bağlantı kurulamaz. "
-            "Uygulama kapatılıyor.");
-        state->running = false;
-        return;
-      }
-    } else if (ll_abi >= 1) {
-      NOX_WARN(LOG_MOD_MAIN,
-               "landlock: ABI v%d < 9 — pathname Unix connect kısıtlanmıyor "
-               "(F1 açık)", ll_abi);
-      ui_print_error(state,
-          "⚠ Landlock ABI < 9: pathname Unix soket bağlantıları "
-          "kısıtlanamıyor (F1 açık). Tam koruma için Linux 7.1+ gerekir.");
-    }
-
-    nox_err_t ll_err = landlock_sandbox_init(state->config_dir_fd,
-                                             state->downloads_dir_fd,
-                                             state->tor_data_fd,
-                                             socks_fd);
-    if (socks_fd >= 0) {
-      close(socks_fd);
-      socks_fd = -1;
-    }
-
-    if (ll_err == NOX_ERR_LANDLOCK_UNSUPPORTED) {
-      if (!state->allow_unsandboxed_fs) {
-        /* C-2 FIX: varsayılan fail-closed — seccomp ile simetrik.
-         * Sandbox'sız çalışmak açık bayrak gerektiren bilinçli bir tercih. */
-        ui_print_error(state,
-            "Bu çekirdek Landlock desteklemiyor (Linux 5.13+ gerekli). "
-            "Dosya sistemi sandbox'ı olmadan çalışmak engellendi. "
-            "Bilinçli olarak devam etmek için --allow-unsandboxed-fs kullanın.");
-        NOX_FATAL(LOG_MOD_MAIN,
-                  "landlock kurulamadı — kullanıcı onayı yok, çıkılıyor");
-        state->running = false;
-        return;
-      }
-      /* Kullanıcı bilerek onayladıysa: devam et ama görünür şekilde uyar —
-       * sadece log'a değil, TUI/terminal ekranına da. */
-      NOX_WARN(LOG_MOD_MAIN,
-               "landlock devre dışı — KULLANICI ONAYIYLA sandbox'sız çalışılıyor");
-      ui_print_error(state, "Dosya sistemi sandbox'ı KAPALI "
-                            "(--allow-unsandboxed-fs ile onaylandı).");
-    } else if (ll_err != NOX_OK) {
-      NOX_ERROR(LOG_MOD_MAIN, "landlock: yapılandırma hatası");
-      ui_print_error(state, "Sandbox yapılandırma hatası.");
-      state->running = false;
-      return;
-    }
-
-    /* C-2 FIX: landlock_is_active() artık ölü kod değil — sandbox
-     * gerçekten uygulanmadıysa (herhangi bir nedenle) görünür uyarı. */
-    if (!landlock_is_active()) {
-      NOX_WARN(LOG_MOD_MAIN, "landlock: sandbox aktif DEĞİL — dosya erişimi kısıtsız");
-      ui_print_error(state, "⚠ Dosya sistemi sandbox'ı AKTİF DEĞİL.");
-    }
+   * no_new_privs ayarlanır — seccomp yüklemesi bundan etkilenmez.
+   *
+   * Android/arm64 build'inde (NOX_PLATFORM_ANDROID → NOX_NO_LANDLOCK)
+   * Landlock yoktur; Android SELinux dosya kısıtları kullanılır. */
+#ifdef NOX_NO_LANDLOCK
+  NOX_INFO(LOG_MOD_MAIN,
+           "android: Landlock yok — SELinux dosya kısıtları kullanılıyor; "
+           "Landlock sandbox'ı atlandı");
+#else
+  if (!event_loop_landlock_gate(state, NULL)) {
+    return;
   }
+#endif
 
   /* ── Stage 3: Sıfır ağ sızıntısı garantisi ────────────────────
    * Tüm mevcut bağlantılar AF_UNIX (Tor control, SOCKS, peer).
    * Event loop tek thread — clone tamamen yasak.
    * TCP/UDP/NETLINK socket oluşturulamaz.
    * open/openat/creat seccomp tarafından engellenmez —
-   * Landlock path-based filtering sağlar (yoksa openat serbest). */
+   * Landlock path-based filtering sağlar (yoksa openat serbest).
+   *
+   * Android/arm64 build'inde (NOX_PLATFORM_ANDROID → NO_SECCOMP)
+   * uygulama seccomp politikası yüklenmez; Android kernel/zygote
+   * seccomp'u + SELinux kullanılır. Normal x86 build'inde bu dal
+   * derlenmez. */
+#ifdef NOX_PLATFORM_ANDROID
+  NOX_INFO(LOG_MOD_MAIN,
+           "android: seccomp stage 3 atlandı — Android kernel/zygote "
+           "seccomp'u kullanılıyor");
+#else
   if (seccomp_policy_load(3) != NOX_OK) {
     NOX_ERROR(LOG_MOD_MAIN, "seccomp stage 3 yüklenemedi");
     ui_print_error(state, "Güvenlik politikası yüklenemedi.");
     state->running = false;
     return;
   }
+#endif
 
   /* ── Hoşgeldiniz + Komutlar — stage 3 sonrası ────────────────
    * Hem TUI hem terminal modunda hoşgeldiniz ve komut listesi basılır.
@@ -1292,15 +1364,12 @@ void event_loop(struct app_state *state) {
           /* State geçişi: IDLE → HANDSHAKE_RESP */
           sm_dispatch(listener_ps, state, EV_PEER_ACCEPTED);
 
-          /* Aktif peer olarak ata — eğer başka aktif peer yoksa */
-          if (state->active_peer_idx < 0) {
-            for (unsigned pi = 0; pi < NOX_MAX_PEERS; pi++) {
-              if (&state->peers[pi] == listener_ps) {
-                state->active_peer_idx = (int)pi;
-                break;
-              }
-            }
-          }
+          /* K-23: aktif peer olarak ata — eğer başka aktif peer yoksa.
+           * İndeks + gösterim tek atomik setter'dan güncellenir; bu
+           * noktada peer_onion henüz boş olabilir, oturum kurulunca
+           * aynı setter gerçek onion ile yeniden çağrılır. */
+          if (state->active_peer_idx < 0)
+            sm_set_active_peer(state, listener_ps);
 
           NOX_INFO(LOG_MOD_MAIN, "gelen peer kabul edildi (slot %lu, toplam %d)",
                    (unsigned long)(listener_ps - state->peers),

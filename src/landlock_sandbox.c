@@ -20,8 +20,78 @@
  * ================================================================ */
 #include "common.h"
 #include "landlock_sandbox.h"
-#include <assert.h>
 
+#include <errno.h>
+
+/* F5: Saf karar yardımcısı — event_loop'un platformdan bağımsız
+ * fail-closed matrisi. Android stub'larında da derlenir. */
+nox_ll_fs_policy_t landlock_fs_policy_decide(bool fds_ok,
+                                             nox_err_t init_rc,
+                                             bool active,
+                                             bool allow_unsandboxed) {
+    if (!fds_ok)
+        return NOX_LL_FS_ABORT;
+
+    if (init_rc == NOX_OK)
+        return active ? NOX_LL_FS_RUN : NOX_LL_FS_ABORT;
+
+    if (init_rc == NOX_ERR_LANDLOCK_UNSUPPORTED &&
+        !active && allow_unsandboxed)
+        return NOX_LL_FS_RUN_UNSANDBOXED;
+
+    /* NOX_ERR_CONFIG veya beklenmeyen hata: bayrak bypass etmez. */
+    return NOX_LL_FS_ABORT;
+}
+
+/* F5/ABI probe: Landlock syscall hata sınıflandırması.
+ * ret >= 0 başarı; ENOSYS/EOPNOTSUPP "kernel/LSM yok"; diğerleri
+ * yapılandırma hatası. Saf fonksiyon — testlerde kernel gerekmez. */
+nox_ll_syscall_status_t landlock_syscall_status(int ret, int err) {
+    if (ret >= 0)
+        return NOX_LL_SYSCALL_OK;
+    if (err == ENOSYS || err == EOPNOTSUPP)
+        return NOX_LL_SYSCALL_UNSUPPORTED;
+    return NOX_LL_SYSCALL_CONFIG_ERROR;
+}
+
+#ifdef NOX_NO_LANDLOCK
+
+/* Android/arm64: Landlock yok. Android SELinux dosya kısıtları
+ * kullanılır; uygulama kendi Landlock katmanını kurmaz. */
+int landlock_abi_version(void) {
+    errno = ENOSYS;
+    return -1;
+}
+
+int landlock_open_unix_socket_fd(const char *path) {
+    (void)path;
+    errno = ENOSYS;
+    return -1;
+}
+
+nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd,
+                                int tor_data_fd, int socks_fd) {
+    (void)config_dir_fd;
+    (void)downloads_dir_fd;
+    (void)tor_data_fd;
+    (void)socks_fd;
+    NOX_INFO(LOG_MOD_MAIN,
+             "android: Landlock yok — SELinux dosya kısıtları kullanılıyor; "
+             "Landlock sandbox'ı atlandı");
+    return NOX_ERR_LANDLOCK_UNSUPPORTED;
+}
+
+nox_hardbool_t landlock_is_available(void) {
+    return false;
+}
+
+nox_hardbool_t landlock_is_active(void) {
+    return false;
+}
+
+#else /* !NOX_NO_LANDLOCK */
+
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/landlock.h>
@@ -146,15 +216,27 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd,
     /* ABI versiyonunu kontrol et */
     int abi = landlock_abi_version();
     if (abi < 0) {
-        NOX_WARN(LOG_MOD_MAIN, "landlock: desteklenmiyor (abi=%d), "
-                 "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz", abi);
+        int probe_err = errno;
+        if (landlock_syscall_status(abi, probe_err) ==
+            NOX_LL_SYSCALL_UNSUPPORTED) {
+            /* F5: kernel Landlock'u hiç bilmiyor/devre dışı — bu bir
+             * yapılandırma hatası değil, "desteklenmiyor"dur. */
+            NOX_WARN(LOG_MOD_MAIN,
+                     "landlock: desteklenmiyor (abi=%d, errno=%d), "
+                     "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz",
+                     abi, probe_err);
+            return NOX_ERR_LANDLOCK_UNSUPPORTED;
+        }
+        NOX_ERROR(LOG_MOD_MAIN,
+                  "landlock: ABI sorgusu başarısız (%s) — yapılandırma hatası",
+                  strerror(probe_err));
         return NOX_ERR_CONFIG;
     }
 
     if (abi < 1) {
         NOX_WARN(LOG_MOD_MAIN, "landlock: ABI v1 gerekli (abi=%d), "
                  "dosya erişimi KISITLI DEĞİL — seccomp alone yetersiz", abi);
-        return NOX_ERR_CONFIG;
+        return NOX_ERR_LANDLOCK_UNSUPPORTED;
     }
 
     NOX_INFO(LOG_MOD_MAIN, "landlock: ABI v%d tespit edildi", abi);
@@ -214,7 +296,9 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd,
     int ruleset_fd = sys_landlock_create_ruleset(&ruleset_attr,
                                                   sizeof(ruleset_attr), 0);
     if (ruleset_fd < 0) {
-        if (errno == EOPNOTSUPP) {
+        int create_err = errno;
+        if (landlock_syscall_status(ruleset_fd, create_err) ==
+            NOX_LL_SYSCALL_UNSUPPORTED) {
             /* C-2 EK FIX: artık NOX_OK DEĞİL — sandbox kurulamadıysa
              * bunu çağırana "başarı" diye yalan söylemiyoruz. */
             NOX_ERROR(LOG_MOD_MAIN,
@@ -223,7 +307,7 @@ nox_err_t landlock_sandbox_init(int config_dir_fd, int downloads_dir_fd,
             return NOX_ERR_LANDLOCK_UNSUPPORTED;
         }
         NOX_ERROR(LOG_MOD_MAIN, "landlock: ruleset oluşturulamadı (%s)",
-                  strerror(errno));
+                  strerror(create_err));
         return NOX_ERR_CONFIG;
     }
 
@@ -425,3 +509,5 @@ nox_hardbool_t landlock_is_active(void) {
 __u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled) {
     return wanted & handled;
 }
+
+#endif /* !NOX_NO_LANDLOCK */

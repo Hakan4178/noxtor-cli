@@ -35,7 +35,7 @@ If an assumption is false, the corresponding mitigation claim is void.
 |---|---|---|
 | A1 | **PIN entropy is user-responsible.** `crypto.c:180` derives `master_key` via Argon2id (`OPSLIMIT_MODERATE`/`MEMLIMIT_MODERATE`, 16-byte salt) — this slows brute-force but does **not** make a weak PIN strong. A 6-digit PIN (~20 bits) is crackable offline if `contacts.db` + salt file are seized; a 4-word diceware passphrase (~50 bits) or 12+ char mixed passphrase is the intended baseline. Weak PIN is a **user-risk, not a code bug** — document it as such and guide users accordingly (see guidance stub below). `[TODO: maintainer — confirm minimum PIN policy / warning UX on weak PIN]` | Seized DB decryptable offline; onion identity derivable (same `master_key` → `NOX_SUBKEY_ONION_SEED`). |
 | A2 | **libsodium, libsqlite3, libseccomp, Tor behave as documented.** No formal verification of these dependencies; supply-chain compromise is out-of-model except as noted in §4.5. | All crypto/DB/sandbox claims collapse. |
-| A3 | **Kernel ≥5.15 enforces seccomp-bpf + Landlock as implemented in `seccomp.c`/`landlock_sandbox.c`.** F1 (pathname Unix `connect` restriction) additionally requires Landlock ABI 9 / Linux 7.1+; ABI 1-8 gets filesystem confinement only. F3 confines the config tree to `READ_FILE\|READ_DIR` and restricts deletion to the per-instance `tor_data_<pid>` directory (which also holds `torrc`). Older kernels fall back to degraded/no sandbox (§5.4). | Post-exploit blast radius larger; on ABI 1-8 the sandbox can still reach pathname Unix services (D-Bus, ssh-agent, gpg-agent, docker.sock). |
+| A3 | **Kernel ≥5.15 enforces seccomp-bpf + Landlock as implemented in `seccomp.c`/`landlock_sandbox.c` on the default Linux/x86 build.** The Android/arm64 build (`make android release`) deliberately omits both and relies on Android kernel/zygote seccomp + SELinux (§5.4); it keeps the same compiler/linker release hardening as the Linux build. F1 (pathname Unix `connect` restriction) additionally requires Landlock ABI 9 / Linux 7.1+; ABI 1-8 gets filesystem confinement only. F3 confines the config tree to `READ_FILE\|READ_DIR` and restricts deletion to the per-instance `tor_data_<pid>` directory (which also holds `torrc`). F5 aborts on missing fds, inactive sandbox, and config errors. Older kernels fall back to degraded/no sandbox (§5.4). | Post-exploit blast radius larger; on ABI 1-8 the sandbox can still reach pathname Unix services (D-Bus, ssh-agent, gpg-agent, docker.sock); on Android the app-level Landlock guarantee is absent. |
 | A4 | **Tor provides anonymity; Noxtor adds no extra padding/cover traffic.** Message size/timing at Noxtor layer is visible to the guard as Tor cell volume/timing (§4.4). | Metadata minimization (§2) is aspirational until padding is added. |
 | A5 | **Device is clean at launch.** No pre-existing implant reading `argv`/env/PIN keystrokes, and `main.c:141` early-constructor hardening (`PR_SET_DUMPABLE`, `RLIMIT_CORE`, seccomp stage 1) runs before attacker-controlled code in the same process. A tiny `execve → constructor` window remains — treated as residual, not in-scope. `[TODO: verify constructor ordering vs. `LD_PRELOAD` / early ptrace]` | PIN/keystroke exfiltration before hardening. |
 | A6 | **Secure arena (`arena.c`) is mlock'd / `MADV_DONTDUMP` where available, and `sodium_memzero` + `strub` scrub keys on failure paths.** Swap-out and core-dump leakage are mitigated, not proven absent on all kernels. | Forensic RAM/swap recovery (see §4.3). |
@@ -106,7 +106,7 @@ assume. All routing below was traced to `event_loop.c`/`network.c` handlers.
 
 **Verification notes (2026-08-23, code-traced):**
 - **E4/E5 routing isolation — VERIFIED:** `tor_ctrl_fd` and `ps->fd` (peer) are distinct `epoll` registrations (`event_loop.c:38` `find_peer_by_fd` vs `tor_ctrl_fd`); peer `recv` data never reaches `ctrl_read_response` / `parse_service_id` and vice-versa.
-- **E5 control-channel closure (F2, 2026-11-15) — VERIFIED:** her iki `ADD_ONION` `Flags=Detach` ile kurulur; HS + seed↔adres doğrulamasından sonra `tor_close_control_fd()` `shutdown(SHUT_RDWR)` + `close` yapar ve `tor_ctrl_fd = -1` atar. Torrc'de `__OwningControllerProcess <pid>` orphan Tor'a karşı ikinci savunmadır. `test_network` 11/11, canlı `test_tor_detach.sh` 10 PASS / owning 13/13, ürün smoke 22/22 (`docs-priv/kanit/f2-tor-detach-2026-11-13/`).
+- **E5 control-channel closure (F2, 2026-11-15) — VERIFIED:** her iki `ADD_ONION` `Flags=Detach` ile kurulur; HS + seed↔adres doğrulamasından sonra `tor_close_control_fd()` `shutdown(SHUT_RDWR)` + `close` yapar ve `tor_ctrl_fd = -1` atar. Torrc'de `__OwningControllerProcess <pid>` orphan Tor'a karşı ikinci savunmadır. `test_network` 16/16 (biçim/sıra + fd kapatma + torrc sahiplik/generate_torrc/EOF/max-path), canlı `test_tor_detach.sh` 10 PASS / owning 13/13, ürün smoke 22/22 (`docs-priv/kanit/f2-tor-detach-2026-11-13/`).
 - **E6 limits — DOCUMENTED:** filename capped to `255B` (`safe_name[256]`), sanitized via whitelist (`[^a-zA-Z0-9._-]`→`_` `file_transfer.c:51`), `..`→`__`, leading `.`→`_`, empty→`file_<hex>`; file size capped `100 GiB`; DATA chunks 4KB; METADATA+DATA both inside Noise AEAD + BLAKE2b (size-in-hash `file_transfer.c:192`).
 - **E9 TOFU binding — STILL OPEN:** whether `y/n` binds to originating `ps` or active slot is the §7 highest-priority question for `stdin_handler.c` review (next step).
 
@@ -603,6 +603,36 @@ explicitly passes `--allow-unsandboxed-fs`, in which case file writes are
 **not** restricted to `downloads/` and a visible warning is shown before
 continuing with seccomp alone.
 
+**F5 (fail-closed matrix) is enforced (2026-11-16):** missing
+`config_dir_fd`/`downloads_dir_fd`, `landlock_sandbox_init` returning
+`NOX_OK` while `landlock_is_active()` is false, and `NOX_ERR_CONFIG` or
+any unexpected init error all abort startup. `--allow-unsandboxed-fs`
+bypasses **only** `NOX_ERR_LANDLOCK_UNSUPPORTED`; it cannot override a
+configuration error or an inactive sandbox. The pure decision helper is
+covered by `tests/test_landlock_policy.c` (14/14).
+
+**Android/arm64 builds (`make android release`) do not use this path.**
+The Android build profile defines `NOX_PLATFORM_ANDROID`, which sets
+`NOX_NO_LANDLOCK`, `NO_SECCOMP` and `NOX_NO_X86_ASM`; the application
+neither installs a Landlock domain nor loads its own seccomp policy. It
+logs both skips and relies on Android's kernel/zygote seccomp and SELinux
+file restrictions. The x86-only RDTSC/CPUID helpers and CET-SS body are
+not compiled; `cpu_has_shstk()`/`cpu_has_ibt()` are constant `false` and
+`cet_ss_lock_and_verify()` returns `CET_SS_UNSUPPORTED`, so the startup
+CET self-test is skipped and no CET protection is claimed on this
+profile. Generic process hardening (`PR_SET_NO_NEW_PRIVS`,
+`PR_SET_DUMPABLE`, `RLIMIT_CORE`; `PR_SET_MDWE` best-effort) remains
+compiled and applied in this profile; `NO_SECCOMP` no longer disables
+`no_new_privs`. Compiler/linker release hardening is identical to the
+normal Linux release; only the sandbox layers and x86 asm paths are
+omitted.
+This is a weaker application-level guarantee than the Linux/x86 build
+and is an explicit platform trust assumption. The default Linux/x86
+build defines none of these macros; `__aarch64__`/`__ANDROID__`
+auto-detection is deliberately not used, so Android-specific code cannot
+leak into it. Real arm64/bionic verification has not been performed on
+this host; `make android release` here exercises the macro profile only.
+
 **F1 (pathname Unix `connect`) requires ABI 9 / Linux 7.1+.** ABI 1-8 still
 gets filesystem confinement, but `connect()` to pathname Unix sockets
 (D-Bus, ssh-agent, gpg-agent, docker.sock) is not restricted; a visible
@@ -723,6 +753,9 @@ test faults with #CP) aborts the same way: the reported state cannot be
 reconciled with observed behavior, and no "enforced" claim is made
 without lock evidence. Locking is never attempted while shadow stack is
 inactive — locking freezes the *current* (off) status irreversibly.
+In the Android/arm64 profile the x86 CET path is not compiled at all:
+`cet_ss_lock_and_verify()` is a stub returning `CET_SS_UNSUPPORTED`, the
+CPUID query and self-test are skipped, and no CET claim is made.
 
 Until reproducible-build attestation exists, rebuilds on other toolchains
 should be treated as unverified for hardening.

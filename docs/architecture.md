@@ -818,8 +818,11 @@ backend'de: varsayılan `fe_ansi_ops` (statik registration), TUI aktifse
 | `ui_print_progress()` | `frontend.c:207` | Dosya transfer ilerleme → dispatch |
 
 T-02: FE_SYSTEM/FE_ERROR yolları da `atomic_message` ile aynı `ui_strip_ansi`
-temizliğinden geçer; ESC/C0 (TAB/LF/CR hariç) terminal injection'ını engeller.
-CR/LF ve bidi ayrı açık kalemdir (K-33). `test_frontend` 19/19.
+temizliğinden geçer; ESC/C0 (TAB hariç) terminal injection'ını engeller.
+K-33 (16 Kasım çalışma ağacı): çıktıda CR/LF boşluğa katlanır, C1 ve bidi
+kontrol kodları düşürülür; stdin `ui_strip_input` ile aynı temizliği yapar
+ama satır sonlarını korur. `test_frontend` 19/19, `test_ansi_strip` 19/19,
+`test_attack_chain` 2/2.
 
 ---
 
@@ -857,6 +860,9 @@ CR/LF ve bidi ayrı açık kalemdir (K-33). `test_frontend` 19/19.
 │    tor_data_<pid> (REMOVE_FILE|REMOVE_DIR); torrc orada │
 │  • F2: Tor control fd HS + seed↔adres doğrulaması sonrası│
 │    kapatılır; HS Flags=Detach ile yaşar                 │
+│  • F5: Landlock fail-closed — eksik fd, init OK ama     │
+│    !active ve NOX_ERR_CONFIG abort; --allow-unsandboxed- │
+│    fs yalnız UNSUPPORTED için                           │
 │  • config RO: identity.key/salt event loop’ta okunabilir (şeffaf, bilerek — şifreli, HS sonrası RAM-only) │
 │  • O_NOFOLLOW: symlink izleme engeli                    │
 │  • O_EXCL: yarış koşulu koruması                        │
@@ -908,6 +914,38 @@ düşer, ama truncate hiç kısıtlanmaz; sandbox öncesi açılmış fd'ler de
 ancak pathname Unix soketlerine `connect` kısıtlanamaz; uygulama görünür
 uyarı basar. `--require-landlock-resolve-unix` bu durumda fail-closed
 yapar.
+
+**F5 fail-closed matrisi:** `landlock_fs_policy_decide()` (`src/landlock_sandbox.c`)
+eksik config/downloads fd'sini, `init OK` olmasına rağmen `!landlock_is_active()`
+durumunu ve `NOX_ERR_CONFIG`/diğer hataları **abort** eder.
+`--allow-unsandboxed-fs` yalnız `NOX_ERR_LANDLOCK_UNSUPPORTED` + `!active`
+durumunda uyarıyla devam sağlar; diğer hataları bypass etmez. ABI probe'unda
+`ENOSYS`/`EOPNOTSUPP` unsupported, diğer hatalar config hatası sayılır.
+Karar matrisi `tests/test_landlock_policy.c` ile **14/14** doğrulanır;
+kernel gerektirmez.
+
+**Android/arm64 build ayrımı:** Yalnız `make android release` build'i
+`-DNOX_PLATFORM_ANDROID` tanımlar. `android` goal'ı platformu otomatik
+seçer; ayrıca `PLATFORM=` değişkeni gerekmez. Build, normal `make release`
+ile aynı `RELEASE_FLAGS` + `RELEASE_LINK` sertleştirmesini kullanır
+(PIE/RELRO/BIND_NOW/noexec stack/CET/`-fhardened`/LTO); fark seccomp,
+Landlock ve x86 CET/CPUID asm'inin dışlanmasıdır. `include/common.h` bu
+makroyu `NOX_NO_LANDLOCK` + `NO_SECCOMP` + `NOX_NO_X86_ASM`'e çevirir;
+`Makefile` `NOX_NO_X86_ASM`'i include sırasına duyarlı olmasın diye
+derleme komutuna da açıkça verir. `src/seccomp.c` derlenmez, uygulama
+Landlock katmanı kurmaz. `src/main.c` stage 2 ve `src/event_loop.c`
+stage 3, Landlock init dalı atlandığını log'lar. `include/asm_utils.h`
+RDTSC/CPUID yardımcılarını derlemez; `cpu_has_shstk()`/`cpu_has_ibt()`
+`false` döner. `src/cet_shstk.c` x86 gövdesi yerine
+`cet_ss_lock_and_verify()` → `CET_SS_UNSUPPORTED` stub'ı derler;
+`src/main.c` CET self-test'ini atlar ve CPUID yerine Android bilgi
+log'u basar. Generic süreç sertleştirmesi (`PR_SET_NO_NEW_PRIVS`,
+`PR_SET_DUMPABLE`, `RLIMIT_CORE`; `PR_SET_MDWE` best-effort) Android
+profilinde de derlenir ve uygulanır; `NO_SECCOMP` artık
+`no_new_privs`'i kapatmaz. Android'de kernel/zygote seccomp'u + SELinux
+dosya kısıtları kullanılır. `__aarch64__`/`__ANDROID__` otomatik
+algılaması yoktur; varsayılan Linux/x86 build'inde bu makrolar
+tanımsızdır ve davranış değişmez.
 
 **Gelecek yerel Unix IPC için not (13 Kasım 2026, upstream doğrulama turu):**
 ABI ≥ 9'da `RESOLVE_UNIX` istisna listesi **yalnız Tor'un `socks.sock`
@@ -1000,7 +1038,10 @@ Not: allowlist yalnız stage 3'ten itibaren yürürlüktedir (kullanıcı
 kararı 2026-11-13); stage 2 aile kuralları bootstrap penceresinde erken
 kapatma için korunur. Test: test_seccomp_stage3 57/57 (14 yeni aile),
 test_seccomp_badpatch socket matrisi (allowlist ters çevrilince sapma
-görünüyor).
+görünüyor). `NO_SECCOMP=1` build'inde `src/seccomp.c` derlenmez;
+`include/seccomp_policy.h` no-op `seccomp_policy_load()` stub'ı sağlar.
+`test_no_seccomp_build.sh` geçici kopyada link + libseccomp yokluğunu
+doğrular (K-07/T-01).
 ```
 
 ### 10.3 Arena Bellek Topolojisi
@@ -1042,28 +1083,31 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 
 ## 11. Test Kapsamı
 
-### 11.1 Unit Testler (33 süit — 460/460, `make test`; B2a baseline 444/444)
+### 11.1 Unit Testler (36 unit süit + 4 e2e — `make test` exit 0)
 
 | Test Dosyası | Test Sayısı | Kapsadığı Fonksiyonlar |
 |--------------|-------------|------------------------|
-| `test_ansi_strip.c` | 16 | ANSI/OSC/DCS strip, C0 filtreleme |
+| `test_ansi_strip.c` | 19 | ANSI/OSC/DCS strip, C0 filtreleme, K-33 CR/LF/C1/bidi + stdin EOL |
 | `test_arena.c` | 24 | arena_init (T-05 çift-init), alloc, canary, destroy |
-| `test_cet_shstk.c` | 3 | CET-SS kilidi, fork-CP self-test sonuçları |
+| `test_attack_chain.c` | 2 | K-23 aktif-peer split-brain + K-33 UI satır/bidi zinciri |
+| `test_cet_shstk.c` | 3 (+3 stub) | CET-SS kilidi, fork-CP self-test sonuçları; `NOX_NO_X86_ASM` stub'ı |
 | `test_chunk_size.c` | 8 | UTF-8 güvenli chunk noktası |
 | `test_crypto.c` | 10 | Argon2id, subkey, salt, identity roundtrip, Ed25519→Curve25519 |
 | `test_database.c` | 5 | DB open/close, contacts, wrong key, queue, history |
 | `test_event_frames.c` | 35 | Frame parsing/routing, H2/H3, K-14 CTRL fail-fast, B1 trickle/T2, B2a gerçek-handshake |
-| `test_file_transfer.c` | 14 | TX/RX, kota, chunk timeout, T-03 METADATA kısmi yazım, fatal flush, 100-chunk akış/hash |
+| `test_file_transfer.c` | 15 | TX/RX, kota, chunk timeout, T-03 METADATA kısmi yazım, T-04/K-29 sniff, fatal flush, 100-chunk akış/hash |
 | `test_frame_queue.c` | 6 | TX kuyruğu sıra/seq, kısmi yazma, fatal teardown |
 | `test_frame_queue_edges.c` | 8 | Ring wrap, reserve/commit atomikliği, kısmi yazım, fatal teardown |
+| `test_frame_queue_contract.c` | 8 | `arm_tx` fail-closed + EPOLLOUT ilgisi, **zeroize sızıntı kanıtı**, reset'te tx_seq monoton, peer izolasyonu, EINTR stresi |
 | `test_c1_text_paths.c` | 10 | TEXT kuyruklama, segmented AEAD sırası, kuyruk dolu/AGAIN, EPOLLOUT liveness |
 | `test_frontend.c` | 19 | Dispatch, FE_SYSTEM/FE_ERROR strip, TUI no-op |
 | `test_landlock_rights.c` | 24 | Landlock hak maskeleme + F1 RESOLVE_UNIX + F3 config/tor_data (birim + entegrasyon) |
+| `test_landlock_policy.c` | 14 | F5 fail-closed karar matrisi (kernel gerektirmez; Android build'inde de derlenir) |
 | `test_log.c` | 1 | Modül log seviyesi |
 | `test_mdwe.c` | 3 | MDWE prctl politikası |
 | `test_net_cleanup.c` | 9 | Soket/peer temizliği |
 | `test_net_io.c` | 28 | Parçalı okuma, EINTR, read/write timeout, slow-loris, EPIPE/SIGPIPE |
-| `test_network.c` | 11 | Frame encode/decode, listener, ADD_ONION biçim/sıra + control fd kapatma (F2) |
+| `test_network.c` | 16 | Frame encode/decode, listener, ADD_ONION biçim/sıra, control fd kapatma + torrc sahiplik/generate_torrc/EOF/max-path (F2) |
 | `test_noise.c` | 17 | Handshake, transport roundtrip, MAC/AD tamper, spec vectors |
 | `test_onion_bind.c` | 13 | Onion↔static key claim üret/doğrula (H-1/H-2) |
 | `test_onion_derive.c` | 7 | Onion seed determinizmi, expanded key format |
@@ -1072,6 +1116,7 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 | `test_seccomp_stage2.c` | 41 | Stage 2 kural seti + clone/prctl özel kuralları |
 | `test_seccomp_stage3.c` | 57 | AF_INET/INET6, clone, DNS, W^X, AF_NETLINK + **S-1 allowlist: 14 aile (AF_PPPOX, TIPC, IB, MCTP, RXRPC, LLC, IRDA, ISDN, SNA, PHONET, X25, DECnet, BRIDGE, ASH) + AF_UNIX tip varyantları** |
 | `test_sm_cleanup.c` | 15 | Durum makinesi cleanup yolları |
+| `test_state_machine_matrix.c` | 8 | Durum/olay matrisi ve geçiş sınırları |
 | `test_socks_peer.c` | 3 | SOCKS `SO_PEERCRED` doğrulaması |
 | `test_stdin.c` | 16 | Komut ayrıştırma, segmentasyon |
 | `test_time_expiry.c` | 6 | Zaman aşımı predikatları |
@@ -1080,28 +1125,61 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 | `test_tx_order.c` | 3 | FILE/TEXT/METADATA wire sırası / nonce sırası |
 | `test_wire_hardening.c` | 9 | Wire format sertleştirmesi |
 
+Ortak test altyapısı: `tests/test_common.h` assert/runner makrolarını;
+`tests/test_support.h` proje bağımsız yardımcıları (`nox_test_ts_of`,
+`nox_test_read_exact`, `nox_test_seccomp_run`); `tests/test_protocol_support.h`
+Noise/frame/fixture yardımcılarını (`nox_test_init_cipher_session`,
+`nox_test_read_frame`, `nox_test_make_split_pair`, `nox_test_fixture_reset`,
+`nox_test_frame_fixture_teardown`) sağlar. Tümü `static inline`'dır; her test
+tek çeviri birimi olarak derlendiği için Makefile'da ek nesne kuralı yoktur.
+Böylece `make_split_pair`, `read_exact`, `read_frame`, `init_cipher_session`,
+`ts_of`, seccomp `run_test`, frame-queue `fixture_teardown` ve `fixture_reset`
+kopyaları tek tanıma indirilmiştir. `test_frame_queue_edges` içindeki kopya
+test adı `test_fatal_write_teardown_multi_frame` olarak ayrıştırılmıştır;
+`test_frame_queue_contract.c` farklı teardown semantiği nedeniyle yerel
+kalır.
+
 Ayrıca: `test_onion_derive.sh` — onion e2e: determinizm + canlı Tor
 `ADD_ONION` ServiceID eşleşmesi (`make test` sonunda koşar).
 `test_tor_detach.sh` — F2 canlı control-spec testi: `Flags=Detach`
 kalıcılığı, yanlış sıra reddi, `TAKEOWNERSHIP`/`DROPOWNERSHIP` ve
 `__OwningControllerProcess` (owning testi `make test-tor-owning`).
+`test_no_seccomp_build.sh` — K-07/T-01: kaynağı geçici dizine kopyalayıp
+gerçek `make NO_SECCOMP=1` build'ini koşar; link başarısı, libseccomp
+yokluğu ve `seccomp_policy_load` sembolünün çözülmesi doğrulanır.
 `test_seccomp.c` (make seccomp-test) — tüm seccomp kural dizisinin
 canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
 
 **Bilinen kırmızı yok.** C2 ile METADATA ve FILE chunk'ları ortak TX
-kuyruğuna alındı; `test_file_transfer` 14/14, `test_tx_order` 3/3, B1
-trickle ve B2a gerçek-handshake testleriyle `test_event_frames` 35/35 ve
-tam `make test` 460/460 (S1 seccomp test genişlemesi dahil; B2a baseline
-444/444) yeşildir. K-28/T-03, HF-1/B1 ve B2a kapanmıştır;
-B2b (iki ayrı süreç + Tor) kullanıcı kararıyla ertelendi (ayrı izleme
-kalemi).
+kuyruğuna alındı; `test_file_transfer` 15/15 (T-04/K-29 dahil),
+`test_tx_order` 3/3, B1 trickle ve B2a gerçek-handshake testleriyle
+`test_event_frames` 35/35; K-23 + K-33 zinciri `test_attack_chain` 2/2
+ve tam `make test` exit 0. K-28/T-03, K-29/T-04, K-23, K-33, HF-1/B1 ve
+B2a kapandı; B2b (iki ayrı süreç + Tor) kullanıcı kararıyla ertelendi
+(ayrı izleme kalemi).
 
 `test_seccomp_stage3` 57/57 — `sendto` bilinçli istisna (glibc `send()`
 uyumu; `TODO(IPC-SENDTO)`).
 
-`make test` bu nedenle exit 0 döner; 33 süitin tamamı yeşildir.
+`make test` bu nedenle exit 0 döner; 36 unit süit + 4 e2e betiğinin
+tamamı yeşildir.
 
-### 11.2 Formal Doğrulama (CBMC + ESBMC + ProVerif)
+### 11.2 Formal Doğrulama (CBMC + ESBMC + ProVerif) — ESKİ / GEÇERSİZ
+
+> **Durum: ESKİ / GEÇERSİZ (2026-11-16 itibarıyla).** Aşağıdaki
+> "VERIFICATION SUCCESSFUL" sonuçları tarihseldir ve **güncel kaynak
+> kodu doğrulamaz**. Sekiz harness'ın beşi üretim kaynağını derlemez
+> (`cbmc_crypto`, `cbmc_stdin`, `cbmc_noise_easy`,
+> `cbmc_sanitize_filename`, `cbmc_validate_onion`); bunlar kopya veya
+> indirgenmiş model doğrular. `cbmc_stdin` C1/C2 öncesi API'ye aittir;
+> `cbmc_crypto` üretimden zayıf Argon2 parametreleri ve eksik zeroize
+> yolları kullanır. `cbmc_sanitize_filename` ile `cbmc_validate_onion`
+> `formal-verify.sh`'e bağlı değildir; tablodaki `sanitize_filename.c`
+> ve `validate_onion.c` adlı kaynak dosyalar mevcut değildir. Formal
+> doğrulama CI'da çalışmaz. 2026-11-16 koşusunda ESBMC `log` hedefi
+> 300 s'de zaman aşımına uğradı; `sm` hedefi ESBMC'nin nesne yerleşimi
+> artefaktı nedeniyle başarısız oldu. Güncel hüküm ve gerekçe:
+> `docs-priv/KONSOLIDE-BULGULAR.md` §22.
 
 | Kaynak | CBMC/ESBMC | Durum |
 |--------|-----------|-------|
@@ -1115,11 +1193,12 @@ uyumu; `TODO(IPC-SENDTO)`).
 | `validate_onion.c` (cbmc_validate_onion.c) | ✅ | VERIFICATION SUCCESSFUL |
 | Noise XX protokolü (tests/proverif/) | ProVerif | XX.noise.active.pv, XX.noise.passive.pv |
 
-**Son koşu (2026-11-13):** `formal-verify.sh stdin` **3/3** — CBMC unwind 100
-(387 property), ESBMC unwind 100 (29 property) ve ESBMC unwind 4200
-(44 property) `VERIFICATION SUCCESSFUL`. Yerel ESBMC 8.6.0 build'i
-kullanıldı (sistemdeki `/usr/local/bin/esbmc`, Boost 1.91 ABI uyuşmazlığı
-nedeniyle çalışmıyor).
+**Tarihsel son koşu (2026-11-13; yalnızca `cbmc_stdin` model harness'ı):**
+`formal-verify.sh stdin` **3/3** — CBMC unwind 100 (387 property), ESBMC
+unwind 100 (29 property) ve ESBMC unwind 4200 (44 property)
+`VERIFICATION SUCCESSFUL`. Bu sonuç `src/stdin_handler.c`'nin güncel
+hâlini kapsamaz. Yerel ESBMC 8.6.0 build'i kullanıldı (sistemdeki
+`/usr/local/bin/esbmc`, Boost 1.91 ABI uyuşmazlığı nedeniyle çalışmıyor).
 
 ### 11.3 Fuzz Testler
 
@@ -1149,18 +1228,17 @@ kampanyaları `fuzz_ctrl` 120 sn, `fuzz_stdin` 120 sn ve `fuzz_handshake`
 
 ```bash
 # Unit testler
-make test                    # 33 süit, 460/460 — ASan+UBSan
-                             # (kırmızı yok; C2/T-03/B1/B2a kapandı)
+make test                    # 36 unit süit + 4 e2e — exit 0, ASan+UBSan
+                             # (kırmızı yok; C2/T-03/T-04/K-23/K-33/K-07-T-01/B1/B2a kapandı)
 make seccomp-test            # Seccomp canlı kural testi
 
 # Tek süit
 ./tests/test_net_io          # örn. ağ G/Ç sertleştirmesi (28/28)
 
-# Formal doğrulama
-./tests/formal-verify.sh     # Tümü (CBMC + ESBMC)
-PATH="/home/hakan/esbmc/build/src/esbmc:$PATH" \
-  ./tests/formal-verify.sh stdin  # çalışan yerel ESBMC 8.6.0 build'i
-./tests/formal-verify.sh arena    # Sadece arena
+# Formal doğrulama — UYARI: hedefler güncel kodu doğrulamaz; bkz. §11.2.
+./tests/formal-verify.sh     # Tümü (CBMC + ESBMC; ESBMC_BIN otomatik bulunur)
+ESBMC_BIN=/path/to/esbmc ./tests/formal-verify.sh stdin  # açık ESBMC seçimi
+./tests/formal-verify.sh arena    # Sadece arena (yalnızca CBMC)
 ./tests/formal-verify.sh sm       # Sadece state machine
 
 # ProVerif
@@ -1234,29 +1312,34 @@ noxtor-cli/
 │   ├── fuzz_noise_differential_noise_star.c # noise_star differential
 │   ├── formal-verify.sh     # Dual formal verification script
 │   ├── proverif/            # ProVerif modeli (XX.noise.active.pv, ...)
-│   ├── test_ansi_strip.c    # ANSI/C0 strip (16)
+│   ├── test_ansi_strip.c    # ANSI/C0 + K-33 CR/LF/C1/bidi (19)
+│   ├── test_attack_chain.c  # K-23 + K-33 saldırgan zinciri (2)
 │   ├── test_arena.c         # Arena unit tests (24; T-05 çift-init)
-│   ├── test_cet_shstk.c     # CET-SS kilidi + self-test (3)
+│   ├── test_cet_shstk.c     # CET-SS kilidi + self-test (3; +3 stub)
 │   ├── test_chunk_size.c    # UTF-8 chunk noktası (8)
 │   ├── test_crypto.c        # Crypto unit tests (10)
 │   ├── test_database.c      # Database unit tests (5)
 │   ├── test_event_frames.c  # Frame/H2/H3/K-14 + B1 trickle + B2a (35)
-│   ├── test_file_transfer.c # Dosya transferi + T-03/fatal flush (14)
+│   ├── test_file_transfer.c # Dosya transferi + T-03/T-04/fatal flush (15)
 │   ├── test_frame_queue.c   # C1 TX kuyruğu (6)
 │   ├── test_frame_queue_edges.c # C1 ring/atomiklik/kısmi yazım (8)
+│   ├── test_frame_queue_contract.c # C1 sözleşme/arm_tx/zeroize (8)
 │   ├── test_c1_text_paths.c # C1 TEXT/kuyruk/EPOLLOUT (10)
 │   ├── test_frontend.c      # Frontend dispatch + T-02 strip (19)
 │   ├── test_landlock_rights.c # Landlock rights + F1/F3 (24)
+│   ├── test_landlock_policy.c # F5 fail-closed matrisi (14)
 │   ├── test_log.c           # Log seviyesi (1)
 │   ├── test_mdwe.c          # MDWE politikası (3)
 │   ├── test_net_cleanup.c   # Soket/peer temizliği (9)
 │   ├── test_net_io.c        # Ağ G/Ç timeout/EINTR/EPIPE (28)
-│   ├── test_network.c       # Network unit tests (10)
+│   ├── test_network.c       # Network unit tests (16)
 │   ├── test_noise.c         # Noise unit tests (17)
 │   ├── test_onion_bind.c    # Onion↔static key claim (13)
 │   ├── test_onion_derive.c  # Onion türetme unit tests (7)
+│   ├── test_no_seccomp_build.sh # NO_SECCOMP=1 build (K-07/T-01)
 │   ├── test_onion_derive.sh # Onion e2e (determinizm + canlı Tor ADD_ONION)
 │   ├── test_pin.c           # PIN unit tests (12)
+│   ├── test_protocol_support.h # Ortak Noise/frame/fixture helper'ları
 │   ├── test_seccomp.c       # Seccomp live tests (make seccomp-test)
 │   ├── test_seccomp_stage1.c # Stage 1 (15)
 │   ├── test_seccomp_stage2.c # Stage 2 (41)
@@ -1264,6 +1347,7 @@ noxtor-cli/
 │   ├── test_sm_cleanup.c    # Durum makinesi cleanup (15)
 │   ├── test_socks_peer.c    # SOCKS SO_PEERCRED (3)
 │   ├── test_stdin.c         # Komut/segmentasyon (16)
+│   ├── test_support.h       # Ortak saf test helper'ları (static inline)
 │   ├── test_time_expiry.c   # Zaman aşımı (6)
 │   ├── test_tofu_epoch.c    # TOFU epoch (9)
 │   ├── test_tor_peer.c      # Tor control SO_PEERCRED (4)
