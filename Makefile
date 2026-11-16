@@ -48,6 +48,25 @@ TEST_DIR := tests
 # ================================================================
 # KAYNAK VE NESNE DOSYALARI
 # ================================================================
+# Platform: linux (varsayılan) | android
+# Android/arm64 hedefi Landlock, uygulama seccomp politikası ve x86
+# CET/CPUID asm'ini derlemez; Android kernel/zygote seccomp + SELinux
+# dosya kısıtları kullanılır.
+# Tercih edilen kullanım: `make android release`
+# `android` goal'ı platformu otomatik seçer; ayrıca PLATFORM değişkeni
+# vermeye gerek yoktur. Varsayılan Linux build PLATFORM_DEF tanımlamaz.
+ifneq ($(filter android,$(MAKECMDGOALS)),)
+    PLATFORM := android
+else
+    PLATFORM ?= linux
+endif
+ifeq ($(PLATFORM),android)
+    override NO_SECCOMP := 1
+    PLATFORM_DEF := -DNOX_PLATFORM_ANDROID -DNOX_NO_X86_ASM
+else
+    PLATFORM_DEF :=
+endif
+
 SRCS_ALL := $(wildcard $(SRC_DIR)/*.c)
 # NO_SECCOMP=1 ise seccomp.c'yi hariç tut
 ifeq ($(NO_SECCOMP),1)
@@ -142,7 +161,8 @@ HARDEN_COMMON := \
     -fPIE \
     -pipe \
     $(TUI_DEF) \
-    $(SECCOMP_DEF)
+    $(SECCOMP_DEF) \
+    $(PLATFORM_DEF)
 
 LINK_COMMON := \
     -pie \
@@ -229,7 +249,7 @@ UBSAN_OPTS := print_stacktrace=1:halt_on_error=1
 # ================================================================
 # HEDEFLER
 # ================================================================
-.PHONY: all debug release _release_build analyze test test-onion test-tor-detach test-tor-owning fuzz fuzz-run clean
+.PHONY: all debug android release _release_build analyze test test-onion test-tor-detach test-tor-owning fuzz fuzz-run clean
 
 # Varsayılan hedef — -include edilen .d dosyalarındaki kuralların ilk hedef
 # hâline gelmesini (src/arena.o) engellemek için açıkça belirtilir
@@ -244,12 +264,23 @@ debug: LDFLAGS = $(LINK_COMMON)
 debug: $(TARGET)
 
 # ----------------------------------------------------------------
+# ANDROID — yalnız release ile birlikte: `make android release`
+# Aynı RELEASE_FLAGS/RELEASE_LINK sertleştirmesi kullanılır; fark
+# yalnız NOX_PLATFORM_ANDROID (Landlock + seccomp kaynakları hariç).
+# ----------------------------------------------------------------
+android:
+	@if [ -z "$(filter release,$(MAKECMDGOALS))" ]; then \
+	    echo "HATA: Android için 'make android release' kullanın." >&2; \
+	    exit 1; \
+	fi
+
+# ----------------------------------------------------------------
 # RELEASE — recursive make ile temiz flag garantisi
 # ----------------------------------------------------------------
 release:
-	@echo "[*] Release build başlıyor (clean + yeniden derleme)..."
+	@echo "[*] Release build başlıyor (clean + yeniden derleme, PLATFORM=$(PLATFORM))..."
 	$(MAKE) clean
-	$(MAKE) _release_build TUI=$(TUI)
+	$(MAKE) _release_build TUI=$(TUI) PLATFORM=$(PLATFORM)
 	strip --strip-debug $(TARGET)
 	@if objdump -T $(TARGET) 2>/dev/null | grep -q "__sanitizer"; then echo "[!] HATA: release binary sanitizer sembolü içeriyor"; exit 1; fi
 	@echo "[*] Binary: $(TARGET)"
@@ -333,6 +364,10 @@ test: $(TEST_BINS)
 	    echo ">> seccomp bad-patch dedektörü (K-01 negatif kontrol)"; \
 	    $(TEST_DIR)/test_seccomp_badpatch.sh || failed=1; \
 	fi; \
+	if [ $$failed -eq 0 ] && [ -x $(TEST_DIR)/test_no_seccomp_build.sh ]; then \
+	    echo ">> NO_SECCOMP=1 build regresyonu (K-07/T-01)"; \
+	    $(TEST_DIR)/test_no_seccomp_build.sh || failed=1; \
+	fi; \
 	[ $$failed -eq 0 ] && echo "=== Tüm testler başarılı ===" || exit 1
 
 # ----------------------------------------------------------------
@@ -357,6 +392,19 @@ $(TEST_DIR)/%: $(TEST_DIR)/%.c $(TEST_SRC_OBJS)
 	$(MSG) 'TEST' '$@'
 	$(Q)$(CC) $(TEST_CFLAGS) $(DEPFLAGS) -I$(INC_DIR) $< $(TEST_SRC_OBJS) \
 	    -o $@ $(TEST_LDFLAGS) $(LIBS)
+
+# ----------------------------------------------------------------
+# NOX_NO_X86_ASM stub regresyonu — aynı CET testi, x86 asm kapalı.
+# Android/arm64 yolunda cet_ss_lock_and_verify() UNSUPPORTED döner;
+# bu hedef bayrağın x86 host'ta da doğru derlendiğini doğrular.
+# ----------------------------------------------------------------
+TEST_BINS += $(TEST_DIR)/test_cet_shstk_no_x86_asm
+$(TEST_DIR)/test_cet_shstk_no_x86_asm: $(TEST_DIR)/test_cet_shstk.c $(SRC_DIR)/cet_shstk.c
+	$(MSG) 'TEST' '$@ (NOX_NO_X86_ASM)'
+	$(Q)$(CC) $(TEST_CFLAGS) -DNOX_NO_X86_ASM -I$(INC_DIR) $^ \
+	    -o $@ $(TEST_LDFLAGS) $(LIBS)
+
+test: $(TEST_DIR)/test_cet_shstk_no_x86_asm
 
 # ----------------------------------------------------------------
 # AFL++ FUZZER — make fuzz / make fuzz-run

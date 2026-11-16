@@ -179,6 +179,16 @@ static void early_hardening_init(void) {
     (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
     _exit(1);
   }
+#ifdef PR_SET_NO_NEW_PRIVS
+  /* Seccomp stage 1 constructor'ı kendi içinde de set eder; constructor
+   * sırası garanti olmadığı için burada da koşulsuz uygulanır. NO_SECCOMP
+   * (ör. Android profili) build'inde tek garanti burasıdır. */
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    const char msg[] = "FATAL: PR_SET_NO_NEW_PRIVS başarısız\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+  }
+#endif
   struct rlimit core_zero = {0, 0};
   if (setrlimit(RLIMIT_CORE, &core_zero) != 0) {
     const char msg[] = "FATAL: RLIMIT_CORE sıfırlanamadı\n";
@@ -925,6 +935,12 @@ int main(int argc, char *argv[]) {
     /* ── 1. Log sistemi ────────────────────────────────── */
     NOX_INFO(LOG_MOD_MAIN, "%s v%s başlatılıyor", PARANOID_APP_NAME,
              PARANOID_VERSION);
+#if defined(NOX_PLATFORM_ANDROID)
+    /* DİKKAT — Android profili sertleştirme kaybı, açılışta bir kez görünür. */
+    NOX_WARN(LOG_MOD_HARD,
+             "DİKKAT: Android build x86 CET-SS/IBT kilidi ve Landlock ve uygulama seccomp YOK"
+             "Strub/hardbool gibi GCC sertleştirmeleri olmayabilir");
+#endif
 
      /* ── tzset() — en başta, sandbox'tan ÖNCE ──────────────────
      * localtime_r() ilk çağrısında /etc/localtime'i açabilir. Bu, Landlock
@@ -932,7 +948,7 @@ int main(int argc, char *argv[]) {
      * düşebilir veya EACCES alabilir. tzset() erken çağrılırsa zaman dilimi
      * önceden çözümlenir ve sonraki sandbox kısıtlamalarından etkilenmez.
      * İlk localtime_r çağrısı step 1'deki log sistemi — bu yüzden ondan
-     * önce gelmeli. (Faz 1, commit 2) */
+     * önce gelmeli. */
     tzset();
 
     /* ── 2. Signal handler'lar ─────────────────────────── */
@@ -948,12 +964,17 @@ int main(int argc, char *argv[]) {
     NOX_INFO(LOG_MOD_MAIN, "libsodium başlatıldı");
 
     /* ── 4. CPU yetenek kontrolü ───────────────────────── */
+#if defined(NOX_NO_X86_ASM)
+    NOX_INFO(LOG_MOD_HARD,
+             "android: CET/IBT x86 asm devre dışı. Donanım sorgusu atlandı");
+#else
     NOX_INFO(LOG_MOD_HARD, "shadow stack (CET-SS): %s",
              cpu_has_shstk() ? "destekleniyor" : "desteklenmiyor");
     NOX_INFO(LOG_MOD_HARD, "IBT (CET-IBT): %s",
              cpu_has_ibt() ? "destekleniyor" : "desteklenmiyor");
+#endif
 
-#ifdef NDEBUG
+#if defined(NDEBUG) && !defined(NOX_NO_X86_ASM)
     /* ── 4b. CET-SS kilidi + self-test ──────────────────────
      * Adım 4'ün raporundan hemen sonra, PIN'den ÖNCE (5/6):
      * self-test fork() yapar — key materyali henüz yok.
@@ -1430,14 +1451,24 @@ int main(int argc, char *argv[]) {
      * Eski kernel (EINVAL): geç — seccomp W^X yine aktif. */
     if (prctl(PR_SET_MDWE, (unsigned long)PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) == 0) {
       NOX_INFO(LOG_MOD_MAIN,
-               "W^X: PR_SET_MDWE aktif (çekirdek düzeyi exec-gain engeli)");
+               "W^X: PR_SET_MDWE aktif (kernel ≥6.3)");
     } else {
+#if defined(NO_SECCOMP)
       NOX_INFO(LOG_MOD_MAIN,
-               "W^X: PR_SET_MDWE yok (kernel <6.3? — errno=%d) — seccomp W^X devrede",
-               errno);
+               "W^X: PR_SET_MDWE yok (kernel <6.3? — errno=%d) — "
+               "seccomp W^X devre dışı", errno);
+#else
+      NOX_INFO(LOG_MOD_MAIN,
+               "W^X: PR_SET_MDWE yok (kernel <6.3? — errno=%d) — "
+               "seccomp W^X devrede", errno);
+#endif
     }
 
-#ifndef NO_SECCOMP
+#if defined(NOX_PLATFORM_ANDROID)
+    NOX_INFO(LOG_MOD_MAIN,
+             "android: seccomp stage 2 atlandı — Android kernel/zygote "
+             "seccomp'u kullanılıyor");
+#elif !defined(NO_SECCOMP)
     if (seccomp_policy_load(2) != NOX_OK) {
       NOX_FATAL(LOG_MOD_MAIN, "seccomp stage 2 yüklenemedi — abort");
       cleanup(&state);

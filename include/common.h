@@ -14,6 +14,35 @@
 #endif
 
 /* ================================================================
+ * PLATFORM SEÇİMİ — yalnız build sistemi tanımlar
+ *
+ * Varsayılan Linux/x86 build'de NOX_PLATFORM_ANDROID tanımsızdır.
+ * Android/arm64 hedefi (`make android release`) bunu tanımlar:
+ *   - Landlock yok  → NOX_NO_LANDLOCK
+ *   - Uygulama seccomp politikası yok → NO_SECCOMP
+ *   - x86 CET/CPUID/RDTSC asm yok → NOX_NO_X86_ASM
+ * Android'de kernel/zygote seccomp + SELinux dosya kısıtları kullanılır.
+ *
+ * `NOX_NO_X86_ASM` ayrıca doğrudan da verilebilir (gelecekteki Linux/arm64
+ * profili); Makefile Android build'inde açıkça tanımlar. `asm_utils.h`
+ * include sırasına duyarlı olmasın diye bayrak derleme komutuna da girer.
+ *
+ * __aarch64__ / __ANDROID__ otomatik algılaması bilinçli olarak YOK:
+ * aynı kaynak normal x86 build'e sızmamalı.
+ * ================================================================ */
+#if defined(NOX_PLATFORM_ANDROID)
+#  ifndef NOX_NO_LANDLOCK
+#    define NOX_NO_LANDLOCK 1
+#  endif
+#  ifndef NO_SECCOMP
+#    define NO_SECCOMP 1
+#  endif
+#  ifndef NOX_NO_X86_ASM
+#    define NOX_NO_X86_ASM 1
+#  endif
+#endif
+
+/* ================================================================
  * STANDART INCLUDE'LAR
  * ================================================================ */
 #include <stdint.h>

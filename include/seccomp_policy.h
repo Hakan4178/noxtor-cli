@@ -50,6 +50,19 @@
  *
  * Return: NOX_OK başarı, NOX_ERR_CRYPTO hata
  */
+#ifdef NO_SECCOMP
+/* T-01/K-07: NO_SECCOMP=1 build'inde src/seccomp.c derlenmez. Çağrı
+ * noktaları (event_loop.c stage 3 dahil) bu sembole referans verdiği
+ * için, politika yüklenmemiş sayılan no-op bir stub sağlanır. Böylece
+ * "seccomp devre dışı" build'i link aşamasında kırılmaz; gerçek
+ * politika yalnız NO_SECCOMP=0 build'inde uygulanır. */
+static inline nox_err_t seccomp_policy_load(int stage)
+{
+  (void)stage;
+  return NOX_OK;
+}
+#else
 nox_err_t seccomp_policy_load(int stage);
+#endif
 
 #endif /* NOX_SECCOMP_POLICY_H */

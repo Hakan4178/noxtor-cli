@@ -15,6 +15,11 @@
 
 #include "common.h"
 
+/* Android/arm64 build'inde (NOX_PLATFORM_ANDROID) Landlock yoktur:
+ * Linux UAPI tipleri ve hak maskeleri derlenmez. Normal Linux/x86
+ * build'inde bu blok aynen korunur. */
+#ifndef NOX_NO_LANDLOCK
+
 #include <linux/landlock.h>
 
 /* Eski kernel header'larıyla derlenen binary yeni kernelde sessizce
@@ -59,6 +64,34 @@
  * Return:   allowed_access — her zaman handled'ın alt kümesi
  */
 __u64 nox_ll_compute_rule_rights(__u64 wanted, __u64 handled);
+
+#endif /* !NOX_NO_LANDLOCK */
+
+/* F5: Landlock dosya sistemi politikası — saf karar yardımcısı.
+ * event_loop yalnız bu kararı mesaj/çıkışa çevirir; test matrisi
+ * kernel gerektirmez. */
+typedef enum {
+    NOX_LL_FS_RUN = 0,          /* sandbox aktif, devam */
+    NOX_LL_FS_RUN_UNSANDBOXED,  /* yalnız unsupported + açık onay */
+    NOX_LL_FS_ABORT             /* fail-closed */
+} nox_ll_fs_policy_t;
+
+nox_ll_fs_policy_t landlock_fs_policy_decide(bool fds_ok,
+                                             nox_err_t init_rc,
+                                             bool active,
+                                             bool allow_unsandboxed);
+
+/* F5/ABI probe: syscall sonucu + errno sınıflandırması — saf,
+ * kernel gerektirmez. ret >= 0 → OK; ret < 0 + ENOSYS/EOPNOTSUPP →
+ * UNSUPPORTED; ret < 0 + diğer → CONFIG_ERROR. ABI == 0 kontrolü
+ * çağırana aittir (landlock_sandbox_init bunu UNSUPPORTED sayar). */
+typedef enum {
+    NOX_LL_SYSCALL_OK = 0,
+    NOX_LL_SYSCALL_UNSUPPORTED,
+    NOX_LL_SYSCALL_CONFIG_ERROR
+} nox_ll_syscall_status_t;
+
+nox_ll_syscall_status_t landlock_syscall_status(int ret, int err);
 
 /**
  * landlock_abi_version — Kernel Landlock ABI sürümü.
