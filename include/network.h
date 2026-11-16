@@ -197,4 +197,13 @@ void cleanup_stale_tor_dirs(const char *config_dir);
 /* strtol + ERANGE/endptr kontrolü; geçersiz → -1. */
 long safe_parse_pid(const char *str);
 
+/* F2: torrc içerik buffer'ına "__OwningControllerProcess <pid>\n"
+ * satırını ekler; başarıda *len güncellenir, hatada değişmez. */
+nox_err_t tor_append_owning_controller_process(char *content, size_t cap,
+                                               size_t *len, int pid);
+
+/* F2: torrc dosyasını üretir (config_dir/tor_data_<pid>/torrc).
+ * UNIT TEST ERİŞİMİ: gerçek çıktıda sahiplik satırını doğrulamak için. */
+nox_err_t generate_torrc(struct app_state *state);
+
 #endif /* PARANOID_NETWORK_H */

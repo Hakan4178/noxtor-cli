@@ -613,7 +613,9 @@ nox_err_t tor_append_owning_controller_process(char *content, size_t cap,
   return NOX_OK;
 }
 
-static nox_err_t generate_torrc(struct app_state *state) {
+/* UNIT TEST ERİŞİMİ (test_network): torrc içeriğini ve dosya yolunu
+ * üretir; gerçek çıktıda sahiplik satırı test edilir. */
+nox_err_t generate_torrc(struct app_state *state) {
   /* F3: tor_data fd'si tek sefer açılır ve Landlock kuralına anchor olur.
    * Yeniden çağrılırsa eski fd'yi sızdırma. */
   if (state->tor_data_fd >= 0) {
@@ -887,19 +889,17 @@ static nox_err_t generate_torrc(struct app_state *state) {
    * sahipsiz (orphan) kalmaması için PID yoklaması ekle. Tor bu satırı
    * 15 sn'de bir denetler ve süreç yoksa kendini kapatır. TAKEOWNERSHIP
    * GÖNDERİLMEZ; gönderilirse control fd kapanınca Tor da kapanırdı. */
-  {
-    size_t remaining = sizeof(content) - (size_t)clen;
-    int own_n = snprintf(content + clen, remaining,
-                         "__OwningControllerProcess %d\n", (int)getpid());
-    if (own_n <= 0 || (size_t)own_n >= remaining) {
-      NOX_ERROR(LOG_MOD_NET, "torrc sahiplik satırı sığmadı");
-      close(fd);
-      if (state->tor_data_fd >= 0)
-        unlinkat(state->tor_data_fd, "torrc", 0);
-      return NOX_ERR_CONFIG;
-    }
-    clen += own_n;
+  size_t content_len = (size_t)clen;
+  nox_err_t own_err = tor_append_owning_controller_process(
+      content, sizeof(content), &content_len, (int)getpid());
+  if (own_err != NOX_OK) {
+    NOX_ERROR(LOG_MOD_NET, "torrc sahiplik satırı eklenemedi");
+    close(fd);
+    if (state->tor_data_fd >= 0)
+      unlinkat(state->tor_data_fd, "torrc", 0);
+    return NOX_ERR_CONFIG;
   }
+  clen = (int)content_len;
 
   nox_err_t err = write_full(fd, content, (size_t)clen);
   close(fd);
