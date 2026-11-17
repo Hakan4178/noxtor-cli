@@ -1,0 +1,73 @@
+name: "Noise differential"
+
+# noise.c ↔ noise-c (bağımsız referans) bayt-bayt diferansiyel doğrulama.
+# Kanıt kaydı artifact olarak yüklenir: run.log, metadata.txt, summary.txt.
+#
+# Referans sürümü commit SHA'sı ile sabittir; libnoiseprotocol sürümü
+# değişirse oracle sessizce kaymasın diye.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    name: Differential (noise-c)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get remove -y libsodium-dev libsodium23 || true
+        sudo apt-get install -y gcc-14 g++-14 make curl cmake
+
+    - name: Build libsodium 1.0.22
+      run: |
+        curl -fsSLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.22.tar.gz
+        echo "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349  libsodium-1.0.22.tar.gz" | sha256sum -c -
+        tar xzf libsodium-1.0.22.tar.gz
+        cd libsodium-1.0.22
+        ./configure --prefix=/usr/local
+        make -j"$(nproc)"
+        sudo make install
+        sudo ldconfig
+
+    - name: Build noise-c (pinned)
+      run: |
+        git clone https://github.com/rweather/noise-c.git /tmp/noise-c
+        cd /tmp/noise-c
+        git checkout cfe25410979a87391bb9ac8d4d4bef64e9f268c6
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        cmake --build build --parallel "$(nproc)"
+        sudo cmake --install build
+        sudo ldconfig
+        test -f /usr/local/lib/libnoiseprotocol.a || test -f /usr/local/lib/libnoiseprotocol.so
+
+    - name: Run differential gate
+      env:
+        CC: gcc-14
+        LIBRARY_PATH: /usr/local/lib
+        PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+      run: |
+        make differential-gate DIFF_EVIDENCE_DIR=artifacts/noise-differential
+
+    - name: Upload evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: noise-differential-evidence
+        path: artifacts/noise-differential/
+        retention-days: 90

@@ -572,13 +572,22 @@ fuzz-run-onion_bind: fuzz
 # ----------------------------------------------------------------
 # DIFFERENTIAL FUZZING — noise-c referans ile karşılaştırma (hedefli + kapsamlı)
 # ----------------------------------------------------------------
+# noise-c kurulum öneki (statik libnoiseprotocol.a burada aranır)
+NOISE_C_PREFIX ?= /usr/local
+
 $(TEST_DIR)/fuzz_noise_differential: $(TEST_DIR)/fuzz_noise_differential.c src/noise.c
 	$(MSG) 'DIFF' '$<'
 	$(Q)$(CC) $(STD) $(HARDEN_COMMON) -fsanitize=address,undefined -DNOISE_TEST_DETERMINISTIC -I$(INC_DIR) \
-		$^ -L/usr/local/lib -lnoiseprotocol -lsodium -o $@
+		$^ -L$(NOISE_C_PREFIX)/lib -lnoiseprotocol -lsodium -o $@
 
 differential: $(TEST_DIR)/fuzz_noise_differential
 	$(Q)$(TEST_DIR)/fuzz_noise_differential
+
+# Diferansiyel kapı: derler + koşar + commit/hash'li kanıt kaydı üretir.
+# Uyuşmazlıkta sıfırdan farklı çıkar (CI/periyodik kapı için).
+DIFF_EVIDENCE_DIR ?= docs-priv/kanit/noise-differential-$(shell date +%F)
+differential-gate: $(TEST_DIR)/fuzz_noise_differential
+	$(Q)NOISE_C_PREFIX=$(NOISE_C_PREFIX) $(TEST_DIR)/differential-gate.sh "$(DIFF_EVIDENCE_DIR)"
 
 
 

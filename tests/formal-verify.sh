@@ -225,6 +225,24 @@ verify_state_machine() {
         tests/cbmc_state_machine.c src/state_machine.c
 }
 
+verify_sanitize_filename() {
+    log "\n${BOLD}${CYAN}═══ sanitize_filename.c — MODEL (kaynak derlenmiyor) ═══${NC}"
+
+    # CBMC 6.9 built-in strrchr(_Generic) hatası → --c23 KULLANILMAZ
+    run_and_check "CBMC sanitize_filename" 300 "$OUTDIR/cbmc_sanitize_filename.txt" \
+        cbmc tests/cbmc_sanitize_filename.c \
+        --unwind 20 --no-standard-checks --stop-on-fail
+}
+
+verify_validate_onion() {
+    log "\n${BOLD}${CYAN}═══ validate_onion — FORMAT MODELİ (SHA3 harness dışı) ═══${NC}"
+
+    run_and_check "CBMC validate_onion" 300 "$OUTDIR/cbmc_validate_onion.txt" \
+        cbmc --c23 --bounds-check --pointer-check \
+        --no-unwinding-assertions --unwind 57 \
+        tests/cbmc_validate_onion.c
+}
+
 # ════════════════════════════════════════════════════════════
 echo -e "${BOLD}${CYAN}noxtor-cli — Formal Verification (CBMC + ESBMC)${NC}"
 command -v cbmc &>/dev/null || { echo -e "${RED}cbmc bulunamadı${NC}"; exit 1; }
@@ -243,9 +261,12 @@ case "$TARGET" in
     noise)  verify_noise ;;
     crypto) verify_crypto ;;
     sm)     verify_state_machine ;;
-    all)    verify_log; verify_arena; verify_stdin; verify_noise; verify_crypto; verify_state_machine ;;
+    sanitize) verify_sanitize_filename ;;
+    onion)  verify_validate_onion ;;
+    all)    verify_log; verify_arena; verify_stdin; verify_noise; verify_crypto; \
+            verify_state_machine; verify_sanitize_filename; verify_validate_onion ;;
     cov-all) verify_arena_coverage ;;
-    *)      echo "Kullanım: $0 [log|arena|arena-cov|stdin|noise|crypto|sm|all|cov-all]"; exit 1 ;;
+    *)      echo "Kullanım: $0 [log|arena|arena-cov|stdin|noise|crypto|sm|sanitize|onion|all|cov-all]"; exit 1 ;;
 esac
 
 log ""

@@ -15,8 +15,6 @@
  *   tests/fuzz_noise_differential.c — Differential fuzzing vs noise-c referansı
  *       (13 hedefli test + 105 key × 12 prologue × 4 pattern × 10 payload brute-force,
  *       error behavior, parametre boyut doğrulaması)
- *   tests/fuzz_noise_differential_noise_star.c — noise-star formal verify referansı
- *       ile differential fuzzing
  *   tests/cbmc_noise_easy.c — ESBMC harness (easy functions,
  *       overflow/memory-leak check)
  *
@@ -660,7 +658,7 @@ nox_err_t handshake_init(struct noise_handshake *hs, bool initiator,
   hs->initiator = initiator;
   hs->msg_index = 0;
 
-/* MixHash("Mustafa Kemal Atatürk") dolu prologue harcored informed choice.
+/* MixHash("Live Libre or Die") dolu prologue harcored informed choice.
  * PROLOGUE: sabit domain-separation değeri. İki taraf aynı değeri
  * kullanmalı; bu sabit genel Noise implementasyonlarıyla interoperability'i
  * bilinçli olarak kaldırır. Değiştirilirse mevcut session'lar bağlanamaz.

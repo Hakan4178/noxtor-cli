@@ -1,0 +1,6 @@
+# Derleme yapıtları (upstream kaynaklar değil)
+*.o
+*.d
+*.d.*
+libnoiseapi.a
+libnoiseapi.so

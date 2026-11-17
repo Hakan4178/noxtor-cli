@@ -15,7 +15,13 @@
  *     + Kapsamlı error behavior (corrupt/zeros/short × msg0/1/2 + wrong key)
  *     + Parametre boyut doğrulaması
  *
- * Derneleme:
+ * Tekrarlanabilirlik: Aşama 2'nin rastgele girdileri tek bir tohumdan
+ * üretilir; tohum her koşuda stderr'e yazılır ve FAIL satırında tekrarlanır.
+ * Aynı senaryoyu yeniden üretmek için:
+ *
+ *   NOX_DIFF_SEED=0x<seed> make differential
+ *
+ * Derleme:
  *   cc -std=c23 -DNOISE_TEST_DETERMINISTIC -Iinclude \
  *     tests/fuzz_noise_differential.c src/noise.c \
  *     -L/usr/local/lib -lnoiseprotocol -lsodium -o tests/fuzz_noise_differential
@@ -53,6 +59,59 @@ void nox_log_impl(log_level_t level, log_module_t mod,
 }
 
 /* ================================================================
+ * Deterministik RNG — NOX_DIFF_SEED
+ *
+ * Aşama 2'nin anahtar/payload üretimi rastgele. Bir uyuşmazlık
+ * çıktığında aynı senaryoyu yeniden üretebilmek için tüm rastgele
+ * girdiler tek bir tohumdan (splitmix64) üretilir. Tohum her koşuda
+ * stderr'e yazılır ve NOX_DIFF_SEED ile sabitlenebilir:
+ *
+ *   NOX_DIFF_SEED=0x1234 make differential
+ *
+ * Anahtar baytları kriptografik kalitede olmak zorunda değil (X25519
+ * private key'ler clamp edilir); amaç tekrarlanabilirlik.
+ * ================================================================ */
+static uint64_t g_seed = 0;
+static uint64_t g_rng_state = 0;
+
+static uint64_t diff_rng_next(void) {
+    uint64_t z = (g_rng_state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static void diff_rng_bytes(void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    while (len > 0) {
+        uint64_t v = diff_rng_next();
+        size_t n = (len < sizeof(v)) ? len : sizeof(v);
+        memcpy(p, &v, n);
+        p += n;
+        len -= n;
+    }
+}
+
+static void diff_rng_init(void) {
+    const char *env = getenv("NOX_DIFF_SEED");
+    if (env && *env) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 0);
+        if (end == env || (end && *end != '\0') || v == 0) {
+            fprintf(stderr, "[diff] geçersiz NOX_DIFF_SEED: %s\n", env);
+            exit(2);
+        }
+        g_seed = (uint64_t)v;
+    } else {
+        randombytes_buf(&g_seed, sizeof(g_seed));
+    }
+    g_rng_state = g_seed;
+    fprintf(stderr,
+            "[diff] seed=0x%016llx (yeniden üret: NOX_DIFF_SEED=0x%016llx)\n",
+            (unsigned long long)g_seed, (unsigned long long)g_seed);
+}
+
+/* ================================================================
  * ASSERT makrosu
  * ================================================================ */
 static int g_pass = 0, g_fail = 0;
@@ -60,7 +119,8 @@ static int g_pass = 0, g_fail = 0;
 #define DIFF_ASSERT(cond, msg) \
     do { \
         if (!(cond)) { \
-            fprintf(stderr, "  FAIL: %s\n", msg); \
+            fprintf(stderr, "  FAIL: %s (seed=0x%016llx)\n", msg, \
+                    (unsigned long long)g_seed); \
             g_fail++; \
         } else { \
             g_pass++; \
@@ -1683,7 +1743,7 @@ static void run_wrong_static_key_test(
     const char *label) {
     char errmsg[128];
     uint8_t wrong_priv[32], wrong_pub[32];
-    randombytes_buf(wrong_priv, 32);
+    diff_rng_bytes(wrong_priv, 32);
     crypto_scalarmult_base(wrong_pub, wrong_priv);
 
     /* noise-c tarafı */
@@ -2185,6 +2245,10 @@ int main(void) {
         return 1;
     }
 
+    /* Rastgele girdiler için tek tohum — FAIL çıktısı bu tohumu yazar;
+     * aynı koşuyu NOX_DIFF_SEED ile birebir yeniden üretebilirsiniz. */
+    diff_rng_init();
+
     /* ═══════════════════════════════════════════════════════════════
      * AŞAMA 1: Hedefli testler (deterministic keys, 13 test)
      * ═══════════════════════════════════════════════════════════════ */
@@ -2301,10 +2365,10 @@ int main(void) {
         uint8_t ki_e_priv_i[32], ki_e_priv_r[32];
 
         if (ki < 100) {
-            randombytes_buf(ki_i_priv, 32);
-            randombytes_buf(ki_r_priv, 32);
-            randombytes_buf(ki_e_priv_i, 32);
-            randombytes_buf(ki_e_priv_r, 32);
+            diff_rng_bytes(ki_i_priv, 32);
+            diff_rng_bytes(ki_r_priv, 32);
+            diff_rng_bytes(ki_e_priv_i, 32);
+            diff_rng_bytes(ki_e_priv_r, 32);
             crypto_scalarmult_base(ki_i_pub, ki_i_priv);
             crypto_scalarmult_base(ki_r_pub, ki_r_priv);
         } else {
@@ -2376,7 +2440,7 @@ int main(void) {
                         payload = malloc(plen);
                         if (!payload) continue;
                         if (pati == 0) {
-                            randombytes_buf(payload, plen);
+                            diff_rng_bytes(payload, plen);
                         } else {
                             fill_fns[pati](payload, plen);
                         }
@@ -2449,7 +2513,7 @@ int main(void) {
                             cpayload = malloc(cplen);
                             if (!cpayload) continue;
                             if (cpat == 0) {
-                                randombytes_buf(cpayload, cplen);
+                                diff_rng_bytes(cpayload, cplen);
                             } else {
                                 fill_fns[cpat](cpayload, cplen);
                             }

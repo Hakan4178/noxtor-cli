@@ -920,8 +920,12 @@ eksik config/downloads fd'sini, `init OK` olmasına rağmen `!landlock_is_active
 durumunu ve `NOX_ERR_CONFIG`/diğer hataları **abort** eder.
 `--allow-unsandboxed-fs` yalnız `NOX_ERR_LANDLOCK_UNSUPPORTED` + `!active`
 durumunda uyarıyla devam sağlar; diğer hataları bypass etmez. ABI probe'unda
-`ENOSYS`/`EOPNOTSUPP` unsupported, diğer hatalar config hatası sayılır.
-Karar matrisi `tests/test_landlock_policy.c` ile **14/14** doğrulanır;
+`ENOSYS`/`EOPNOTSUPP` unsupported, diğer hatalar config hatası sayılır
+(`landlock_syscall_status()` saf yardımcısı). Karar matrisi
+`tests/test_landlock_policy.c` ile **14/14** doğrulanır; ABI errno
+sınıflandırması ve `event_loop_landlock_gate()` üzerinden gerçek abort
+yolu (`state->running = false`, init/socks sırası) fake ops ile
+`tests/test_landlock_gate.c` içinde **105/105** doğrulanır; iki test de
 kernel gerektirmez.
 
 **Android/arm64 build ayrımı:** Yalnız `make android release` build'i
@@ -1102,6 +1106,7 @@ mapping kurmaz (fail-closed). `test_arena` 24/24.
 | `test_c1_text_paths.c` | 10 | TEXT kuyruklama, segmented AEAD sırası, kuyruk dolu/AGAIN, EPOLLOUT liveness |
 | `test_frontend.c` | 19 | Dispatch, FE_SYSTEM/FE_ERROR strip, TUI no-op |
 | `test_landlock_rights.c` | 24 | Landlock hak maskeleme + F1 RESOLVE_UNIX + F3 config/tor_data (birim + entegrasyon) |
+| `test_landlock_gate.c` | 105 | ABI probe errno sınıflandırması + event loop Landlock kapısı fault-injection (fake ops; kernel gerektirmez) |
 | `test_landlock_policy.c` | 14 | F5 fail-closed karar matrisi (kernel gerektirmez; Android build'inde de derlenir) |
 | `test_log.c` | 1 | Modül log seviyesi |
 | `test_mdwe.c` | 3 | MDWE prctl politikası |
@@ -1328,6 +1333,7 @@ noxtor-cli/
 │   ├── test_frontend.c      # Frontend dispatch + T-02 strip (19)
 │   ├── test_landlock_rights.c # Landlock rights + F1/F3 (24)
 │   ├── test_landlock_policy.c # F5 fail-closed matrisi (14)
+│   ├── test_landlock_gate.c   # ABI errno + event loop kapısı (105)
 │   ├── test_log.c           # Log seviyesi (1)
 │   ├── test_mdwe.c          # MDWE politikası (3)
 │   ├── test_net_cleanup.c   # Soket/peer temizliği (9)
