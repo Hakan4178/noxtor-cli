@@ -49,8 +49,11 @@ done
     "libnoiseprotocol bulunamadı ($PREFIX/lib) — noise-c kurun veya NOISE_C_PREFIX verin."
 
 # ── 2. Derle ───────────────────────────────────────────────────────
+# Eski ikiliyi sil: kanıt, mevcut bayraklarla yapılmış taze derlemeyi göstersin.
+rm -f "$BIN"
+# V=1: derleme komutu (prefix bayrakları dahil) build.log'a yazılsın.
 make -C "$ROOT" tests/fuzz_noise_differential NOISE_C_PREFIX="$PREFIX" \
-    CC="${CC:-gcc}" >"$BUILDLOG" 2>&1 || die 3 "derleme başarısız — $BUILDLOG"
+    CC="${CC:-gcc}" V=1 >"$BUILDLOG" 2>&1 || die 3 "derleme başarısız — $BUILDLOG"
 [ -x "$BIN" ] || die 3 "ikili üretilemedi: $BIN"
 
 # ── 3. Koş ─────────────────────────────────────────────────────────

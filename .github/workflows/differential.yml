@@ -32,7 +32,8 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get remove -y libsodium-dev libsodium23 || true
-        sudo apt-get install -y gcc-14 g++-14 make curl cmake
+        sudo apt-get install -y gcc-14 g++-14 make curl \
+          autoconf automake libtool
 
     - name: Build libsodium 1.0.22
       run: |
@@ -45,14 +46,17 @@ jobs:
         sudo make install
         sudo ldconfig
 
+    # noise-c autotools kullanır (autogen.sh + configure.ac); CMakeLists.txt YOK.
+    # Bu yüzden cmake değil autogen/configure/make.
     - name: Build noise-c (pinned)
       run: |
         git clone https://github.com/rweather/noise-c.git /tmp/noise-c
         cd /tmp/noise-c
         git checkout cfe25410979a87391bb9ac8d4d4bef64e9f268c6
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-        cmake --build build --parallel "$(nproc)"
-        sudo cmake --install build
+        ./autogen.sh
+        ./configure --prefix=/usr/local
+        make -j"$(nproc)"
+        sudo make install
         sudo ldconfig
         test -f /usr/local/lib/libnoiseprotocol.a || test -f /usr/local/lib/libnoiseprotocol.so
 
