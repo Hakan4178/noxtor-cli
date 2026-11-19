@@ -77,8 +77,9 @@ endif
 OBJS     := $(SRCS:%.c=%.o)
 DEPS     := $(OBJS:%.o=%.d)
 
-# Test binary'leri — cbmc_ ve fuzz_noise_differential hariç
-TEST_SRCS := $(filter-out $(TEST_DIR)/cbmc_%.c $(TEST_DIR)/fuzz_%.c $(TEST_DIR)/test_seccomp.c, $(wildcard $(TEST_DIR)/*.c))
+# Test binary'leri — cbmc_, fuzz_ ve opsiyonel noise_star_ spike'ı hariç
+# (spike ayrı bir hedef ve HACL* gerektirir: make noise-star-spike)
+TEST_SRCS := $(filter-out $(TEST_DIR)/cbmc_%.c $(TEST_DIR)/fuzz_%.c $(TEST_DIR)/test_seccomp.c $(TEST_DIR)/noise_star_%.c, $(wildcard $(TEST_DIR)/*.c))
 TEST_BINS := $(TEST_SRCS:%.c=%)
 TEST_DEPS := $(TEST_SRCS:%.c=%.d)
 
@@ -592,6 +593,36 @@ differential-gate:
 	$(Q)NOISE_C_PREFIX=$(NOISE_C_PREFIX) $(TEST_DIR)/differential-gate.sh "$(DIFF_EVIDENCE_DIR)"
 
 
+# ----------------------------------------------------------------
+# NOISE* İKİNCİ ORACLE — opsiyonel handshake spike (ZORUNLU KAPI DEĞİL)
+# ----------------------------------------------------------------
+# HACL* repoya girmez; scripts/build-noise-star.sh ile $HACL_DIR altına
+# sparse clone + derleme yapılır. Pin: 349b052 (bkz third_party/noise-star/README.md).
+HACL_DIR ?= /tmp/hacl-349b052
+NOISE_STAR_SUITE := third_party/noise-star/XX_25519_ChaChaPoly_BLAKE2b
+NOISE_STAR_DIST  := $(HACL_DIR)/dist
+NOISE_STAR_LIB   := $(NOISE_STAR_SUITE)/libnoiseapi.a
+NOISE_STAR_EVER  := $(NOISE_STAR_DIST)/gcc-compatible/libevercrypt.a
+
+$(NOISE_STAR_LIB):
+	$(Q)echo "HATA: Noise* suite derlenmedi. Önce: scripts/build-noise-star.sh (HACL_DIR=$(HACL_DIR))" >&2; exit 1
+
+$(NOISE_STAR_EVER):
+	$(Q)echo "HATA: HACL* derlenmedi. Önce: scripts/build-noise-star.sh (HACL_DIR=$(HACL_DIR))" >&2; exit 1
+
+$(TEST_DIR)/noise_star_handshake_spike: $(TEST_DIR)/noise_star_handshake_spike.c src/noise.c $(NOISE_STAR_LIB) $(NOISE_STAR_EVER)
+	$(MSG) 'SPIKE' '$<'
+	$(Q)$(CC) $(STD) -D_DEFAULT_SOURCE -D_BSD_SOURCE -DNOISE_TEST_DETERMINISTIC \
+		-I$(INC_DIR) -I$(NOISE_STAR_SUITE) \
+		-I$(NOISE_STAR_DIST)/karamel/include \
+		-I$(NOISE_STAR_DIST)/karamel/krmllib/dist/minimal \
+		-I$(NOISE_STAR_DIST)/kremlin/include \
+		-I$(NOISE_STAR_DIST)/kremlin/kremlib/dist/minimal \
+		$^ -o $@ -lsodium
+
+noise-star-spike: $(TEST_DIR)/noise_star_handshake_spike
+	$(Q)$(TEST_DIR)/noise_star_handshake_spike
+
 
 # ----------------------------------------------------------------
 # SECCOMP DENEME
@@ -613,6 +644,7 @@ clean:
 	rm -f $(TEST_BINS) $(TEST_DEPS)
 	rm -f $(FUZZ_DIR)/*.fuzz.o $(FUZZ_DIR)/fuzz_frame_decode $(FUZZ_DIR)/fuzz_sanitize $(FUZZ_DIR)/fuzz_arena $(FUZZ_DIR)/fuzz_stdin $(FUZZ_DIR)/fuzz_file_transfer $(FUZZ_DIR)/fuzz_stdin_events $(FUZZ_DIR)/fuzz_ctrl $(FUZZ_DIR)/fuzz_socks5 $(FUZZ_DIR)/fuzz_handshake
 	rm -f $(TEST_DIR)/fuzz_noise_differential
+	rm -f $(TEST_DIR)/noise_star_handshake_spike
 
 	rm -f $(TEST_DIR)/test_seccomp
 	rm -rf $(FUZZ_DIR)/tmp_downloads

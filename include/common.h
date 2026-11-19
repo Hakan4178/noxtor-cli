@@ -14,6 +14,19 @@
 #endif
 
 /* ================================================================
+ * TEST HOOK'I RELEASE'A SIZDIRMA KORUMASI
+ *
+ * RELEASE_FLAGS -DNDEBUG tanımlar; test/fuzz/differential derlemeleri
+ * -DNOISE_TEST_DETERMINISTIC kullanır ama NDEBUG tanımlamaz. İkisi birden
+ * görülürse test hook'ları (handshake_inject_ephemeral, handshake_get_k vb.)
+ * üretim binary'sine giriyor ve ephemeral key rastgelelik yerine enjeksiyona
+ * açılıyor demektir. Derlemeyi kırarak durdur.
+ * ================================================================ */
+#if defined(NDEBUG) && defined(NOISE_TEST_DETERMINISTIC)
+#error "NOISE_TEST_DETERMINISTIC release derlemesinde kullanılamaz"
+#endif
+
+/* ================================================================
  * PLATFORM SEÇİMİ — yalnız build sistemi tanımlar
  *
  * Varsayılan Linux/x86 build'de NOX_PLATFORM_ANDROID tanımsızdır.

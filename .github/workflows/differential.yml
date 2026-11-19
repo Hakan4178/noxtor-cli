@@ -5,12 +5,23 @@ name: "Noise differential"
 #
 # Referans sürümü commit SHA'sı ile sabittir; libnoiseprotocol sürümü
 # değişirse oracle sessizce kaymasın diye.
+#
+# main push'unda CodeQL ile birlikte çalışır; PR'da yalnız noise ile ilgili
+# yollar değiştiğinde, ayrıca haftalık cron ve manuel tetikleme ile çalışır.
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    paths:
+      - 'src/noise.c'
+      - 'include/noise.h'
+      - 'include/common.h'
+      - 'tests/fuzz_noise_differential.c'
+      - 'tests/differential-gate.sh'
+      - 'Makefile'
+      - '.github/workflows/differential.yml'
   schedule:
     - cron: '17 4 * * 1'
   workflow_dispatch:
@@ -26,7 +37,9 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
 
     - name: Install build dependencies
       run: |
@@ -35,28 +48,53 @@ jobs:
         sudo apt-get install -y gcc-14 g++-14 make curl \
           autoconf automake libtool
 
+    # libsodium derlemesi pahalı. /usr/local root'a ait olduğu için doğrudan
+    # önbelleklenemez; derleme ağacı önbelleklenir, kurulum her koşuda yapılır.
+    - name: Cache libsodium build
+      id: cache-libsodium
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: /tmp/libsodium-1.0.22
+        key: libsodium-1.0.22-adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349-${{ runner.os }}-${{ runner.arch }}
+
     - name: Build libsodium 1.0.22
+      if: steps.cache-libsodium.outputs.cache-hit != 'true'
       run: |
-        curl -fsSLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.22.tar.gz
-        echo "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349  libsodium-1.0.22.tar.gz" | sha256sum -c -
-        tar xzf libsodium-1.0.22.tar.gz
-        cd libsodium-1.0.22
+        curl -fsSLo /tmp/libsodium-1.0.22.tar.gz https://download.libsodium.org/libsodium/releases/libsodium-1.0.22.tar.gz
+        echo "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349  /tmp/libsodium-1.0.22.tar.gz" | sha256sum -c -
+        tar xzf /tmp/libsodium-1.0.22.tar.gz -C /tmp
+        cd /tmp/libsodium-1.0.22
         ./configure --prefix=/usr/local
         make -j"$(nproc)"
-        sudo make install
+
+    - name: Install libsodium 1.0.22
+      run: |
+        sudo make -C /tmp/libsodium-1.0.22 install
         sudo ldconfig
 
     # noise-c autotools kullanır (autogen.sh + configure.ac); CMakeLists.txt YOK.
     # Bu yüzden cmake değil autogen/configure/make.
+    - name: Cache noise-c build
+      id: cache-noise-c
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: /tmp/noise-c
+        key: noise-c-cfe25410979a87391bb9ac8d4d4bef64e9f268c6-${{ runner.os }}-${{ runner.arch }}
+
     - name: Build noise-c (pinned)
+      if: steps.cache-noise-c.outputs.cache-hit != 'true'
       run: |
+        rm -rf /tmp/noise-c
         git clone https://github.com/rweather/noise-c.git /tmp/noise-c
         cd /tmp/noise-c
         git checkout cfe25410979a87391bb9ac8d4d4bef64e9f268c6
         ./autogen.sh
         ./configure --prefix=/usr/local
         make -j"$(nproc)"
-        sudo make install
+
+    - name: Install noise-c (pinned)
+      run: |
+        sudo make -C /tmp/noise-c install
         sudo ldconfig
         test -f /usr/local/lib/libnoiseprotocol.a || test -f /usr/local/lib/libnoiseprotocol.so
 
@@ -70,7 +108,7 @@ jobs:
 
     - name: Upload evidence
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: noise-differential-evidence
         path: artifacts/noise-differential/

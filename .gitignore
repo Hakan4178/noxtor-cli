@@ -21,6 +21,8 @@ __pycache__/
 /tests/fuzz_*
 !/tests/fuzz_*.c
 !/tests/fuzz_*.h
+# Opsiyonel Noise* spike binary'si (make noise-star-spike)
+/tests/noise_star_handshake_spike
 /fuzz/fuzz_*
 !/fuzz/fuzz_*.c
 !/fuzz/fuzz_*.h
