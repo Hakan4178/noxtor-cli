@@ -30,15 +30,26 @@ static void fixture_reset(void)
     st.active_peer_idx  = -1;
     st.epoll_fd         = -1;
     st.downloads_dir_fd = -1;
-    st.peers[0].fd      = -1; /* cleanup'ta close(0) olmasın */
+    for (unsigned i = 0; i < NOX_MAX_PEERS; i++) {
+        st.peers[i].fd         = -1; /* cleanup'ta close(0) olmasın */
+        st.peers[i].rx_file.fd = -1;
+        st.peers[i].tx_file.fd = -1;
+    }
+}
+
+/* Belirli slottaki peer'ı prompt'a sokar (event_loop EV_HANDSHAKE_DONE). */
+static nox_err_t prompt_slot(unsigned idx, uint8_t fill)
+{
+    struct peer_session *ps = &st.peers[idx];
+    ps->state = ST_HANDSHAKE_INIT;
+    memset(ps->tofu_new_key, fill, NOX_KEY_LEN);
+    return sm_dispatch(ps, &st, EV_HANDSHAKE_DONE);
 }
 
 /* Aynı slotta prompt'a sokar (event_loop EV_HANDSHAKE_DONE yolunun karşılığı) */
 static nox_err_t prompt_with(uint8_t fill)
 {
-    slot0()->state = ST_HANDSHAKE_INIT;
-    memset(slot0()->tofu_new_key, fill, NOX_KEY_LEN);
-    return sm_dispatch(slot0(), &st, EV_HANDSHAKE_DONE);
+    return prompt_slot(0, fill);
 }
 
 /* action_tofu_accept tamamlanmış Noise XX + geçerli db ister; şablon
@@ -266,7 +277,56 @@ static int test_cleanup_clears_prompt_token(void)
     return 0;
 }
 
-/* 9) GERÇEK accept yolu: tam onay akışı — ST_ACTIVE + session + rehber */
+/* 9) Karar aktif slota değil, ST_TOFU_PENDING olan peer'a bağlanır. */
+static int test_pending_peer_not_active_slot(void)
+{
+    fixture_reset();
+
+    struct peer_session *active = &st.peers[0];
+    active->state = ST_ACTIVE;
+    st.active_peer_idx = 0;
+
+    struct peer_session *pending = &st.peers[1];
+    TEST_ASSERT(prompt_slot(1, 0xB2) == NOX_OK);
+    TEST_ASSERT(pending->state == ST_TOFU_PENDING);
+    TEST_ASSERT(st.tofu_prompt_epoch == pending->tofu_epoch);
+
+    process_line(&st, "n");
+
+    TEST_ASSERT(pending->state == ST_IDLE);       /* karar bekleyen peer'a */
+    TEST_ASSERT(active->state == ST_ACTIVE);      /* aktif slot dokunulmadı */
+    TEST_ASSERT(st.active_peer_idx == 0);
+    TEST_ASSERT(st.tofu_prompt_epoch == 0);
+    return 0;
+}
+
+/* 10) İki prompt beklerken y/n hiçbirine karar vermez (çoklu-pending). */
+static int test_multiple_pending_no_decision(void)
+{
+    fixture_reset();
+    TEST_ASSERT(prompt_slot(0, 0xA1) == NOX_OK);
+    TEST_ASSERT(prompt_slot(1, 0xB2) == NOX_OK);
+    TEST_ASSERT(st.peers[0].state == ST_TOFU_PENDING);
+    TEST_ASSERT(st.peers[1].state == ST_TOFU_PENDING);
+
+    uint64_t snap_epoch = st.tofu_prompt_epoch;
+    uint8_t  snap_fp[NOX_KEY_LEN];
+    memcpy(snap_fp, st.tofu_prompt_fp, NOX_KEY_LEN);
+
+    process_line(&st, "y");
+    TEST_ASSERT(st.peers[0].state == ST_TOFU_PENDING);
+    TEST_ASSERT(st.peers[1].state == ST_TOFU_PENDING);
+    TEST_ASSERT(st.tofu_prompt_epoch == snap_epoch);
+    TEST_ASSERT(memcmp(st.tofu_prompt_fp, snap_fp, NOX_KEY_LEN) == 0);
+
+    process_line(&st, "n");
+    TEST_ASSERT(st.peers[0].state == ST_TOFU_PENDING);
+    TEST_ASSERT(st.peers[1].state == ST_TOFU_PENDING);
+    TEST_ASSERT(st.tofu_prompt_epoch == snap_epoch);
+    return 0;
+}
+
+/* 11) GERÇEK accept yolu: tam onay akışı — ST_ACTIVE + session + rehber */
 static int test_real_accept_path(void)
 {
     fixture_reset();
@@ -324,6 +384,8 @@ int main(void)
     RUN_TEST(test_fp_match_epoch_mismatch_rejected);
     RUN_TEST(test_yes_without_hs_cleans_up);
     RUN_TEST(test_cleanup_clears_prompt_token);
+    RUN_TEST(test_pending_peer_not_active_slot);
+    RUN_TEST(test_multiple_pending_no_decision);
     RUN_TEST(test_real_accept_path);
 
     fprintf(stderr, "\n=== Sonuç: %d/%d test başarılı ===\n",

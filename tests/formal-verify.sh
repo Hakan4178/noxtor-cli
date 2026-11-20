@@ -8,6 +8,11 @@
 #   ./tests/formal-verify.sh stdin    # sadece stdin_handler.c
 #   ./tests/formal-verify.sh noise    # sadece noise.c
 #   ./tests/formal-verify.sh crypto   # sadece crypto.c
+#
+# LEGACY / FROZEN — 2026-11-16 itibarıyla bu betik ve cbmc_*.c harness'ları
+# güncel üretim kodundan kopmuştur: beşi kopya/model doğrulaması yapar,
+# ikisi bu betiğe hiç bağlı değildir. Sonuçlar güncel kaynak için GEÇERLİ
+# DEĞİLDİR; CI'da çalışmaz. Bkz. docs/architecture.md §11.2.
 
 set -uo pipefail
 

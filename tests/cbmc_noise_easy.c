@@ -1,3 +1,7 @@
+/* LEGACY / FROZEN — 2026-11-16. Bu harness güncel üretim kodundan
+ * kopmuştur; kopya/model doğrulamasıdır. Sonuçlar güncel kaynak için
+ * geçerli değildir. Bkz. docs/architecture.md §11.2.
+ */
 /* ESBMC harness for noise.c — Kolay + Çok Kolay fonksiyonlar (12 adet)
  *
  * Self-contained: types.h kullanılmaz (sodium.h conflict önlemi).

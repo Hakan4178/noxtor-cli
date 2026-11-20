@@ -1155,8 +1155,12 @@ yokluğu ve `seccomp_policy_load` sembolünün çözülmesi doğrulanır.
 `test_seccomp.c` (make seccomp-test) — tüm seccomp kural dizisinin
 canlı testi (LSan kapalı, seccomp ptrace ile uyumsuz olduğundan).
 
-**Bilinen kırmızı yok.** C2 ile METADATA ve FILE chunk'ları ortak TX
-kuyruğuna alındı; `test_file_transfer` 15/15 (T-04/K-29 dahil),
+**`make test` içinde bilinen kırmızı yok.** `tests/red/test_open_attack_chain.c`
+bilerek ayrı tutulur: K-26 + T-15 açık saldırgan zinciri (ghost modda RX
+yazımı, onaysız kabul, timeout sonrası geç chunk ile diriltme).
+`make test-open-chain` exit 1 verir; `make test` yeşil kalır. Açıklar
+kapanınca test normal suite'e taşınır. C2 ile METADATA ve FILE chunk'ları
+ortak TX kuyruğuna alındı; `test_file_transfer` 15/15 (T-04/K-29 dahil),
 `test_tx_order` 3/3, B1 trickle ve B2a gerçek-handshake testleriyle
 `test_event_frames` 35/35; K-23 + K-33 zinciri `test_attack_chain` 2/2
 ve tam `make test` exit 0. K-28/T-03, K-29/T-04, K-23, K-33, HF-1/B1 ve
@@ -1319,6 +1323,7 @@ noxtor-cli/
 │   ├── proverif/            # ProVerif modeli (XX.noise.active.pv, ...)
 │   ├── test_ansi_strip.c    # ANSI/C0 + K-33 CR/LF/C1/bidi (19)
 │   ├── test_attack_chain.c  # K-23 + K-33 saldırgan zinciri (2)
+│   ├── red/test_open_attack_chain.c # K-26 + T-15 açık zinciri (bilerek kırmızı)
 │   ├── test_arena.c         # Arena unit tests (24; T-05 çift-init)
 │   ├── test_cet_shstk.c     # CET-SS kilidi + self-test (3; +3 stub)
 │   ├── test_chunk_size.c    # UTF-8 chunk noktası (8)

@@ -3,7 +3,8 @@
 #
 # Kullanım:
 #   make              → debug build (ASan + UBSan)
-#   make release      → release build (CET, Shadow Stack, -fhardened)
+#   make release      → release build (Linux x86: CET + Shadow Stack + -fhardened;
+#                       Android/arm64: CET yok, -fhardened var)
 #   make analyze      → -fanalyzer ile statik analiz
 #   make test         → testleri ASan/UBSan altında çalıştırır
 #   make TUI=1        → termbox2 arayüzü (varsayılan: ANSI_ONLY)
@@ -65,6 +66,14 @@ ifeq ($(PLATFORM),android)
     PLATFORM_DEF := -DNOX_PLATFORM_ANDROID -DNOX_NO_X86_ASM
 else
     PLATFORM_DEF :=
+endif
+
+# x86 CET — Android/arm64 derleyici ve linker'ı desteklemez.
+# Linux'ta boş değil; Android'de boş kalır (yoksa -fcf-protection /
+# -Wl,-z,shstk arm64 araç zincirinde hata verir).
+ifneq ($(PLATFORM),android)
+    CET_CFLAGS  := -fcf-protection=full
+    CET_LDFLAGS := -Wl,-z,shstk
 endif
 
 SRCS_ALL := $(wildcard $(SRC_DIR)/*.c)
@@ -199,7 +208,7 @@ RELEASE_FLAGS := \
     -g \
     -flto=auto \
     -fno-omit-frame-pointer \
-    -fcf-protection=full \
+    $(CET_CFLAGS) \
     -fhardened \
     -Wuse-after-free=3 \
     -Wdangling-pointer=2 \
@@ -215,7 +224,7 @@ RELEASE_FLAGS := \
 RELEASE_LINK := \
     -flto=auto \
     $(LINK_COMMON) \
-    -Wl,-z,shstk
+    $(CET_LDFLAGS)
 
 # ================================================================
 # ANALYZE BUILD (make analyze)
@@ -386,6 +395,29 @@ test-tor-detach:
 # 15 sn PID yoklaması nedeniyle ayrı hedef (make test'e dahil değil)
 test-tor-owning:
 	$(Q)NOX_TEST_TOR_OWNING=1 $(TEST_DIR)/test_tor_detach.sh
+
+# ----------------------------------------------------------------
+# AÇIK SALDIRGAN ZİNCİRİ — K-26 + T-15 (KASITLI KIRMIZI)
+# Açıklar kapanana kadar make test'e DAHİL EDİLMEZ; bu hedef kırmızı
+# döner ve düzeltmeleri tetikler. Yeşile dönünce normal suite'e taşı.
+# ----------------------------------------------------------------
+test-open-chain: $(TEST_DIR)/red/test_open_attack_chain
+	@echo "=== Açık saldırgan zinciri (K-26 + T-15) ==="
+	@ASAN_OPTIONS="$(ASAN_OPTS)" UBSAN_OPTIONS="$(UBSAN_OPTS)" \
+	    ./$(TEST_DIR)/red/test_open_attack_chain; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+	    echo "BEKLENMEDİK YEŞİL: açıklar kapanmış olabilir — testi make test'e taşıyın"; \
+	else \
+	    echo "BEKLENEN KIRMIZI: exit $$rc (K-26 + T-15 hâlâ açık)"; \
+	fi; \
+	exit $$rc
+
+$(TEST_DIR)/red/test_open_attack_chain: \
+		$(TEST_DIR)/red/test_open_attack_chain.c $(TEST_SRC_OBJS)
+	$(MSG) 'TEST' '$@'
+	$(Q)$(CC) $(TEST_CFLAGS) $(DEPFLAGS) -I$(INC_DIR) -I$(TEST_DIR) \
+	    $< $(TEST_SRC_OBJS) -o $@ $(TEST_LDFLAGS) $(LIBS)
 
 # Test binary kuralı — .test.o objelerine link eder (main.test.o hariç)
 # Testlerin kendi main() fonksiyonu var, src/main.test.o çakışır

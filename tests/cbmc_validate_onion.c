@@ -1,3 +1,7 @@
+/* LEGACY / FROZEN — 2026-11-16. Bu harness güncel üretim kodundan
+ * kopmuştur; kopya/model doğrulamasıdır. Sonuçlar güncel kaynak için
+ * geçerli değildir. Bkz. docs/architecture.md §11.2.
+ */
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * cbmc_validate_onion.c — CBMC/ESBMC harness for crypto_onion_pubkey
  *                          format zinciri + network.c:validate_onion_address

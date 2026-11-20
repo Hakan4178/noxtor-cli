@@ -1,3 +1,7 @@
+/* LEGACY / FROZEN — 2026-11-16. Bu harness güncel üretim kodundan
+ * kopmuştur; kopya/model doğrulamasıdır. Sonuçlar güncel kaynak için
+ * geçerli değildir. Bkz. docs/architecture.md §11.2.
+ */
 /* CBMC harness for log.c — formally verified (akademik rigor)
  *
  * Properties:
