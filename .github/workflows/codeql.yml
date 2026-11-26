@@ -27,7 +27,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
@@ -41,7 +41,7 @@ jobs:
     # önbelleklenemez; derleme ağacı önbelleklenir, kurulum her koşuda yapılır.
     - name: Cache libsodium build
       id: cache-libsodium
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: /tmp/libsodium-1.0.22
         key: libsodium-1.0.22-adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349-${{ runner.os }}-${{ runner.arch }}
@@ -63,7 +63,7 @@ jobs:
         grep -q crypto_hash_sha3256 /usr/local/include/sodium/crypto_hash_sha3.h
 
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+      uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
@@ -79,6 +79,6 @@ jobs:
         make CC=gcc-14
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+      uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
       with:
         category: "/language:${{matrix.language}}"
